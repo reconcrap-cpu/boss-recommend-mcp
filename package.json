@@ -1,0 +1,46 @@
+{
+  "name": "@reconcrap/boss-recommend-mcp",
+  "version": "0.1.0",
+  "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
+  "keywords": [
+    "boss",
+    "mcp",
+    "codex",
+    "recruiting",
+    "boss-zhipin",
+    "recommend"
+  ],
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "boss-recommend-mcp": "bin/boss-recommend-mcp.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "cli": "node src/cli.js",
+    "install:local": "node src/cli.js install",
+    "postinstall": "node scripts/postinstall.cjs",
+    "test:parser": "node src/test-parser.js",
+    "test:pipeline": "node src/test-pipeline.js"
+  },
+  "files": [
+    "bin",
+    "config/screening-config.example.json",
+    "skills",
+    "scripts/postinstall.cjs",
+    "src",
+    "vendor",
+    "README.md"
+  ],
+  "dependencies": {
+    "chrome-remote-interface": "^0.33.3",
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}
