@@ -94,6 +94,27 @@ CLI fallback 的状态机与 MCP 保持一致：
 - Chrome 远程调试端口是否可连
 - 当前 Chrome 是否停留在 `https://www.zhipin.com/web/chat/recommend`
 
+## Preflight 失败自动修复
+
+当工具返回 `status=FAILED` 且 `error.code=PIPELINE_PREFLIGHT_FAILED` 时：
+
+1. 优先读取 `diagnostics.recovery.agent_prompt`，直接把这段提示词交给 AI agent 执行环境修复。
+2. 若 `diagnostics.recovery.agent_prompt` 不存在，使用下面的兜底提示词（严格顺序，不可跳步）：
+
+```text
+你是环境修复 agent。请根据 diagnostics.checks 修复依赖，必须串行执行：
+1) 若 node_cli 失败：先安装 Node.js >=18，未成功前禁止执行 npm install。
+2) 若任意 npm_dep_* 失败：再安装 npm 依赖（chrome-remote-interface / ws）。
+3) 若 python_cli 失败：安装 Python，并确保 python 命令可用。
+4) 若 python_pillow 失败：最后执行 python -m pip install pillow。
+每一步完成后重新运行 doctor，全部通过后再重试 run_recommend_pipeline。
+```
+
+安装顺序约束（必须遵守）：
+
+- 没有 Node.js 时，不能先装 npm 包
+- 没有 Python 时，不能先装 Pillow
+
 ## Response Style
 
 - 用结构化中文输出

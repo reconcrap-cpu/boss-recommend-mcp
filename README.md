@@ -31,6 +31,8 @@ MCP 工具名：`run_recommend_pipeline`
 - 不会对每位候选人重复确认
 - 推荐页详情处理完成后，会强制关闭详情页并确认已关闭
 - 简历提取采用“分段滚动截图 + 拼成长图”的方式，再交给多模态模型判断
+- 运行前会自动做依赖体检（Node.js、Python、Pillow、`chrome-remote-interface`、`ws`），缺失时会在 `doctor` 与流水线失败诊断中明确提示
+- 若 preflight 失败，返回 `diagnostics.recovery`（含有序修复步骤与 `agent_prompt`），可直接交给 AI agent 自动按顺序安装依赖
 
 ## 安装
 

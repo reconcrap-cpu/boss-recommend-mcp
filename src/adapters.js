@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -174,6 +174,201 @@ function runProcess({ command, args, cwd, timeoutMs }) {
   });
 }
 
+function runProcessSync({ command, args, cwd }) {
+  try {
+    const result = spawnSync(command, args, {
+      cwd,
+      windowsHide: true,
+      shell: false,
+      env: process.env,
+      encoding: "utf8"
+    });
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    return {
+      ok: result.status === 0,
+      status: result.status,
+      stdout,
+      stderr,
+      output: [stdout, stderr].filter(Boolean).join("\n").trim(),
+      error_code: result.error?.code || null,
+      error_message: result.error?.message || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: -1,
+      stdout: "",
+      stderr: "",
+      output: "",
+      error_code: error.code || "SPAWN_FAILED",
+      error_message: error.message || String(error)
+    };
+  }
+}
+
+function parseMajorVersion(raw) {
+  const match = String(raw || "").match(/v?(\d+)(?:\.\d+){0,2}/);
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+function buildNodeCommandCheck() {
+  const probe = runProcessSync({
+    command: "node",
+    args: ["--version"]
+  });
+  const major = parseMajorVersion(probe.output);
+  const versionOk = Number.isInteger(major) && major >= 18;
+  return {
+    key: "node_cli",
+    ok: probe.ok && versionOk,
+    path: "node --version",
+    message: probe.ok
+      ? (versionOk
+        ? `Node 命令可用 (${probe.output || "unknown version"})`
+        : `Node 版本过低 (${probe.output || "unknown version"})，要求 >= 18`)
+      : `未找到 node 命令，请先安装 Node.js >= 18。${probe.error_message ? ` (${probe.error_message})` : ""}`
+  };
+}
+
+function detectPythonCommand() {
+  const python = runProcessSync({
+    command: "python",
+    args: ["--version"]
+  });
+  if (python.ok) {
+    return {
+      ok: true,
+      command: "python",
+      probe: python
+    };
+  }
+  const python3 = runProcessSync({
+    command: "python3",
+    args: ["--version"]
+  });
+  if (python3.ok) {
+    return {
+      ok: false,
+      command: null,
+      probe: python,
+      fallback: python3
+    };
+  }
+  return {
+    ok: false,
+    command: null,
+    probe: python,
+    fallback: null
+  };
+}
+
+function buildPythonCommandCheck() {
+  const detected = detectPythonCommand();
+  if (detected.ok) {
+    return {
+      key: "python_cli",
+      ok: true,
+      path: "python --version",
+      message: `Python 命令可用 (${detected.probe.output || "unknown version"})`
+    };
+  }
+  if (detected.fallback) {
+    return {
+      key: "python_cli",
+      ok: false,
+      path: "python --version",
+      message: `检测到 ${detected.fallback.output || "python3"}，但当前流程依赖 python 命令；请创建 python 别名后重试。`
+    };
+  }
+  return {
+    key: "python_cli",
+    ok: false,
+    path: "python --version",
+    message: "未找到 python 命令，请安装 Python 并确保 python 在 PATH 中。"
+  };
+}
+
+function buildPillowCheck() {
+  const detected = detectPythonCommand();
+  if (!detected.ok || !detected.command) {
+    return {
+      key: "python_pillow",
+      ok: false,
+      path: "python -c \"import PIL\"",
+      message: "无法校验 Pillow：python 命令不可用。"
+    };
+  }
+  const probe = runProcessSync({
+    command: detected.command,
+    args: ["-c", "import PIL, PIL.Image; print(PIL.__version__)"]
+  });
+  return {
+    key: "python_pillow",
+    ok: probe.ok,
+    path: `${detected.command} -c "import PIL"`,
+    message: probe.ok
+      ? `Pillow 可用 (${probe.output || "version unknown"})`
+      : "Pillow 未安装。请执行 `python -m pip install pillow`。"
+  };
+}
+
+function buildNodePackageCheck({ key, moduleName, cwd, missingMessage }) {
+  if (!cwd || !pathExists(cwd)) {
+    return {
+      key,
+      ok: false,
+      path: moduleName,
+      module: moduleName,
+      install_cwd: null,
+      message: missingMessage
+    };
+  }
+  const probe = runProcessSync({
+    command: "node",
+    args: ["-e", `require.resolve(${JSON.stringify(moduleName)});`],
+    cwd
+  });
+  return {
+    key,
+    ok: probe.ok,
+    path: moduleName,
+    module: moduleName,
+    install_cwd: cwd,
+    message: probe.ok
+      ? `${moduleName} npm 依赖可用`
+      : `缺少 npm 依赖 ${moduleName}，请在 boss-recommend-mcp 目录执行 npm install。`
+  };
+}
+
+function buildRuntimeDependencyChecks({ searchDir, screenDir }) {
+  return [
+    buildNodeCommandCheck(),
+    buildPythonCommandCheck(),
+    buildPillowCheck(),
+    buildNodePackageCheck({
+      key: "npm_dep_chrome_remote_interface_search",
+      moduleName: "chrome-remote-interface",
+      cwd: searchDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-recommend-search-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_chrome_remote_interface_screen",
+      moduleName: "chrome-remote-interface",
+      cwd: screenDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-recommend-screen-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_ws",
+      moduleName: "ws",
+      cwd: screenDir,
+      missingMessage: "无法校验 ws：boss-recommend-screen-cli 目录不存在。"
+    })
+  ];
+}
+
 function parseJsonOutput(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
@@ -248,6 +443,7 @@ export function runPipelinePreflight(workspaceRoot) {
       message: "screening-config.json 不存在"
     }
   ];
+  checks.push(...buildRuntimeDependencyChecks({ searchDir, screenDir }));
 
   return {
     ok: checks.every((item) => item.ok),
