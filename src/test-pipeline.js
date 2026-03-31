@@ -5,6 +5,7 @@ function createParsed(overrides = {}) {
   return {
     searchParams: {
       school_tag: "985",
+      degree: ["本科"],
       gender: "男",
       recent_not_view: "近14天没有"
     },
@@ -180,6 +181,7 @@ async function testCompletedPipeline() {
   assert.equal(result.result.processed_count, 10);
   assert.equal(result.result.passed_count, 3);
   assert.equal(result.result.post_action, "favorite");
+  assert.deepEqual(result.result.applied_filters.degree, ["本科"]);
   assert.equal(calls[0].type, "search");
   assert.equal(calls[1].type, "screen");
 }

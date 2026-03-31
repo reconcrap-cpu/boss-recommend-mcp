@@ -7,6 +7,25 @@ const SCHOOL_TAG_OPTIONS = [
   "国内外名校",
   "公办本科"
 ];
+const DEGREE_OPTIONS = [
+  "不限",
+  "初中及以下",
+  "中专/中技",
+  "高中",
+  "大专",
+  "本科",
+  "硕士",
+  "博士"
+];
+const DEGREE_ORDER = [
+  "初中及以下",
+  "中专/中技",
+  "高中",
+  "大专",
+  "本科",
+  "硕士",
+  "博士"
+];
 const GENDER_OPTIONS = ["不限", "男", "女"];
 const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
 const POST_ACTION_OPTIONS = ["favorite", "greet"];
@@ -29,6 +48,15 @@ const SCHOOL_TAG_PATTERNS = [
   { label: "留学", pattern: /留学|留学生/i },
   { label: "国内外名校", pattern: /国内外名校|名校/i },
   { label: "公办本科", pattern: /公办本科/i }
+];
+const DEGREE_PATTERNS = [
+  { label: "初中及以下", pattern: /初中及以下|初中以下/i },
+  { label: "中专/中技", pattern: /中专\s*\/\s*中技|中专中技|中专|中技/i },
+  { label: "高中", pattern: /(?:学历|教育|要求)?[^。；;\n]{0,8}高中/i },
+  { label: "大专", pattern: /(?:学历|教育|要求)?[^。；;\n]{0,8}(?:大专|专科)/i },
+  { label: "本科", pattern: /(?:学历|教育|要求)?[^。；;\n]{0,8}(?:本科|学士)/i },
+  { label: "硕士", pattern: /(?:学历|教育|要求)?[^。；;\n]{0,8}(?:硕士|研究生)/i },
+  { label: "博士", pattern: /(?:学历|教育|要求)?[^。；;\n]{0,8}博士/i }
 ];
 const GENDER_PATTERNS = [
   { label: "男", pattern: /(?:性别|候选人|人选)?[^。；;\n]{0,8}(?:男生|男性|男)/i },
@@ -57,6 +85,7 @@ const MAX_GREET_COUNT_PATTERNS = [
 ];
 const FILTER_CLAUSE_PATTERNS = [
   /学校标签|院校标签|985|211|双一流|留学|国内外名校|公办本科/i,
+  /学历|学位|教育|初中及以下|中专|中技|高中|大专|专科|本科|硕士|研究生|博士/i,
   /性别|男生|女生|男性|女性|男\b|女\b/i,
   /近?14天(?:内)?没有|近?14天(?:内)?没看过|近?14天(?:内)?未查看|过滤[^。；;\n]{0,12}14天|排除[^。；;\n]{0,12}14天/i,
   /目标(?:处理|筛选)?(?:人数|数量)?|至少(?:处理|筛选)|(?:处理|筛选)\s*\d+\s*(?:位|人)/i,
@@ -87,6 +116,75 @@ function normalizeSchoolTag(value) {
   if (normalized === "双一流") return "双一流院校";
   if (SCHOOL_TAG_OPTIONS.includes(normalized)) return normalized;
   return null;
+}
+
+function normalizeDegree(value) {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  if (normalized === "专科") return "大专";
+  if (normalized === "研究生") return "硕士";
+  if (normalized === "中专" || normalized === "中技" || normalized === "中专中技") return "中专/中技";
+  return DEGREE_OPTIONS.includes(normalized) ? normalized : null;
+}
+
+function sortDegreeSelections(values) {
+  return uniqueList(values).sort((left, right) => {
+    const leftIndex = DEGREE_ORDER.indexOf(left);
+    const rightIndex = DEGREE_ORDER.indexOf(right);
+    return leftIndex - rightIndex;
+  });
+}
+
+function expandDegreeAtOrAbove(value) {
+  const normalized = normalizeDegree(value);
+  if (!normalized || normalized === "不限") return [];
+  const startIndex = DEGREE_ORDER.indexOf(normalized);
+  if (startIndex === -1) return [];
+  return DEGREE_ORDER.slice(startIndex);
+}
+
+function parseDegreeSelectionsFromText(text) {
+  const normalizedText = normalizeText(text);
+  if (!normalizedText) return [];
+  if (/(?:学历|学位|教育)[^。；;\n]{0,6}不限|不限[^。；;\n]{0,6}(?:学历|学位|教育)/i.test(normalizedText)) {
+    return ["不限"];
+  }
+
+  const selected = [];
+  const atOrAbovePattern = /(初中及以下|中专\/中技|中专中技|中专|中技|高中|大专|专科|本科|硕士|研究生|博士)\s*(?:及|或)?以上/g;
+  let match;
+  while ((match = atOrAbovePattern.exec(normalizedText)) !== null) {
+    selected.push(...expandDegreeAtOrAbove(match[1]));
+  }
+
+  for (const { label, pattern } of DEGREE_PATTERNS) {
+    if (pattern.test(normalizedText)) {
+      selected.push(label);
+    }
+  }
+  return sortDegreeSelections(selected);
+}
+
+function normalizeDegreeSelections(input) {
+  if (Array.isArray(input)) {
+    const normalized = sortDegreeSelections(input.map((item) => normalizeDegree(item)).filter(Boolean));
+    if (!normalized.length) return null;
+    return normalized.includes("不限") ? ["不限"] : normalized;
+  }
+
+  const text = normalizeText(input);
+  if (!text) return null;
+  if (text.includes("以上")) {
+    const fromText = parseDegreeSelectionsFromText(text);
+    if (fromText.length) return fromText;
+  }
+  const parts = text.split(/[，,、/|]/).map((item) => normalizeDegree(item)).filter(Boolean);
+  if (parts.length) {
+    const normalized = sortDegreeSelections(parts);
+    return normalized.includes("不限") ? ["不限"] : normalized;
+  }
+  const single = normalizeDegree(text);
+  return single ? [single] : null;
 }
 
 function normalizeGender(value) {
@@ -140,6 +238,10 @@ function extractGender(text) {
     }
   }
   return null;
+}
+
+function extractDegrees(text) {
+  return parseDegreeSelectionsFromText(text);
 }
 
 function extractRecentNotView(text) {
@@ -298,13 +400,22 @@ function collectSuspiciousFields({ detectedSchoolTags }) {
 export function parseRecommendInstruction({ instruction, confirmation, overrides }) {
   const text = normalizeText(instruction);
   const detectedSchoolTags = extractSchoolTags(text);
+  const detectedDegrees = extractDegrees(text);
   const overrideSchoolTag = normalizeSchoolTag(overrides?.school_tag);
+  const overrideDegrees = normalizeDegreeSelections(overrides?.degree);
   const overrideGender = normalizeGender(overrides?.gender);
   const overrideRecentNotView = normalizeRecentNotView(overrides?.recent_not_view);
   const overrideCriteria = overrides?.criteria;
 
   const searchParams = {
     school_tag: overrideSchoolTag || detectedSchoolTags[0] || "不限",
+    degree: (
+      (Array.isArray(overrideDegrees) && overrideDegrees.length > 0
+        ? overrideDegrees
+        : Array.isArray(detectedDegrees) && detectedDegrees.length > 0
+          ? detectedDegrees
+          : ["不限"])
+    ),
     gender: overrideGender || extractGender(text) || "不限",
     recent_not_view: overrideRecentNotView || extractRecentNotView(text) || "不限"
   };
@@ -415,6 +526,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
 }
 
 export {
+  DEGREE_OPTIONS,
   GENDER_OPTIONS,
   POST_ACTION_LABELS,
   POST_ACTION_OPTIONS,

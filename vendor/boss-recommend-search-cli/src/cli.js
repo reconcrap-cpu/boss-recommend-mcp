@@ -1,22 +1,90 @@
 #!/usr/bin/env node
 import process from "node:process";
+import readline from "node:readline";
 import CDP from "chrome-remote-interface";
 
 const DEFAULT_PORT = 9222;
 const RECOMMEND_URL_FRAGMENT = "/web/chat/recommend";
+const SCHOOL_TAG_OPTIONS = ["不限", "985", "211", "双一流院校", "留学", "国内外名校", "公办本科"];
+const DEGREE_OPTIONS = ["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"];
+const DEGREE_ORDER = ["初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"];
+const GENDER_OPTIONS = ["不限", "男", "女"];
+const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
 
 function parsePositiveInteger(raw) {
   const value = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function normalizeDegree(value) {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  if (normalized === "专科") return "大专";
+  if (normalized === "研究生") return "硕士";
+  if (normalized === "中专" || normalized === "中技" || normalized === "中专中技") return "中专/中技";
+  return DEGREE_OPTIONS.includes(normalized) ? normalized : null;
+}
+
+function sortDegreeSelection(values) {
+  return Array.from(new Set(values.filter(Boolean))).sort((left, right) => DEGREE_ORDER.indexOf(left) - DEGREE_ORDER.indexOf(right));
+}
+
+function expandDegreeAtOrAbove(value) {
+  const normalized = normalizeDegree(value);
+  if (!normalized || normalized === "不限") return [];
+  const index = DEGREE_ORDER.indexOf(normalized);
+  if (index === -1) return [];
+  return DEGREE_ORDER.slice(index);
+}
+
+function parseDegreeSelection(raw) {
+  const text = normalizeText(raw);
+  if (!text) return null;
+  if (text === "不限") return ["不限"];
+  if (/不限/.test(text) && !/(初中|中专|中技|高中|大专|专科|本科|硕士|研究生|博士)/.test(text)) {
+    return ["不限"];
+  }
+
+  const selected = [];
+  const atOrAbovePattern = /(初中及以下|中专\/中技|中专中技|中专|中技|高中|大专|专科|本科|硕士|研究生|博士)\s*(?:及|或)?以上/g;
+  let match;
+  while ((match = atOrAbovePattern.exec(text)) !== null) {
+    selected.push(...expandDegreeAtOrAbove(match[1]));
+  }
+
+  const chunks = text.split(/[，,、/|]/).map((item) => normalizeDegree(item)).filter(Boolean);
+  selected.push(...chunks);
+
+  for (const label of DEGREE_OPTIONS) {
+    if (label === "不限") continue;
+    if (text.includes(label)) {
+      selected.push(label);
+    }
+  }
+
+  const normalized = sortDegreeSelection(selected);
+  return normalized.length ? normalized : null;
+}
+
 function parseArgs(argv) {
   const args = {
     schoolTag: "不限",
+    degree: ["不限"],
     gender: "不限",
     recentNotView: "不限",
     port: DEFAULT_PORT,
-    help: false
+    help: false,
+    __provided: {
+      schoolTag: false,
+      degree: false,
+      gender: false,
+      recentNotView: false,
+      port: false
+    }
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -24,15 +92,23 @@ function parseArgs(argv) {
     const next = argv[index + 1];
     if (token === "--school-tag" && next) {
       args.schoolTag = next;
+      args.__provided.schoolTag = true;
+      index += 1;
+    } else if (token === "--degree" && next) {
+      args.degree = parseDegreeSelection(next);
+      args.__provided.degree = true;
       index += 1;
     } else if (token === "--gender" && next) {
       args.gender = next;
+      args.__provided.gender = true;
       index += 1;
     } else if (token === "--recent-not-view" && next) {
       args.recentNotView = next;
+      args.__provided.recentNotView = true;
       index += 1;
     } else if (token === "--port" && next) {
       args.port = parsePositiveInteger(next) || DEFAULT_PORT;
+      args.__provided.port = true;
       index += 1;
     } else if (token === "--help" || token === "-h") {
       args.help = true;
@@ -40,6 +116,78 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+function isInteractiveTTY() {
+  return Boolean(process.stdin?.isTTY && process.stdout?.isTTY);
+}
+
+async function promptValue(ask, question, validate, defaultValue) {
+  while (true) {
+    const answer = normalizeText(await ask(question));
+    if (!answer && defaultValue !== undefined) return defaultValue;
+    const validated = validate(answer);
+    if (validated !== null && validated !== undefined) return validated;
+    console.error("输入无效，请重试。");
+  }
+}
+
+async function enrichArgsFromPrompt(args) {
+  if (!isInteractiveTTY() || args.help) return args;
+  const askTargets = Object.values(args.__provided || {}).some((item) => item === false) || !Array.isArray(args.degree) || args.degree.length === 0;
+  if (!askTargets) return args;
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  const ask = (question) => new Promise((resolve) => rl.question(question, resolve));
+  try {
+    if (!args.__provided.schoolTag) {
+      args.schoolTag = await promptValue(
+        ask,
+        `学校标签（${SCHOOL_TAG_OPTIONS.join("/")}，默认: ${args.schoolTag}）: `,
+        (value) => SCHOOL_TAG_OPTIONS.includes(value) ? value : null,
+        args.schoolTag
+      );
+    }
+    if (!args.__provided.gender) {
+      args.gender = await promptValue(
+        ask,
+        `性别（${GENDER_OPTIONS.join("/")}，默认: ${args.gender}）: `,
+        (value) => GENDER_OPTIONS.includes(value) ? value : null,
+        args.gender
+      );
+    }
+    if (!args.__provided.degree || !Array.isArray(args.degree) || args.degree.length === 0) {
+      const current = Array.isArray(args.degree) && args.degree.length > 0 ? args.degree.join(",") : "不限";
+      args.degree = await promptValue(
+        ask,
+        `学历（可多选逗号分隔，支持“本科及以上”；默认: ${current}）: `,
+        (value) => parseDegreeSelection(value),
+        Array.isArray(args.degree) && args.degree.length > 0 ? args.degree : ["不限"]
+      );
+    }
+    if (!args.__provided.recentNotView) {
+      args.recentNotView = await promptValue(
+        ask,
+        `近14天已看过滤（${RECENT_NOT_VIEW_OPTIONS.join("/")}，默认: ${args.recentNotView}）: `,
+        (value) => RECENT_NOT_VIEW_OPTIONS.includes(value) ? value : null,
+        args.recentNotView
+      );
+    }
+    if (!args.__provided.port) {
+      args.port = await promptValue(
+        ask,
+        `Chrome 调试端口（默认: ${args.port}）: `,
+        (value) => parsePositiveInteger(value),
+        args.port
+      );
+    }
+    return args;
+  } finally {
+    rl.close();
+  }
 }
 
 function sleep(ms) {
@@ -64,10 +212,6 @@ function generateBezierPath(start, end, steps = 18) {
     path.push({ x, y });
   }
   return path;
-}
-
-function normalizeText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 class RecommendSearchCli {
@@ -218,9 +362,10 @@ class RecommendSearchCli {
         return rect.width > 2 && rect.height > 2;
       };
       const school = doc.querySelector('.check-box.school');
+      const degree = doc.querySelector('.check-box.degree');
       const gender = doc.querySelector('.check-box.gender');
       const recent = doc.querySelector('.check-box.recentNotView');
-      return Boolean((school && gender && recent) || isVisible(panel));
+      return Boolean((school && degree && gender && recent) || isVisible(panel));
     })()`);
     return result === true;
   }
@@ -399,10 +544,11 @@ class RecommendSearchCli {
       if (!target) {
         return { ok: false, error: 'OPTION_NOT_FOUND', activeText };
       }
+      const targetActive = target.classList.contains('active');
       return {
         ok: true,
         activeText,
-        alreadySelected: activeText === normalize(label),
+        alreadySelected: targetActive || activeText === normalize(label),
         x: getPoint(target).x,
         y: getPoint(target).y
       };
@@ -419,6 +565,60 @@ class RecommendSearchCli {
     }
     await this.simulateHumanClick(option.x, option.y);
     await sleep(humanDelay(300, 80));
+  }
+
+  async getDegreeFilterState() {
+    return this.evaluate(`(() => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const group = doc.querySelector('.check-box.degree');
+      if (!group) {
+        return { ok: false, error: 'GROUP_NOT_FOUND' };
+      }
+      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+      const labels = ${JSON.stringify(DEGREE_OPTIONS)};
+      const activeLabels = labels.filter((label) => {
+        const node = Array.from(group.querySelectorAll('.options .option'))
+          .find((item) => normalize(item.textContent) === normalize(label));
+        return Boolean(node && node.classList.contains('active'));
+      });
+      const defaultOption = group.querySelector('.default.option');
+      return {
+        ok: true,
+        defaultActive: Boolean(defaultOption && defaultOption.classList.contains('active')),
+        activeLabels
+      };
+    })()`);
+  }
+
+  async selectDegreeFilter(labels) {
+    const targetLabels = Array.isArray(labels) && labels.length > 0 ? labels : ["不限"];
+    if (targetLabels.includes("不限")) {
+      await this.selectOption("degree", "不限");
+      return;
+    }
+
+    const currentState = await this.getDegreeFilterState();
+    if (!currentState?.ok) {
+      throw new Error(currentState?.error || "DEGREE_FILTER_STATE_FAILED");
+    }
+    const current = sortDegreeSelection(currentState.activeLabels || []);
+    const desired = sortDegreeSelection(targetLabels);
+    const same =
+      !currentState.defaultActive
+      && current.length === desired.length
+      && current.every((value, index) => value === desired[index]);
+    if (same) return;
+
+    await this.selectOption("degree", "不限");
+    for (const label of desired) {
+      await this.selectOption("degree", label);
+    }
   }
 
   async countCandidates() {
@@ -470,10 +670,13 @@ class RecommendSearchCli {
       console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node src/cli.js --school-tag 985 --gender 男 --recent-not-view 近14天没有 --port 9222"
+          usage: "node src/cli.js --school-tag 985 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --port 9222"
         }
       }));
       return;
+    }
+    if (!Array.isArray(this.args.degree) || this.args.degree.length === 0) {
+      throw new Error("INVALID_DEGREE_INPUT");
     }
 
     await this.connect();
@@ -485,6 +688,7 @@ class RecommendSearchCli {
 
       await this.openFilterPanel();
       await this.selectOption("school", this.args.schoolTag);
+      await this.selectDegreeFilter(this.args.degree);
       await this.selectOption("gender", this.args.gender);
       await this.selectOption("recentNotView", this.args.recentNotView);
       await this.closeFilterPanel();
@@ -495,6 +699,7 @@ class RecommendSearchCli {
         result: {
           applied_filters: {
             school_tag: this.args.schoolTag,
+            degree: this.args.degree,
             gender: this.args.gender,
             recent_not_view: this.args.recentNotView
           },
@@ -511,9 +716,14 @@ class RecommendSearchCli {
   }
 }
 
-const args = parseArgs(process.argv.slice(2));
-const cli = new RecommendSearchCli(args);
-cli.run().catch((error) => {
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const finalArgs = await enrichArgsFromPrompt(args);
+  const cli = new RecommendSearchCli(finalArgs);
+  await cli.run();
+}
+
+main().catch((error) => {
   console.log(JSON.stringify({
     status: "FAILED",
     error: {

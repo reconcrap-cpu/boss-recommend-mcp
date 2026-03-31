@@ -50,6 +50,7 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
     - `max_greet_count_value` (integer)
   - `overrides`
     - `school_tag`
+    - `degree`（可传单值或数组；如“本科及以上”应展开为 `["本科","硕士","博士"]`）
     - `gender`
     - `recent_not_view`
     - `criteria`

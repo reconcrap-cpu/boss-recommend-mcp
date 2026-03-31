@@ -64,6 +64,23 @@ function createToolSchema() {
               type: "string",
               enum: ["不限", "985", "211", "双一流院校", "留学", "国内外名校", "公办本科"]
             },
+            degree: {
+              oneOf: [
+                {
+                  type: "string",
+                  enum: ["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"]
+                },
+                {
+                  type: "array",
+                  items: {
+                    type: "string",
+                    enum: ["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"]
+                  },
+                  minItems: 1,
+                  uniqueItems: true
+                }
+              ]
+            },
             gender: {
               type: "string",
               enum: ["不限", "男", "女"]

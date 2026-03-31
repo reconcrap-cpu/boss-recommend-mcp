@@ -20,6 +20,8 @@ MCP 工具名：`run_recommend_pipeline`
 
 - 页面目标固定为 `https://www.zhipin.com/web/chat/recommend`
 - 支持推荐页原生筛选：学校标签 / 性别 / 近14天没有
+- 支持推荐页原生筛选：学校标签 / 学历 / 性别 / 近14天没有
+- 学历支持单选与多选语义：如“本科及以上”会展开为 `本科/硕士/博士`；如“大专、本科”只勾选这两项
 - `post_action` 必须在每次完整运行开始时确认一次
 - `target_count` 会在每次运行开始时询问一次（可留空，不设上限）
 - 当 `post_action=greet` 时，必须在运行开始时确认 `max_greet_count`
@@ -102,6 +104,7 @@ node src/cli.js run --instruction-file request.txt --confirmation-file confirmat
   },
   "overrides": {
     "school_tag": "211",
+    "degree": ["本科", "硕士", "博士"],
     "gender": "女",
     "recent_not_view": "近14天没有",
     "criteria": "候选人需要有 AI Agent 或 MCP 工具开发经验",

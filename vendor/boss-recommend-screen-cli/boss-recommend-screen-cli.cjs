@@ -53,7 +53,18 @@ function parseArgs(argv) {
     output: path.resolve(process.cwd(), `筛选结果_${Date.now()}.csv`),
     postAction: null,
     postActionConfirmed: null,
-    help: false
+    help: false,
+    __provided: {
+      baseUrl: false,
+      apiKey: false,
+      model: false,
+      criteria: false,
+      targetCount: false,
+      maxGreetCount: false,
+      port: false,
+      postAction: false,
+      postActionConfirmed: false
+    }
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -61,12 +72,15 @@ function parseArgs(argv) {
     const next = argv[index + 1];
     if (token === "--baseurl" && next) {
       parsed.baseUrl = next;
+      parsed.__provided.baseUrl = true;
       index += 1;
     } else if (token === "--apikey" && next) {
       parsed.apiKey = next;
+      parsed.__provided.apiKey = true;
       index += 1;
     } else if (token === "--model" && next) {
       parsed.model = next;
+      parsed.__provided.model = true;
       index += 1;
     } else if (token === "--openai-organization" && next) {
       parsed.openaiOrganization = next;
@@ -76,24 +90,30 @@ function parseArgs(argv) {
       index += 1;
     } else if (token === "--criteria" && next) {
       parsed.criteria = next;
+      parsed.__provided.criteria = true;
       index += 1;
     } else if (token === "--targetCount" && next) {
       parsed.targetCount = parsePositiveInteger(next);
+      parsed.__provided.targetCount = true;
       index += 1;
     } else if (token === "--max-greet-count" && next) {
       parsed.maxGreetCount = parsePositiveInteger(next);
+      parsed.__provided.maxGreetCount = true;
       index += 1;
     } else if (token === "--port" && next) {
       parsed.port = parsePositiveInteger(next) || DEFAULT_PORT;
+      parsed.__provided.port = true;
       index += 1;
     } else if (token === "--output" && next) {
       parsed.output = path.resolve(next);
       index += 1;
     } else if (token === "--post-action" && next) {
       parsed.postAction = normalizePostAction(next);
+      parsed.__provided.postAction = true;
       index += 1;
     } else if (token === "--post-action-confirmed" && next) {
       parsed.postActionConfirmed = parseBoolean(next);
+      parsed.__provided.postActionConfirmed = true;
       index += 1;
     } else if (token === "--help" || token === "-h") {
       parsed.help = true;
@@ -101,6 +121,109 @@ function parseArgs(argv) {
   }
 
   return parsed;
+}
+
+function isInteractiveTTY() {
+  return Boolean(process.stdin?.isTTY && process.stdout?.isTTY);
+}
+
+async function askWithValidation(ask, question, validate, options = {}) {
+  const { allowEmpty = false, defaultValue = undefined } = options;
+  while (true) {
+    const answer = normalizeText(await ask(question));
+    if (!answer) {
+      if (defaultValue !== undefined) return defaultValue;
+      if (allowEmpty) return null;
+    }
+    const validated = validate(answer);
+    if (validated !== null && validated !== undefined) return validated;
+    console.error("输入无效，请重试。");
+  }
+}
+
+async function promptMissingInputs(args) {
+  if (!isInteractiveTTY() || args.help) return args;
+
+  if (args.__provided.postAction && args.postAction && args.postActionConfirmed === null) {
+    args.postActionConfirmed = true;
+  }
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+  const ask = (question) => new Promise((resolve) => rl.question(question, resolve));
+  try {
+    if (!normalizeText(args.criteria)) {
+      args.criteria = await askWithValidation(
+        ask,
+        "请输入筛选标准（--criteria）: ",
+        (value) => normalizeText(value) || null
+      );
+    }
+    if (!normalizeText(args.baseUrl)) {
+      args.baseUrl = await askWithValidation(
+        ask,
+        "请输入模型接口 baseUrl（--baseurl，例如 https://api.openai.com/v1）: ",
+        (value) => normalizeText(value) || null
+      );
+    }
+    if (!normalizeText(args.apiKey)) {
+      args.apiKey = await askWithValidation(
+        ask,
+        "请输入模型接口 apiKey（--apikey）: ",
+        (value) => normalizeText(value) || null
+      );
+    }
+    if (!normalizeText(args.model)) {
+      args.model = await askWithValidation(
+        ask,
+        "请输入模型名（--model）: ",
+        (value) => normalizeText(value) || null
+      );
+    }
+    if (args.targetCount === null) {
+      const targetCount = await askWithValidation(
+        ask,
+        "请输入目标筛选人数（--targetCount，可留空表示不设上限）: ",
+        (value) => parsePositiveInteger(value),
+        { allowEmpty: true }
+      );
+      if (Number.isInteger(targetCount) && targetCount > 0) {
+        args.targetCount = targetCount;
+      }
+    }
+    if (!(args.postActionConfirmed === true && args.postAction)) {
+      args.postAction = await askWithValidation(
+        ask,
+        "本次通过人选统一执行什么动作？请输入 1(收藏) 或 2(直接沟通): ",
+        (value) => {
+          if (value === "1") return "favorite";
+          if (value === "2") return "greet";
+          return null;
+        }
+      );
+      args.postActionConfirmed = true;
+    }
+    if (args.postAction === "greet" && !(Number.isInteger(args.maxGreetCount) && args.maxGreetCount > 0)) {
+      args.maxGreetCount = await askWithValidation(
+        ask,
+        "本次最多打招呼多少位候选人？请输入正整数（--max-greet-count）: ",
+        (value) => parsePositiveInteger(value)
+      );
+    }
+    if (!args.__provided.port) {
+      args.port = await askWithValidation(
+        ask,
+        `Chrome 调试端口（--port，默认: ${args.port}）: `,
+        (value) => parsePositiveInteger(value),
+        { defaultValue: args.port }
+      );
+    }
+    return args;
+  } finally {
+    rl.close();
+  }
 }
 
 function sleep(ms) {
@@ -1605,7 +1728,8 @@ async function main() {
     return;
   }
 
-  const cli = new RecommendScreenCli(args);
+  const finalArgs = await promptMissingInputs(args);
+  const cli = new RecommendScreenCli(finalArgs);
   const result = await cli.run();
   console.log(JSON.stringify(result));
 }

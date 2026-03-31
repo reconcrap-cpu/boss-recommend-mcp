@@ -9,6 +9,7 @@ function testNeedConfirmationIncludesPostAction() {
   });
 
   assert.equal(result.searchParams.school_tag, "985");
+  assert.deepEqual(result.searchParams.degree, ["不限"]);
   assert.equal(result.searchParams.gender, "男");
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
   assert.equal(result.screenParams.criteria, "有大模型平台经验");
@@ -33,12 +34,14 @@ function testConfirmedPostActionAndOverrides() {
     },
     overrides: {
       school_tag: "211",
+      degree: "本科",
       recent_not_view: "近14天没有",
       target_count: 12
     }
   });
 
   assert.equal(result.searchParams.school_tag, "211");
+  assert.deepEqual(result.searchParams.degree, ["本科"]);
   assert.equal(result.searchParams.gender, "女");
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
   assert.equal(result.screenParams.criteria, "有多模态经历");
@@ -65,8 +68,51 @@ function testMultipleSchoolTagsMarkedSuspicious() {
   });
 
   assert.equal(result.searchParams.school_tag, "985");
+  assert.deepEqual(result.searchParams.degree, ["不限"]);
   assert.equal(result.suspicious_fields.length, 1);
   assert.equal(result.suspicious_fields[0].field, "school_tag");
+}
+
+function testDegreeCanBeExtracted() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选本科女生，近14天没有，有大模型项目经验",
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.deepEqual(result.searchParams.degree, ["本科"]);
+}
+
+function testDegreeAtOrAboveExpansion() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选大专及以上，近14天没有，有Agent经验",
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.deepEqual(result.searchParams.degree, ["大专", "本科", "硕士", "博士"]);
+}
+
+function testDegreeExplicitListOnly() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选大专、本科，近14天没有，有Agent经验",
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.deepEqual(result.searchParams.degree, ["大专", "本科"]);
+}
+
+function testDegreeOverrideCanBeArray() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选本科，近14天没有，有Agent经验",
+    confirmation: null,
+    overrides: {
+      degree: ["大专", "本科"]
+    }
+  });
+
+  assert.deepEqual(result.searchParams.degree, ["大专", "本科"]);
 }
 
 function testCriteriaCanBeProvidedViaOverrides() {
@@ -190,6 +236,10 @@ function main() {
   testNeedConfirmationIncludesPostAction();
   testConfirmedPostActionAndOverrides();
   testMultipleSchoolTagsMarkedSuspicious();
+  testDegreeCanBeExtracted();
+  testDegreeAtOrAboveExpansion();
+  testDegreeExplicitListOnly();
+  testDegreeOverrideCanBeArray();
   testCriteriaCanBeProvidedViaOverrides();
   testMissingCriteriaTriggersNeedInput();
   testMcpMentionShouldStayInCriteria();

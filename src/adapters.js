@@ -36,6 +36,15 @@ function parsePositiveInteger(raw) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function serializeDegreeSelection(value) {
+  if (Array.isArray(value)) {
+    const normalized = value.map((item) => String(item || "").trim()).filter(Boolean);
+    return normalized.length ? normalized.join(",") : "不限";
+  }
+  const normalized = String(value || "").trim();
+  return normalized || "不限";
+}
+
 function resolveScreenConfigPath(workspaceRoot) {
   const envConfigPath = process.env.BOSS_RECOMMEND_SCREEN_CONFIG
     ? path.resolve(process.env.BOSS_RECOMMEND_SCREEN_CONFIG)
@@ -506,6 +515,8 @@ export async function runRecommendSearchCli({ workspaceRoot, searchParams }) {
     cliPath,
     "--school-tag",
     searchParams.school_tag,
+    "--degree",
+    serializeDegreeSelection(searchParams.degree),
     "--gender",
     searchParams.gender,
     "--recent-not-view",
