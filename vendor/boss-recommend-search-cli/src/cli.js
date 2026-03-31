@@ -20,6 +20,39 @@ function parsePositiveInteger(raw) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function sortSchoolSelection(values) {
+  const order = new Map(SCHOOL_TAG_OPTIONS.map((label, index) => [label, index]));
+  const unique = Array.from(new Set((values || []).filter((item) => order.has(item))));
+  if (!unique.length) return [];
+  if (unique.includes("不限")) {
+    return unique.length === 1
+      ? ["不限"]
+      : unique.filter((item) => item !== "不限").sort((left, right) => order.get(left) - order.get(right));
+  }
+  return unique.sort((left, right) => order.get(left) - order.get(right));
+}
+
+function parseSchoolSelection(raw) {
+  const text = normalizeText(raw);
+  if (!text) return null;
+  if (text === "不限") return ["不限"];
+
+  const selected = [];
+  for (const chunk of text.split(/[，,、/|]/)) {
+    const value = normalizeText(chunk);
+    if (SCHOOL_TAG_OPTIONS.includes(value)) {
+      selected.push(value);
+    }
+  }
+  for (const label of SCHOOL_TAG_OPTIONS) {
+    if (label !== "不限" && text.includes(label)) {
+      selected.push(label);
+    }
+  }
+  const normalized = sortSchoolSelection(selected);
+  return normalized.length ? normalized : null;
+}
+
 function normalizeDegree(value) {
   const normalized = normalizeText(value);
   if (!normalized) return null;
@@ -72,7 +105,7 @@ function parseDegreeSelection(raw) {
 
 function parseArgs(argv) {
   const args = {
-    schoolTag: "不限",
+    schoolTag: ["不限"],
     degree: ["不限"],
     gender: "不限",
     recentNotView: "不限",
@@ -91,7 +124,7 @@ function parseArgs(argv) {
     const token = argv[index];
     const next = argv[index + 1];
     if (token === "--school-tag" && next) {
-      args.schoolTag = next;
+      args.schoolTag = parseSchoolSelection(next);
       args.__provided.schoolTag = true;
       index += 1;
     } else if (token === "--degree" && next) {
@@ -134,7 +167,12 @@ async function promptValue(ask, question, validate, defaultValue) {
 
 async function enrichArgsFromPrompt(args) {
   if (!isInteractiveTTY() || args.help) return args;
-  const askTargets = Object.values(args.__provided || {}).some((item) => item === false) || !Array.isArray(args.degree) || args.degree.length === 0;
+  const askTargets =
+    Object.values(args.__provided || {}).some((item) => item === false)
+    || !Array.isArray(args.schoolTag)
+    || args.schoolTag.length === 0
+    || !Array.isArray(args.degree)
+    || args.degree.length === 0;
   if (!askTargets) return args;
 
   const rl = readline.createInterface({
@@ -144,11 +182,12 @@ async function enrichArgsFromPrompt(args) {
   const ask = (question) => new Promise((resolve) => rl.question(question, resolve));
   try {
     if (!args.__provided.schoolTag) {
+      const current = Array.isArray(args.schoolTag) && args.schoolTag.length > 0 ? args.schoolTag.join("/") : "不限";
       args.schoolTag = await promptValue(
         ask,
-        `学校标签（${SCHOOL_TAG_OPTIONS.join("/")}，默认: ${args.schoolTag}）: `,
-        (value) => SCHOOL_TAG_OPTIONS.includes(value) ? value : null,
-        args.schoolTag
+        `学校标签（可多选，逗号/斜杠分隔；${SCHOOL_TAG_OPTIONS.join("/")}，默认: ${current}）: `,
+        (value) => parseSchoolSelection(value),
+        Array.isArray(args.schoolTag) && args.schoolTag.length > 0 ? args.schoolTag : ["不限"]
       );
     }
     if (!args.__provided.gender) {
@@ -159,6 +198,14 @@ async function enrichArgsFromPrompt(args) {
         args.gender
       );
     }
+    if (!args.__provided.recentNotView) {
+      args.recentNotView = await promptValue(
+        ask,
+        `近14天已看过滤（${RECENT_NOT_VIEW_OPTIONS.join("/")}，默认: ${args.recentNotView}）: `,
+        (value) => RECENT_NOT_VIEW_OPTIONS.includes(value) ? value : null,
+        args.recentNotView
+      );
+    }
     if (!args.__provided.degree || !Array.isArray(args.degree) || args.degree.length === 0) {
       const current = Array.isArray(args.degree) && args.degree.length > 0 ? args.degree.join(",") : "不限";
       args.degree = await promptValue(
@@ -166,14 +213,6 @@ async function enrichArgsFromPrompt(args) {
         `学历（可多选逗号分隔，支持“本科及以上”；默认: ${current}）: `,
         (value) => parseDegreeSelection(value),
         Array.isArray(args.degree) && args.degree.length > 0 ? args.degree : ["不限"]
-      );
-    }
-    if (!args.__provided.recentNotView) {
-      args.recentNotView = await promptValue(
-        ask,
-        `近14天已看过滤（${RECENT_NOT_VIEW_OPTIONS.join("/")}，默认: ${args.recentNotView}）: `,
-        (value) => RECENT_NOT_VIEW_OPTIONS.includes(value) ? value : null,
-        args.recentNotView
       );
     }
     if (!args.__provided.port) {
@@ -687,21 +726,16 @@ class RecommendSearchCli {
     if (option.alreadySelected) {
       return;
     }
-    await this.simulateHumanClick(option.x, option.y);
-    await sleep(humanDelay(300, 80));
-
-    let afterClick = await this.getOptionInfo(groupClass, label);
-    if (afterClick?.ok && afterClick.alreadySelected) {
+    const domClick = await this.clickOptionBySelector(groupClass, label);
+    if (!domClick?.ok) {
+      throw new Error(domClick?.error || "OPTION_DOM_CLICK_FAILED");
+    }
+    if (await this.waitOptionSelected(groupClass, label, 10)) {
       return;
     }
 
-    const fallback = await this.clickOptionBySelector(groupClass, label);
-    if (!fallback?.ok) {
-      throw new Error(fallback?.error || "OPTION_FALLBACK_CLICK_FAILED");
-    }
-    await sleep(humanDelay(220, 60));
-    afterClick = await this.getOptionInfo(groupClass, label);
-    if (!(afterClick?.ok && afterClick.alreadySelected)) {
+    await this.simulateHumanClick(option.x, option.y);
+    if (!(await this.waitOptionSelected(groupClass, label, 10))) {
       throw new Error("OPTION_SELECTION_NOT_APPLIED");
     }
   }
@@ -765,6 +799,85 @@ class RecommendSearchCli {
       target.click();
       return { ok: true };
     })(${JSON.stringify(groupClass)}, ${JSON.stringify(label)})`);
+  }
+
+  async waitOptionSelected(groupClass, label, rounds = 8) {
+    for (let index = 0; index < rounds; index += 1) {
+      const state = await this.getOptionInfo(groupClass, label);
+      if (state?.ok && state.alreadySelected) {
+        return true;
+      }
+      await sleep(120 + index * 40);
+    }
+    return false;
+  }
+
+  async getSchoolFilterState() {
+    return this.evaluate(`(() => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+      const groups = Array.from(doc.querySelectorAll('.check-box'));
+      const group = doc.querySelector('.check-box.school')
+        || groups.find((item) => {
+          const set = new Set(
+            Array.from(item.querySelectorAll('.default.option, .options .option, .option'))
+              .map((node) => normalize(node.textContent))
+              .filter(Boolean)
+          );
+          return set.has('985') || set.has('211') || set.has('双一流院校');
+        });
+      if (!group) {
+        return { ok: false, error: 'GROUP_NOT_FOUND' };
+      }
+      const labels = ${JSON.stringify(SCHOOL_TAG_OPTIONS)};
+      const activeLabels = labels.filter((label) => {
+        const node = Array.from(group.querySelectorAll('.options .option, .option'))
+          .find((item) => normalize(item.textContent) === normalize(label));
+        return Boolean(node && node.classList.contains('active'));
+      });
+      const defaultOption = group.querySelector('.default.option');
+      return {
+        ok: true,
+        defaultActive: Boolean(defaultOption && defaultOption.classList.contains('active')),
+        activeLabels
+      };
+    })()`);
+  }
+
+  async selectSchoolFilter(labels) {
+    const ensure = await this.ensureGroupReady("school");
+    if (!ensure?.ok) {
+      throw new Error(ensure?.error || "GROUP_NOT_FOUND");
+    }
+
+    const targetLabels = Array.isArray(labels) && labels.length > 0 ? labels : ["不限"];
+    if (targetLabels.includes("不限")) {
+      await this.selectOption("school", "不限");
+      return;
+    }
+
+    const currentState = await this.getSchoolFilterState();
+    if (!currentState?.ok) {
+      throw new Error(currentState?.error || "SCHOOL_FILTER_STATE_FAILED");
+    }
+    const current = sortSchoolSelection(currentState.activeLabels || []);
+    const desired = sortSchoolSelection(targetLabels);
+    const same =
+      !currentState.defaultActive
+      && current.length === desired.length
+      && current.every((value, index) => value === desired[index]);
+    if (same) return;
+
+    await this.selectOption("school", "不限");
+    for (const label of desired) {
+      await this.selectOption("school", label);
+    }
   }
 
   async getDegreeFilterState() {
@@ -884,10 +997,13 @@ class RecommendSearchCli {
       console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node src/cli.js --school-tag 985 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --port 9222"
+          usage: "node src/cli.js --school-tag 985/211 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --port 9222"
         }
       }));
       return;
+    }
+    if (!Array.isArray(this.args.schoolTag) || this.args.schoolTag.length === 0) {
+      throw new Error("INVALID_SCHOOL_TAG_INPUT");
     }
     if (!Array.isArray(this.args.degree) || this.args.degree.length === 0) {
       throw new Error("INVALID_DEGREE_INPUT");
@@ -901,10 +1017,10 @@ class RecommendSearchCli {
       }
 
       await this.openFilterPanel();
-      await this.selectOption("school", this.args.schoolTag);
-      await this.selectDegreeFilter(this.args.degree);
+      await this.selectSchoolFilter(this.args.schoolTag);
       await this.selectOption("gender", this.args.gender);
       await this.selectOption("recentNotView", this.args.recentNotView);
+      await this.selectDegreeFilter(this.args.degree);
       await this.closeFilterPanel();
       const candidateInfo = await this.waitForCandidateCountStable();
 
