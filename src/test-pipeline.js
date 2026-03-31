@@ -18,6 +18,10 @@ function createParsed(overrides = {}) {
     missing_fields: [],
     suspicious_fields: [],
     needs_filters_confirmation: false,
+    needs_school_tag_confirmation: false,
+    needs_degree_confirmation: false,
+    needs_gender_confirmation: false,
+    needs_recent_not_view_confirmation: false,
     needs_criteria_confirmation: false,
     needs_target_count_confirmation: false,
     needs_post_action_confirmation: false,
@@ -81,6 +85,35 @@ async function testNeedTargetCountConfirmationGate() {
 
   assert.equal(result.status, "NEED_CONFIRMATION");
   assert.equal(result.required_confirmations.includes("target_count"), true);
+  assert.equal(preflightCalled, false);
+}
+
+async function testNeedSchoolTagConfirmationGate() {
+  let preflightCalled = false;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {},
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        needs_school_tag_confirmation: true,
+        pending_questions: [{ field: "school_tag" }]
+      }),
+      runPipelinePreflight: () => {
+        preflightCalled = true;
+        return { ok: true, checks: [], debug_port: 9222 };
+      },
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      runRecommendSearchCli: async () => ({ ok: true, summary: {} }),
+      runRecommendScreenCli: async () => ({ ok: true, summary: {} })
+    }
+  );
+
+  assert.equal(result.status, "NEED_CONFIRMATION");
+  assert.equal(result.required_confirmations.includes("school_tag"), true);
   assert.equal(preflightCalled, false);
 }
 
@@ -218,6 +251,7 @@ async function testSearchFailure() {
 
 async function main() {
   await testNeedConfirmationGate();
+  await testNeedSchoolTagConfirmationGate();
   await testNeedTargetCountConfirmationGate();
   await testNeedMaxGreetCountConfirmationGate();
   await testNeedInputGate();

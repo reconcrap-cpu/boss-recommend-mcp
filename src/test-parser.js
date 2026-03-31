@@ -15,6 +15,10 @@ function testNeedConfirmationIncludesPostAction() {
   assert.equal(result.screenParams.criteria, "有大模型平台经验");
   assert.equal(result.proposed_post_action, "favorite");
   assert.equal(result.needs_filters_confirmation, true);
+  assert.equal(result.needs_school_tag_confirmation, true);
+  assert.equal(result.needs_degree_confirmation, true);
+  assert.equal(result.needs_gender_confirmation, true);
+  assert.equal(result.needs_recent_not_view_confirmation, true);
   assert.equal(result.needs_criteria_confirmation, true);
   assert.equal(result.needs_post_action_confirmation, true);
 }
@@ -24,6 +28,10 @@ function testConfirmedPostActionAndOverrides() {
     instruction: "推荐页筛选女生，有多模态经历",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       target_count_confirmed: true,
       target_count_value: 12,
@@ -49,6 +57,10 @@ function testConfirmedPostActionAndOverrides() {
   assert.equal(result.screenParams.post_action, "greet");
   assert.equal(result.screenParams.max_greet_count, 8);
   assert.equal(result.needs_filters_confirmation, false);
+  assert.equal(result.needs_school_tag_confirmation, false);
+  assert.equal(result.needs_degree_confirmation, false);
+  assert.equal(result.needs_gender_confirmation, false);
+  assert.equal(result.needs_recent_not_view_confirmation, false);
   assert.equal(result.needs_criteria_confirmation, false);
   assert.equal(result.needs_target_count_confirmation, false);
   assert.equal(result.needs_post_action_confirmation, false);
@@ -60,6 +72,10 @@ function testMultipleSchoolTagsMarkedSuspicious() {
     instruction: "推荐页筛选985和211，有推荐系统经验",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       post_action_confirmed: true,
       post_action_value: "favorite"
@@ -120,6 +136,10 @@ function testCriteriaCanBeProvidedViaOverrides() {
     instruction: "推荐页筛选211女生",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
@@ -139,6 +159,10 @@ function testMissingCriteriaTriggersNeedInput() {
     instruction: "推荐页筛选985男生",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
@@ -155,6 +179,10 @@ function testGreetNeedsMaxGreetCountConfirmation() {
     instruction: "推荐页筛选985男生，有大模型工程经验，符合标准直接沟通",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
@@ -174,6 +202,10 @@ function testGreetMaxGreetCountCanComeFromOverrides() {
     instruction: "推荐页筛选985男生，有大模型工程经验，符合标准直接沟通",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
@@ -194,6 +226,10 @@ function testTargetCountNeedsConfirmationEvenWhenOptional() {
     instruction: "推荐页筛选985男生，有大模型平台经验，符合标准收藏",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       post_action_confirmed: true,
       post_action_value: "favorite"
@@ -210,6 +246,10 @@ function testTargetCountCanBeSkippedAfterConfirmation() {
     instruction: "推荐页筛选985男生，有大模型平台经验，符合标准收藏",
     confirmation: {
       filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,

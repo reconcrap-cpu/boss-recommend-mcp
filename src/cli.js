@@ -27,6 +27,8 @@ const defaultMcpServerName = "boss-recommend";
 const defaultMcpCommand = "npx";
 const defaultMcpArgs = ["-y", "@reconcrap/boss-recommend-mcp@latest", "start"];
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h"]);
+const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
+const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
 
 function getPackageVersion() {
   try {
@@ -47,6 +49,39 @@ function getCodexHome() {
 
 function ensureDir(targetPath) {
   fs.mkdirSync(targetPath, { recursive: true });
+}
+
+function pathExists(targetPath) {
+  try {
+    return fs.existsSync(targetPath);
+  } catch {
+    return false;
+  }
+}
+
+function readJsonObjectFileSafe(filePath) {
+  if (!pathExists(filePath)) return {};
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  } catch {
+    // Fallback below.
+  }
+  return {};
+}
+
+function dedupePaths(items) {
+  const result = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    const resolved = path.resolve(String(item || ""));
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+    result.push(resolved);
+  }
+  return result;
 }
 
 function getDesktopDir() {
@@ -154,6 +189,7 @@ function normalizeMcpClientName(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return "";
   if (raw === "claude-code") return "claudecode";
+  if (raw === "trae-cn") return "trae";
   return raw;
 }
 
@@ -217,6 +253,135 @@ function writeMcpConfigFiles(options = {}) {
     files.push({ client, file: filePath });
   }
   return { outputDir, files };
+}
+
+function parsePathListFromEnv(raw) {
+  if (!raw) return [];
+  const text = String(raw).trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return dedupePaths(parsed.filter(Boolean));
+    }
+  } catch {
+    // Fallback to delimiter split.
+  }
+  return dedupePaths(text.split(path.delimiter).map((item) => item.trim()).filter(Boolean));
+}
+
+function getKnownExternalMcpConfigPaths() {
+  const home = os.homedir();
+  const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+  return dedupePaths([
+    path.join(appData, "Cursor", "User", "mcp.json"),
+    path.join(appData, "Trae", "User", "mcp.json"),
+    path.join(appData, "Trae CN", "User", "mcp.json"),
+    path.join(home, ".trae", "mcp.json"),
+    path.join(home, ".trae-cn", "mcp.json"),
+    path.join(home, ".claude", "mcp.json"),
+    path.join(home, ".openclaw", "mcp.json")
+  ]);
+}
+
+function resolveExternalMcpConfigTargets() {
+  const fromEnv = parsePathListFromEnv(process.env[externalMcpTargetsEnv]);
+  const known = getKnownExternalMcpConfigPaths().filter((filePath) => {
+    if (pathExists(filePath)) return true;
+    return pathExists(path.dirname(filePath));
+  });
+  return dedupePaths([...fromEnv, ...known]);
+}
+
+function mergeMcpServerConfigFile(filePath, options = {}) {
+  const nextConfig = buildMcpConfigFileContent(options);
+  const serverName = Object.keys(nextConfig.mcpServers || {})[0] || defaultMcpServerName;
+  const launchConfig = nextConfig.mcpServers?.[serverName] || buildMcpLaunchConfig(options);
+  const current = readJsonObjectFileSafe(filePath);
+  const existingServers =
+    current?.mcpServers && typeof current.mcpServers === "object" && !Array.isArray(current.mcpServers)
+      ? current.mcpServers
+      : {};
+  const existingEntry = existingServers[serverName];
+  const merged = {
+    ...current,
+    mcpServers: {
+      ...existingServers,
+      [serverName]: launchConfig
+    }
+  };
+
+  ensureDir(path.dirname(filePath));
+  fs.writeFileSync(filePath, JSON.stringify(merged, null, 2), "utf8");
+  const updated = JSON.stringify(existingEntry || null) !== JSON.stringify(launchConfig);
+  return {
+    file: filePath,
+    server: serverName,
+    updated
+  };
+}
+
+function installExternalMcpConfigs(options = {}) {
+  const targets = resolveExternalMcpConfigTargets();
+  const applied = [];
+  const skipped = [];
+  for (const target of targets) {
+    try {
+      const existed = pathExists(target);
+      const merged = mergeMcpServerConfigFile(target, options);
+      applied.push({
+        file: target,
+        server: merged.server,
+        created: !existed,
+        updated: merged.updated
+      });
+    } catch (error) {
+      skipped.push({
+        file: target,
+        reason: error.message
+      });
+    }
+  }
+  return { targets, applied, skipped };
+}
+
+function getKnownExternalSkillBaseDirs() {
+  const home = os.homedir();
+  const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+  return dedupePaths([
+    path.join(home, ".cursor", "skills"),
+    path.join(home, ".trae", "skills"),
+    path.join(home, ".trae-cn", "skills"),
+    path.join(home, ".claude", "skills"),
+    path.join(home, ".openclaw", "skills"),
+    path.join(appData, "Cursor", "User", "skills"),
+    path.join(appData, "Trae", "User", "skills"),
+    path.join(appData, "Trae CN", "User", "skills"),
+    path.join(appData, "OpenClaw", "User", "skills")
+  ]);
+}
+
+function resolveExternalSkillBaseDirs() {
+  const fromEnv = parsePathListFromEnv(process.env[externalSkillDirsEnv]);
+  const known = getKnownExternalSkillBaseDirs().filter((dirPath) => pathExists(dirPath));
+  return dedupePaths([...fromEnv, ...known]);
+}
+
+function mirrorSkillToExternalDirs() {
+  const baseDirs = resolveExternalSkillBaseDirs();
+  const mirrored = [];
+  const skipped = [];
+  for (const baseDir of baseDirs) {
+    try {
+      const targetDir = path.join(baseDir, skillName);
+      ensureDir(path.dirname(targetDir));
+      fs.cpSync(skillSourceDir, targetDir, { recursive: true, force: true });
+      mirrored.push({ base_dir: baseDir, target_dir: targetDir });
+    } catch (error) {
+      skipped.push({ base_dir: baseDir, reason: error.message });
+    }
+  }
+  return { baseDirs, mirrored, skipped };
 }
 
 function syncSkillAssets(options = {}) {
@@ -421,7 +586,7 @@ function printHelp() {
   console.log("  boss-recommend-mcp install-skill Install only the Codex skill");
   console.log("  boss-recommend-mcp init-config  Create ~/.codex/boss-recommend-mcp/screening-config.json if missing");
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
-  console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae/Claude Code/OpenClaw");
+  console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae(含 trae-cn)/Claude Code/OpenClaw");
   console.log("  boss-recommend-mcp doctor       Check config and runtime prerequisites");
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
@@ -447,11 +612,30 @@ function installAll() {
   const skillTarget = installSkill();
   const configResult = ensureUserConfig();
   const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
+  const externalMcpResult = installExternalMcpConfigs({});
+  const externalSkillResult = mirrorSkillToExternalDirs();
   console.log(`Skill installed to: ${skillTarget}`);
   console.log(configResult.created ? `Config template created at: ${configResult.path}` : `Config already exists at: ${configResult.path}`);
   console.log(`MCP config templates exported to: ${mcpTemplateResult.outputDir}`);
   for (const item of mcpTemplateResult.files) {
     console.log(`- ${item.client}: ${item.file}`);
+  }
+  if (externalMcpResult.targets.length > 0) {
+    console.log(`Auto-configured external MCP files: ${externalMcpResult.applied.length}`);
+    for (const item of externalMcpResult.applied) {
+      const action = item.created ? "created" : item.updated ? "updated" : "unchanged";
+      console.log(`- ${item.file} (${action})`);
+    }
+  } else {
+    console.log("No external MCP config target detected. Set BOSS_RECOMMEND_MCP_CONFIG_TARGETS to auto-configure custom agents.");
+  }
+  if (externalSkillResult.baseDirs.length > 0) {
+    console.log(`Mirrored skill to external dirs: ${externalSkillResult.mirrored.length}`);
+    for (const item of externalSkillResult.mirrored) {
+      console.log(`- ${item.target_dir}`);
+    }
+  } else {
+    console.log("No external skill dir detected. Set BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS to mirror skill for non-Codex agents.");
   }
 }
 

@@ -9,6 +9,10 @@ import {
 function buildRequiredConfirmations(parsedResult) {
   const confirmations = [];
   if (parsedResult.needs_filters_confirmation) confirmations.push("filters");
+  if (parsedResult.needs_school_tag_confirmation) confirmations.push("school_tag");
+  if (parsedResult.needs_degree_confirmation) confirmations.push("degree");
+  if (parsedResult.needs_gender_confirmation) confirmations.push("gender");
+  if (parsedResult.needs_recent_not_view_confirmation) confirmations.push("recent_not_view");
   if (parsedResult.needs_criteria_confirmation) confirmations.push("criteria");
   if (parsedResult.needs_target_count_confirmation) confirmations.push("target_count");
   if (parsedResult.needs_post_action_confirmation) confirmations.push("post_action");
@@ -89,6 +93,10 @@ export async function runRecommendPipeline(
 
   if (
     parsed.needs_filters_confirmation
+    || parsed.needs_school_tag_confirmation
+    || parsed.needs_degree_confirmation
+    || parsed.needs_gender_confirmation
+    || parsed.needs_recent_not_view_confirmation
     || parsed.needs_criteria_confirmation
     || parsed.needs_target_count_confirmation
     || parsed.needs_post_action_confirmation

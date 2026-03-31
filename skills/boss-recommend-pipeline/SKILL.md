@@ -22,7 +22,10 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
 
 在真正执行前，必须先确认：
 
-- 推荐页 filters 是否正确
+- 学校标签（`school_tag`）
+- 学历（`degree`）
+- 性别（`gender`）
+- 是否过滤近14天已看（`recent_not_view`）
 - screening criteria 是否正确
 - `target_count`（目标筛选人数）是否需要设置（可不设上限）
 - `post_action` 是否确定为 `favorite` 或 `greet`
@@ -41,6 +44,10 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
   - `instruction` (required)
   - `confirmation`
     - `filters_confirmed`
+    - `school_tag_confirmed`
+    - `degree_confirmed`
+    - `gender_confirmed`
+    - `recent_not_view_confirmed`
     - `criteria_confirmed`
     - `target_count_confirmed`
     - `target_count_value` (integer, optional)
@@ -91,5 +98,6 @@ CLI fallback 的状态机与 MCP 保持一致：
 
 - 用结构化中文输出
 - 先给用户确认卡片，再正式执行
+- 对 `school_tag/degree/gender/recent_not_view` 必须逐项提问并逐项确认，不可合并成一句“filters已确认”
 - 不要跳过 `post_action` 的首轮确认
 - 不要把 recommend 流程说成 search 流程

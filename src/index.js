@@ -38,6 +38,10 @@ function createToolSchema() {
           type: "object",
           properties: {
             filters_confirmed: { type: "boolean" },
+            school_tag_confirmed: { type: "boolean" },
+            degree_confirmed: { type: "boolean" },
+            gender_confirmed: { type: "boolean" },
+            recent_not_view_confirmed: { type: "boolean" },
             criteria_confirmed: { type: "boolean" },
             target_count_confirmed: { type: "boolean" },
             target_count_value: {

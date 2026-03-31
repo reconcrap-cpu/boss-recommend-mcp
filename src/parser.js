@@ -443,17 +443,63 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   }
 
   const suspicious_fields = collectSuspiciousFields({ detectedSchoolTags });
-  const needs_filters_confirmation = confirmation?.filters_confirmed !== true;
+  const needs_school_tag_confirmation = confirmation?.school_tag_confirmed !== true;
+  const needs_degree_confirmation = confirmation?.degree_confirmed !== true;
+  const needs_gender_confirmation = confirmation?.gender_confirmed !== true;
+  const needs_recent_not_view_confirmation = confirmation?.recent_not_view_confirmed !== true;
+  const needs_filters_confirmation = (
+    confirmation?.filters_confirmed !== true
+    || needs_school_tag_confirmation
+    || needs_degree_confirmation
+    || needs_gender_confirmation
+    || needs_recent_not_view_confirmation
+  );
   const needs_criteria_confirmation = confirmation?.criteria_confirmed !== true;
   const needs_target_count_confirmation = targetCountResolution.needs_target_count_confirmation;
   const needs_post_action_confirmation = postActionResolution.needs_post_action_confirmation;
   const needs_max_greet_count_confirmation = maxGreetCountResolution.needs_max_greet_count_confirmation;
   const pending_questions = [];
 
-  if (needs_filters_confirmation) {
+  if (needs_school_tag_confirmation) {
+    pending_questions.push({
+      field: "school_tag",
+      question: "请确认学校标签筛选。",
+      value: searchParams.school_tag,
+      options: SCHOOL_TAG_OPTIONS
+    });
+  }
+
+  if (needs_degree_confirmation) {
+    pending_questions.push({
+      field: "degree",
+      question: "请确认学历筛选（可多选）。",
+      value: searchParams.degree,
+      options: DEGREE_OPTIONS
+    });
+  }
+
+  if (needs_gender_confirmation) {
+    pending_questions.push({
+      field: "gender",
+      question: "请确认性别筛选。",
+      value: searchParams.gender,
+      options: GENDER_OPTIONS
+    });
+  }
+
+  if (needs_recent_not_view_confirmation) {
+    pending_questions.push({
+      field: "recent_not_view",
+      question: "请确认是否过滤近14天内已看过的人选。",
+      value: searchParams.recent_not_view,
+      options: RECENT_NOT_VIEW_OPTIONS
+    });
+  }
+
+  if (needs_filters_confirmation && pending_questions.every((item) => item.field !== "filters")) {
     pending_questions.push({
       field: "filters",
-      question: "请确认推荐页筛选项是否正确。",
+      question: "请确认以上推荐页筛选项整体无误。",
       value: searchParams
     });
   }
@@ -500,6 +546,10 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     missing_fields,
     suspicious_fields,
     needs_filters_confirmation,
+    needs_school_tag_confirmation,
+    needs_degree_confirmation,
+    needs_gender_confirmation,
+    needs_recent_not_view_confirmation,
     needs_criteria_confirmation,
     needs_target_count_confirmation,
     needs_post_action_confirmation,

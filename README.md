@@ -19,9 +19,10 @@ MCP 工具名：`run_recommend_pipeline`
 ## 设计特点
 
 - 页面目标固定为 `https://www.zhipin.com/web/chat/recommend`
-- 支持推荐页原生筛选：学校标签 / 性别 / 近14天没有
 - 支持推荐页原生筛选：学校标签 / 学历 / 性别 / 近14天没有
 - 学历支持单选与多选语义：如“本科及以上”会展开为 `本科/硕士/博士`；如“大专、本科”只勾选这两项
+- 执行前会逐项确认筛选参数：学校标签 / 学历 / 性别 / 是否过滤近14天已看
+- npm 全局安装后会自动执行 install：生成 Codex skill、导出 MCP 模板，并自动尝试写入已检测到的外部 agent MCP 配置（含 Trae / trae-cn / Cursor / Claude / OpenClaw）
 - `post_action` 必须在每次完整运行开始时确认一次
 - `target_count` 会在每次运行开始时询问一次（可留空，不设上限）
 - 当 `post_action=greet` 时，必须在运行开始时确认 `max_greet_count`
@@ -41,6 +42,13 @@ npm install
 
 ```bash
 node src/cli.js start
+```
+
+可选环境变量（用于跨 agent 自动配置）：
+
+```bash
+BOSS_RECOMMEND_MCP_CONFIG_TARGETS   # JSON 数组或系统 path 分隔路径列表，指定额外 mcp.json 目标文件
+BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS  # JSON 数组或系统 path 分隔路径列表，指定额外 skills 根目录
 ```
 
 或使用 CLI fallback：
@@ -94,6 +102,10 @@ node src/cli.js run --instruction-file request.txt --confirmation-file confirmat
   "instruction": "推荐页筛选211女生，近14天没有，有 AI Agent 经验，符合标准的直接沟通",
   "confirmation": {
     "filters_confirmed": true,
+    "school_tag_confirmed": true,
+    "degree_confirmed": true,
+    "gender_confirmed": true,
+    "recent_not_view_confirmed": true,
     "criteria_confirmed": true,
     "target_count_confirmed": true,
     "target_count_value": 20,
