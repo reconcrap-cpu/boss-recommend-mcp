@@ -361,11 +361,10 @@ class RecommendSearchCli {
         const rect = el.getBoundingClientRect();
         return rect.width > 2 && rect.height > 2;
       };
-      const school = doc.querySelector('.check-box.school');
-      const degree = doc.querySelector('.check-box.degree');
-      const gender = doc.querySelector('.check-box.gender');
-      const recent = doc.querySelector('.check-box.recentNotView');
-      return Boolean((school && degree && gender && recent) || isVisible(panel));
+      const groups = Array.from(doc.querySelectorAll('.check-box'));
+      const visibleGroups = groups.filter((group) => isVisible(group));
+      if (visibleGroups.length >= 2) return true;
+      return Boolean(isVisible(panel) && visibleGroups.length >= 1);
     })()`);
     return result === true;
   }
@@ -522,11 +521,46 @@ class RecommendSearchCli {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
       const doc = frame.contentDocument;
-      const group = doc.querySelector('.check-box.' + groupClass);
+      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+      const groupCandidates = Array.from(doc.querySelectorAll('.check-box'));
+      const getOptionSet = (group) => new Set(
+        Array.from(group.querySelectorAll('.default.option, .options .option, .option'))
+          .map((item) => normalize(item.textContent))
+          .filter(Boolean)
+      );
+      const findGroup = () => {
+        const direct = doc.querySelector('.check-box.' + groupClass);
+        if (direct) return direct;
+        if (groupClass === 'school') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('985') || set.has('211') || set.has('双一流院校');
+          }) || null;
+        }
+        if (groupClass === 'degree') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('大专') || set.has('本科') || set.has('硕士') || set.has('博士');
+          }) || null;
+        }
+        if (groupClass === 'gender') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('男') || set.has('女');
+          }) || null;
+        }
+        if (groupClass === 'recentNotView') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('近14天没有');
+          }) || null;
+        }
+        return null;
+      };
+      const group = findGroup();
       if (!group) {
         return { ok: false, error: 'GROUP_NOT_FOUND' };
       }
-      const normalize = (value) => String(value || '').replace(/\s+/g, '').trim();
       const frameRect = frame.getBoundingClientRect();
       const getPoint = (el) => {
         const rect = el.getBoundingClientRect();
@@ -555,8 +589,98 @@ class RecommendSearchCli {
     })(${JSON.stringify(groupClass)}, ${JSON.stringify(label)})`);
   }
 
+  async ensureGroupReady(groupClass) {
+    return this.evaluate(`((groupClass) => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+      const groupCandidates = Array.from(doc.querySelectorAll('.check-box'));
+      const getOptionSet = (group) => new Set(
+        Array.from(group.querySelectorAll('.default.option, .options .option, .option'))
+          .map((item) => normalize(item.textContent))
+          .filter(Boolean)
+      );
+      const findGroup = () => {
+        const direct = doc.querySelector('.check-box.' + groupClass);
+        if (direct) return direct;
+        if (groupClass === 'school') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('985') || set.has('211') || set.has('双一流院校');
+          }) || null;
+        }
+        if (groupClass === 'degree') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('大专') || set.has('本科') || set.has('硕士') || set.has('博士');
+          }) || null;
+        }
+        if (groupClass === 'gender') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('男') || set.has('女');
+          }) || null;
+        }
+        if (groupClass === 'recentNotView') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('近14天没有');
+          }) || null;
+        }
+        return null;
+      };
+
+      const scrollGroupIntoView = (group) => {
+        try {
+          group.scrollIntoView({ behavior: 'instant', block: 'center' });
+        } catch {
+          try { group.scrollIntoView({ block: 'center' }); } catch {}
+        }
+      };
+
+      let group = findGroup();
+      if (group) {
+        scrollGroupIntoView(group);
+        return { ok: true, found: true, scrolled: false };
+      }
+
+      const topScroller = doc.querySelector('.recommend-filter.op-filter .filter-panel .top')
+        || doc.querySelector('.recommend-filter.op-filter .top')
+        || doc.querySelector('.recommend-filter.op-filter .filter-panel');
+      if (!topScroller) {
+        return { ok: false, error: 'FILTER_SCROLL_CONTAINER_NOT_FOUND' };
+      }
+      const maxScrollTop = Math.max(0, topScroller.scrollHeight - topScroller.clientHeight);
+      const steps = 14;
+      for (let index = 0; index <= steps; index += 1) {
+        const nextTop = maxScrollTop <= 0 ? 0 : Math.round((maxScrollTop * index) / steps);
+        topScroller.scrollTop = nextTop;
+        group = findGroup();
+        if (group) {
+          scrollGroupIntoView(group);
+          return { ok: true, found: true, scrolled: true, step: index };
+        }
+      }
+      return { ok: false, error: 'GROUP_NOT_FOUND' };
+    })(${JSON.stringify(groupClass)})`);
+  }
+
   async selectOption(groupClass, label) {
-    const option = await this.getOptionInfo(groupClass, label);
+    let option = await this.getOptionInfo(groupClass, label);
+    if (!option?.ok && option?.error === "GROUP_NOT_FOUND") {
+      await this.openFilterPanel();
+      const ensure = await this.ensureGroupReady(groupClass);
+      if (!ensure?.ok) {
+        throw new Error(ensure?.error || "GROUP_NOT_FOUND");
+      }
+      await sleep(humanDelay(180, 60));
+      option = await this.getOptionInfo(groupClass, label);
+    }
     if (!option?.ok) {
       throw new Error(option?.error || 'OPTION_NOT_FOUND');
     }
@@ -565,6 +689,82 @@ class RecommendSearchCli {
     }
     await this.simulateHumanClick(option.x, option.y);
     await sleep(humanDelay(300, 80));
+
+    let afterClick = await this.getOptionInfo(groupClass, label);
+    if (afterClick?.ok && afterClick.alreadySelected) {
+      return;
+    }
+
+    const fallback = await this.clickOptionBySelector(groupClass, label);
+    if (!fallback?.ok) {
+      throw new Error(fallback?.error || "OPTION_FALLBACK_CLICK_FAILED");
+    }
+    await sleep(humanDelay(220, 60));
+    afterClick = await this.getOptionInfo(groupClass, label);
+    if (!(afterClick?.ok && afterClick.alreadySelected)) {
+      throw new Error("OPTION_SELECTION_NOT_APPLIED");
+    }
+  }
+
+  async clickOptionBySelector(groupClass, label) {
+    return this.evaluate(`((groupClass, label) => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+      const groupCandidates = Array.from(doc.querySelectorAll('.check-box'));
+      const getOptionSet = (group) => new Set(
+        Array.from(group.querySelectorAll('.default.option, .options .option, .option'))
+          .map((item) => normalize(item.textContent))
+          .filter(Boolean)
+      );
+      const findGroup = () => {
+        const direct = doc.querySelector('.check-box.' + groupClass);
+        if (direct) return direct;
+        if (groupClass === 'school') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('985') || set.has('211') || set.has('双一流院校');
+          }) || null;
+        }
+        if (groupClass === 'degree') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('大专') || set.has('本科') || set.has('硕士') || set.has('博士');
+          }) || null;
+        }
+        if (groupClass === 'gender') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('男') || set.has('女');
+          }) || null;
+        }
+        if (groupClass === 'recentNotView') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('近14天没有');
+          }) || null;
+        }
+        return null;
+      };
+      const group = findGroup();
+      if (!group) {
+        return { ok: false, error: 'GROUP_NOT_FOUND' };
+      }
+      const options = Array.from(group.querySelectorAll('.options .option, .option'));
+      const target = label === '不限'
+        ? (group.querySelector('.default.option') || options.find((item) => normalize(item.textContent) === '不限'))
+        : options.find((item) => normalize(item.textContent) === normalize(label));
+      if (!target) {
+        return { ok: false, error: 'OPTION_NOT_FOUND' };
+      }
+      target.click();
+      return { ok: true };
+    })(${JSON.stringify(groupClass)}, ${JSON.stringify(label)})`);
   }
 
   async getDegreeFilterState() {
@@ -576,11 +776,20 @@ class RecommendSearchCli {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
       const doc = frame.contentDocument;
-      const group = doc.querySelector('.check-box.degree');
+      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+      const groups = Array.from(doc.querySelectorAll('.check-box'));
+      const group = doc.querySelector('.check-box.degree')
+        || groups.find((item) => {
+          const set = new Set(
+            Array.from(item.querySelectorAll('.default.option, .options .option, .option'))
+              .map((node) => normalize(node.textContent))
+              .filter(Boolean)
+          );
+          return set.has('大专') || set.has('本科') || set.has('硕士') || set.has('博士');
+        });
       if (!group) {
         return { ok: false, error: 'GROUP_NOT_FOUND' };
       }
-      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
       const labels = ${JSON.stringify(DEGREE_OPTIONS)};
       const activeLabels = labels.filter((label) => {
         const node = Array.from(group.querySelectorAll('.options .option'))
@@ -597,6 +806,11 @@ class RecommendSearchCli {
   }
 
   async selectDegreeFilter(labels) {
+    const ensure = await this.ensureGroupReady("degree");
+    if (!ensure?.ok) {
+      throw new Error(ensure?.error || "GROUP_NOT_FOUND");
+    }
+
     const targetLabels = Array.isArray(labels) && labels.length > 0 ? labels : ["不限"];
     if (targetLabels.includes("不限")) {
       await this.selectOption("degree", "不限");
