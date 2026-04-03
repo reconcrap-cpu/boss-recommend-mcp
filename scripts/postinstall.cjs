@@ -14,16 +14,18 @@ function isGlobalInstall() {
 }
 
 function main() {
-  if (!isGlobalInstall()) {
-    return;
-  }
-
   const cliPath = path.join(__dirname, "..", "src", "cli.js");
   if (!fs.existsSync(cliPath)) {
     return;
   }
 
-  const result = spawnSync(process.execPath, [cliPath, "install"], {
+  const initCwd = String(process.env.INIT_CWD || "").trim();
+  const workspaceArgs = initCwd ? ["--workspace-root", path.resolve(initCwd)] : [];
+  const cliArgs = isGlobalInstall()
+    ? [cliPath, "install", ...workspaceArgs]
+    : [cliPath, "init-config", ...workspaceArgs];
+
+  const result = spawnSync(process.execPath, cliArgs, {
     cwd: path.join(__dirname, ".."),
     stdio: "inherit",
     windowsHide: true,

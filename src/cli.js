@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { startServer } from "./index.js";
 import {
   ensureBossRecommendPageReady,
+  getScreenConfigResolution,
   inspectBossRecommendPageState,
   runPipelinePreflight
 } from "./adapters.js";
@@ -26,6 +27,8 @@ const supportedMcpClients = ["generic", "cursor", "trae", "claudecode", "opencla
 const defaultMcpServerName = "boss-recommend";
 const defaultMcpCommand = "npx";
 const defaultMcpArgs = ["-y", "@reconcrap/boss-recommend-mcp@latest", "start"];
+const recommendMcpPackageName = "@reconcrap/boss-recommend-mcp";
+const recommendMcpBinaryName = "boss-recommend-mcp";
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h"]);
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
@@ -45,6 +48,12 @@ function getCodexHome() {
   return process.env.CODEX_HOME
     ? path.resolve(process.env.CODEX_HOME)
     : path.join(os.homedir(), ".codex");
+}
+
+function getStateHome() {
+  return process.env.BOSS_RECOMMEND_HOME
+    ? path.resolve(process.env.BOSS_RECOMMEND_HOME)
+    : path.join(os.homedir(), ".boss-recommend-mcp");
 }
 
 function ensureDir(targetPath) {
@@ -76,7 +85,9 @@ function dedupePaths(items) {
   const result = [];
   const seen = new Set();
   for (const item of items || []) {
-    const resolved = path.resolve(String(item || ""));
+    const raw = String(item ?? "").trim();
+    if (!raw) continue;
+    const resolved = path.resolve(raw);
     if (!resolved || seen.has(resolved)) continue;
     seen.add(resolved);
     result.push(resolved);
@@ -84,11 +95,41 @@ function dedupePaths(items) {
   return result;
 }
 
+function dedupeLower(values = []) {
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized) continue;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function discoverAppDataDirsByPattern(baseDir, pattern) {
+  try {
+    if (!pathExists(baseDir)) return [];
+    const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() && pattern.test(entry.name))
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
 function getDesktopDir() {
   return path.join(os.homedir(), "Desktop");
 }
 
 function getUserConfigPath() {
+  return path.join(getStateHome(), "screening-config.json");
+}
+
+function getLegacyUserConfigPath() {
   return path.join(getCodexHome(), "boss-recommend-mcp", "screening-config.json");
 }
 
@@ -138,9 +179,29 @@ function parsePositivePort(raw) {
   return Number.isFinite(port) && port > 0 ? port : null;
 }
 
+function isEphemeralWorkspaceRoot(rootPath) {
+  const normalized = path.resolve(String(rootPath || ""))
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  return (
+    normalized.includes("/appdata/local/npm-cache/_npx/")
+    || normalized.includes("/node_modules/@reconcrap/boss-recommend-mcp")
+  );
+}
+
 function getWorkspaceRoot(options) {
-  const raw = options["workspace-root"] || process.env.BOSS_WORKSPACE_ROOT || process.cwd();
-  return path.resolve(String(raw));
+  const fromOption = String(options["workspace-root"] || "").trim();
+  if (fromOption) return path.resolve(fromOption);
+
+  const fromEnv = String(process.env.BOSS_WORKSPACE_ROOT || "").trim();
+  if (fromEnv) return path.resolve(fromEnv);
+
+  const cwd = path.resolve(process.cwd());
+  const initCwd = String(process.env.INIT_CWD || "").trim();
+  if (isEphemeralWorkspaceRoot(cwd) && initCwd) {
+    return path.resolve(initCwd);
+  }
+  return cwd;
 }
 
 function readTextFile(filePath, label) {
@@ -210,7 +271,7 @@ function getAgentConfigOutputDir(options = {}) {
   if (typeof options["output-dir"] === "string" && options["output-dir"].trim()) {
     return path.resolve(options["output-dir"]);
   }
-  return path.join(getCodexHome(), "boss-recommend-mcp", "agent-mcp-configs");
+  return path.join(getStateHome(), "agent-mcp-configs");
 }
 
 function buildMcpLaunchConfig(options = {}) {
@@ -270,23 +331,56 @@ function parsePathListFromEnv(raw) {
   return dedupePaths(text.split(path.delimiter).map((item) => item.trim()).filter(Boolean));
 }
 
-function getKnownExternalMcpConfigPaths() {
-  const home = os.homedir();
-  const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-  return dedupePaths([
-    path.join(appData, "Cursor", "User", "mcp.json"),
-    path.join(appData, "Trae", "User", "mcp.json"),
-    path.join(appData, "Trae CN", "User", "mcp.json"),
-    path.join(home, ".trae", "mcp.json"),
-    path.join(home, ".trae-cn", "mcp.json"),
-    path.join(home, ".claude", "mcp.json"),
-    path.join(home, ".openclaw", "mcp.json")
-  ]);
+const supportedExternalAgents = ["cursor", "trae", "trae-cn", "claude", "openclaw"];
+
+function normalizeAgentName(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (raw === "claude-code") return "claude";
+  return raw;
 }
 
-function resolveExternalMcpConfigTargets() {
+function parseAgentTargets(rawValue) {
+  if (!rawValue) return supportedExternalAgents.slice();
+  const raw = String(rawValue).trim().toLowerCase();
+  if (!raw || raw === "all") return supportedExternalAgents.slice();
+  const candidates = raw.split(",").map(normalizeAgentName).filter(Boolean);
+  const unique = [...new Set(candidates)];
+  const invalid = unique.filter((item) => !supportedExternalAgents.includes(item));
+  if (invalid.length > 0) {
+    throw new Error(`Unsupported --agent value: ${invalid.join(", ")}. Supported: ${supportedExternalAgents.join(", ")}, all`);
+  }
+  return unique;
+}
+
+function getKnownExternalMcpConfigPathsByAgent() {
+  const home = os.homedir();
+  const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+  const traeDirNames = dedupeLower([
+    "Trae",
+    "Trae CN",
+    "TraeCN",
+    "trae-cn",
+    "trae_cn",
+    ...discoverAppDataDirsByPattern(appData, /^trae(?:[\s\-_]?cn)?$/i)
+  ]);
+  const traeConfigPaths = traeDirNames.map((dir) => path.join(appData, dir, "User", "mcp.json"));
+  return {
+    cursor: [path.join(appData, "Cursor", "User", "mcp.json"), path.join(home, ".cursor", "mcp.json")],
+    trae: [...traeConfigPaths, path.join(home, ".trae", "mcp.json"), path.join(home, ".trae-cn", "mcp.json")],
+    "trae-cn": [...traeConfigPaths, path.join(home, ".trae-cn", "mcp.json"), path.join(home, ".trae", "mcp.json")],
+    claude: [path.join(home, ".claude", "mcp.json")],
+    openclaw: [path.join(home, ".openclaw", "mcp.json")]
+  };
+}
+
+function resolveExternalMcpConfigTargets(options = {}) {
   const fromEnv = parsePathListFromEnv(process.env[externalMcpTargetsEnv]);
-  const known = getKnownExternalMcpConfigPaths().filter((filePath) => {
+  const pathMap = getKnownExternalMcpConfigPathsByAgent();
+  const agents = parseAgentTargets(options.agent);
+  const knownCandidates = agents.flatMap((agent) => pathMap[agent] || []);
+  const known = dedupePaths(knownCandidates).filter((filePath) => {
+    if (options.agent) return true;
     if (pathExists(filePath)) return true;
     return pathExists(path.dirname(filePath));
   });
@@ -322,7 +416,7 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
 }
 
 function installExternalMcpConfigs(options = {}) {
-  const targets = resolveExternalMcpConfigTargets();
+  const targets = resolveExternalMcpConfigTargets(options);
   const applied = [];
   const skipped = [];
   for (const target of targets) {
@@ -345,30 +439,93 @@ function installExternalMcpConfigs(options = {}) {
   return { targets, applied, skipped };
 }
 
-function getKnownExternalSkillBaseDirs() {
+function getKnownExternalSkillBaseDirsByAgent() {
   const home = os.homedir();
   const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-  return dedupePaths([
-    path.join(home, ".cursor", "skills"),
-    path.join(home, ".trae", "skills"),
-    path.join(home, ".trae-cn", "skills"),
-    path.join(home, ".claude", "skills"),
-    path.join(home, ".openclaw", "skills"),
-    path.join(appData, "Cursor", "User", "skills"),
-    path.join(appData, "Trae", "User", "skills"),
-    path.join(appData, "Trae CN", "User", "skills"),
-    path.join(appData, "OpenClaw", "User", "skills")
+  const traeDirNames = dedupeLower([
+    "Trae",
+    "Trae CN",
+    "TraeCN",
+    "trae-cn",
+    "trae_cn",
+    ...discoverAppDataDirsByPattern(appData, /^trae(?:[\s\-_]?cn)?$/i)
   ]);
+  const traeSkillDirs = traeDirNames.map((dir) => path.join(appData, dir, "User", "skills"));
+  return {
+    cursor: [path.join(home, ".cursor", "skills"), path.join(appData, "Cursor", "User", "skills")],
+    trae: [path.join(home, ".trae", "skills"), path.join(home, ".trae-cn", "skills"), ...traeSkillDirs],
+    "trae-cn": [path.join(home, ".trae-cn", "skills"), path.join(home, ".trae", "skills"), ...traeSkillDirs],
+    claude: [path.join(home, ".claude", "skills")],
+    openclaw: [path.join(home, ".openclaw", "skills"), path.join(appData, "OpenClaw", "User", "skills")]
+  };
 }
 
-function resolveExternalSkillBaseDirs() {
+function isRecommendMcpLaunchConfig(launchConfig) {
+  if (!launchConfig || typeof launchConfig !== "object") return false;
+  const command = String(launchConfig.command || "").toLowerCase();
+  const args = Array.isArray(launchConfig.args) ? launchConfig.args : [];
+  const joined = `${command} ${args.map((item) => String(item || "")).join(" ")}`.toLowerCase();
+  return (
+    joined.includes(recommendMcpPackageName.toLowerCase())
+    || joined.includes(`${recommendMcpBinaryName} start`)
+    || (command.endsWith(recommendMcpBinaryName) && args.includes("start"))
+    || command === recommendMcpBinaryName
+  );
+}
+
+function inspectMcpServerEntries(filePath) {
+  if (!pathExists(filePath)) {
+    return {
+      exists: false,
+      has_boss_recommend: false,
+      has_boss_recruit: false,
+      recommend_server_names: [],
+      recruit_server_names: []
+    };
+  }
+  const parsed = readJsonObjectFileSafe(filePath);
+  const servers = parsed?.mcpServers && typeof parsed.mcpServers === "object" && !Array.isArray(parsed.mcpServers)
+    ? parsed.mcpServers
+    : {};
+  const recommendNames = [];
+  const recruitNames = [];
+  for (const [name, config] of Object.entries(servers)) {
+    const lowerName = String(name || "").toLowerCase();
+    if (isRecommendMcpLaunchConfig(config) || lowerName.includes("boss-recommend")) {
+      recommendNames.push(name);
+    }
+    const serialized = JSON.stringify(config || {}).toLowerCase();
+    if (
+      lowerName.includes("boss-recruit")
+      || serialized.includes("@reconcrap/boss-recruit-mcp")
+      || serialized.includes("boss-recruit-mcp")
+    ) {
+      recruitNames.push(name);
+    }
+  }
+  return {
+    exists: true,
+    has_boss_recommend: recommendNames.length > 0,
+    has_boss_recruit: recruitNames.length > 0,
+    recommend_server_names: recommendNames,
+    recruit_server_names: recruitNames
+  };
+}
+
+function resolveExternalSkillBaseDirs(options = {}) {
   const fromEnv = parsePathListFromEnv(process.env[externalSkillDirsEnv]);
-  const known = getKnownExternalSkillBaseDirs().filter((dirPath) => pathExists(dirPath));
+  const pathMap = getKnownExternalSkillBaseDirsByAgent();
+  const agents = parseAgentTargets(options.agent);
+  const knownCandidates = agents.flatMap((agent) => pathMap[agent] || []);
+  const known = dedupePaths(knownCandidates).filter((dirPath) => {
+    if (options.agent) return true;
+    return pathExists(dirPath);
+  });
   return dedupePaths([...fromEnv, ...known]);
 }
 
-function mirrorSkillToExternalDirs() {
-  const baseDirs = resolveExternalSkillBaseDirs();
+function mirrorSkillToExternalDirs(options = {}) {
+  const baseDirs = resolveExternalSkillBaseDirs(options);
   const mirrored = [];
   const skipped = [];
   for (const baseDir of baseDirs) {
@@ -412,18 +569,52 @@ function installSkill() {
   return syncSkillAssets({ force: true }).targetDir;
 }
 
-function ensureUserConfig() {
-  const targetDir = path.join(getCodexHome(), "boss-recommend-mcp");
-  const targetPath = getUserConfigPath();
-  ensureDir(targetDir);
-  if (!fs.existsSync(targetPath)) {
-    const template = JSON.parse(fs.readFileSync(exampleConfigPath, "utf8"));
-    template.outputDir = getDesktopDir();
-    template.debugPort = 9222;
-    fs.writeFileSync(targetPath, JSON.stringify(template, null, 2), "utf8");
-    return { path: targetPath, created: true };
+function pathStartsWith(filePath, rootPath) {
+  const file = path.resolve(String(filePath || ""));
+  const root = path.resolve(String(rootPath || ""));
+  if (process.platform === "win32") {
+    return file.toLowerCase().startsWith(root.toLowerCase());
   }
-  return { path: targetPath, created: false };
+  return file.startsWith(root);
+}
+
+function resolveCliConfigTarget(options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const resolution = getScreenConfigResolution(workspaceRoot);
+  const workspacePreferred = (resolution.candidate_paths || []).find((item) => pathStartsWith(item, workspaceRoot)) || null;
+  const configPath = resolution.writable_path || resolution.resolved_path || workspacePreferred || getUserConfigPath();
+  return {
+    workspaceRoot,
+    resolution,
+    configPath,
+    workspacePreferred
+  };
+}
+
+function ensureUserConfig(options = {}) {
+  const { configPath, workspacePreferred } = resolveCliConfigTarget(options);
+  const writeTargets = dedupePaths([configPath, workspacePreferred]).filter(Boolean);
+  let lastError = null;
+  for (const targetPath of writeTargets) {
+    try {
+      ensureDir(path.dirname(targetPath));
+      if (!fs.existsSync(targetPath)) {
+        const template = JSON.parse(fs.readFileSync(exampleConfigPath, "utf8"));
+        template.outputDir = getDesktopDir();
+        template.debugPort = 9222;
+        fs.writeFileSync(targetPath, JSON.stringify(template, null, 2), "utf8");
+        return { path: targetPath, created: true };
+      }
+      const stat = fs.statSync(targetPath);
+      if (stat.isFile()) {
+        return { path: targetPath, created: false };
+      }
+      lastError = new Error(`Config target is a directory and cannot be used as file: ${targetPath}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("No writable target for screening-config.json");
 }
 
 function readJsonObjectFile(filePath) {
@@ -435,15 +626,57 @@ function readJsonObjectFile(filePath) {
   return parsed;
 }
 
-function persistDebugPortSelection(port) {
-  const configPath = getUserConfigPath();
-  let config = {};
-  if (fs.existsSync(configPath)) {
-    config = readJsonObjectFile(configPath);
+function loadBestExistingUserConfig(options = {}) {
+  const { resolution, configPath, workspacePreferred } = resolveCliConfigTarget(options);
+  const candidates = dedupePaths([
+    ...(resolution.candidate_paths || []),
+    configPath,
+    workspacePreferred,
+    getLegacyUserConfigPath()
+  ]).filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      try {
+        const stat = fs.statSync(candidate);
+        if (!stat.isFile()) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      return { path: candidate, config: readJsonObjectFile(candidate) };
+    }
   }
+  return { path: configPath, config: {} };
+}
+
+function writeConfigWithFallback(nextConfig, options = {}) {
+  const { configPath, workspacePreferred } = resolveCliConfigTarget(options);
+  const targets = dedupePaths([configPath, workspacePreferred]).filter(Boolean);
+  let lastError = null;
+  for (const target of targets) {
+    try {
+      ensureDir(path.dirname(target));
+      if (fs.existsSync(target)) {
+        const stat = fs.statSync(target);
+        if (!stat.isFile()) {
+          lastError = new Error(`Config target is a directory and cannot be used as file: ${target}`);
+          continue;
+        }
+      }
+      fs.writeFileSync(target, JSON.stringify(nextConfig, null, 2), "utf8");
+      return target;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("No writable target for screening-config.json");
+}
+
+function persistDebugPortSelection(port, options = {}) {
+  const { config } = loadBestExistingUserConfig(options);
   config.debugPort = port;
-  ensureDir(path.dirname(configPath));
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf8");
+  const configPath = writeConfigWithFallback(config, options);
   return { port, configPath };
 }
 
@@ -453,7 +686,39 @@ function setDebugPort(options = {}) {
     throw new Error("Missing required --port <number> for set-port.");
   }
   process.env.BOSS_RECOMMEND_CHROME_PORT = String(selected);
-  return persistDebugPortSelection(selected);
+  return persistDebugPortSelection(selected, options);
+}
+
+function setScreeningConfig(options = {}) {
+  const baseUrl = String(options["base-url"] || options.baseUrl || "").trim();
+  const apiKey = String(options["api-key"] || options.apiKey || "").trim();
+  const model = String(options.model || "").trim();
+  if (!baseUrl || !apiKey || !model) {
+    throw new Error("Missing required fields: --base-url, --api-key, --model");
+  }
+
+  const { config: existing } = loadBestExistingUserConfig(options);
+  const nextConfig = {
+    ...existing,
+    baseUrl,
+    apiKey,
+    model
+  };
+  if (typeof options["openai-organization"] === "string") {
+    nextConfig.openaiOrganization = options["openai-organization"];
+  }
+  if (typeof options["openai-project"] === "string") {
+    nextConfig.openaiProject = options["openai-project"];
+  }
+  if (typeof options["output-dir"] === "string" && options["output-dir"].trim()) {
+    nextConfig.outputDir = options["output-dir"].trim();
+  }
+  const debugPort = parsePositivePort(options.port || options["debug-port"]);
+  if (debugPort) {
+    nextConfig.debugPort = debugPort;
+  }
+  const configPath = writeConfigWithFallback(nextConfig, options);
+  return { path: configPath, updated: true };
 }
 
 function printJson(value) {
@@ -478,20 +743,66 @@ function findChromeOnboardingUrl(tabs) {
   return null;
 }
 
+function getDefaultChromeExecutableCandidates() {
+  const candidates = [process.env.BOSS_RECOMMEND_CHROME_PATH].filter(Boolean);
+  if (process.platform === "win32") {
+    candidates.push(
+      path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(process.env.ProgramFiles || "", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(process.env["ProgramFiles(x86)"] || "", "Google", "Chrome", "Application", "chrome.exe")
+    );
+  } else if (process.platform === "darwin") {
+    candidates.push(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(os.homedir(), "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    );
+  } else {
+    candidates.push(
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/chromium-browser",
+      "/usr/bin/chromium",
+      "/snap/bin/chromium"
+    );
+  }
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
 function getChromeExecutable() {
-  const candidates = [
-    process.env.BOSS_RECOMMEND_CHROME_PATH,
-    path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(process.env.ProgramFiles || "", "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(process.env["ProgramFiles(x86)"] || "", "Google", "Chrome", "Application", "chrome.exe")
-  ].filter(Boolean);
+  const candidates = getDefaultChromeExecutableCandidates();
   return candidates.find((candidate) => fs.existsSync(candidate)) || null;
 }
 
 function getChromeUserDataDir(port) {
-  const targetPath = path.join(getCodexHome(), "boss-recommend-mcp", `chrome-profile-${port}`);
+  const targetPath = resolveDefaultChromeUserDataDir(port);
   ensureDir(targetPath);
   return targetPath;
+}
+
+function getSharedChromeUserDataDir(port) {
+  return path.join(getCodexHome(), "boss-mcp", `chrome-profile-${port}`);
+}
+
+function getLegacyRecruitChromeUserDataDir(port) {
+  return path.join(getCodexHome(), "boss-recruit-mcp", `chrome-profile-${port}`);
+}
+
+function getLegacyRecommendChromeUserDataDir(port) {
+  return path.join(getStateHome(), `chrome-profile-${port}`);
+}
+
+function resolveDefaultChromeUserDataDir(port) {
+  const sharedPath = getSharedChromeUserDataDir(port);
+  if (pathExists(sharedPath)) {
+    return sharedPath;
+  }
+  const legacyPaths = [
+    getLegacyRecruitChromeUserDataDir(port),
+    getLegacyRecommendChromeUserDataDir(port)
+  ];
+  const legacyExisting = legacyPaths.find((candidate) => pathExists(candidate));
+  return legacyExisting || sharedPath;
 }
 
 async function launchChrome(options = {}) {
@@ -542,16 +853,90 @@ async function launchChrome(options = {}) {
   }
 }
 
+function inspectAgentIntegration(agentRaw) {
+  const agent = normalizeAgentName(agentRaw);
+  if (!supportedExternalAgents.includes(agent)) {
+    throw new Error(`Unsupported --agent value for doctor: ${agentRaw}. Supported: ${supportedExternalAgents.join(", ")}`);
+  }
+
+  const mcpPathMap = getKnownExternalMcpConfigPathsByAgent();
+  const skillPathMap = getKnownExternalSkillBaseDirsByAgent();
+  const mcp_paths = dedupePaths([
+    ...(mcpPathMap[agent] || []),
+    ...parsePathListFromEnv(process.env[externalMcpTargetsEnv])
+  ]);
+  const skill_bases = dedupePaths([
+    ...(skillPathMap[agent] || []),
+    ...parsePathListFromEnv(process.env[externalSkillDirsEnv])
+  ]);
+
+  const mcp_checks = mcp_paths.map((mcpPath) => {
+    const detail = inspectMcpServerEntries(mcpPath);
+    return {
+      path: mcpPath,
+      ...detail
+    };
+  });
+
+  const hasRecommendIntent = (content) => /(recommend|推荐页|boss recommend|recommend page)/i.test(content);
+  const hasSearchIntent = (content) => /(search|搜索页|boss search|search page)/i.test(content);
+  const hasRecommendPipelineRoute = (content) => /(boss-recommend-pipeline|start_recommend_pipeline_run)/i.test(content);
+  const hasRecruitPipelineRoute = (content) => /(boss-recruit-pipeline|run_recruit_pipeline)/i.test(content);
+
+  const skill_checks = skill_bases.map((baseDir) => {
+    const targetDir = path.join(baseDir, skillName);
+    const skillFile = path.join(targetDir, "SKILL.md");
+    const recruitSkillFile = path.join(baseDir, "boss-recruit-pipeline", "SKILL.md");
+    const recommendContent = pathExists(skillFile) ? fs.readFileSync(skillFile, "utf8") : "";
+    const recruitContent = pathExists(recruitSkillFile) ? fs.readFileSync(recruitSkillFile, "utf8") : "";
+    const recruitRouteGuard = hasRecommendIntent(recruitContent) && hasRecommendPipelineRoute(recruitContent);
+    const recommendRouteGuard = hasSearchIntent(recommendContent) && hasRecruitPipelineRoute(recommendContent);
+    return {
+      base_dir: baseDir,
+      target_dir: targetDir,
+      exists: pathExists(skillFile),
+      recruit_skill_exists: pathExists(recruitSkillFile),
+      recruit_route_guard: recruitRouteGuard,
+      recommend_route_guard: recommendRouteGuard
+    };
+  });
+
+  const route_guard_ok = skill_checks.every(
+    (item) => (
+      (!item.recruit_skill_exists || item.recruit_route_guard)
+      && (!item.exists || item.recommend_route_guard)
+    )
+  );
+
+  return {
+    agent,
+    mcp_checks,
+    skill_checks,
+    route_guard_ok,
+    ok: mcp_checks.some((item) => item.has_boss_recommend) && skill_checks.some((item) => item.exists) && route_guard_ok
+  };
+}
+
 async function printDoctor(options = {}) {
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
   const workspaceRoot = getWorkspaceRoot(options);
-  const checks = runPipelinePreflight(workspaceRoot).checks.slice();
+  const preflight = runPipelinePreflight(workspaceRoot);
+  const checks = preflight.checks.slice();
+  const configResolution = getScreenConfigResolution(workspaceRoot);
   const pageState = await inspectBossRecommendPageState(port, { timeoutMs: 2000, pollMs: 500 });
+  const resolvedConfigPath = configResolution.resolved_path || configResolution.writable_path;
+  const userConfigExists = (
+    (resolvedConfigPath && fs.existsSync(resolvedConfigPath))
+    || fs.existsSync(configResolution.writable_path)
+    || fs.existsSync(configResolution.legacy_path)
+  );
   checks.push({
     key: "user_config",
-    ok: fs.existsSync(getUserConfigPath()),
-    path: getUserConfigPath(),
-    message: "用户配置不存在"
+    ok: userConfigExists,
+    path: resolvedConfigPath,
+    message: userConfigExists
+      ? `检测到配置文件（resolved_path）：${resolvedConfigPath}`
+      : "用户配置不存在（可通过 `boss-recommend-mcp init-config` 创建模板，或 `boss-recommend-mcp config set` 写入真实值）"
   });
   checks.push({
     key: "chrome_debug_port",
@@ -562,16 +947,90 @@ async function printDoctor(options = {}) {
       : `Chrome 调试端口 ${port} 可连接`
   });
   checks.push(pageState);
-  printJson({ ok: checks.every((item) => item.ok), port, checks });
+
+  let agentIntegration = null;
+  if (typeof options.agent === "string" && options.agent.trim()) {
+    agentIntegration = inspectAgentIntegration(options.agent.trim());
+    const agentMcpOk = agentIntegration.mcp_checks.some((item) => item.has_boss_recommend);
+    const agentRecruitOnly = (
+      !agentMcpOk
+      && agentIntegration.mcp_checks.some((item) => item.has_boss_recruit)
+    );
+    const agentSkillOk = agentIntegration.skill_checks.some((item) => item.exists);
+    const agentRecruitRouteGuardOk = agentIntegration.skill_checks.every(
+      (item) => !item.recruit_skill_exists || item.recruit_route_guard
+    );
+    const agentRecommendRouteGuardOk = agentIntegration.skill_checks.every(
+      (item) => !item.exists || item.recommend_route_guard
+    );
+    const agentRouteGuardOk = agentIntegration.route_guard_ok;
+    checks.push({
+      key: `agent_${agentIntegration.agent}_mcp`,
+      ok: agentMcpOk,
+      path: agentIntegration.mcp_checks.map((item) => item.path).join(" | "),
+      message: agentMcpOk
+        ? "目标 Agent MCP 配置已检测到 boss-recommend。"
+        : agentRecruitOnly
+          ? "目标 Agent MCP 配置未检测到 boss-recommend，但检测到 boss-recruit（可能导致错误调用 recruit pipeline）。"
+          : "目标 Agent MCP 配置未检测到 boss-recommend。"
+    });
+    checks.push({
+      key: `agent_${agentIntegration.agent}_skill`,
+      ok: agentSkillOk,
+      path: agentIntegration.skill_checks.map((item) => item.target_dir).join(" | "),
+      message: agentSkillOk
+        ? "目标 Agent skills 目录已检测到 boss-recommend-pipeline。"
+        : "目标 Agent skills 目录未检测到 boss-recommend-pipeline。"
+    });
+    checks.push({
+      key: `agent_${agentIntegration.agent}_recruit_route_guard`,
+      ok: agentRecruitRouteGuardOk,
+      path: agentIntegration.skill_checks.map((item) => item.base_dir).join(" | "),
+      message: agentRecruitRouteGuardOk
+        ? "recruit skill 路由保护检查通过（recommend 请求不会误触发 recruit pipeline）。"
+        : "检测到 boss-recruit-pipeline 但未发现 recommend 路由保护，可能误触发 recruit pipeline。"
+    });
+    checks.push({
+      key: `agent_${agentIntegration.agent}_recommend_route_guard`,
+      ok: agentRecommendRouteGuardOk,
+      path: agentIntegration.skill_checks.map((item) => item.base_dir).join(" | "),
+      message: agentRecommendRouteGuardOk
+        ? "recommend skill 路由保护检查通过（search 请求会转交 recruit pipeline）。"
+        : "检测到 boss-recommend-pipeline 但未发现 search 路由保护，可能误触发 recommend pipeline。"
+    });
+    checks.push({
+      key: `agent_${agentIntegration.agent}_route_guard`,
+      ok: agentRouteGuardOk,
+      path: agentIntegration.skill_checks.map((item) => item.base_dir).join(" | "),
+      message: agentRouteGuardOk
+        ? "双向路由保护检查通过（recommend 与 search 语义已正确分流）。"
+        : "双向路由保护未完全通过，可能出现 recommend/recruit 串路由。"
+    });
+  }
+
+  printJson({
+    ok: checks.every((item) => item.ok),
+    port,
+    checks,
+    config_resolution: configResolution,
+    preflight: {
+      debug_port: preflight.debug_port,
+      config_resolution: preflight.config_resolution
+    },
+    agent_integration: agentIntegration
+  });
 }
 
 function printPaths() {
   const codexHome = getCodexHome();
+  const stateHome = getStateHome();
   console.log(`package_root=${packageRoot}`);
   console.log(`skill_source=${skillSourceDir}`);
   console.log(`codex_home=${codexHome}`);
+  console.log(`state_home=${stateHome}`);
   console.log(`skill_target=${path.join(codexHome, "skills", skillName)}`);
   console.log(`config_target=${getUserConfigPath()}`);
+  console.log(`legacy_config_target=${getLegacyUserConfigPath()}`);
   console.log(`desktop_output_default=${getDesktopDir()}`);
 }
 
@@ -582,17 +1041,21 @@ function printHelp() {
   console.log("  boss-recommend-mcp              Start the MCP server");
   console.log("  boss-recommend-mcp start        Start the MCP server");
   console.log("  boss-recommend-mcp run          Run the recommend pipeline once via CLI and print JSON");
-  console.log("  boss-recommend-mcp install      Install Codex skill and initialize user config");
+  console.log("  boss-recommend-mcp install      Install skill/MCP templates and auto-init screening-config.json (supports --agent trae-cn/cursor/...)");
   console.log("  boss-recommend-mcp install-skill Install only the Codex skill");
-  console.log("  boss-recommend-mcp init-config  Create ~/.codex/boss-recommend-mcp/screening-config.json if missing");
+  console.log("  boss-recommend-mcp init-config  Create screening-config.json if missing (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
+  console.log("  boss-recommend-mcp config set   Write baseUrl/apiKey/model (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
   console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae(含 trae-cn)/Claude Code/OpenClaw");
-  console.log("  boss-recommend-mcp doctor       Check config and runtime prerequisites");
+  console.log("  boss-recommend-mcp doctor       Check config and runtime prerequisites (supports --agent trae-cn/cursor/...)");
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("");
   console.log("Run command:");
   console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}']");
+  console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--openai-organization <id>] [--openai-project <id>]");
+  console.log("  boss-recommend-mcp install --agent trae-cn");
+  console.log("  boss-recommend-mcp doctor --agent trae-cn");
 }
 
 function printMcpConfig(options = {}) {
@@ -608,14 +1071,19 @@ function printMcpConfig(options = {}) {
   }
 }
 
-function installAll() {
+function installAll(options = {}) {
   const skillTarget = installSkill();
-  const configResult = ensureUserConfig();
+  const configResult = ensureUserConfig(options);
   const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
-  const externalMcpResult = installExternalMcpConfigs({});
-  const externalSkillResult = mirrorSkillToExternalDirs();
+  const externalMcpResult = installExternalMcpConfigs(options);
+  const externalSkillResult = mirrorSkillToExternalDirs(options);
   console.log(`Skill installed to: ${skillTarget}`);
-  console.log(configResult.created ? `Config template created at: ${configResult.path}` : `Config already exists at: ${configResult.path}`);
+  console.log(
+    configResult.created
+      ? `screening-config.json created: ${configResult.path}`
+      : `screening-config.json already exists: ${configResult.path}`
+  );
+  console.log(`请在该目录修改 baseUrl/apiKey/model 并替换占位词后再运行：${path.dirname(configResult.path)}`);
   console.log(`MCP config templates exported to: ${mcpTemplateResult.outputDir}`);
   for (const item of mcpTemplateResult.files) {
     console.log(`- ${item.client}: ${item.file}`);
@@ -637,6 +1105,9 @@ function installAll() {
   } else {
     console.log("No external skill dir detected. Set BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS to mirror skill for non-Codex agents.");
   }
+  if (typeof options.agent === "string" && options.agent.trim()) {
+    console.log(`Target agent filter: ${options.agent.trim()}`);
+  }
 }
 
 async function runPipelineOnce(options) {
@@ -647,7 +1118,7 @@ async function runPipelineOnce(options) {
   const explicitPort = parsePositivePort(options.port);
   if (explicitPort) {
     process.env.BOSS_RECOMMEND_CHROME_PORT = String(explicitPort);
-    persistDebugPortSelection(explicitPort);
+    persistDebugPortSelection(explicitPort, options);
   }
 
   const result = await runRecommendPipeline({
@@ -683,13 +1154,18 @@ switch (command) {
     }
     break;
   case "install":
-    installAll();
+    try {
+      installAll(options);
+    } catch (error) {
+      console.error(error.message || "Install failed.");
+      process.exitCode = 1;
+    }
     break;
   case "install-skill":
     console.log(`Skill installed to: ${installSkill()}`);
     break;
   case "init-config": {
-    const result = ensureUserConfig();
+    const result = ensureUserConfig(options);
     console.log(result.created ? `Config template created at: ${result.path}` : `Config already exists at: ${result.path}`);
     break;
   }
@@ -703,6 +1179,33 @@ switch (command) {
       console.error(error.message || "Failed to persist debug port.");
       process.exitCode = 1;
     }
+    break;
+  }
+  case "set-config": {
+    try {
+      const result = setScreeningConfig(options);
+      console.log(`screening-config.json updated: ${result.path}`);
+    } catch (error) {
+      console.error(error.message || "Failed to write screening-config.json.");
+      process.exitCode = 1;
+    }
+    break;
+  }
+  case "config": {
+    const sub = String(process.argv[3] || "").trim().toLowerCase();
+    if (!sub || sub.startsWith("--") || sub === "set") {
+      const configOptions = sub === "set" ? parseOptions(process.argv.slice(4)) : options;
+      try {
+        const result = setScreeningConfig(configOptions);
+        console.log(`screening-config.json updated: ${result.path}`);
+      } catch (error) {
+        console.error(error.message || "Failed to write screening-config.json.");
+        process.exitCode = 1;
+      }
+      break;
+    }
+    console.error(`Unknown config subcommand: ${sub}`);
+    process.exitCode = 1;
     break;
   }
   case "mcp-config":

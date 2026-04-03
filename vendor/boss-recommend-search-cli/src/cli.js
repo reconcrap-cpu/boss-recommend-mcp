@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 import process from "node:process";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 import CDP from "chrome-remote-interface";
 
 const DEFAULT_PORT = 9222;
 const RECOMMEND_URL_FRAGMENT = "/web/chat/recommend";
+const BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/?ka=bticket";
+const BOSS_LOGIN_URL_PATTERN = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhipin\.com)/i;
+const BOSS_LOGIN_TITLE_PATTERN = /登录|signin|扫码登录|BOSS直聘登录/i;
 const SCHOOL_TAG_OPTIONS = ["不限", "985", "211", "双一流院校", "留学", "国内外名校", "公办本科"];
 const DEGREE_OPTIONS = ["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"];
 const DEGREE_ORDER = ["初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"];
@@ -13,6 +17,19 @@ const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeJobTitle(value) {
+  const text = normalizeText(value);
+  if (!text) return "";
+  const byGap = text.split(/\s{2,}/).map((item) => item.trim()).filter(Boolean)[0] || text;
+  const strippedRange = byGap
+    .replace(/\s+\d+(?:\.\d+)?\s*(?:-|~|—|至)\s*\d+(?:\.\d+)?\s*(?:k|K|千|万|元\/天|元\/月|元\/年|K\/月|k\/月|万\/月|万\/年)?$/u, "")
+    .trim();
+  const strippedSingle = strippedRange
+    .replace(/\s+\d+(?:\.\d+)?\s*(?:k|K|千|万|元\/天|元\/月|元\/年|K\/月|k\/月|万\/月|万\/年)$/u, "")
+    .trim();
+  return strippedSingle || byGap;
 }
 
 function parsePositiveInteger(raw) {
@@ -66,6 +83,22 @@ function sortDegreeSelection(values) {
   return Array.from(new Set(values.filter(Boolean))).sort((left, right) => DEGREE_ORDER.indexOf(left) - DEGREE_ORDER.indexOf(right));
 }
 
+function selectionEquals(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+function uniqueNormalizedLabels(values) {
+  return Array.from(
+    new Set(
+      (values || [])
+        .map((item) => normalizeText(item))
+        .filter(Boolean)
+    )
+  );
+}
+
 function expandDegreeAtOrAbove(value) {
   const normalized = normalizeDegree(value);
   if (!normalized || normalized === "不限") return [];
@@ -110,13 +143,16 @@ function parseArgs(argv) {
     gender: "不限",
     recentNotView: "不限",
     port: DEFAULT_PORT,
+    listJobs: false,
+    job: null,
     help: false,
     __provided: {
       schoolTag: false,
       degree: false,
       gender: false,
       recentNotView: false,
-      port: false
+      port: false,
+      job: false
     }
   };
 
@@ -143,6 +179,12 @@ function parseArgs(argv) {
       args.port = parsePositiveInteger(next) || DEFAULT_PORT;
       args.__provided.port = true;
       index += 1;
+    } else if (token === "--job" && next) {
+      args.job = normalizeText(next) || null;
+      args.__provided.job = true;
+      index += 1;
+    } else if (token === "--list-jobs") {
+      args.listJobs = true;
     } else if (token === "--help" || token === "-h") {
       args.help = true;
     }
@@ -167,6 +209,7 @@ async function promptValue(ask, question, validate, defaultValue) {
 
 async function enrichArgsFromPrompt(args) {
   if (!isInteractiveTTY() || args.help) return args;
+  if (args.listJobs) return args;
   const askTargets =
     Object.values(args.__provided || {}).some((item) => item === false)
     || !Array.isArray(args.schoolTag)
@@ -345,14 +388,32 @@ class RecommendSearchCli {
 
   async getFrameState() {
     return this.evaluate(`(() => {
+      const currentUrl = (() => {
+        try { return String(window.location.href || ''); } catch { return ''; }
+      })();
+      const title = (() => {
+        try { return String(document.title || ''); } catch { return ''; }
+      })();
+      const isLogin = ${BOSS_LOGIN_URL_PATTERN}.test(currentUrl)
+        || ${BOSS_LOGIN_TITLE_PATTERN}.test(title);
+      if (isLogin) {
+        return {
+          ok: false,
+          error: 'LOGIN_REQUIRED',
+          currentUrl: currentUrl || ${JSON.stringify(BOSS_LOGIN_URL)},
+          title
+        };
+      }
       const frame = document.querySelector('iframe[name="recommendFrame"]')
         || document.querySelector('iframe[src*="/web/frame/recommend/"]')
         || document.querySelector('iframe');
       if (!frame || !frame.contentDocument) {
-        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME', currentUrl, title };
       }
       return {
         ok: true,
+        currentUrl,
+        title,
         frameUrl: (() => {
           try { return String(frame.contentWindow.location.href || ''); } catch { return ''; }
         })()
@@ -381,6 +442,247 @@ class RecommendSearchCli {
         y: frameRect.top + rect.top + rect.height / 2
       };
     })()`);
+  }
+
+  async getJobListState() {
+    return this.evaluate(`(() => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const normalizeTitle = (value) => {
+        const text = normalize(value);
+        if (!text) return '';
+        const byGap = text.split(/\\s{2,}/).map((item) => item.trim()).filter(Boolean)[0] || text;
+        const strippedRange = byGap
+          .replace(/\\s+\\d+(?:\\.\\d+)?\\s*(?:-|~|—|至)\\s*\\d+(?:\\.\\d+)?\\s*(?:k|K|千|万|元\\/天|元\\/月|元\\/年|K\\/月|k\\/月|万\\/月|万\\/年)?$/u, '')
+          .trim();
+        const strippedSingle = strippedRange
+          .replace(/\\s+\\d+(?:\\.\\d+)?\\s*(?:k|K|千|万|元\\/天|元\\/月|元\\/年|K\\/月|k\\/月|万\\/月|万\\/年)$/u, '')
+          .trim();
+        return strippedSingle || byGap;
+      };
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 2 && rect.height > 2;
+      };
+
+      const items = Array.from(doc.querySelectorAll([
+        '.ui-dropmenu-list .job-list .job-item',
+        '.job-selecter-options .job-list .job-item',
+        '.job-selector-options .job-list .job-item',
+        '.dropmenu-list .job-list .job-item',
+        '.job-list .job-item'
+      ].join(',')));
+      const jobs = [];
+      const seen = new Set();
+      for (const item of items) {
+        const label = normalize(item.querySelector('.label')?.textContent || item.textContent || '');
+        const title = normalizeTitle(label);
+        const value = normalize(item.getAttribute('value') || item.dataset?.value || '');
+        const dedupeKey = value || title || label;
+        if (!dedupeKey || seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
+        jobs.push({
+          value: value || null,
+          title: title || label || null,
+          label: label || null,
+          current: item.classList.contains('curr') || item.classList.contains('active'),
+          visible: isVisible(item)
+        });
+      }
+
+      const selectedLabelNode = doc.querySelector('.chat-job-name, .job-selecter .label, .job-selecter .job-name, .job-select .label');
+      return {
+        ok: true,
+        jobs,
+        selected_label: normalize(selectedLabelNode ? selectedLabelNode.textContent : ''),
+        frame_url: (() => {
+          try { return String(frame.contentWindow.location.href || ''); } catch { return ''; }
+        })()
+      };
+    })()`);
+  }
+
+  async clickJobDropdownTriggerBySelector() {
+    return this.evaluate(`(() => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const selectors = [
+        '.chat-job-select',
+        '.chat-job-selector',
+        '.job-selecter',
+        '.job-selector',
+        '.job-select-wrap',
+        '.job-select',
+        '.job-select-box',
+        '.job-wrap',
+        '.chat-job-name',
+        '.top-chat-search'
+      ];
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 2 && rect.height > 2;
+      };
+      for (const selector of selectors) {
+        const el = doc.querySelector(selector);
+        if (el && isVisible(el)) {
+          el.click();
+          return { ok: true };
+        }
+      }
+      return { ok: false, error: 'JOB_TRIGGER_NOT_FOUND' };
+    })()`);
+  }
+
+  async ensureJobListReady() {
+    let lastError = "JOB_LIST_NOT_FOUND";
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const state = await this.getJobListState();
+      if (state?.ok && Array.isArray(state.jobs) && state.jobs.length > 0) {
+        return state;
+      }
+      lastError = state?.error || lastError;
+      const clickResult = await this.clickJobDropdownTriggerBySelector();
+      if (!clickResult?.ok) {
+        lastError = clickResult?.error || lastError;
+      }
+      await sleep(220 + attempt * 80);
+    }
+    throw new Error(lastError);
+  }
+
+  findJobMatch(jobList, requestedJobRaw) {
+    const requested = normalizeText(requestedJobRaw);
+    if (!requested) return null;
+    const normalizedRequestedTitle = normalizeJobTitle(requested);
+    const normalize = (value) => normalizeText(value).toLowerCase();
+    const byValue = jobList.find((job) => normalize(job.value || "") === normalize(requested));
+    if (byValue) return byValue;
+    const exactTitle = jobList.find((job) => normalize(job.title || "") === normalize(normalizedRequestedTitle));
+    if (exactTitle) return exactTitle;
+    const exactLabel = jobList.find((job) => normalize(job.label || "") === normalize(requested));
+    if (exactLabel) return exactLabel;
+    const contains = jobList.filter((job) => {
+      const title = normalize(job.title || "");
+      const label = normalize(job.label || "");
+      const target = normalize(normalizedRequestedTitle);
+      return (
+        (title && (title.includes(target) || target.includes(title)))
+        || (label && (label.includes(normalize(requested)) || normalize(requested).includes(label)))
+      );
+    });
+    if (contains.length === 1) return contains[0];
+    if (contains.length > 1) {
+      throw new Error("JOB_SELECTION_AMBIGUOUS");
+    }
+    return null;
+  }
+
+  async clickJobBySelector(job) {
+    return this.evaluate(`((job) => {
+      const frame = document.querySelector('iframe[name="recommendFrame"]')
+        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+        || document.querySelector('iframe');
+      if (!frame || !frame.contentDocument) {
+        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+      }
+      const doc = frame.contentDocument;
+      const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+      const normalizeTitle = (value) => {
+        const text = normalize(value);
+        if (!text) return '';
+        const byGap = text.split(/\\s{2,}/).map((item) => item.trim()).filter(Boolean)[0] || text;
+        const strippedRange = byGap
+          .replace(/\\s+\\d+(?:\\.\\d+)?\\s*(?:-|~|—|至)\\s*\\d+(?:\\.\\d+)?\\s*(?:k|K|千|万|元\\/天|元\\/月|元\\/年|K\\/月|k\\/月|万\\/月|万\\/年)?$/u, '')
+          .trim();
+        const strippedSingle = strippedRange
+          .replace(/\\s+\\d+(?:\\.\\d+)?\\s*(?:k|K|千|万|元\\/天|元\\/月|元\\/年|K\\/月|k\\/月|万\\/月|万\\/年)$/u, '')
+          .trim();
+        return strippedSingle || byGap;
+      };
+      const items = Array.from(doc.querySelectorAll([
+        '.ui-dropmenu-list .job-list .job-item',
+        '.job-selecter-options .job-list .job-item',
+        '.job-selector-options .job-list .job-item',
+        '.dropmenu-list .job-list .job-item',
+        '.job-list .job-item'
+      ].join(',')));
+      const target = items.find((item) => {
+        const value = normalize(item.getAttribute('value') || item.dataset?.value || '');
+        const label = normalize(item.querySelector('.label')?.textContent || item.textContent || '');
+        const title = normalizeTitle(label);
+        const matchValue = job.value && value && value === normalize(job.value);
+        const matchTitle = job.title && title && title === normalize(job.title);
+        const matchLabel = job.label && label && label === normalize(job.label);
+        return matchValue || matchTitle || matchLabel;
+      });
+      if (!target) {
+        return { ok: false, error: 'JOB_OPTION_NOT_FOUND' };
+      }
+      target.click();
+      return { ok: true };
+    })(${JSON.stringify(job)})`);
+  }
+
+  async waitJobSelected(job, rounds = 8) {
+    const selectedValue = normalizeText(job.value || "");
+    const selectedTitle = normalizeText(job.title || "");
+    const selectedLabel = normalizeText(job.label || "");
+    for (let index = 0; index < rounds; index += 1) {
+      const state = await this.getJobListState();
+      if (state?.ok) {
+        const current = (state.jobs || []).find((item) => item.current);
+        if (current) {
+          const sameValue = selectedValue && normalizeText(current.value || "") === selectedValue;
+          const sameTitle = selectedTitle && normalizeText(current.title || "") === selectedTitle;
+          const sameLabel = selectedLabel && normalizeText(current.label || "") === selectedLabel;
+          if (sameValue || sameTitle || sameLabel) return true;
+        }
+        const selectedText = normalizeText(state.selected_label || "");
+        if (selectedTitle && selectedText && (selectedText === selectedTitle || selectedText.includes(selectedTitle))) {
+          return true;
+        }
+      }
+      await sleep(150 + index * 40);
+    }
+    return false;
+  }
+
+  async selectJob(jobSelection) {
+    const state = await this.ensureJobListReady();
+    const matched = this.findJobMatch(state.jobs || [], jobSelection);
+    if (!matched) {
+      throw new Error("JOB_OPTION_NOT_FOUND");
+    }
+    const clicked = await this.clickJobBySelector(matched);
+    if (!clicked?.ok) {
+      throw new Error(clicked?.error || "JOB_SELECT_FAILED");
+    }
+    const selected = await this.waitJobSelected(matched, 10);
+    if (!selected) {
+      throw new Error("JOB_SELECTION_NOT_APPLIED");
+    }
+    return matched;
   }
 
   async isFilterPanelVisible() {
@@ -812,8 +1114,8 @@ class RecommendSearchCli {
     return false;
   }
 
-  async getSchoolFilterState() {
-    return this.evaluate(`(() => {
+  async getFilterGroupState(groupClass) {
+    return this.evaluate(`((groupClass) => {
       const frame = document.querySelector('iframe[name="recommendFrame"]')
         || document.querySelector('iframe[src*="/web/frame/recommend/"]')
         || document.querySelector('iframe');
@@ -822,32 +1124,88 @@ class RecommendSearchCli {
       }
       const doc = frame.contentDocument;
       const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
-      const groups = Array.from(doc.querySelectorAll('.check-box'));
-      const group = doc.querySelector('.check-box.school')
-        || groups.find((item) => {
-          const set = new Set(
-            Array.from(item.querySelectorAll('.default.option, .options .option, .option'))
-              .map((node) => normalize(node.textContent))
-              .filter(Boolean)
-          );
-          return set.has('985') || set.has('211') || set.has('双一流院校');
-        });
+      const groupCandidates = Array.from(doc.querySelectorAll('.check-box'));
+      const getOptionSet = (group) => new Set(
+        Array.from(group.querySelectorAll('.default.option, .options .option, .option'))
+          .map((item) => normalize(item.textContent))
+          .filter(Boolean)
+      );
+      const findGroup = () => {
+        const direct = doc.querySelector('.check-box.' + groupClass);
+        if (direct) return direct;
+        if (groupClass === 'school') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('985') || set.has('211') || set.has('双一流院校');
+          }) || null;
+        }
+        if (groupClass === 'degree') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('大专') || set.has('本科') || set.has('硕士') || set.has('博士');
+          }) || null;
+        }
+        if (groupClass === 'gender') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('男') || set.has('女');
+          }) || null;
+        }
+        if (groupClass === 'recentNotView') {
+          return groupCandidates.find((group) => {
+            const set = getOptionSet(group);
+            return set.has('近14天没有');
+          }) || null;
+        }
+        return null;
+      };
+
+      const group = findGroup();
       if (!group) {
         return { ok: false, error: 'GROUP_NOT_FOUND' };
       }
-      const labels = ${JSON.stringify(SCHOOL_TAG_OPTIONS)};
-      const activeLabels = labels.filter((label) => {
-        const node = Array.from(group.querySelectorAll('.options .option, .option'))
-          .find((item) => normalize(item.textContent) === normalize(label));
-        return Boolean(node && node.classList.contains('active'));
-      });
+
       const defaultOption = group.querySelector('.default.option');
+      const options = Array.from(group.querySelectorAll('.default.option, .options .option, .option'));
+      const byLabel = new Map();
+      for (const node of options) {
+        const label = normalize(node.textContent);
+        if (!label) continue;
+        const className = String(node.className || '').trim();
+        const active = node.classList.contains('active');
+        const existing = byLabel.get(label);
+        if (existing) {
+          existing.active = existing.active || active;
+          if (className && !existing.classNames.includes(className)) {
+            existing.classNames.push(className);
+          }
+        } else {
+          byLabel.set(label, {
+            label,
+            active,
+            classNames: className ? [className] : []
+          });
+        }
+      }
+
+      const normalizedOptions = Array.from(byLabel.values()).map((item) => ({
+        label: item.label,
+        active: item.active,
+        class_name: item.classNames.join(' | ')
+      }));
       return {
         ok: true,
+        group_class: groupClass,
         defaultActive: Boolean(defaultOption && defaultOption.classList.contains('active')),
-        activeLabels
+        defaultClassName: defaultOption ? String(defaultOption.className || '').trim() : '',
+        options: normalizedOptions,
+        activeLabels: normalizedOptions.filter((item) => item.active).map((item) => item.label)
       };
-    })()`);
+    })(${JSON.stringify(groupClass)})`);
+  }
+
+  async getSchoolFilterState() {
+    return this.getFilterGroupState("school");
   }
 
   async selectSchoolFilter(labels) {
@@ -857,65 +1215,57 @@ class RecommendSearchCli {
     }
 
     const targetLabels = Array.isArray(labels) && labels.length > 0 ? labels : ["不限"];
-    if (targetLabels.includes("不限")) {
-      await this.selectOption("school", "不限");
-      return;
-    }
-
-    const currentState = await this.getSchoolFilterState();
-    if (!currentState?.ok) {
-      throw new Error(currentState?.error || "SCHOOL_FILTER_STATE_FAILED");
-    }
-    const current = sortSchoolSelection(currentState.activeLabels || []);
     const desired = sortSchoolSelection(targetLabels);
-    const same =
-      !currentState.defaultActive
-      && current.length === desired.length
-      && current.every((value, index) => value === desired[index]);
-    if (same) return;
+    const expectDefaultOnly = desired.includes("不限");
+    let lastState = null;
 
-    await this.selectOption("school", "不限");
-    for (const label of desired) {
-      await this.selectOption("school", label);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const state = await this.getSchoolFilterState();
+      if (!state?.ok) {
+        throw new Error(state?.error || "SCHOOL_FILTER_STATE_FAILED");
+      }
+      lastState = state;
+      const current = sortSchoolSelection(state.activeLabels || []);
+      const matched = expectDefaultOnly
+        ? Boolean(state.defaultActive)
+        : (!state.defaultActive && selectionEquals(current, desired));
+      if (matched) {
+        return;
+      }
+
+      if (expectDefaultOnly) {
+        await this.selectOption("school", "不限");
+        await sleep(humanDelay(180, 50));
+        continue;
+      }
+
+      if (state.defaultActive) {
+        const clearDefault = await this.clickOptionBySelector("school", "不限");
+        if (!clearDefault?.ok) {
+          throw new Error(clearDefault?.error || "SCHOOL_DEFAULT_CLEAR_FAILED");
+        }
+        await sleep(humanDelay(180, 50));
+      }
+      for (const label of desired) {
+        await this.selectOption("school", label);
+        await sleep(humanDelay(120, 40));
+      }
+      await sleep(humanDelay(180, 50));
     }
+
+    throw new Error(`SCHOOL_FILTER_VERIFY_FAILED:${JSON.stringify(lastState || {})}`);
   }
 
   async getDegreeFilterState() {
-    return this.evaluate(`(() => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
-      if (!frame || !frame.contentDocument) {
-        return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
-      }
-      const doc = frame.contentDocument;
-      const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
-      const groups = Array.from(doc.querySelectorAll('.check-box'));
-      const group = doc.querySelector('.check-box.degree')
-        || groups.find((item) => {
-          const set = new Set(
-            Array.from(item.querySelectorAll('.default.option, .options .option, .option'))
-              .map((node) => normalize(node.textContent))
-              .filter(Boolean)
-          );
-          return set.has('大专') || set.has('本科') || set.has('硕士') || set.has('博士');
-        });
-      if (!group) {
-        return { ok: false, error: 'GROUP_NOT_FOUND' };
-      }
-      const labels = ${JSON.stringify(DEGREE_OPTIONS)};
-      const activeLabels = labels.filter((label) => {
-        const node = Array.from(group.querySelectorAll('.options .option'))
-          .find((item) => normalize(item.textContent) === normalize(label));
-        return Boolean(node && node.classList.contains('active'));
-      });
-      const defaultOption = group.querySelector('.default.option');
-      return {
-        ok: true,
-        defaultActive: Boolean(defaultOption && defaultOption.classList.contains('active')),
-        activeLabels
-      };
-    })()`);
+    return this.getFilterGroupState("degree");
+  }
+
+  async getGenderFilterState() {
+    return this.getFilterGroupState("gender");
+  }
+
+  async getRecentNotViewFilterState() {
+    return this.getFilterGroupState("recentNotView");
   }
 
   async selectDegreeFilter(labels) {
@@ -925,27 +1275,151 @@ class RecommendSearchCli {
     }
 
     const targetLabels = Array.isArray(labels) && labels.length > 0 ? labels : ["不限"];
-    if (targetLabels.includes("不限")) {
-      await this.selectOption("degree", "不限");
-      return;
-    }
-
-    const currentState = await this.getDegreeFilterState();
-    if (!currentState?.ok) {
-      throw new Error(currentState?.error || "DEGREE_FILTER_STATE_FAILED");
-    }
-    const current = sortDegreeSelection(currentState.activeLabels || []);
     const desired = sortDegreeSelection(targetLabels);
-    const same =
-      !currentState.defaultActive
-      && current.length === desired.length
-      && current.every((value, index) => value === desired[index]);
-    if (same) return;
+    const expectDefaultOnly = desired.includes("不限");
+    let lastState = null;
 
-    await this.selectOption("degree", "不限");
-    for (const label of desired) {
-      await this.selectOption("degree", label);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const state = await this.getDegreeFilterState();
+      if (!state?.ok) {
+        throw new Error(state?.error || "DEGREE_FILTER_STATE_FAILED");
+      }
+      lastState = state;
+      const current = sortDegreeSelection(state.activeLabels || []);
+      const matched = expectDefaultOnly
+        ? Boolean(state.defaultActive)
+        : (!state.defaultActive && selectionEquals(current, desired));
+      if (matched) {
+        return;
+      }
+
+      if (expectDefaultOnly) {
+        await this.selectOption("degree", "不限");
+        await sleep(humanDelay(180, 50));
+        continue;
+      }
+
+      if (state.defaultActive) {
+        const clearDefault = await this.clickOptionBySelector("degree", "不限");
+        if (!clearDefault?.ok) {
+          throw new Error(clearDefault?.error || "DEGREE_DEFAULT_CLEAR_FAILED");
+        }
+        await sleep(humanDelay(180, 50));
+      }
+      for (const label of desired) {
+        await this.selectOption("degree", label);
+        await sleep(humanDelay(120, 40));
+      }
+      await sleep(humanDelay(180, 50));
     }
+
+    throw new Error(`DEGREE_FILTER_VERIFY_FAILED:${JSON.stringify(lastState || {})}`);
+  }
+
+  buildGroupClassVerification(groupName, state, expectedLabels, availableOptions, sortFn) {
+    if (!state?.ok) {
+      return {
+        group: groupName,
+        ok: false,
+        reason: state?.error || "GROUP_STATE_UNAVAILABLE",
+        expected_labels: expectedLabels,
+        state: state || null
+      };
+    }
+
+    const expectedSorted = sortFn(uniqueNormalizedLabels(expectedLabels));
+    const expectedSet = new Set(expectedSorted);
+    const allowedSet = new Set(uniqueNormalizedLabels(availableOptions));
+    const optionMap = new Map();
+    for (const option of state.options || []) {
+      optionMap.set(normalizeText(option.label), option);
+    }
+
+    const selectedNotActive = [];
+    const unselectedButActive = [];
+    for (const label of expectedSorted) {
+      const option = optionMap.get(label);
+      if (!option || option.active !== true) {
+        selectedNotActive.push(label);
+      }
+    }
+    for (const label of allowedSet) {
+      if (expectedSet.has(label)) continue;
+      const option = optionMap.get(label);
+      if (option?.active === true) {
+        unselectedButActive.push(label);
+      }
+    }
+
+    const expectDefault = expectedSet.has("不限");
+    const defaultMismatch = expectDefault ? !state.defaultActive : Boolean(state.defaultActive);
+    const ok = (
+      selectedNotActive.length === 0
+      && unselectedButActive.length === 0
+      && !defaultMismatch
+    );
+
+    return {
+      group: groupName,
+      ok,
+      expected_labels: expectedSorted,
+      actual_active_labels: sortFn(uniqueNormalizedLabels(state.activeLabels || [])),
+      default_active: Boolean(state.defaultActive),
+      selected_not_active: selectedNotActive,
+      unselected_but_active: unselectedButActive,
+      default_mismatch: defaultMismatch,
+      options: state.options || []
+    };
+  }
+
+  async verifyFilterDomClassStates(expected) {
+    const schoolState = await this.getSchoolFilterState();
+    const degreeState = await this.getDegreeFilterState();
+    const genderState = await this.getGenderFilterState();
+    const recentState = await this.getRecentNotViewFilterState();
+
+    const checks = [
+      this.buildGroupClassVerification(
+        "school",
+        schoolState,
+        Array.isArray(expected?.schoolTag) && expected.schoolTag.length > 0 ? expected.schoolTag : ["不限"],
+        SCHOOL_TAG_OPTIONS,
+        sortSchoolSelection
+      ),
+      this.buildGroupClassVerification(
+        "degree",
+        degreeState,
+        Array.isArray(expected?.degree) && expected.degree.length > 0 ? expected.degree : ["不限"],
+        DEGREE_OPTIONS,
+        sortDegreeSelection
+      ),
+      this.buildGroupClassVerification(
+        "gender",
+        genderState,
+        [normalizeText(expected?.gender || "不限")],
+        GENDER_OPTIONS,
+        uniqueNormalizedLabels
+      ),
+      this.buildGroupClassVerification(
+        "recent_not_view",
+        recentState,
+        [normalizeText(expected?.recentNotView || "不限")],
+        RECENT_NOT_VIEW_OPTIONS,
+        uniqueNormalizedLabels
+      )
+    ];
+    const failures = checks.filter((item) => item.ok === false);
+    return {
+      ok: failures.length === 0,
+      checks,
+      failures,
+      states: {
+        school: schoolState,
+        degree: degreeState,
+        gender: genderState,
+        recent_not_view: recentState
+      }
+    };
   }
 
   async countCandidates() {
@@ -997,7 +1471,8 @@ class RecommendSearchCli {
       console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node src/cli.js --school-tag 985/211 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --port 9222"
+          usage: "node src/cli.js --school-tag 985/211 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --job \"算法工程师（视频/图像模型方向） _ 杭州\" --port 9222",
+          list_jobs_usage: "node src/cli.js --list-jobs --port 9222"
         }
       }));
       return;
@@ -1013,7 +1488,31 @@ class RecommendSearchCli {
     try {
       const frameState = await this.getFrameState();
       if (!frameState?.ok) {
+        if (frameState?.error === "LOGIN_REQUIRED") {
+          throw new Error("LOGIN_REQUIRED");
+        }
         throw new Error(frameState?.error || 'NO_RECOMMEND_IFRAME');
+      }
+
+      if (this.args.listJobs) {
+        const jobState = await this.ensureJobListReady();
+        console.log(JSON.stringify({
+          status: "COMPLETED",
+          result: {
+            jobs: jobState.jobs || [],
+            page_state: {
+              target_url: this.target?.url || null,
+              frame_url: frameState.frameUrl || jobState.frame_url || null
+            }
+          }
+        }));
+        return;
+      }
+
+      let selectedJob = null;
+      if (this.args.job) {
+        selectedJob = await this.selectJob(this.args.job);
+        await sleep(humanDelay(220, 70));
       }
 
       await this.openFilterPanel();
@@ -1021,6 +1520,15 @@ class RecommendSearchCli {
       await this.selectOption("gender", this.args.gender);
       await this.selectOption("recentNotView", this.args.recentNotView);
       await this.selectDegreeFilter(this.args.degree);
+      const domClassVerification = await this.verifyFilterDomClassStates({
+        schoolTag: this.args.schoolTag,
+        degree: this.args.degree,
+        gender: this.args.gender,
+        recentNotView: this.args.recentNotView
+      });
+      if (!domClassVerification.ok) {
+        throw new Error(`FILTER_DOM_CLASS_VERIFY_FAILED:${JSON.stringify(domClassVerification.failures)}`);
+      }
       await this.closeFilterPanel();
       const candidateInfo = await this.waitForCandidateCountStable();
 
@@ -1033,6 +1541,17 @@ class RecommendSearchCli {
             gender: this.args.gender,
             recent_not_view: this.args.recentNotView
           },
+          verified_filters: {
+            school: domClassVerification.states.school,
+            degree: domClassVerification.states.degree,
+            gender: domClassVerification.states.gender,
+            recent_not_view: domClassVerification.states.recent_not_view,
+            dom_class_check: {
+              ok: domClassVerification.ok,
+              checks: domClassVerification.checks
+            }
+          },
+          selected_job: selectedJob,
           candidate_count: candidateInfo?.candidateCount ?? null,
           page_state: {
             target_url: this.target?.url || null,
@@ -1053,14 +1572,32 @@ async function main() {
   await cli.run();
 }
 
-main().catch((error) => {
-  console.log(JSON.stringify({
-    status: "FAILED",
-    error: {
-      code: error.message || "RECOMMEND_SEARCH_FAILED",
-      message: error.message || "推荐页筛选执行失败。",
-      retryable: true
-    }
-  }));
-  process.exitCode = 1;
-});
+function isDirectExecution() {
+  const entry = process.argv?.[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectExecution()) {
+  main().catch((error) => {
+    console.log(JSON.stringify({
+      status: "FAILED",
+      error: {
+        code: error.message || "RECOMMEND_SEARCH_FAILED",
+        message: error.message || "推荐页筛选执行失败。",
+        retryable: true
+      }
+    }));
+    process.exitCode = 1;
+  });
+}
+
+export {
+  RecommendSearchCli,
+  normalizeJobTitle,
+  parseArgs
+};

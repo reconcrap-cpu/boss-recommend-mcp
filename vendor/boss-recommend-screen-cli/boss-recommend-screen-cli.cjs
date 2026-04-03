@@ -9,6 +9,9 @@ const { captureFullResumeCanvas } = require("./scripts/capture-full-resume-canva
 const DEFAULT_PORT = 9222;
 const RECOMMEND_URL_FRAGMENT = "/web/chat/recommend";
 const CSV_HEADER = ["姓名", "最高学历学校", "最高学历专业", "最近工作公司", "最近工作职位", "评估通过详细原因"].join(",");
+const RESUME_CAPTURE_WAIT_MS = 60000;
+const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
+const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
 
 function log(...args) {
   console.error(...args);
@@ -28,6 +31,9 @@ function normalizePostAction(value) {
   if (!normalized) return null;
   if (["favorite", "fav", "收藏"].includes(normalized)) return "favorite";
   if (["greet", "chat", "打招呼", "直接沟通", "沟通"].includes(normalized)) return "greet";
+  if (["none", "noop", "no-op", "什么也不做", "不做任何操作", "不操作", "仅筛选", "只筛选"].includes(normalized)) {
+    return "none";
+  }
   return null;
 }
 
@@ -51,6 +57,9 @@ function parseArgs(argv) {
     maxGreetCount: null,
     port: DEFAULT_PORT,
     output: path.resolve(process.cwd(), `筛选结果_${Date.now()}.csv`),
+    checkpointPath: null,
+    pauseControlPath: null,
+    resume: false,
     postAction: null,
     postActionConfirmed: null,
     help: false,
@@ -107,6 +116,14 @@ function parseArgs(argv) {
     } else if (token === "--output" && next) {
       parsed.output = path.resolve(next);
       index += 1;
+    } else if (token === "--checkpoint-path" && next) {
+      parsed.checkpointPath = path.resolve(next);
+      index += 1;
+    } else if (token === "--pause-control-path" && next) {
+      parsed.pauseControlPath = path.resolve(next);
+      index += 1;
+    } else if (token === "--resume") {
+      parsed.resume = true;
     } else if (token === "--post-action" && next) {
       parsed.postAction = normalizePostAction(next);
       parsed.__provided.postAction = true;
@@ -196,10 +213,11 @@ async function promptMissingInputs(args) {
     if (!(args.postActionConfirmed === true && args.postAction)) {
       args.postAction = await askWithValidation(
         ask,
-        "本次通过人选统一执行什么动作？请输入 1(收藏) 或 2(直接沟通): ",
+        "本次通过人选统一执行什么动作？请输入 1(收藏) / 2(直接沟通) / 3(什么也不做): ",
         (value) => {
           if (value === "1") return "favorite";
           if (value === "2") return "greet";
+          if (value === "3") return "none";
           return null;
         }
       );
@@ -275,9 +293,10 @@ async function promptPostAction() {
   });
   const ask = (question) => new Promise((resolve) => rl.question(question, resolve));
   try {
-    const answer = normalizeText(await ask("本次通过人选统一执行什么动作？请输入 1(收藏) 或 2(直接沟通): "));
+    const answer = normalizeText(await ask("本次通过人选统一执行什么动作？请输入 1(收藏) / 2(直接沟通) / 3(什么也不做): "));
     if (answer === "1") return "favorite";
     if (answer === "2") return "greet";
+    if (answer === "3") return "none";
     throw new Error("INVALID_POST_ACTION_CONFIRMATION");
   } finally {
     rl.close();
@@ -368,6 +387,7 @@ const jsGetListState = `(() => {
   }
   const doc = frame.contentDocument;
   const body = doc.body;
+  const frameRect = frame.getBoundingClientRect();
   const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
   const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
   return {
@@ -375,6 +395,15 @@ const jsGetListState = `(() => {
     scrollTop: body ? body.scrollTop : 0,
     scrollHeight: body ? body.scrollHeight : 0,
     clientHeight: body ? body.clientHeight : 0,
+    clientWidth: body ? body.clientWidth : 0,
+    frameRect: {
+      width: frameRect.width,
+      height: frameRect.height
+    },
+    viewport: {
+      width: (doc.defaultView && Number.isFinite(doc.defaultView.innerWidth)) ? doc.defaultView.innerWidth : 0,
+      height: (doc.defaultView && Number.isFinite(doc.defaultView.innerHeight)) ? doc.defaultView.innerHeight : 0
+    },
     candidateCount: candidateCards.length,
     totalCards: cards.length
   };
@@ -998,23 +1027,7 @@ const jsClickCloseFallback = `(() => {
 })()`;
 
 const jsReloadRecommendFrame = `(() => {
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
-  if (!frame || !frame.contentWindow) {
-    return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
-  }
-  try {
-    const current = String(frame.contentWindow.location.href || '');
-    if (current.includes('/web/frame/recommend/')) {
-      frame.contentWindow.location.reload();
-    } else {
-      frame.contentWindow.location.href = 'https://www.zhipin.com/web/frame/recommend/';
-    }
-    return { ok: true };
-  } catch (error) {
-    return { ok: false, error: String(error && error.message ? error.message : error) };
-  }
+  return { ok: false, error: 'RELOAD_DISABLED_BY_POLICY' };
 })()`;
 
 class RecommendScreenCli {
@@ -1024,7 +1037,9 @@ class RecommendScreenCli {
     this.Runtime = null;
     this.Input = null;
     this.Page = null;
+    this.Browser = null;
     this.target = null;
+    this.windowId = null;
     this.discoveredKeys = new Set();
     this.processedKeys = new Set();
     this.candidateQueue = [];
@@ -1040,8 +1055,121 @@ class RecommendScreenCli {
     this.greetLimitFallbackCount = 0;
     this.restCounter = 0;
     this.restThreshold = 25 + Math.floor(Math.random() * 8);
+    this.checkpointPath = this.args.checkpointPath ? path.resolve(this.args.checkpointPath) : null;
+    this.pauseControlPath = this.args.pauseControlPath ? path.resolve(this.args.pauseControlPath) : null;
     this.debugDir = path.join(os.tmpdir(), "boss-recommend-screen", String(Date.now()));
     fs.mkdirSync(this.debugDir, { recursive: true });
+  }
+
+  readPauseControlState() {
+    if (!this.pauseControlPath) return { pause_requested: false };
+    try {
+      if (!fs.existsSync(this.pauseControlPath)) return { pause_requested: false };
+      const raw = fs.readFileSync(this.pauseControlPath, "utf8");
+      const parsed = JSON.parse(raw);
+      const pauseRequested = parsed?.pause_requested === true || parsed?.control?.pause_requested === true;
+      const pauseRequestedAt = normalizeText(parsed?.pause_requested_at || parsed?.control?.pause_requested_at);
+      const requestedBy = normalizeText(parsed?.requested_by || parsed?.control?.pause_requested_by);
+      return {
+        pause_requested: pauseRequested,
+        pause_requested_at: pauseRequestedAt,
+        requested_by: requestedBy
+      };
+    } catch {
+      return { pause_requested: false };
+    }
+  }
+
+  shouldPauseAtBoundary() {
+    const control = this.readPauseControlState();
+    return control.pause_requested === true;
+  }
+
+  buildCheckpointPayload() {
+    return {
+      version: 1,
+      saved_at: new Date().toISOString(),
+      output_csv: this.args.output,
+      processed_count: this.processedCount,
+      skipped_count: this.skippedCount,
+      greet_count: this.greetCount,
+      greet_limit_fallback_count: this.greetLimitFallbackCount,
+      processed_keys: Array.from(this.processedKeys),
+      passed_candidates: this.passedCandidates.map((item) => ({
+        name: item?.name || "",
+        school: item?.school || "",
+        major: item?.major || "",
+        company: item?.company || "",
+        position: item?.position || "",
+        reason: item?.reason || "",
+        action: item?.action || "",
+        geekId: item?.geekId || "",
+        summary: item?.summary || "",
+        imagePath: item?.imagePath || ""
+      }))
+    };
+  }
+
+  saveCheckpoint() {
+    if (!this.checkpointPath) return;
+    const payload = this.buildCheckpointPayload();
+    fs.mkdirSync(path.dirname(this.checkpointPath), { recursive: true });
+    const tempPath = `${this.checkpointPath}.tmp`;
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    fs.renameSync(tempPath, this.checkpointPath);
+  }
+
+  loadCheckpointIfNeeded() {
+    if (!this.args.resume || !this.checkpointPath) return false;
+    if (!fs.existsSync(this.checkpointPath)) return false;
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(this.checkpointPath, "utf8"));
+    } catch (error) {
+      throw this.buildError("RESUME_CHECKPOINT_INVALID", `无法读取 checkpoint：${error.message || error}`);
+    }
+    if (!parsed || typeof parsed !== "object") {
+      throw this.buildError("RESUME_CHECKPOINT_INVALID", "checkpoint 格式无效");
+    }
+
+    if (normalizeText(parsed.output_csv)) {
+      this.args.output = path.resolve(parsed.output_csv);
+    }
+    this.processedCount = Number.isInteger(parsed.processed_count) && parsed.processed_count >= 0
+      ? parsed.processed_count
+      : this.processedCount;
+    this.skippedCount = Number.isInteger(parsed.skipped_count) && parsed.skipped_count >= 0
+      ? parsed.skipped_count
+      : this.skippedCount;
+    this.greetCount = Number.isInteger(parsed.greet_count) && parsed.greet_count >= 0
+      ? parsed.greet_count
+      : this.greetCount;
+    this.greetLimitFallbackCount = Number.isInteger(parsed.greet_limit_fallback_count) && parsed.greet_limit_fallback_count >= 0
+      ? parsed.greet_limit_fallback_count
+      : this.greetLimitFallbackCount;
+
+    this.processedKeys = new Set(Array.isArray(parsed.processed_keys) ? parsed.processed_keys.filter(Boolean) : []);
+    this.discoveredKeys = new Set(Array.from(this.processedKeys));
+    this.candidateQueue = [];
+    this.candidateByKey = new Map();
+    this.insertedAt = new Map();
+    this.insertCounter = 0;
+    this.passedCandidates = Array.isArray(parsed.passed_candidates)
+      ? parsed.passed_candidates.map((item) => ({
+          name: item?.name || "",
+          school: item?.school || "",
+          major: item?.major || "",
+          company: item?.company || "",
+          position: item?.position || "",
+          reason: item?.reason || "",
+          action: item?.action || "",
+          geekId: item?.geekId || "",
+          summary: item?.summary || "",
+          imagePath: item?.imagePath || ""
+        }))
+      : [];
+
+    return true;
   }
 
   async connect() {
@@ -1053,12 +1181,21 @@ class RecommendScreenCli {
       throw this.buildError("RECOMMEND_PAGE_NOT_READY", "No debuggable recommend page target found.");
     }
     this.client = await CDP({ port: this.args.port, target: this.target });
-    const { Runtime, Input, Page } = this.client;
+    const { Runtime, Input, Page, Browser } = this.client;
     this.Runtime = Runtime;
     this.Input = Input;
     this.Page = Page;
+    this.Browser = Browser || null;
     await Runtime.enable();
     await Page.enable();
+    if (this.Browser && typeof this.Browser.getWindowForTarget === "function") {
+      try {
+        const windowInfo = await this.Browser.getWindowForTarget();
+        if (Number.isInteger(windowInfo?.windowId)) {
+          this.windowId = windowInfo.windowId;
+        }
+      } catch {}
+    }
     await Page.bringToFront();
   }
 
@@ -1155,7 +1292,115 @@ class RecommendScreenCli {
     return state?.closed === false;
   }
 
+  async getListState() {
+    const state = await this.evaluate(jsGetListState);
+    if (state && typeof state === "object") return state;
+    return { ok: false, error: "INVALID_LIST_STATE" };
+  }
+
+  isListViewportCollapsed(state) {
+    if (!state?.ok) return false;
+    const clientHeight = Number(state.clientHeight || 0);
+    const clientWidth = Number(state.clientWidth || 0);
+    const frameWidth = Number(state.frameRect?.width || 0);
+    const frameHeight = Number(state.frameRect?.height || 0);
+    const viewportWidth = Number(state.viewport?.width || 0);
+    const viewportHeight = Number(state.viewport?.height || 0);
+
+    return (
+      (clientHeight > 0 && clientHeight < 260)
+      || (clientWidth > 0 && clientWidth < 280)
+      || (frameHeight > 0 && frameHeight < 320)
+      || (frameWidth > 0 && frameWidth < 460)
+      || (viewportHeight > 0 && viewportHeight < 260)
+      || (viewportWidth > 0 && viewportWidth < 360)
+    );
+  }
+
+  async getCurrentWindowState() {
+    if (!this.Browser || !this.windowId || typeof this.Browser.getWindowBounds !== "function") {
+      return null;
+    }
+    try {
+      const info = await this.Browser.getWindowBounds({ windowId: this.windowId });
+      const state = String(info?.bounds?.windowState || "").toLowerCase();
+      return state || null;
+    } catch {
+      return null;
+    }
+  }
+
+  async setWindowStateIfPossible(windowState, reason = "unknown") {
+    if (!this.Browser || !this.windowId || typeof this.Browser.setWindowBounds !== "function") {
+      return false;
+    }
+    try {
+      await this.Browser.setWindowBounds({
+        windowId: this.windowId,
+        bounds: {
+          windowState
+        }
+      });
+      log(`[视口恢复] 已设置窗口状态为 ${windowState}，原因: ${reason}`);
+      return true;
+    } catch (error) {
+      log(`[视口恢复] 设置窗口状态 ${windowState} 失败: ${error.message || error}`);
+      return false;
+    }
+  }
+
+  async toggleWindowStateForViewportRecovery(reason = "unknown") {
+    const currentState = await this.getCurrentWindowState();
+    const sequence = currentState === "normal"
+      ? ["maximized", "normal"]
+      : ["normal", "maximized"];
+    let applied = false;
+    for (const state of sequence) {
+      const ok = await this.setWindowStateIfPossible(state, reason);
+      if (ok) {
+        applied = true;
+        await sleep(humanDelay(520, 80));
+      }
+    }
+    if (applied && this.Page && typeof this.Page.bringToFront === "function") {
+      try {
+        await this.Page.bringToFront();
+      } catch {}
+    }
+    return applied;
+  }
+
+  async ensureHealthyListViewport(reason = "unknown") {
+    let state = await this.getListState();
+    if (!this.isListViewportCollapsed(state)) {
+      return { ok: true, recovered: false, state };
+    }
+
+    log(`[视口恢复] 检测到推荐列表视口异常缩小，尝试自动恢复。原因: ${reason}`);
+    await this.toggleWindowStateForViewportRecovery(reason);
+    await sleep(humanDelay(900, 130));
+    state = await this.getListState();
+    if (!this.isListViewportCollapsed(state)) {
+      return { ok: true, recovered: true, state };
+    }
+
+    return {
+      ok: false,
+      recovered: false,
+      state
+    };
+  }
+
   async discoverCandidates() {
+    const health = await this.ensureHealthyListViewport("discover_candidates");
+    if (!health?.ok) {
+      return {
+        ok: false,
+        error: "LIST_VIEWPORT_COLLAPSED",
+        added: 0,
+        list_state: health?.state || null
+      };
+    }
     const scan = await this.evaluate(buildListCandidatesExpr(Array.from(this.processedKeys)));
     if (!scan?.ok) {
       return {
@@ -1211,10 +1456,11 @@ class RecommendScreenCli {
   }
 
   async scrollAndLoadMore() {
-    const before = await this.evaluate(jsGetListState);
+    const health = await this.ensureHealthyListViewport("scroll_and_load_more");
+    const before = health?.state?.ok ? health.state : await this.getListState();
     const scrollResult = await this.evaluate(jsScrollList);
     await sleep(humanDelay(1200, 260));
-    const after = await this.evaluate(jsGetListState);
+    const after = await this.getListState();
     const bottom = await this.evaluate(jsDetectBottom);
     return { before, scrollResult, after, bottom };
   }
@@ -1293,18 +1539,40 @@ class RecommendScreenCli {
   }
 
   async captureResumeImage(candidate) {
-    const outPrefix = path.join(this.debugDir, `${candidate.geek_id}_${Date.now()}`);
-    try {
-      return await captureFullResumeCanvas({
-        port: this.args.port,
-        outPrefix,
-        targetPattern: RECOMMEND_URL_FRAGMENT,
-        waitResumeMs: 30000,
-        scrollSettleMs: 500
-      });
-    } catch (error) {
-      throw this.buildError("RESUME_CAPTURE_FAILED", error.message || "Failed to capture resume image.");
+    const candidateLabel = normalizeText(candidate?.geek_id || candidate?.name || "unknown");
+    const candidateKey = String(candidate?.geek_id || candidate?.name || "candidate")
+      .replace(/[^\w.-]+/g, "_")
+      .slice(0, 80) || "candidate";
+    const attemptSummaries = [];
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= RESUME_CAPTURE_MAX_ATTEMPTS; attempt += 1) {
+      const outPrefix = path.join(this.debugDir, `${candidateKey}_${Date.now()}_a${attempt}`);
+      try {
+        return await captureFullResumeCanvas({
+          port: this.args.port,
+          outPrefix,
+          targetPattern: RECOMMEND_URL_FRAGMENT,
+          waitResumeMs: RESUME_CAPTURE_WAIT_MS,
+          scrollSettleMs: 500
+        });
+      } catch (error) {
+        lastError = error;
+        const message = normalizeText(error?.message || String(error) || "Failed to capture resume image.");
+        attemptSummaries.push(`a${attempt}/${RESUME_CAPTURE_MAX_ATTEMPTS}:${message.slice(0, 320)}`);
+        log(`[简历截图失败] candidate=${candidateLabel} attempt=${attempt}/${RESUME_CAPTURE_MAX_ATTEMPTS} error=${message}`);
+        if (attempt < RESUME_CAPTURE_MAX_ATTEMPTS) {
+          await sleep(RESUME_CAPTURE_RETRY_DELAY_MS);
+        }
+      }
     }
+
+    const lastMessage = normalizeText(lastError?.message || "Failed to capture resume image.");
+    const attemptsText = attemptSummaries.join(" | ");
+    throw this.buildError(
+      "RESUME_CAPTURE_FAILED",
+      `Resume capture failed after ${RESUME_CAPTURE_MAX_ATTEMPTS} attempts; last_error=${lastMessage}; attempts=${attemptsText}`
+    );
   }
 
   async callVisionModel(imagePath) {
@@ -1407,14 +1675,26 @@ class RecommendScreenCli {
       }
     }
 
+    const isListReadyNow = async () => {
+      const detailState = await this.getDetailClosedState();
+      if (!detailState?.closed) return false;
+      const listState = await this.evaluate(jsGetListState);
+      return Boolean(listState?.ok);
+    };
+
     let know = null;
     for (let index = 0; index < 10; index += 1) {
       await sleep(humanDelay(260, 80));
       know = await this.evaluate(jsGetKnowButtonState);
       if (know?.ok) break;
+      if (await isListReadyNow()) {
+        log("[打招呼] 未检测到“知道了”弹窗，页面已自动返回列表，继续下一位候选人。");
+        return { actionTaken: "greet", ackMode: "auto_return_no_popup" };
+      }
     }
     if (!know?.ok) {
-      throw this.buildError("ACK_BUTTON_FAILED", know?.error || "未出现知道了确认按钮");
+      log(`[打招呼] 未检测到“知道了”弹窗（${know?.error || "ACK_BUTTON_NOT_FOUND"}），按无弹窗流程继续。`);
+      return { actionTaken: "greet", ackMode: "no_popup_detected" };
     }
 
     try {
@@ -1422,7 +1702,12 @@ class RecommendScreenCli {
     } catch {
       const fallback = await this.evaluate(jsClickKnowFallback);
       if (!fallback?.ok) {
-        throw this.buildError("ACK_BUTTON_FAILED", fallback?.error || "知道了按钮点击失败");
+        if (await isListReadyNow()) {
+          log("[打招呼] “知道了”点击兜底失败，但页面已回列表，继续下一位候选人。");
+          return { actionTaken: "greet", ackMode: "ack_click_failed_but_list_ready" };
+        }
+        log(`[打招呼] “知道了”按钮点击失败（${fallback?.error || "unknown"}），后续由详情关闭流程兜底。`);
+        return { actionTaken: "greet", ackMode: "ack_click_failed" };
       }
     }
 
@@ -1430,11 +1715,18 @@ class RecommendScreenCli {
       await sleep(humanDelay(220, 60));
       const state = await this.evaluate(jsGetKnowButtonState);
       if (!state?.ok) {
-        return { actionTaken: "greet" };
+        return { actionTaken: "greet", ackMode: "ack_closed" };
+      }
+      if (await isListReadyNow()) {
+        return { actionTaken: "greet", ackMode: "auto_return_after_ack" };
       }
     }
 
-    throw this.buildError("ACK_BUTTON_FAILED", "知道了弹窗未成功关闭。");
+    if (await isListReadyNow()) {
+      return { actionTaken: "greet", ackMode: "ack_still_visible_but_list_ready" };
+    }
+    log("[打招呼] “知道了”弹窗关闭未确认，后续由详情关闭流程兜底。");
+    return { actionTaken: "greet", ackMode: "ack_close_unconfirmed" };
   }
 
   async closeDetailPage(maxRetries = 3) {
@@ -1466,35 +1758,21 @@ class RecommendScreenCli {
       }
     }
 
-    log(`[关闭详情] 常规关闭失败，进入强制恢复。最后状态: ${state?.reason || "unknown"}`);
+    log(`[关闭详情] 常规关闭失败，进入额外 ESC 重试（禁用刷新/跳转）。最后状态: ${state?.reason || "unknown"}`);
     for (let retry = 0; retry < 2; retry += 1) {
+      await sleep(2000);
       await this.pressEsc();
-      await sleep(900 + retry * 250);
+      await sleep(humanDelay(260, 60));
       state = await this.getDetailClosedState();
       if (state?.closed) {
-        log(`[关闭详情] 强制ESC成功: ${state.reason || "closed"}`);
+        log(`[关闭详情] 额外ESC成功: ${state.reason || "closed"}`);
         return true;
       }
     }
 
-    const reloaded = await this.evaluate(jsReloadRecommendFrame);
-    if (reloaded?.ok) {
-      log("[关闭详情] 已触发 recommendFrame reload，等待列表恢复。");
-      const listReady = await this.waitForListReady(45);
-      if (listReady) {
-        state = await this.getDetailClosedState();
-        if (state?.closed) {
-          log(`[关闭详情] reload 后恢复成功: ${state.reason || "closed"}`);
-          return true;
-        }
-      }
-    } else {
-      log(`[关闭详情] recommendFrame reload 失败: ${reloaded?.error || "unknown"}`);
-    }
-
     state = await this.getDetailClosedState();
-    log(`[关闭详情] 失败，当前状态: ${state?.reason || "unknown"}`);
-    return false;
+    log(`[关闭详情] 连续 ESC 后仍未确认关闭（${state?.reason || "unknown"}），按策略视为检测误差并继续下一位。`);
+    return true;
   }
 
   async waitForListReady(maxRounds = 30) {
@@ -1557,9 +1835,30 @@ class RecommendScreenCli {
       this.args.maxGreetCount = await promptMaxGreetCount();
     }
 
+    const restoredFromCheckpoint = this.loadCheckpointIfNeeded();
+    if (restoredFromCheckpoint) {
+      log(`[恢复] 已从 checkpoint 恢复，已处理 ${this.processedCount} 位候选人。`);
+    }
+
     await this.connect();
     try {
-      const initialList = await this.evaluate(jsGetListState);
+      const startupDetailState = await this.getDetailClosedState();
+      if (!startupDetailState?.closed) {
+        log("[恢复] 检测到详情页处于打开状态，先尝试关闭后再继续筛选");
+        const startupClosed = await this.closeDetailPage(4);
+        if (!startupClosed) {
+          throw this.buildError("DETAIL_CLOSE_FAILED_AT_START", "启动时未能关闭遗留详情页");
+        }
+      }
+      const startupListReady = await this.waitForListReady(18);
+      if (!startupListReady) {
+        throw this.buildError("RECOMMEND_PAGE_NOT_READY", "推荐列表未就绪（可能仍停留在详情页）");
+      }
+      const initialHealth = await this.ensureHealthyListViewport("startup");
+      if (!initialHealth?.ok) {
+        throw this.buildError("LIST_VIEWPORT_COLLAPSED", "推荐列表视口异常缩小，自动恢复失败。");
+      }
+      const initialList = initialHealth.state || await this.getListState();
       if (!initialList?.ok) {
         throw this.buildError("RECOMMEND_PAGE_NOT_READY", initialList?.error || "推荐列表不可用");
       }
@@ -1572,6 +1871,25 @@ class RecommendScreenCli {
       }
 
       while (!this.args.targetCount || this.processedCount < this.args.targetCount) {
+        if (this.shouldPauseAtBoundary()) {
+          this.saveCsv();
+          this.saveCheckpoint();
+          return {
+            status: "PAUSED",
+            result: {
+              processed_count: this.processedCount,
+              passed_count: this.passedCandidates.length,
+              skipped_count: this.skippedCount,
+              output_csv: this.args.output,
+              checkpoint_path: this.checkpointPath,
+              completion_reason: "paused",
+              post_action: this.args.postAction,
+              max_greet_count: this.args.postAction === "greet" ? this.args.maxGreetCount : null,
+              greet_count: this.greetCount,
+              greet_limit_fallback_count: this.greetLimitFallbackCount
+            }
+          };
+        }
         const periodicDiscovery = await this.discoverCandidates();
         if (!periodicDiscovery.ok) {
           throw this.buildError("CANDIDATE_SCAN_FAILED", periodicDiscovery.error || "候选人列表扫描失败");
@@ -1642,7 +1960,9 @@ class RecommendScreenCli {
             }
             const actionResult = effectiveAction === "favorite"
               ? await this.favoriteCandidate()
-              : await this.greetCandidate();
+              : effectiveAction === "greet"
+                ? await this.greetCandidate()
+                : { actionTaken: "none" };
             if (actionResult.actionTaken === "greet") {
               this.greetCount += 1;
             }
@@ -1676,9 +1996,19 @@ class RecommendScreenCli {
         }
 
         await this.takeBreakIfNeeded();
+        try {
+          this.saveCheckpoint();
+        } catch (checkpointError) {
+          log(`[保存checkpoint失败] ${checkpointError.message || checkpointError}`);
+        }
       }
 
       this.saveCsv();
+      try {
+        this.saveCheckpoint();
+      } catch (checkpointError) {
+        log(`[保存checkpoint失败] ${checkpointError.message || checkpointError}`);
+      }
       return {
         status: "COMPLETED",
         result: {
@@ -1701,6 +2031,11 @@ class RecommendScreenCli {
       } catch (saveError) {
         log(`[保存CSV失败] ${saveError.message || saveError}`);
       }
+      try {
+        this.saveCheckpoint();
+      } catch (checkpointError) {
+        log(`[保存checkpoint失败] ${checkpointError.message || checkpointError}`);
+      }
       if (!error.partial_result) {
         error.partial_result = {
           processed_count: this.processedCount,
@@ -1722,7 +2057,7 @@ async function main() {
     console.log(JSON.stringify({
       status: "COMPLETED",
       result: {
-        usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action greet --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --port 9222"
+        usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --port 9222 --output <csv-path> --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
       }
     }));
     return;

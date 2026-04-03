@@ -1,13 +1,22 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const packagedMcpDir = path.resolve(path.dirname(currentFilePath), "..");
 const bossRecommendUrl = "https://www.zhipin.com/web/chat/recommend";
+const bossLoginUrl = "https://www.zhipin.com/web/user/?ka=bticket";
 const chromeOnboardingUrlPattern = /^chrome:\/\/(welcome|intro|newtab|signin|history-sync|settings\/syncSetup)/i;
+const bossLoginUrlPattern = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhipin\.com)/i;
+const bossLoginTitlePattern = /登录|signin|扫码登录|BOSS直聘登录/i;
+const screenConfigTemplateDefaults = {
+  baseUrl: "https://api.openai.com/v1",
+  apiKey: "replace-with-openai-api-key",
+  model: "gpt-4.1-mini"
+};
+const DEFAULT_RECOMMEND_SCREEN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -15,12 +24,26 @@ function getCodexHome() {
     : path.join(os.homedir(), ".codex");
 }
 
+function getStateHome() {
+  return process.env.BOSS_RECOMMEND_HOME
+    ? path.resolve(process.env.BOSS_RECOMMEND_HOME)
+    : path.join(os.homedir(), ".boss-recommend-mcp");
+}
+
 function getUserConfigPath() {
+  return path.join(getStateHome(), "screening-config.json");
+}
+
+function getLegacyUserConfigPath() {
   return path.join(getCodexHome(), "boss-recommend-mcp", "screening-config.json");
 }
 
 function getDesktopDir() {
   return path.join(os.homedir(), "Desktop");
+}
+
+function ensureDir(targetPath) {
+  fs.mkdirSync(targetPath, { recursive: true });
 }
 
 function pathExists(targetPath) {
@@ -36,6 +59,65 @@ function parsePositiveInteger(raw) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function isRootDirectory(targetPath) {
+  const resolved = path.resolve(String(targetPath || ""));
+  const parsed = path.parse(resolved);
+  return resolved.toLowerCase() === String(parsed.root || "").toLowerCase();
+}
+
+function isSystemDirectoryWorkspaceRoot(workspaceRoot) {
+  const root = path.resolve(String(workspaceRoot || ""));
+  const normalized = root.replace(/\\/g, "/").toLowerCase();
+  if (process.platform === "win32") {
+    return (
+      normalized.endsWith("/windows")
+      || normalized.endsWith("/windows/system32")
+      || normalized.endsWith("/windows/syswow64")
+      || normalized.endsWith("/program files")
+      || normalized.endsWith("/program files (x86)")
+    );
+  }
+  return (
+    normalized === "/system"
+    || normalized.startsWith("/system/")
+    || normalized === "/usr"
+    || normalized.startsWith("/usr/")
+    || normalized === "/bin"
+    || normalized.startsWith("/bin/")
+    || normalized === "/sbin"
+    || normalized.startsWith("/sbin/")
+  );
+}
+
+function shouldIgnoreWorkspaceConfigRoot(workspaceRoot) {
+  const root = path.resolve(String(workspaceRoot || process.cwd()));
+  const home = path.resolve(os.homedir());
+  return (
+    isEphemeralNpxWorkspaceRoot(root)
+    || isRootDirectory(root)
+    || root.toLowerCase() === home.toLowerCase()
+    || isSystemDirectoryWorkspaceRoot(root)
+  );
+}
+
+function resolveWorkspaceConfigCandidates(workspaceRoot) {
+  const root = path.resolve(String(workspaceRoot || process.cwd()));
+  if (shouldIgnoreWorkspaceConfigRoot(root)) {
+    return [];
+  }
+  const directPath = path.join(root, "config", "screening-config.json");
+  const nestedPath = path.join(root, "boss-recommend-mcp", "config", "screening-config.json");
+  const candidates = [directPath];
+  if (path.basename(root).toLowerCase() !== "boss-recommend-mcp") {
+    candidates.push(nestedPath);
+  }
+  return Array.from(new Set(candidates));
+}
+
 function serializeDegreeSelection(value) {
   if (Array.isArray(value)) {
     const normalized = value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -45,20 +127,112 @@ function serializeDegreeSelection(value) {
   return normalized || "不限";
 }
 
-function resolveScreenConfigPath(workspaceRoot) {
-  const envConfigPath = process.env.BOSS_RECOMMEND_SCREEN_CONFIG
-    ? path.resolve(process.env.BOSS_RECOMMEND_SCREEN_CONFIG)
-    : null;
-  const workspaceConfigPath = path.join(workspaceRoot, "boss-recommend-mcp", "config", "screening-config.json");
-  const userConfigPath = getUserConfigPath();
-  const packagedConfigPath = path.join(packagedMcpDir, "config", "screening-config.json");
-  const candidates = [
-    envConfigPath,
-    workspaceConfigPath,
-    userConfigPath,
-    packagedConfigPath
+function serializeSchoolTagSelection(value) {
+  if (Array.isArray(value)) {
+    const normalized = value.map((item) => String(item || "").trim()).filter(Boolean);
+    if (!normalized.length) return "不限";
+    if (normalized.includes("不限")) {
+      return normalized.length === 1
+        ? "不限"
+        : normalized.filter((item) => item !== "不限").join(",");
+    }
+    return normalized.join(",");
+  }
+  const normalized = String(value || "").trim();
+  return normalized || "不限";
+}
+
+function isEphemeralNpxWorkspaceRoot(workspaceRoot) {
+  const root = path.resolve(String(workspaceRoot || ""));
+  const normalized = root.replace(/\\/g, "/").toLowerCase();
+  return (
+    normalized.includes("/appdata/local/npm-cache/_npx/")
+    || normalized.includes("/node_modules/@reconcrap/boss-recommend-mcp")
+  );
+}
+
+function buildScreenConfigCandidateMap(workspaceRoot) {
+  return {
+    env_path: process.env.BOSS_RECOMMEND_SCREEN_CONFIG
+      ? path.resolve(process.env.BOSS_RECOMMEND_SCREEN_CONFIG)
+      : null,
+    workspace_paths: resolveWorkspaceConfigCandidates(workspaceRoot),
+    user_path: getUserConfigPath(),
+    legacy_path: getLegacyUserConfigPath()
+  };
+}
+
+function resolveScreenConfigCandidates(workspaceRoot) {
+  const candidateMap = buildScreenConfigCandidateMap(workspaceRoot);
+  return [
+    candidateMap.env_path,
+    candidateMap.user_path,
+    ...candidateMap.workspace_paths,
+    candidateMap.legacy_path
   ].filter(Boolean);
-  return candidates.find((candidate) => pathExists(candidate)) || candidates[0];
+}
+
+function canWriteDirectory(targetDir) {
+  try {
+    ensureDir(targetDir);
+    fs.accessSync(targetDir, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveWritableScreenConfigPath(workspaceRoot) {
+  const candidateMap = buildScreenConfigCandidateMap(workspaceRoot);
+  const workspacePreferred = candidateMap.workspace_paths?.[0] || null;
+  if (candidateMap.env_path) {
+    return candidateMap.env_path;
+  }
+  if (candidateMap.user_path && canWriteDirectory(path.dirname(candidateMap.user_path))) {
+    return candidateMap.user_path;
+  }
+  if (workspacePreferred && canWriteDirectory(path.dirname(workspacePreferred))) {
+    return workspacePreferred;
+  }
+  if (workspacePreferred) {
+    return workspacePreferred;
+  }
+  return candidateMap.user_path || candidateMap.legacy_path;
+}
+
+function resolveScreenConfigPath(workspaceRoot) {
+  const candidateMap = buildScreenConfigCandidateMap(workspaceRoot);
+  if (candidateMap.env_path) {
+    return candidateMap.env_path;
+  }
+  if (candidateMap.user_path && pathExists(candidateMap.user_path)) {
+    return candidateMap.user_path;
+  }
+  const existingWorkspacePath = candidateMap.workspace_paths.find((item) => pathExists(item));
+  if (existingWorkspacePath) {
+    return existingWorkspacePath;
+  }
+  const writablePath = resolveWritableScreenConfigPath(workspaceRoot);
+  if (writablePath) {
+    return writablePath;
+  }
+  return candidateMap.legacy_path;
+}
+
+export function getScreenConfigResolution(workspaceRoot) {
+  const candidateMap = buildScreenConfigCandidateMap(workspaceRoot);
+  const candidate_paths = resolveScreenConfigCandidates(workspaceRoot);
+  const resolved_path = resolveScreenConfigPath(workspaceRoot) || null;
+  const workspace_root = path.resolve(String(workspaceRoot || process.cwd()));
+  return {
+    resolved_path,
+    candidate_paths,
+    workspace_root,
+    workspace_ephemeral: isEphemeralNpxWorkspaceRoot(workspaceRoot),
+    workspace_ignored_for_config: shouldIgnoreWorkspaceConfigRoot(workspace_root),
+    writable_path: resolveWritableScreenConfigPath(workspaceRoot),
+    legacy_path: candidateMap.legacy_path
+  };
 }
 
 function readJsonFile(filePath) {
@@ -71,11 +245,157 @@ function readJsonFile(filePath) {
   }
 }
 
+function validateScreenConfig(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return {
+      ok: false,
+      reason: "INVALID_OR_MISSING_CONFIG",
+      message: "screening-config.json 缺失或格式无效。请填写 baseUrl、apiKey、model。"
+    };
+  }
+  const baseUrl = String(config.baseUrl || "").trim();
+  const apiKey = String(config.apiKey || "").trim();
+  const model = String(config.model || "").trim();
+  const missing = [];
+  if (!baseUrl) missing.push("baseUrl");
+  if (!apiKey) missing.push("apiKey");
+  if (!model) missing.push("model");
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: "MISSING_REQUIRED_FIELDS",
+      message: `screening-config.json 缺少必填字段：${missing.join(", ")}。`
+    };
+  }
+  if (/^replace-with/i.test(apiKey) || apiKey === screenConfigTemplateDefaults.apiKey) {
+    return {
+      ok: false,
+      reason: "PLACEHOLDER_API_KEY",
+      message: "screening-config.json 的 apiKey 仍是模板占位符，请填写真实 API Key。"
+    };
+  }
+  if (
+    baseUrl === screenConfigTemplateDefaults.baseUrl
+    && apiKey === screenConfigTemplateDefaults.apiKey
+    && model === screenConfigTemplateDefaults.model
+  ) {
+    return {
+      ok: false,
+      reason: "PLACEHOLDER_TEMPLATE_VALUES",
+      message: "screening-config.json 仍是默认模板值，请填写 baseUrl、apiKey、model。"
+    };
+  }
+  return { ok: true, reason: "OK", message: "screening-config.json 校验通过。" };
+}
+
 function resolveWorkspaceDebugPort(workspaceRoot) {
   const fromEnv = parsePositiveInteger(process.env.BOSS_RECOMMEND_CHROME_PORT);
   if (fromEnv) return fromEnv;
   const config = readJsonFile(resolveScreenConfigPath(workspaceRoot));
   return parsePositiveInteger(config?.debugPort) || 9222;
+}
+
+function getDefaultChromeExecutableCandidates() {
+  const candidates = [process.env.BOSS_RECOMMEND_CHROME_PATH].filter(Boolean);
+  if (process.platform === "win32") {
+    candidates.push(
+      path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(process.env.ProgramFiles || "", "Google", "Chrome", "Application", "chrome.exe"),
+      path.join(process.env["ProgramFiles(x86)"] || "", "Google", "Chrome", "Application", "chrome.exe")
+    );
+  } else if (process.platform === "darwin") {
+    candidates.push(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(os.homedir(), "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    );
+  } else {
+    candidates.push(
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/chromium-browser",
+      "/usr/bin/chromium",
+      "/snap/bin/chromium"
+    );
+  }
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
+function getChromeExecutable() {
+  const candidates = getDefaultChromeExecutableCandidates();
+  return candidates.find((candidate) => pathExists(candidate)) || null;
+}
+
+function getChromeUserDataDir(port) {
+  const profileDir = resolveDefaultChromeUserDataDir(port);
+  ensureDir(profileDir);
+  return profileDir;
+}
+
+function getSharedChromeUserDataDir(port) {
+  return path.join(getCodexHome(), "boss-mcp", `chrome-profile-${port}`);
+}
+
+function getLegacyRecruitChromeUserDataDir(port) {
+  return path.join(getCodexHome(), "boss-recruit-mcp", `chrome-profile-${port}`);
+}
+
+function getLegacyRecommendChromeUserDataDir(port) {
+  return path.join(getStateHome(), `chrome-profile-${port}`);
+}
+
+function resolveDefaultChromeUserDataDir(port) {
+  const sharedPath = getSharedChromeUserDataDir(port);
+  if (pathExists(sharedPath)) {
+    return sharedPath;
+  }
+  const legacyPaths = [
+    getLegacyRecruitChromeUserDataDir(port),
+    getLegacyRecommendChromeUserDataDir(port)
+  ];
+  const legacyExisting = legacyPaths.find((candidate) => pathExists(candidate));
+  return legacyExisting || sharedPath;
+}
+
+function launchChromeWithDebugPort(port) {
+  const chromePath = getChromeExecutable();
+  if (!chromePath) {
+    return {
+      ok: false,
+      code: "CHROME_EXECUTABLE_NOT_FOUND",
+      message: "未找到 Chrome 可执行文件，请安装 Chrome 或设置 BOSS_RECOMMEND_CHROME_PATH。"
+    };
+  }
+  const userDataDir = getChromeUserDataDir(port);
+  const args = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--new-window",
+    bossRecommendUrl
+  ];
+
+  try {
+    const child = spawn(chromePath, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false
+    });
+    child.unref();
+    return {
+      ok: true,
+      code: "CHROME_LAUNCHED",
+      chrome_path: chromePath,
+      user_data_dir: userDataDir
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      code: "CHROME_LAUNCH_FAILED",
+      message: error.message || "Chrome 启动失败。"
+    };
+  }
 }
 
 function resolveRecommendSearchCliDir(workspaceRoot) {
@@ -110,18 +430,100 @@ function resolveRecommendSearchCliEntry(searchDir) {
   return candidates.find((candidate) => pathExists(candidate)) || candidates[0];
 }
 
-function runProcess({ command, args, cwd, timeoutMs }) {
+function safeInvokeCallback(callback, payload) {
+  if (typeof callback !== "function") return;
+  try {
+    callback(payload);
+  } catch {
+    // Ignore callback errors to keep pipeline runtime stable.
+  }
+}
+
+function runProcess({
+  command,
+  args,
+  cwd,
+  timeoutMs,
+  onOutput,
+  onLine,
+  onHeartbeat,
+  heartbeatIntervalMs = 10_000,
+  signal
+}) {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    let stdoutLineBuffer = "";
+    let stderrLineBuffer = "";
     let settled = false;
     let timer = null;
+    let heartbeatTimer = null;
+    let abortedBySignal = Boolean(signal?.aborted);
+    let abortListener = null;
+
+    function notifyHeartbeat(source) {
+      safeInvokeCallback(onHeartbeat, {
+        source,
+        command,
+        args,
+        cwd,
+        at: new Date().toISOString()
+      });
+    }
+
+    function emitLine(stream, line) {
+      const normalized = String(line ?? "").replace(/\r$/, "");
+      if (!normalized) return;
+      safeInvokeCallback(onLine, {
+        stream,
+        line: normalized,
+        at: new Date().toISOString()
+      });
+    }
+
+    function pushLineBuffer(stream, chunkText) {
+      if (stream === "stdout") {
+        stdoutLineBuffer += chunkText;
+      } else {
+        stderrLineBuffer += chunkText;
+      }
+      let buffer = stream === "stdout" ? stdoutLineBuffer : stderrLineBuffer;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex !== -1) {
+        emitLine(stream, buffer.slice(0, newlineIndex));
+        buffer = buffer.slice(newlineIndex + 1);
+        newlineIndex = buffer.indexOf("\n");
+      }
+      if (stream === "stdout") {
+        stdoutLineBuffer = buffer;
+      } else {
+        stderrLineBuffer = buffer;
+      }
+    }
 
     function finish(payload) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (signal && typeof signal.removeEventListener === "function" && abortListener) {
+        signal.removeEventListener("abort", abortListener);
+      }
+      emitLine("stdout", stdoutLineBuffer);
+      emitLine("stderr", stderrLineBuffer);
+      stdoutLineBuffer = "";
+      stderrLineBuffer = "";
       resolve(payload);
+    }
+
+    if (abortedBySignal) {
+      finish({
+        code: -1,
+        stdout,
+        stderr: "Process aborted before spawn",
+        error_code: "ABORTED"
+      });
+      return;
     }
 
     let child;
@@ -142,6 +544,16 @@ function runProcess({ command, args, cwd, timeoutMs }) {
       return;
     }
 
+    if (signal && typeof signal.addEventListener === "function") {
+      abortListener = () => {
+        abortedBySignal = true;
+        try {
+          child.kill();
+        } catch {}
+      };
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
+
     if (timeoutMs && Number.isFinite(timeoutMs) && timeoutMs > 0) {
       timer = setTimeout(() => {
         try {
@@ -156,13 +568,46 @@ function runProcess({ command, args, cwd, timeoutMs }) {
       }, timeoutMs);
     }
 
+    if (Number.isFinite(heartbeatIntervalMs) && heartbeatIntervalMs > 0) {
+      heartbeatTimer = setInterval(() => {
+        notifyHeartbeat("timer");
+      }, heartbeatIntervalMs);
+    }
+
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      pushLineBuffer("stdout", text);
+      safeInvokeCallback(onOutput, {
+        stream: "stdout",
+        text,
+        at: new Date().toISOString()
+      });
+      notifyHeartbeat("stdout");
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      pushLineBuffer("stderr", text);
+      safeInvokeCallback(onOutput, {
+        stream: "stderr",
+        text,
+        at: new Date().toISOString()
+      });
+      notifyHeartbeat("stderr");
     });
-    child.on("close", (code) => finish({ code, stdout, stderr }));
+    child.on("close", (code) => {
+      if (abortedBySignal) {
+        finish({
+          code: -1,
+          stdout,
+          stderr: `${stderr}\nProcess aborted by signal`.trim(),
+          error_code: "ABORTED"
+        });
+        return;
+      }
+      finish({ code, stdout, stderr });
+    });
     child.on("error", (error) => {
       finish({
         code: -1,
@@ -172,6 +617,201 @@ function runProcess({ command, args, cwd, timeoutMs }) {
       });
     });
   });
+}
+
+function runProcessSync({ command, args, cwd }) {
+  try {
+    const result = spawnSync(command, args, {
+      cwd,
+      windowsHide: true,
+      shell: false,
+      env: process.env,
+      encoding: "utf8"
+    });
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    return {
+      ok: result.status === 0,
+      status: result.status,
+      stdout,
+      stderr,
+      output: [stdout, stderr].filter(Boolean).join("\n").trim(),
+      error_code: result.error?.code || null,
+      error_message: result.error?.message || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: -1,
+      stdout: "",
+      stderr: "",
+      output: "",
+      error_code: error.code || "SPAWN_FAILED",
+      error_message: error.message || String(error)
+    };
+  }
+}
+
+function parseMajorVersion(raw) {
+  const match = String(raw || "").match(/v?(\d+)(?:\.\d+){0,2}/);
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+function buildNodeCommandCheck() {
+  const probe = runProcessSync({
+    command: "node",
+    args: ["--version"]
+  });
+  const major = parseMajorVersion(probe.output);
+  const versionOk = Number.isInteger(major) && major >= 18;
+  return {
+    key: "node_cli",
+    ok: probe.ok && versionOk,
+    path: "node --version",
+    message: probe.ok
+      ? (versionOk
+        ? `Node 命令可用 (${probe.output || "unknown version"})`
+        : `Node 版本过低 (${probe.output || "unknown version"})，要求 >= 18`)
+      : `未找到 node 命令，请先安装 Node.js >= 18。${probe.error_message ? ` (${probe.error_message})` : ""}`
+  };
+}
+
+function detectPythonCommand() {
+  const python = runProcessSync({
+    command: "python",
+    args: ["--version"]
+  });
+  if (python.ok) {
+    return {
+      ok: true,
+      command: "python",
+      probe: python
+    };
+  }
+  const python3 = runProcessSync({
+    command: "python3",
+    args: ["--version"]
+  });
+  if (python3.ok) {
+    return {
+      ok: false,
+      command: null,
+      probe: python,
+      fallback: python3
+    };
+  }
+  return {
+    ok: false,
+    command: null,
+    probe: python,
+    fallback: null
+  };
+}
+
+function buildPythonCommandCheck() {
+  const detected = detectPythonCommand();
+  if (detected.ok) {
+    return {
+      key: "python_cli",
+      ok: true,
+      path: "python --version",
+      message: `Python 命令可用 (${detected.probe.output || "unknown version"})`
+    };
+  }
+  if (detected.fallback) {
+    return {
+      key: "python_cli",
+      ok: false,
+      path: "python --version",
+      message: `检测到 ${detected.fallback.output || "python3"}，但当前流程依赖 python 命令；请创建 python 别名后重试。`
+    };
+  }
+  return {
+    key: "python_cli",
+    ok: false,
+    path: "python --version",
+    message: "未找到 python 命令，请安装 Python 并确保 python 在 PATH 中。"
+  };
+}
+
+function buildPillowCheck() {
+  const detected = detectPythonCommand();
+  if (!detected.ok || !detected.command) {
+    return {
+      key: "python_pillow",
+      ok: false,
+      path: "python -c \"import PIL\"",
+      message: "无法校验 Pillow：python 命令不可用。"
+    };
+  }
+  const probe = runProcessSync({
+    command: detected.command,
+    args: ["-c", "import PIL, PIL.Image; print(PIL.__version__)"]
+  });
+  return {
+    key: "python_pillow",
+    ok: probe.ok,
+    path: `${detected.command} -c "import PIL"`,
+    message: probe.ok
+      ? `Pillow 可用 (${probe.output || "version unknown"})`
+      : "Pillow 未安装。请执行 `python -m pip install pillow`。"
+  };
+}
+
+function buildNodePackageCheck({ key, moduleName, cwd, missingMessage }) {
+  if (!cwd || !pathExists(cwd)) {
+    return {
+      key,
+      ok: false,
+      path: moduleName,
+      module: moduleName,
+      install_cwd: null,
+      message: missingMessage
+    };
+  }
+  const probe = runProcessSync({
+    command: "node",
+    args: ["-e", `require.resolve(${JSON.stringify(moduleName)});`],
+    cwd
+  });
+  return {
+    key,
+    ok: probe.ok,
+    path: moduleName,
+    module: moduleName,
+    install_cwd: cwd,
+    message: probe.ok
+      ? `${moduleName} npm 依赖可用`
+      : `缺少 npm 依赖 ${moduleName}，请在 boss-recommend-mcp 目录执行 npm install。`
+  };
+}
+
+function buildRuntimeDependencyChecks({ searchDir, screenDir }) {
+  return [
+    buildNodeCommandCheck(),
+    buildPythonCommandCheck(),
+    buildPillowCheck(),
+    buildNodePackageCheck({
+      key: "npm_dep_chrome_remote_interface_search",
+      moduleName: "chrome-remote-interface",
+      cwd: searchDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-recommend-search-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_chrome_remote_interface_screen",
+      moduleName: "chrome-remote-interface",
+      cwd: screenDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-recommend-screen-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_ws",
+      moduleName: "ws",
+      cwd: screenDir,
+      missingMessage: "无法校验 ws：boss-recommend-screen-cli 目录不存在。"
+    })
+  ];
 }
 
 function parseJsonOutput(text) {
@@ -191,18 +831,150 @@ function parseJsonOutput(text) {
   return null;
 }
 
-function loadScreenConfig(configPath) {
-  const parsed = readJsonFile(configPath);
-  if (!parsed) {
+function createScreenProgressTracker(currentTracker = {}) {
+  const outcome = String(currentTracker.outcome || "").trim();
+  return {
+    candidate_index: Number.isInteger(currentTracker.candidate_index) ? currentTracker.candidate_index : null,
+    outcome: outcome === "pass" || outcome === "skip" ? outcome : null,
+    action_failed: currentTracker.action_failed === true
+  };
+}
+
+function finalizeCandidateProgress(progress, tracker) {
+  if (!Number.isInteger(tracker.candidate_index)) {
+    return false;
+  }
+
+  let changed = false;
+  if (tracker.action_failed === true) {
+    progress.skipped += 1;
+    changed = true;
+  } else if (tracker.outcome === "pass") {
+    progress.passed += 1;
+    changed = true;
+  } else if (tracker.outcome === "skip") {
+    progress.skipped += 1;
+    changed = true;
+  }
+
+  tracker.candidate_index = null;
+  tracker.outcome = null;
+  tracker.action_failed = false;
+  return changed;
+}
+
+function parseScreenProgressLine(line, currentProgress = {}, currentTracker = {}) {
+  const normalizedLine = String(line || "").replace(/\s+/g, " ").trim();
+  if (!normalizedLine) return null;
+
+  const nextProgress = {
+    processed: Number.isInteger(currentProgress.processed) ? currentProgress.processed : 0,
+    passed: Number.isInteger(currentProgress.passed) ? currentProgress.passed : 0,
+    skipped: Number.isInteger(currentProgress.skipped) ? currentProgress.skipped : 0,
+    greet_count: Number.isInteger(currentProgress.greet_count) ? currentProgress.greet_count : 0
+  };
+  const nextTracker = createScreenProgressTracker(currentTracker);
+
+  let changed = false;
+  const processedMatch = normalizedLine.match(/处理第\s*(\d+)\s*位候选人/u);
+  if (processedMatch) {
+    if (finalizeCandidateProgress(nextProgress, nextTracker)) {
+      changed = true;
+    }
+    const processed = Number.parseInt(processedMatch[1], 10);
+    if (Number.isInteger(processed) && processed >= 0 && processed !== nextProgress.processed) {
+      nextProgress.processed = processed;
+      changed = true;
+    }
+    nextTracker.candidate_index = processed;
+    nextTracker.outcome = null;
+    nextTracker.action_failed = false;
+  }
+
+  if (/筛选结果:\s*通过/u.test(normalizedLine)) {
+    if (nextTracker.outcome !== "pass" || nextTracker.action_failed) {
+      changed = true;
+    }
+    nextTracker.outcome = "pass";
+    nextTracker.action_failed = false;
+  } else if (/筛选结果:\s*不通过/u.test(normalizedLine)) {
+    if (nextTracker.outcome !== "skip" || nextTracker.action_failed) {
+      changed = true;
+    }
+    nextTracker.outcome = "skip";
+    nextTracker.action_failed = false;
+  }
+
+  if (/候选人处理失败\s*:/u.test(normalizedLine)) {
+    if (!nextTracker.action_failed) {
+      changed = true;
+    }
+    nextTracker.action_failed = true;
+  }
+
+  if (/^\[关闭详情\].*成功/u.test(normalizedLine)) {
+    if (finalizeCandidateProgress(nextProgress, nextTracker)) {
+      changed = true;
+    }
+  }
+
+  const finalStateLine = /Process timed out after|status"\s*:\s*"(?:COMPLETED|PAUSED|FAILED)"/iu.test(normalizedLine);
+  if (finalStateLine) {
+    if (finalizeCandidateProgress(nextProgress, nextTracker)) {
+      changed = true;
+    }
+  }
+
+  const greetMatch = normalizedLine.match(/greet[_\s-]*count\s*[:=]\s*(\d+)/iu);
+  if (greetMatch) {
+    const greetCount = Number.parseInt(greetMatch[1], 10);
+    if (Number.isInteger(greetCount) && greetCount >= 0 && greetCount !== nextProgress.greet_count) {
+      nextProgress.greet_count = greetCount;
+      changed = true;
+    }
+  }
+
+  if (!changed) return null;
+  return {
+    line: normalizedLine,
+    progress: nextProgress,
+    tracker: nextTracker
+  };
+}
+
+function resolveRecommendScreenTimeoutMs(runtime = null) {
+  const runtimeTimeoutMs = parsePositiveInteger(runtime?.timeoutMs);
+  const envTimeoutMs = parsePositiveInteger(process.env.BOSS_RECOMMEND_SCREEN_TIMEOUT_MS);
+  return runtimeTimeoutMs || envTimeoutMs || DEFAULT_RECOMMEND_SCREEN_TIMEOUT_MS;
+}
+
+function buildRecommendScreenProcessError(result, screenTimeoutMs) {
+  if (result.code === 0) return null;
+  if (result.error_code === "TIMEOUT") {
     return {
-      ok: false,
-      error: `Screen config file not found or invalid: ${configPath}`
+      code: "TIMEOUT",
+      message: `推荐页筛选命令执行超时（${screenTimeoutMs}ms）。`
     };
   }
-  if (!parsed.baseUrl || !parsed.apiKey || !parsed.model) {
+  if (result.error_code === "ABORTED") {
+    return {
+      code: "PROCESS_ABORTED",
+      message: "推荐页筛选命令已取消。"
+    };
+  }
+  return {
+    code: "RECOMMEND_SCREEN_FAILED",
+    message: "推荐页筛选命令执行失败。"
+  };
+}
+
+function loadScreenConfig(configPath) {
+  const parsed = readJsonFile(configPath);
+  const validation = validateScreenConfig(parsed);
+  if (!validation.ok) {
     return {
       ok: false,
-      error: "Invalid screen config: baseUrl/apiKey/model are required"
+      error: `${validation.message} (path: ${configPath})`
     };
   }
   return { ok: true, config: parsed };
@@ -215,44 +987,185 @@ function localDirHint(workspaceRoot, dirName) {
 export function runPipelinePreflight(workspaceRoot) {
   const searchDir = resolveRecommendSearchCliDir(workspaceRoot);
   const screenDir = resolveRecommendScreenCliDir(workspaceRoot);
-  const screenConfigPath = resolveScreenConfigPath(workspaceRoot);
+  const searchDirExists = Boolean(searchDir && pathExists(searchDir));
+  const searchEntryPath = searchDir
+    ? resolveRecommendSearchCliEntry(searchDir)
+    : path.join(localDirHint(workspaceRoot, "boss-recommend-search-cli"), "src", "cli.js");
+  const searchEntryExists = Boolean(searchDir && pathExists(searchEntryPath));
+  const screenDirExists = Boolean(screenDir && pathExists(screenDir));
+  const screenEntryPath = screenDir
+    ? resolveRecommendScreenCliEntry(screenDir)
+    : path.join(localDirHint(workspaceRoot, "boss-recommend-screen-cli"), "boss-recommend-screen-cli.cjs");
+  const screenEntryExists = Boolean(screenDir && pathExists(screenEntryPath));
+  const configResolution = getScreenConfigResolution(workspaceRoot);
+  const screenConfigPath = configResolution.resolved_path;
+  const screenConfigParsed = readJsonFile(screenConfigPath);
+  const screenConfigValidation = validateScreenConfig(screenConfigParsed);
   const checks = [
     {
       key: "recommend_search_cli_dir",
-      ok: Boolean(searchDir && pathExists(searchDir)),
+      ok: searchDirExists,
       path: searchDir || localDirHint(workspaceRoot, "boss-recommend-search-cli"),
-      message: "boss-recommend-search-cli 目录不存在"
+      message: searchDirExists
+        ? "boss-recommend-search-cli 目录可用"
+        : "boss-recommend-search-cli 目录不存在"
     },
     {
       key: "recommend_search_cli_entry",
-      ok: Boolean(searchDir && pathExists(resolveRecommendSearchCliEntry(searchDir))),
-      path: searchDir ? resolveRecommendSearchCliEntry(searchDir) : path.join(localDirHint(workspaceRoot, "boss-recommend-search-cli"), "src", "cli.js"),
-      message: "boss-recommend-search-cli 入口文件缺失"
+      ok: searchEntryExists,
+      path: searchEntryPath,
+      message: searchEntryExists
+        ? "boss-recommend-search-cli 入口文件可用"
+        : "boss-recommend-search-cli 入口文件缺失"
     },
     {
       key: "recommend_screen_cli_dir",
-      ok: Boolean(screenDir && pathExists(screenDir)),
+      ok: screenDirExists,
       path: screenDir || localDirHint(workspaceRoot, "boss-recommend-screen-cli"),
-      message: "boss-recommend-screen-cli 目录不存在"
+      message: screenDirExists
+        ? "boss-recommend-screen-cli 目录可用"
+        : "boss-recommend-screen-cli 目录不存在"
     },
     {
       key: "recommend_screen_cli_entry",
-      ok: Boolean(screenDir && pathExists(resolveRecommendScreenCliEntry(screenDir))),
-      path: screenDir ? resolveRecommendScreenCliEntry(screenDir) : path.join(localDirHint(workspaceRoot, "boss-recommend-screen-cli"), "boss-recommend-screen-cli.cjs"),
-      message: "boss-recommend-screen-cli 入口文件缺失"
+      ok: screenEntryExists,
+      path: screenEntryPath,
+      message: screenEntryExists
+        ? "boss-recommend-screen-cli 入口文件可用"
+        : "boss-recommend-screen-cli 入口文件缺失"
     },
     {
       key: "screen_config",
-      ok: pathExists(screenConfigPath),
+      ok: screenConfigValidation.ok,
       path: screenConfigPath,
-      message: "screening-config.json 不存在"
+      reason: screenConfigValidation.reason || null,
+      message: screenConfigValidation.ok ? "screening-config.json 可用" : screenConfigValidation.message
     }
   ];
+  checks.push(...buildRuntimeDependencyChecks({ searchDir, screenDir }));
 
   return {
     ok: checks.every((item) => item.ok),
     checks,
-    debug_port: resolveWorkspaceDebugPort(workspaceRoot)
+    debug_port: resolveWorkspaceDebugPort(workspaceRoot),
+    config_resolution: configResolution
+  };
+}
+
+function collectFailedCheckKeys(checks = []) {
+  return new Set(
+    checks
+      .filter((item) => item && item.ok === false && typeof item.key === "string")
+      .map((item) => item.key)
+  );
+}
+
+function collectNpmInstallDirsFromChecks(checks = [], workspaceRoot) {
+  const npmKeys = new Set([
+    "npm_dep_chrome_remote_interface_search",
+    "npm_dep_chrome_remote_interface_screen",
+    "npm_dep_ws"
+  ]);
+  const dirs = checks
+    .filter((item) => item && item.ok === false && npmKeys.has(item.key))
+    .map((item) => item.install_cwd)
+    .filter((item) => typeof item === "string" && item.trim())
+    .map((item) => path.resolve(item));
+  if (dirs.length > 0) {
+    return [...new Set(dirs)];
+  }
+  return [path.resolve(workspaceRoot)];
+}
+
+function installNpmDependencies(checks, workspaceRoot) {
+  const dirs = collectNpmInstallDirsFromChecks(checks, workspaceRoot);
+  const commandResults = [];
+  let allOk = true;
+  for (const cwd of dirs) {
+    const result = runProcessSync({
+      command: "npm",
+      args: ["install"],
+      cwd
+    });
+    commandResults.push({
+      cwd,
+      ok: result.ok,
+      output: result.output || result.error_message || ""
+    });
+    if (!result.ok) allOk = false;
+  }
+  return {
+    ok: allOk,
+    action: "install_npm_dependencies",
+    changed: true,
+    command_results: commandResults,
+    message: allOk ? "npm 依赖自动安装完成。" : "npm 依赖自动安装失败。"
+  };
+}
+
+function installPillowIfPossible() {
+  const detected = detectPythonCommand();
+  if (!detected.ok || !detected.command) {
+    return {
+      ok: false,
+      action: "install_pillow",
+      changed: false,
+      message: "未检测到可用 python 命令，无法自动安装 Pillow。"
+    };
+  }
+  const install = runProcessSync({
+    command: detected.command,
+    args: ["-m", "pip", "install", "pillow"]
+  });
+  return {
+    ok: install.ok,
+    action: "install_pillow",
+    changed: install.ok,
+    message: install.ok ? "Pillow 自动安装完成。" : `Pillow 自动安装失败：${install.output || install.error_message || "unknown"}`
+  };
+}
+
+export function attemptPipelineAutoRepair(workspaceRoot, preflight = {}) {
+  const checks = Array.isArray(preflight.checks) ? preflight.checks : [];
+  const failed = collectFailedCheckKeys(checks);
+  const actions = [];
+
+  if (
+    failed.has("npm_dep_chrome_remote_interface_search")
+    || failed.has("npm_dep_chrome_remote_interface_screen")
+    || failed.has("npm_dep_ws")
+  ) {
+    if (!failed.has("node_cli")) {
+      actions.push(installNpmDependencies(checks, workspaceRoot));
+    } else {
+      actions.push({
+        ok: false,
+        action: "install_npm_dependencies",
+        changed: false,
+        message: "Node 命令不可用，跳过 npm 自动安装。"
+      });
+    }
+  }
+
+  if (failed.has("python_pillow")) {
+    if (!failed.has("python_cli")) {
+      actions.push(installPillowIfPossible());
+    } else {
+      actions.push({
+        ok: false,
+        action: "install_pillow",
+        changed: false,
+        message: "python 命令不可用，跳过 Pillow 自动安装。"
+      });
+    }
+  }
+
+  const attempted = actions.length > 0;
+  const nextPreflight = runPipelinePreflight(workspaceRoot);
+  return {
+    attempted,
+    actions,
+    preflight: nextPreflight
   };
 }
 
@@ -292,6 +1205,16 @@ function findChromeOnboardingUrl(tabs) {
   return null;
 }
 
+function isBossLoginTab(tab) {
+  const url = String(tab?.url || "");
+  const title = String(tab?.title || "");
+  return (
+    url === bossLoginUrl
+    || bossLoginUrlPattern.test(url)
+    || bossLoginTitlePattern.test(title)
+  );
+}
+
 export async function inspectBossRecommendPageState(port, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 6000;
   const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
@@ -308,6 +1231,19 @@ export async function inspectBossRecommendPageState(port, options = {}) {
         (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/recommend")
       );
       if (exactTab) {
+        if (isBossLoginTab(exactTab)) {
+          return buildBossPageState({
+            ok: false,
+            state: "LOGIN_REQUIRED",
+            path: exactTab.url || bossLoginUrl,
+            current_url: exactTab.url || bossLoginUrl,
+            title: exactTab.title || null,
+            requires_login: true,
+            expected_url: expectedUrl,
+            login_url: bossLoginUrl,
+            message: "当前标签页虽在 recommend 路径，但检测到登录态页面特征，请先完成 Boss 登录。"
+          });
+        }
         return buildBossPageState({
           ok: true,
           state: "RECOMMEND_READY",
@@ -319,19 +1255,37 @@ export async function inspectBossRecommendPageState(port, options = {}) {
         });
       }
 
+      const loginTab = tabs.find((tab) => isBossLoginTab(tab));
+      if (loginTab) {
+        return buildBossPageState({
+          ok: false,
+          state: "LOGIN_REQUIRED",
+          path: loginTab.url || bossLoginUrl,
+          current_url: loginTab.url || bossLoginUrl,
+          title: loginTab.title || null,
+          requires_login: true,
+          expected_url: expectedUrl,
+          login_url: bossLoginUrl,
+          message: "Boss 页面未登录，需先完成登录后再进入 recommend 页面。"
+        });
+      }
+
       const bossTab = tabs.find(
         (tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")
       );
       if (bossTab) {
+        const requiresLogin = bossLoginUrlPattern.test(bossTab.url);
         return buildBossPageState({
           ok: false,
-          state: "LOGIN_REQUIRED",
+          state: requiresLogin ? "LOGIN_REQUIRED" : "BOSS_NOT_ON_RECOMMEND",
           path: bossTab.url,
           current_url: bossTab.url,
           title: bossTab.title || null,
-          requires_login: true,
+          requires_login: requiresLogin,
           expected_url: expectedUrl,
-          message: "Boss 页面没有停留在 recommend 页面，通常表示需要重新登录。"
+          message: requiresLogin
+            ? "Boss 页面未登录，需先完成登录后再进入 recommend 页面。"
+            : "Boss 已登录但当前不在 recommend 页面，将尝试自动跳转。"
         });
       }
     } catch (error) {
@@ -349,7 +1303,7 @@ export async function inspectBossRecommendPageState(port, options = {}) {
       current_url: null,
       title: null,
       requires_login: false,
-      expected_url,
+      expected_url: expectedUrl,
       message: `无法连接到 Chrome DevTools 端口 ${port}。请确认 Chrome 已以远程调试模式启动。`,
       error: lastError.message
     });
@@ -364,7 +1318,7 @@ export async function inspectBossRecommendPageState(port, options = {}) {
       current_url: onboardingUrl,
       title: null,
       requires_login: false,
-      expected_url,
+      expected_url: expectedUrl,
       message: "Chrome 当前停留在登录或引导页，尚未稳定到 Boss 推荐页。",
       sample_urls: extractSampleUrls(lastTabs)
     });
@@ -451,17 +1405,69 @@ export async function ensureBossRecommendPageReady(workspaceRoot, options = {}) 
       page_state: stableState
     };
   }
-  if (pageState.state === "LOGIN_REQUIRED") {
+
+  let launchAttempt = null;
+  if (pageState.state === "LOGIN_REQUIRED" || pageState.state === "LOGIN_REQUIRED_AFTER_REDIRECT") {
     return {
       ok: false,
       debug_port: debugPort,
       state: pageState.state,
-      page_state: pageState
+      page_state: {
+        ...pageState,
+        launch_attempt: launchAttempt
+      }
     };
+  }
+  if (pageState.state === "DEBUG_PORT_UNREACHABLE") {
+    launchAttempt = launchChromeWithDebugPort(debugPort);
+    if (launchAttempt.ok) {
+      await sleep(settleMs + 1200);
+      pageState = await inspectBossRecommendPageState(debugPort, {
+        timeoutMs: inspectTimeoutMs,
+        pollMs
+      });
+      if (pageState.state === "LOGIN_REQUIRED" || pageState.state === "LOGIN_REQUIRED_AFTER_REDIRECT") {
+        return {
+          ok: false,
+          debug_port: debugPort,
+          state: pageState.state,
+          page_state: {
+            ...pageState,
+            launch_attempt: launchAttempt
+          }
+        };
+      }
+      if (pageState.state === "RECOMMEND_READY") {
+        const stableState = await verifyRecommendPageStable(debugPort, { settleMs, pollMs });
+        return {
+          ok: stableState.state === "RECOMMEND_READY",
+          debug_port: debugPort,
+          state: stableState.state,
+          page_state: {
+            ...stableState,
+            launch_attempt: launchAttempt
+          }
+        };
+      }
+    } else {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: pageState.state,
+        page_state: {
+          ...pageState,
+          launch_attempt: launchAttempt
+        }
+      };
+    }
   }
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    if (pageState.state === "DEBUG_PORT_UNREACHABLE") {
+    if (
+      pageState.state === "DEBUG_PORT_UNREACHABLE"
+      || pageState.state === "LOGIN_REQUIRED"
+      || pageState.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+    ) {
       break;
     }
     await openBossRecommendTab(debugPort);
@@ -476,15 +1482,10 @@ export async function ensureBossRecommendPageReady(workspaceRoot, options = {}) 
         ok: stableState.state === "RECOMMEND_READY",
         debug_port: debugPort,
         state: stableState.state,
-        page_state: stableState
-      };
-    }
-    if (pageState.state === "LOGIN_REQUIRED") {
-      return {
-        ok: false,
-        debug_port: debugPort,
-        state: pageState.state,
-        page_state: pageState
+        page_state: {
+          ...stableState,
+          launch_attempt: launchAttempt
+        }
       };
     }
   }
@@ -493,11 +1494,81 @@ export async function ensureBossRecommendPageReady(workspaceRoot, options = {}) 
     ok: false,
     debug_port: debugPort,
     state: pageState.state || "UNKNOWN",
-    page_state: pageState
+    page_state: {
+      ...pageState,
+      launch_attempt: launchAttempt
+    }
   };
 }
 
-export async function runRecommendSearchCli({ workspaceRoot, searchParams }) {
+export async function listRecommendJobs({ workspaceRoot, port, runtime = null }) {
+  const searchDir = resolveRecommendSearchCliDir(workspaceRoot);
+  if (!searchDir) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: "boss-recommend-search-cli package not found",
+      error: {
+        code: "RECOMMEND_SEARCH_CLI_MISSING",
+        message: "boss-recommend-search-cli 目录不存在。"
+      }
+    };
+  }
+  const cliPath = resolveRecommendSearchCliEntry(searchDir);
+  const args = [
+    cliPath,
+    "--list-jobs",
+    "--port",
+    String(parsePositiveInteger(port) || resolveWorkspaceDebugPort(workspaceRoot))
+  ];
+  const result = await runProcess({
+    command: "node",
+    args,
+    cwd: searchDir,
+    timeoutMs: 180000,
+    heartbeatIntervalMs: runtime?.heartbeatIntervalMs,
+    signal: runtime?.signal,
+    onOutput: (event) => {
+      safeInvokeCallback(runtime?.onOutput, event);
+    },
+    onHeartbeat: (event) => {
+      safeInvokeCallback(runtime?.onHeartbeat, event);
+    }
+  });
+  const structured = parseJsonOutput(result.stdout) || parseJsonOutput(result.stderr);
+  const jobs = Array.isArray(structured?.result?.jobs) ? structured.result.jobs : [];
+  const missingOutputError = result.code === 0 && !structured
+    ? {
+        code: "RECOMMEND_JOB_LIST_NO_OUTPUT",
+        message: "岗位列表读取完成但未返回可解析结果。"
+      }
+    : null;
+  return {
+    ok: result.code === 0 && structured?.status === "COMPLETED" && jobs.length > 0,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    structured,
+    jobs,
+    error: structured?.error || missingOutputError || (
+      result.code === 0
+        ? {
+            code: "RECOMMEND_JOB_LIST_EMPTY",
+            message: "未读取到可选岗位。"
+          }
+        : result.error_code === "ABORTED"
+          ? {
+              code: "PROCESS_ABORTED",
+              message: "岗位列表读取已取消。"
+            }
+          : {
+              code: "RECOMMEND_JOB_LIST_FAILED",
+              message: "岗位列表读取失败。"
+            }
+    )
+  };
+}
+
+export async function runRecommendSearchCli({ workspaceRoot, searchParams, selectedJob, runtime = null }) {
   const searchDir = resolveRecommendSearchCliDir(workspaceRoot);
   if (!searchDir) {
     return {
@@ -514,7 +1585,7 @@ export async function runRecommendSearchCli({ workspaceRoot, searchParams }) {
   const args = [
     cliPath,
     "--school-tag",
-    searchParams.school_tag,
+    serializeSchoolTagSelection(searchParams.school_tag),
     "--degree",
     serializeDegreeSelection(searchParams.degree),
     "--gender",
@@ -524,31 +1595,54 @@ export async function runRecommendSearchCli({ workspaceRoot, searchParams }) {
     "--port",
     String(resolveWorkspaceDebugPort(workspaceRoot))
   ];
+  const normalizedSelectedJob = String(selectedJob || "").trim();
+  if (normalizedSelectedJob) {
+    args.push("--job", normalizedSelectedJob);
+  }
   const result = await runProcess({
     command: "node",
     args,
     cwd: searchDir,
-    timeoutMs: 180000
+    timeoutMs: 180000,
+    heartbeatIntervalMs: runtime?.heartbeatIntervalMs,
+    signal: runtime?.signal,
+    onOutput: (event) => {
+      safeInvokeCallback(runtime?.onOutput, event);
+    },
+    onHeartbeat: (event) => {
+      safeInvokeCallback(runtime?.onHeartbeat, event);
+    }
   });
-  const structured = parseJsonOutput(result.stdout);
+  const structured = parseJsonOutput(result.stdout) || parseJsonOutput(result.stderr);
+  const missingOutputError = result.code === 0 && !structured
+    ? {
+        code: "RECOMMEND_SEARCH_NO_OUTPUT",
+        message: "推荐页筛选命令执行结束但未返回可解析结果。"
+      }
+    : null;
   return {
     ok: result.code === 0 && structured?.status === "COMPLETED",
     stdout: result.stdout,
     stderr: result.stderr,
     structured,
     summary: structured?.result || null,
-    error: structured?.error || (
+    error: structured?.error || missingOutputError || (
       result.code === 0
         ? null
-        : {
-            code: "RECOMMEND_SEARCH_FAILED",
-            message: "推荐页筛选命令执行失败。"
-          }
+        : result.error_code === "ABORTED"
+          ? {
+              code: "PROCESS_ABORTED",
+              message: "推荐页筛选命令已取消。"
+            }
+          : {
+              code: "RECOMMEND_SEARCH_FAILED",
+              message: "推荐页筛选命令执行失败。"
+            }
     )
   };
 }
 
-export async function runRecommendScreenCli({ workspaceRoot, screenParams }) {
+export async function runRecommendScreenCli({ workspaceRoot, screenParams, resume = null, runtime = null }) {
   const screenDir = resolveRecommendScreenCliDir(workspaceRoot);
   if (!screenDir) {
     return {
@@ -575,16 +1669,60 @@ export async function runRecommendScreenCli({ workspaceRoot, screenParams }) {
     };
   }
 
+  const fixedOutput = normalizeText(resume?.output_csv || "");
   const outputName = `recommend_screen_result_${Date.now()}.csv`;
-  let outputPath = outputName;
-  if (loaded.config.outputDir) {
-    const resolvedOutputDir = path.resolve(path.dirname(configPath), loaded.config.outputDir);
-    fs.mkdirSync(resolvedOutputDir, { recursive: true });
-    outputPath = path.join(resolvedOutputDir, outputName);
+  let outputPath = fixedOutput ? path.resolve(fixedOutput) : outputName;
+  if (!fixedOutput) {
+    if (loaded.config.outputDir) {
+      const resolvedOutputDir = path.resolve(path.dirname(configPath), loaded.config.outputDir);
+      fs.mkdirSync(resolvedOutputDir, { recursive: true });
+      outputPath = path.join(resolvedOutputDir, outputName);
+    } else {
+      const desktopDir = getDesktopDir();
+      fs.mkdirSync(desktopDir, { recursive: true });
+      outputPath = path.join(desktopDir, outputName);
+    }
   } else {
-    const desktopDir = getDesktopDir();
-    fs.mkdirSync(desktopDir, { recursive: true });
-    outputPath = path.join(desktopDir, outputName);
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  }
+
+  const checkpointPath = normalizeText(resume?.checkpoint_path || "")
+    ? path.resolve(String(resume.checkpoint_path))
+    : null;
+  const pauseControlPath = normalizeText(resume?.pause_control_path || "")
+    ? path.resolve(String(resume.pause_control_path))
+    : null;
+  const resumeRequested = resume?.resume === true;
+  const requireCheckpoint = resume?.require_checkpoint === true;
+  if (resumeRequested && requireCheckpoint) {
+    if (!checkpointPath) {
+      return {
+        ok: false,
+        paused: false,
+        stdout: "",
+        stderr: "",
+        structured: null,
+        summary: null,
+        error: {
+          code: "RESUME_CHECKPOINT_MISSING",
+          message: "恢复执行缺少 checkpoint_path，无法从上次进度继续。"
+        }
+      };
+    }
+    if (!fs.existsSync(checkpointPath)) {
+      return {
+        ok: false,
+        paused: false,
+        stdout: "",
+        stderr: "",
+        structured: null,
+        summary: null,
+        error: {
+          code: "RESUME_CHECKPOINT_MISSING",
+          message: `恢复执行未找到 checkpoint 文件：${checkpointPath}`
+        }
+      };
+    }
   }
 
   const cliPath = resolveRecommendScreenCliEntry(screenDir);
@@ -622,27 +1760,81 @@ export async function runRecommendScreenCli({ workspaceRoot, screenParams }) {
     && screenParams.max_greet_count > 0) {
     args.push("--max-greet-count", String(screenParams.max_greet_count));
   }
+  if (checkpointPath) {
+    args.push("--checkpoint-path", checkpointPath);
+  }
+  if (pauseControlPath) {
+    args.push("--pause-control-path", pauseControlPath);
+  }
+  if (resumeRequested) {
+    args.push("--resume");
+  }
+
+  let inferredProgress = {
+    processed: 0,
+    passed: 0,
+    skipped: 0,
+    greet_count: 0
+  };
+  let inferredTracker = createScreenProgressTracker();
+  const screenTimeoutMs = resolveRecommendScreenTimeoutMs(runtime);
 
   const result = await runProcess({
     command: "node",
     args,
     cwd: screenDir,
-    timeoutMs: 60 * 60 * 1000
+    timeoutMs: screenTimeoutMs,
+    heartbeatIntervalMs: runtime?.heartbeatIntervalMs,
+    signal: runtime?.signal,
+    onOutput: (event) => {
+      safeInvokeCallback(runtime?.onOutput, event);
+    },
+    onLine: (event) => {
+      const parsed = parseScreenProgressLine(event?.line, inferredProgress, inferredTracker);
+      if (!parsed) return;
+      inferredProgress = parsed.progress;
+      inferredTracker = parsed.tracker;
+      safeInvokeCallback(runtime?.onProgress, {
+        ...inferredProgress,
+        line: parsed.line
+      });
+    },
+    onHeartbeat: (event) => {
+      safeInvokeCallback(runtime?.onHeartbeat, event);
+    }
   });
-  const structured = parseJsonOutput(result.stdout);
+  const structured = parseJsonOutput(result.stdout) || parseJsonOutput(result.stderr);
+  const status = normalizeText(structured?.status || "").toUpperCase();
+  const summary = structured?.result || null;
+  if (summary) {
+    safeInvokeCallback(runtime?.onProgress, {
+      processed: Number.isInteger(summary.processed_count) ? summary.processed_count : inferredProgress.processed,
+      passed: Number.isInteger(summary.passed_count) ? summary.passed_count : inferredProgress.passed,
+      skipped: Number.isInteger(summary.skipped_count) ? summary.skipped_count : inferredProgress.skipped,
+      greet_count: Number.isInteger(summary.greet_count) ? summary.greet_count : inferredProgress.greet_count
+    });
+  }
+  const missingOutputError = result.code === 0 && !structured
+    ? {
+        code: "RECOMMEND_SCREEN_NO_OUTPUT",
+        message: "推荐页筛选命令执行结束但未返回可解析结果。"
+      }
+    : null;
   return {
-    ok: result.code === 0 && structured?.status === "COMPLETED",
+    ok: result.code === 0 && status === "COMPLETED",
+    paused: result.code === 0 && status === "PAUSED",
     stdout: result.stdout,
     stderr: result.stderr,
     structured,
-    summary: structured?.result || null,
-    error: structured?.error || (
-      result.code === 0
-        ? null
-        : {
-            code: "RECOMMEND_SCREEN_FAILED",
-            message: "推荐页筛选命令执行失败。"
-          }
-    )
+    summary,
+    error: structured?.error || missingOutputError || buildRecommendScreenProcessError(result, screenTimeoutMs)
   };
 }
+
+export const __testables = {
+  runProcess,
+  parseJsonOutput,
+  parseScreenProgressLine,
+  resolveRecommendScreenTimeoutMs,
+  buildRecommendScreenProcessError
+};

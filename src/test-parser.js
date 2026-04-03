@@ -8,7 +8,7 @@ function testNeedConfirmationIncludesPostAction() {
     overrides: null
   });
 
-  assert.equal(result.searchParams.school_tag, "985");
+  assert.deepEqual(result.searchParams.school_tag, ["985"]);
   assert.deepEqual(result.searchParams.degree, ["不限"]);
   assert.equal(result.searchParams.gender, "男");
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
@@ -29,9 +29,13 @@ function testConfirmedPostActionAndOverrides() {
     confirmation: {
       filters_confirmed: true,
       school_tag_confirmed: true,
+      school_tag_value: ["211"],
       degree_confirmed: true,
+      degree_value: ["本科"],
       gender_confirmed: true,
+      gender_value: "女",
       recent_not_view_confirmed: true,
+      recent_not_view_value: "近14天没有",
       criteria_confirmed: true,
       target_count_confirmed: true,
       target_count_value: 12,
@@ -48,7 +52,7 @@ function testConfirmedPostActionAndOverrides() {
     }
   });
 
-  assert.equal(result.searchParams.school_tag, "211");
+  assert.deepEqual(result.searchParams.school_tag, ["211"]);
   assert.deepEqual(result.searchParams.degree, ["本科"]);
   assert.equal(result.searchParams.gender, "女");
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
@@ -67,6 +71,94 @@ function testConfirmedPostActionAndOverrides() {
   assert.equal(result.needs_max_greet_count_confirmation, false);
 }
 
+function testMissingRecentNotViewValueShouldRequireReconfirmation() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选985男生，近14天没有，有销售经验，符合标准收藏",
+    confirmation: {
+      filters_confirmed: true,
+      school_tag_confirmed: true,
+      school_tag_value: ["985"],
+      degree_confirmed: true,
+      degree_value: ["本科"],
+      gender_confirmed: true,
+      gender_value: "男",
+      recent_not_view_confirmed: true,
+      criteria_confirmed: true,
+      target_count_confirmed: true,
+      post_action_confirmed: true,
+      post_action_value: "favorite"
+    },
+    overrides: null
+  });
+
+  assert.equal(result.needs_recent_not_view_confirmation, true);
+  assert.equal(result.pending_questions.some((q) => q.field === "recent_not_view"), true);
+}
+
+function testFilterConfirmedWithoutExplicitValuesShouldRequireReconfirmation() {
+  const result = parseRecommendInstruction({
+    instruction: "通过boss推荐skill帮我找人",
+    confirmation: {
+      filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
+      criteria_confirmed: true,
+      target_count_confirmed: true,
+      post_action_confirmed: true,
+      post_action_value: "favorite"
+    },
+    overrides: {
+      criteria: "必须有至少3年工作经验，且做过算法"
+    }
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["不限"]);
+  assert.deepEqual(result.searchParams.degree, ["不限"]);
+  assert.equal(result.searchParams.gender, "不限");
+  assert.equal(result.searchParams.recent_not_view, "不限");
+  assert.equal(result.needs_school_tag_confirmation, true);
+  assert.equal(result.needs_degree_confirmation, true);
+  assert.equal(result.needs_gender_confirmation, true);
+  assert.equal(result.needs_recent_not_view_confirmation, true);
+  assert.equal(result.needs_filters_confirmation, true);
+}
+
+function testFilterConfirmedWithExplicitConfirmationValuesShouldNotFallbackToUnlimited() {
+  const result = parseRecommendInstruction({
+    instruction: "通过boss推荐skill帮我找人",
+    confirmation: {
+      filters_confirmed: true,
+      school_tag_confirmed: true,
+      school_tag_value: ["985", "211"],
+      degree_confirmed: true,
+      degree_value: ["大专", "本科", "硕士", "博士"],
+      gender_confirmed: true,
+      gender_value: "男",
+      recent_not_view_confirmed: true,
+      recent_not_view_value: "近14天没有",
+      criteria_confirmed: true,
+      target_count_confirmed: true,
+      target_count_value: 3,
+      post_action_confirmed: true,
+      post_action_value: "favorite"
+    },
+    overrides: {
+      criteria: "必须有至少3年工作经验，且做过算法"
+    }
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["985", "211"]);
+  assert.deepEqual(result.searchParams.degree, ["大专", "本科", "硕士", "博士"]);
+  assert.equal(result.searchParams.gender, "男");
+  assert.equal(result.searchParams.recent_not_view, "近14天没有");
+  assert.equal(result.needs_school_tag_confirmation, false);
+  assert.equal(result.needs_degree_confirmation, false);
+  assert.equal(result.needs_gender_confirmation, false);
+  assert.equal(result.needs_recent_not_view_confirmation, false);
+}
+
 function testMultipleSchoolTagsMarkedSuspicious() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选985和211，有推荐系统经验",
@@ -83,10 +175,9 @@ function testMultipleSchoolTagsMarkedSuspicious() {
     overrides: null
   });
 
-  assert.equal(result.searchParams.school_tag, "985");
+  assert.deepEqual(result.searchParams.school_tag, ["985", "211"]);
   assert.deepEqual(result.searchParams.degree, ["不限"]);
-  assert.equal(result.suspicious_fields.length, 1);
-  assert.equal(result.suspicious_fields[0].field, "school_tag");
+  assert.equal(result.suspicious_fields.length, 0);
 }
 
 function testDegreeCanBeExtracted() {
@@ -106,6 +197,17 @@ function testDegreeAtOrAboveExpansion() {
     overrides: null
   });
 
+  assert.deepEqual(result.searchParams.degree, ["大专", "本科", "硕士", "博士"]);
+}
+
+function testDegreeShouldNotBeOverwrittenBySchoolTagUnlimitedClause() {
+  const result = parseRecommendInstruction({
+    instruction: "学校标签不限，学历要求大专及以上，性别不限，过滤近14天已看",
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["不限"]);
   assert.deepEqual(result.searchParams.degree, ["大专", "本科", "硕士", "博士"]);
 }
 
@@ -129,6 +231,43 @@ function testDegreeOverrideCanBeArray() {
   });
 
   assert.deepEqual(result.searchParams.degree, ["大专", "本科"]);
+}
+
+function testSchoolTagOverrideCanBeArray() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选985候选人，有算法经验",
+    confirmation: null,
+    overrides: {
+      school_tag: ["985", "211"]
+    }
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["985", "211"]);
+}
+
+function testSchoolTagOverrideMixedValidAndInvalidShouldKeepValidOnes() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选候选人，有算法经验",
+    confirmation: null,
+    overrides: {
+      school_tag: ["985", "211", "qs100"]
+    }
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["985", "211"]);
+  assert.equal(result.suspicious_fields.some((item) => item.field === "school_tag"), true);
+}
+
+function testSchoolTagOverrideAllInvalidShouldFallbackToUnlimited() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选候选人，有算法经验",
+    confirmation: null,
+    overrides: {
+      school_tag: ["qs100", "abc"]
+    }
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["不限"]);
 }
 
 function testCriteriaCanBeProvidedViaOverrides() {
@@ -172,6 +311,7 @@ function testMissingCriteriaTriggersNeedInput() {
   });
 
   assert.deepEqual(result.missing_fields, ["criteria"]);
+  assert.equal(result.pending_questions.some((q) => q.field === "criteria"), true);
 }
 
 function testGreetNeedsMaxGreetCountConfirmation() {
@@ -217,8 +357,35 @@ function testGreetMaxGreetCountCanComeFromOverrides() {
   });
 
   assert.equal(result.screenParams.post_action, "greet");
-  assert.equal(result.screenParams.max_greet_count, 5);
-  assert.equal(result.needs_max_greet_count_confirmation, false);
+  assert.equal(result.screenParams.max_greet_count, null);
+  assert.equal(result.needs_max_greet_count_confirmation, true);
+}
+
+function testGreetAutoFilledMaxGreetCountShouldRequireReconfirmation() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选985男生，有大模型工程经验，目标3人，符合标准直接沟通",
+    confirmation: {
+      filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
+      criteria_confirmed: true,
+      target_count_confirmed: true,
+      target_count_value: 3,
+      post_action_confirmed: true,
+      post_action_value: "greet",
+      max_greet_count_confirmed: true,
+      max_greet_count_value: 3
+    },
+    overrides: null
+  });
+
+  assert.equal(result.screenParams.post_action, "greet");
+  assert.equal(result.screenParams.max_greet_count, null);
+  assert.equal(result.needs_max_greet_count_confirmation, true);
+  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), true);
+  assert.equal(result.suspicious_fields.some((item) => item.field === "max_greet_count"), true);
 }
 
 function testTargetCountNeedsConfirmationEvenWhenOptional() {
@@ -262,6 +429,43 @@ function testTargetCountCanBeSkippedAfterConfirmation() {
   assert.equal(result.screenParams.target_count, null);
 }
 
+function testPostActionNoneCanBeConfirmed() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选211女生，近14天没有，有AI经验，符合标准什么也不做",
+    confirmation: {
+      filters_confirmed: true,
+      school_tag_confirmed: true,
+      school_tag_value: ["211"],
+      degree_confirmed: true,
+      degree_value: ["本科"],
+      gender_confirmed: true,
+      gender_value: "女",
+      recent_not_view_confirmed: true,
+      recent_not_view_value: "近14天没有",
+      criteria_confirmed: true,
+      target_count_confirmed: true,
+      post_action_confirmed: true,
+      post_action_value: "none"
+    },
+    overrides: null
+  });
+
+  assert.equal(result.screenParams.post_action, "none");
+  assert.equal(result.needs_post_action_confirmation, false);
+}
+
+function testJobSelectionHintCanComeFromOverrides() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选211女生，有算法经验，符合标准收藏",
+    confirmation: null,
+    overrides: {
+      job: "算法工程师（视频/图像模型方向） _ 杭州"
+    }
+  });
+
+  assert.equal(result.job_selection_hint, "算法工程师（视频/图像模型方向） _ 杭州");
+}
+
 function testMcpMentionShouldStayInCriteria() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选211女生，近14天没有，有 AI Agent 或 MCP 工具开发经验，符合标准的直接沟通",
@@ -275,18 +479,28 @@ function testMcpMentionShouldStayInCriteria() {
 function main() {
   testNeedConfirmationIncludesPostAction();
   testConfirmedPostActionAndOverrides();
+  testMissingRecentNotViewValueShouldRequireReconfirmation();
+  testFilterConfirmedWithoutExplicitValuesShouldRequireReconfirmation();
+  testFilterConfirmedWithExplicitConfirmationValuesShouldNotFallbackToUnlimited();
   testMultipleSchoolTagsMarkedSuspicious();
   testDegreeCanBeExtracted();
   testDegreeAtOrAboveExpansion();
+  testDegreeShouldNotBeOverwrittenBySchoolTagUnlimitedClause();
   testDegreeExplicitListOnly();
   testDegreeOverrideCanBeArray();
+  testSchoolTagOverrideCanBeArray();
+  testSchoolTagOverrideMixedValidAndInvalidShouldKeepValidOnes();
+  testSchoolTagOverrideAllInvalidShouldFallbackToUnlimited();
   testCriteriaCanBeProvidedViaOverrides();
   testMissingCriteriaTriggersNeedInput();
   testMcpMentionShouldStayInCriteria();
   testGreetNeedsMaxGreetCountConfirmation();
   testGreetMaxGreetCountCanComeFromOverrides();
+  testGreetAutoFilledMaxGreetCountShouldRequireReconfirmation();
   testTargetCountNeedsConfirmationEvenWhenOptional();
   testTargetCountCanBeSkippedAfterConfirmation();
+  testPostActionNoneCanBeConfirmed();
+  testJobSelectionHintCanComeFromOverrides();
   console.log("parser tests passed");
 }
 
