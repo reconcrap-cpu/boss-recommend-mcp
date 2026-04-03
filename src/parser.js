@@ -28,10 +28,11 @@ const DEGREE_ORDER = [
 ];
 const GENDER_OPTIONS = ["不限", "男", "女"];
 const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
-const POST_ACTION_OPTIONS = ["favorite", "greet"];
+const POST_ACTION_OPTIONS = ["favorite", "greet", "none"];
 const POST_ACTION_LABELS = {
   favorite: "收藏",
-  greet: "直接沟通"
+  greet: "直接沟通",
+  none: "什么也不做"
 };
 const LEADING_NOISE_PATTERNS = [
   /^使用boss-recommend-pipeline skills/i,
@@ -90,7 +91,7 @@ const FILTER_CLAUSE_PATTERNS = [
   /近?14天(?:内)?没有|近?14天(?:内)?没看过|近?14天(?:内)?未查看|过滤[^。；;\n]{0,12}14天|排除[^。；;\n]{0,12}14天/i,
   /目标(?:处理|筛选)?(?:人数|数量)?|至少(?:处理|筛选)|(?:处理|筛选)\s*\d+\s*(?:位|人)/i,
   /最多(?:打招呼|沟通|联系)|(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多)/i,
-  /收藏|打招呼|直接沟通/i
+  /收藏|打招呼|直接沟通|什么也不做|不做任何操作|不操作|仅筛选|只筛选/i
 ];
 const META_CLAUSE_PATTERNS = [
   /推荐页|推荐页面|boss推荐/i,
@@ -116,6 +117,52 @@ function normalizeSchoolTag(value) {
   if (normalized === "双一流") return "双一流院校";
   if (SCHOOL_TAG_OPTIONS.includes(normalized)) return normalized;
   return null;
+}
+
+function toSchoolTagInputList(input) {
+  if (Array.isArray(input)) {
+    return input.map((item) => normalizeText(item)).filter(Boolean);
+  }
+  const text = normalizeText(input);
+  if (!text) return [];
+  return text.split(/[，,、/|]/).map((item) => normalizeText(item)).filter(Boolean);
+}
+
+function auditSchoolTagSelections(input) {
+  const rawItems = toSchoolTagInputList(input);
+  const valid = [];
+  const invalid = [];
+  for (const item of rawItems) {
+    const normalized = normalizeSchoolTag(item);
+    if (normalized) {
+      valid.push(normalized);
+    } else {
+      invalid.push(item);
+    }
+  }
+  return {
+    valid: sortSchoolTagSelections(valid),
+    invalid: uniqueList(invalid)
+  };
+}
+
+function sortSchoolTagSelections(values) {
+  const order = new Map(SCHOOL_TAG_OPTIONS.map((item, index) => [item, index]));
+  const unique = Array.from(
+    new Set((values || []).map((item) => normalizeSchoolTag(item)).filter(Boolean))
+  );
+  if (!unique.length) return [];
+  if (unique.includes("不限")) {
+    return unique.length === 1
+      ? ["不限"]
+      : unique.filter((item) => item !== "不限").sort((left, right) => order.get(left) - order.get(right));
+  }
+  return unique.sort((left, right) => order.get(left) - order.get(right));
+}
+
+function normalizeSchoolTagSelections(input) {
+  const audited = auditSchoolTagSelections(input);
+  return audited.valid.length ? audited.valid : null;
 }
 
 function normalizeDegree(value) {
@@ -146,7 +193,10 @@ function expandDegreeAtOrAbove(value) {
 function parseDegreeSelectionsFromText(text) {
   const normalizedText = normalizeText(text);
   if (!normalizedText) return [];
-  if (/(?:学历|学位|教育)[^。；;\n]{0,6}不限|不限[^。；;\n]{0,6}(?:学历|学位|教育)/i.test(normalizedText)) {
+  if (
+    /(?:学历|学位|教育)(?:要求)?\s*(?:[:：]\s*)?(?:不限|不限制|无要求)|(?:不限|不限制)\s*(?:[:：]\s*)?(?:学历|学位|教育)(?:要求)?/i
+      .test(normalizedText)
+  ) {
     return ["不限"];
   }
 
@@ -210,6 +260,9 @@ function normalizePostAction(value) {
   if (!normalized) return null;
   if (["favorite", "fav", "收藏"].includes(normalized)) return "favorite";
   if (["greet", "chat", "打招呼", "直接沟通", "沟通"].includes(normalized)) return "greet";
+  if (["none", "noop", "no-op", "什么也不做", "不做任何操作", "不操作", "仅筛选", "只筛选"].includes(normalized)) {
+    return "none";
+  }
   return null;
 }
 
@@ -328,6 +381,8 @@ function resolvePostAction({ instruction, confirmation, overrides }) {
       ? "favorite"
       : /打招呼|直接沟通|沟通/.test(instruction)
         ? "greet"
+        : /什么也不做|不做任何操作|不操作|仅筛选|只筛选/.test(instruction)
+          ? "none"
         : null;
   const proposed = overrideValue || confirmationValue || instructionValue || null;
 
@@ -367,7 +422,8 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
     return {
       max_greet_count: null,
       proposed_max_greet_count: null,
-      needs_max_greet_count_confirmation: false
+      needs_max_greet_count_confirmation: false,
+      suspicious_auto_fill: false
     };
   }
 
@@ -375,23 +431,50 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
   const confirmed = confirmation?.max_greet_count_confirmed === true;
   const confirmationValue = parsePositiveIntegerValue(confirmation?.max_greet_count_value);
   const instructionValue = extractMaxGreetCount(instruction);
-  const proposed = overrideValue || confirmationValue || instructionValue || null;
-  const resolved = overrideValue || (confirmed ? confirmationValue : null);
+  const targetCountHint = (
+    parsePositiveIntegerValue(confirmation?.target_count_value)
+    || parsePositiveIntegerValue(overrides?.target_count)
+    || extractTargetCount(instruction)
+    || null
+  );
+  const proposed = confirmationValue || overrideValue || instructionValue || null;
+  const resolved = confirmed ? (confirmationValue || overrideValue || null) : null;
+  const suspiciousAutoFill = Boolean(
+    confirmed
+    && Number.isInteger(confirmationValue)
+    && confirmationValue > 0
+    && !Number.isInteger(instructionValue)
+    && Number.isInteger(targetCountHint)
+    && targetCountHint > 0
+    && confirmationValue === targetCountHint
+  );
+  const needsConfirmation = (
+    !(Number.isInteger(resolved) && resolved > 0)
+    || suspiciousAutoFill
+  );
 
   return {
-    max_greet_count: resolved,
+    max_greet_count: needsConfirmation ? null : resolved,
     proposed_max_greet_count: proposed,
-    needs_max_greet_count_confirmation: !(Number.isInteger(resolved) && resolved > 0)
+    needs_max_greet_count_confirmation: needsConfirmation,
+    suspicious_auto_fill: suspiciousAutoFill
   };
 }
 
-function collectSuspiciousFields({ detectedSchoolTags }) {
+function collectSuspiciousFields({ invalidOverrideSchoolTags, maxGreetCountResolution }) {
   const suspicious = [];
-  if (detectedSchoolTags.length > 1) {
+  if (Array.isArray(invalidOverrideSchoolTags) && invalidOverrideSchoolTags.length > 0) {
     suspicious.push({
       field: "school_tag",
-      value: detectedSchoolTags,
-      reason: "推荐页学校标签当前是单选，指令里同时提到了多个学校标签，请确认最终要应用哪一个。"
+      value: invalidOverrideSchoolTags,
+      reason: `已忽略无效学校标签：${invalidOverrideSchoolTags.join(" / ")}；仅保留可识别选项。`
+    });
+  }
+  if (maxGreetCountResolution?.suspicious_auto_fill) {
+    suspicious.push({
+      field: "max_greet_count",
+      value: maxGreetCountResolution.proposed_max_greet_count,
+      reason: "检测到 max_greet_count 与 target_count 相同且原始指令未明确该值，可能是自动填充，需用户再次确认。"
     });
   }
   return suspicious;
@@ -401,23 +484,34 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const text = normalizeText(instruction);
   const detectedSchoolTags = extractSchoolTags(text);
   const detectedDegrees = extractDegrees(text);
-  const overrideSchoolTag = normalizeSchoolTag(overrides?.school_tag);
+  const schoolTagAudit = auditSchoolTagSelections(overrides?.school_tag);
+  const overrideSchoolTag = schoolTagAudit.valid.length > 0 ? schoolTagAudit.valid : null;
+  const confirmationSchoolTag = normalizeSchoolTagSelections(confirmation?.school_tag_value);
   const overrideDegrees = normalizeDegreeSelections(overrides?.degree);
+  const confirmationDegrees = normalizeDegreeSelections(confirmation?.degree_value);
   const overrideGender = normalizeGender(overrides?.gender);
+  const confirmationGender = normalizeGender(confirmation?.gender_value);
   const overrideRecentNotView = normalizeRecentNotView(overrides?.recent_not_view);
+  const confirmationRecentNotView = normalizeRecentNotView(confirmation?.recent_not_view_value);
   const overrideCriteria = overrides?.criteria;
+  const jobSelectionHint = normalizeText(overrides?.job || confirmation?.job_value || "");
 
+  const inferredSchoolTag = detectedSchoolTags.length > 0
+    ? sortSchoolTagSelections(detectedSchoolTags)
+    : ["不限"];
   const searchParams = {
-    school_tag: overrideSchoolTag || detectedSchoolTags[0] || "不限",
+    school_tag: overrideSchoolTag || confirmationSchoolTag || inferredSchoolTag,
     degree: (
       (Array.isArray(overrideDegrees) && overrideDegrees.length > 0
         ? overrideDegrees
+        : Array.isArray(confirmationDegrees) && confirmationDegrees.length > 0
+          ? confirmationDegrees
         : Array.isArray(detectedDegrees) && detectedDegrees.length > 0
           ? detectedDegrees
           : ["不限"])
     ),
-    gender: overrideGender || extractGender(text) || "不限",
-    recent_not_view: overrideRecentNotView || extractRecentNotView(text) || "不限"
+    gender: overrideGender || confirmationGender || extractGender(text) || "不限",
+    recent_not_view: overrideRecentNotView || confirmationRecentNotView || extractRecentNotView(text) || "不限"
   };
   const screenParams = {
     criteria: buildCriteria(text, overrideCriteria),
@@ -442,11 +536,30 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     missing_fields.push("criteria");
   }
 
-  const suspicious_fields = collectSuspiciousFields({ detectedSchoolTags });
-  const needs_school_tag_confirmation = confirmation?.school_tag_confirmed !== true;
-  const needs_degree_confirmation = confirmation?.degree_confirmed !== true;
-  const needs_gender_confirmation = confirmation?.gender_confirmed !== true;
-  const needs_recent_not_view_confirmation = confirmation?.recent_not_view_confirmed !== true;
+  const suspicious_fields = collectSuspiciousFields({
+    invalidOverrideSchoolTags: schoolTagAudit.invalid,
+    maxGreetCountResolution
+  });
+  const hasConfirmedSchoolTagValue = Array.isArray(confirmationSchoolTag) && confirmationSchoolTag.length > 0;
+  const hasConfirmedDegreeValue = Array.isArray(confirmationDegrees) && confirmationDegrees.length > 0;
+  const hasConfirmedGenderValue = Boolean(confirmationGender);
+  const hasConfirmedRecentNotViewValue = Boolean(confirmationRecentNotView);
+  const needs_school_tag_confirmation = (
+    confirmation?.school_tag_confirmed !== true
+    || !hasConfirmedSchoolTagValue
+  );
+  const needs_degree_confirmation = (
+    confirmation?.degree_confirmed !== true
+    || !hasConfirmedDegreeValue
+  );
+  const needs_gender_confirmation = (
+    confirmation?.gender_confirmed !== true
+    || !hasConfirmedGenderValue
+  );
+  const needs_recent_not_view_confirmation = (
+    confirmation?.recent_not_view_confirmed !== true
+    || !hasConfirmedRecentNotViewValue
+  );
   const needs_filters_confirmation = (
     confirmation?.filters_confirmed !== true
     || needs_school_tag_confirmation
@@ -461,9 +574,12 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const pending_questions = [];
 
   if (needs_school_tag_confirmation) {
+    const schoolTagQuestion = detectedSchoolTags.length > 1
+      ? `检测到学校标签：${detectedSchoolTags.join(" / ")}。请确认学校标签筛选（可多选）。`
+      : "请确认学校标签筛选（可多选）。";
     pending_questions.push({
       field: "school_tag",
-      question: "请确认学校标签筛选。",
+      question: schoolTagQuestion,
       value: searchParams.school_tag,
       options: SCHOOL_TAG_OPTIONS
     });
@@ -504,10 +620,16 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     });
   }
 
-  if (needs_criteria_confirmation && screenParams.criteria) {
+  if (!screenParams.criteria) {
     pending_questions.push({
       field: "criteria",
-      question: "请确认筛选 criteria 是否准确无误。",
+      question: "请用自然语言填写本次筛选 criteria（必填，不支持“严格执行/宽松执行”等预设选项）。",
+      value: null
+    });
+  } else if (needs_criteria_confirmation) {
+    pending_questions.push({
+      field: "criteria",
+      question: "请再次确认筛选 criteria（自然语言描述）是否准确；如需调整请直接改写完整 criteria。",
       value: screenParams.criteria
     });
   }
@@ -527,7 +649,8 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       value: postActionResolution.proposed_post_action,
       options: [
         { label: POST_ACTION_LABELS.favorite, value: "favorite" },
-        { label: POST_ACTION_LABELS.greet, value: "greet" }
+        { label: POST_ACTION_LABELS.greet, value: "greet" },
+        { label: POST_ACTION_LABELS.none, value: "none" }
       ]
     });
   }
@@ -535,7 +658,9 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   if (needs_max_greet_count_confirmation) {
     pending_questions.push({
       field: "max_greet_count",
-      question: "本次选择直接沟通时，最多打招呼多少位候选人？达到上限后会自动改为收藏。",
+      question: maxGreetCountResolution.suspicious_auto_fill
+        ? "检测到最大打招呼人数可能是自动默认值，请明确确认本次最多打招呼多少位候选人（必须为正整数）。"
+        : "本次选择直接沟通时，最多打招呼多少位候选人？达到上限后会自动改为收藏。",
       value: maxGreetCountResolution.proposed_max_greet_count
     });
   }
@@ -557,6 +682,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     proposed_target_count: targetCountResolution.proposed_target_count,
     proposed_post_action: postActionResolution.proposed_post_action,
     proposed_max_greet_count: maxGreetCountResolution.proposed_max_greet_count,
+    job_selection_hint: jobSelectionHint || null,
     pending_questions,
     review: {
       extracted_search_params: searchParams,

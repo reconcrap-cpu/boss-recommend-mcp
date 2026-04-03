@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "0.1.6",
+  "version": "1.1.3",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -21,7 +21,11 @@
     "install:local": "node src/cli.js install",
     "postinstall": "node scripts/postinstall.cjs",
     "test:parser": "node src/test-parser.js",
-    "test:pipeline": "node src/test-pipeline.js"
+    "test:pipeline": "node src/test-pipeline.js",
+    "test:run-state": "node src/test-run-state.js",
+    "test:runtime": "node src/test-adapters-runtime.js",
+    "test:async": "node src/test-index-async.js",
+    "test:search-job": "node vendor/boss-recommend-search-cli/src/test-job-selection.js"
   },
   "files": [
     "bin",

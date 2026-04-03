@@ -1,6 +1,9 @@
+import path from "node:path";
 import { parseRecommendInstruction } from "./parser.js";
 import {
+  attemptPipelineAutoRepair,
   ensureBossRecommendPageReady,
+  listRecommendJobs,
   runPipelinePreflight,
   runRecommendSearchCli,
   runRecommendScreenCli
@@ -8,6 +11,92 @@ import {
 
 function dedupe(values = []) {
   return [...new Set(values.filter(Boolean))];
+}
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeJobTitle(value) {
+  const text = normalizeText(value);
+  if (!text) return "";
+  const byGap = text.split(/\s{2,}/).map((item) => item.trim()).filter(Boolean)[0] || text;
+  const strippedRange = byGap
+    .replace(/\s+\d+(?:\.\d+)?\s*(?:-|~|—|至)\s*\d+(?:\.\d+)?\s*(?:k|K|千|万|元\/天|元\/月|元\/年|K\/月|k\/月|万\/月|万\/年)?$/u, "")
+    .trim();
+  const strippedSingle = strippedRange
+    .replace(/\s+\d+(?:\.\d+)?\s*(?:k|K|千|万|元\/天|元\/月|元\/年|K\/月|k\/月|万\/月|万\/年)$/u, "")
+    .trim();
+  return strippedSingle || byGap;
+}
+
+function normalizeJobOptions(jobOptions = []) {
+  const normalized = [];
+  const seen = new Set();
+  for (const item of jobOptions) {
+    if (!item || typeof item !== "object") continue;
+    const value = normalizeText(item.value);
+    const label = normalizeText(item.label);
+    const title = normalizeJobTitle(item.title || label);
+    const optionKey = value || title || label;
+    if (!optionKey || seen.has(optionKey)) continue;
+    seen.add(optionKey);
+    normalized.push({
+      value: value || null,
+      title: title || label || null,
+      label: label || title || null,
+      current: item.current === true
+    });
+  }
+  return normalized;
+}
+
+function resolveSelectedJob(jobOptions = [], requestedRaw) {
+  const requested = normalizeText(requestedRaw);
+  if (!requested) {
+    return { job: null, ambiguous: false, candidates: [] };
+  }
+  const requestedTitle = normalizeJobTitle(requested).toLowerCase();
+  const requestedLower = requested.toLowerCase();
+  const byValue = jobOptions.find((item) => normalizeText(item.value || "").toLowerCase() === requestedLower);
+  if (byValue) return { job: byValue, ambiguous: false, candidates: [] };
+  const byTitle = jobOptions.find((item) => normalizeJobTitle(item.title || "").toLowerCase() === requestedTitle);
+  if (byTitle) return { job: byTitle, ambiguous: false, candidates: [] };
+  const byLabel = jobOptions.find((item) => normalizeText(item.label || "").toLowerCase() === requestedLower);
+  if (byLabel) return { job: byLabel, ambiguous: false, candidates: [] };
+  const partialMatches = jobOptions.filter((item) => {
+    const title = normalizeJobTitle(item.title || "").toLowerCase();
+    const label = normalizeText(item.label || "").toLowerCase();
+    return (
+      (title && (title.includes(requestedTitle) || requestedTitle.includes(title)))
+      || (label && (label.includes(requestedLower) || requestedLower.includes(label)))
+    );
+  });
+  if (partialMatches.length === 1) {
+    return { job: partialMatches[0], ambiguous: false, candidates: [] };
+  }
+  if (partialMatches.length > 1) {
+    return {
+      job: null,
+      ambiguous: true,
+      candidates: partialMatches.map((item) => item.title || item.label || "").filter(Boolean)
+    };
+  }
+  return { job: null, ambiguous: false, candidates: [] };
+}
+
+function buildJobPendingQuestion(jobOptions = [], selectedHint = null, reason = null) {
+  const options = jobOptions.map((item) => ({
+    label: item.title || item.label || item.value,
+    value: item.value || item.title || item.label
+  }));
+  return {
+    field: "job",
+    question: reason
+      || "已识别当前推荐页岗位列表，请确认本次要执行的岗位。确认后会先点击该岗位，再开始 search 和 screen。",
+    value: normalizeText(selectedHint) || null,
+    options
+  };
 }
 
 function failedCheckSet(checks = []) {
@@ -31,15 +120,56 @@ function collectNpmInstallDirs(checks = [], workspaceRoot) {
   return workspaceRoot ? [workspaceRoot] : [];
 }
 
+function quoteForCommand(value) {
+  return JSON.stringify(String(value));
+}
+
 function buildNpmInstallCommands(checks = [], workspaceRoot) {
   const dirs = collectNpmInstallDirs(checks, workspaceRoot);
   const commands = [];
   for (const dir of dirs) {
-    const escaped = String(dir).replace(/'/g, "''");
-    commands.push(`Set-Location '${escaped}'`);
-    commands.push("npm install");
+    commands.push(`npm install --prefix ${quoteForCommand(dir)}`);
   }
   return commands;
+}
+
+function getNodeInstallCommands() {
+  if (process.platform === "win32") {
+    return [
+      "winget install OpenJS.NodeJS.LTS",
+      "node --version"
+    ];
+  }
+  if (process.platform === "darwin") {
+    return [
+      "brew install node",
+      "node --version"
+    ];
+  }
+  return [
+    "使用系统包管理器安装 Node.js >= 18（例如 apt / yum / brew）",
+    "node --version"
+  ];
+}
+
+function getPythonInstallCommands() {
+  if (process.platform === "win32") {
+    return [
+      "winget install Python.Python.3.12",
+      "python --version"
+    ];
+  }
+  if (process.platform === "darwin") {
+    return [
+      "brew install python",
+      "python3 --version",
+      "若系统无 python 命令，请在当前终端建立 python -> python3 别名后重试。"
+    ];
+  }
+  return [
+    "使用系统包管理器安装 Python（例如 apt / yum / brew）",
+    "python --version"
+  ];
 }
 
 function formatCommandBlock(commands = []) {
@@ -50,6 +180,7 @@ function buildPreflightRecovery(checks = [], workspaceRoot) {
   const failed = failedCheckSet(checks);
   if (failed.size === 0) return null;
 
+  const needScreenConfig = failed.has("screen_config");
   const needNode = failed.has("node_cli");
   const needNpm = (
     failed.has("npm_dep_chrome_remote_interface_search")
@@ -60,15 +191,24 @@ function buildPreflightRecovery(checks = [], workspaceRoot) {
   const needPillow = failed.has("python_pillow");
 
   const ordered_steps = [];
+  if (needScreenConfig) {
+    const configCheck = checks.find((item) => item?.key === "screen_config");
+    ordered_steps.push({
+      id: "fill_screening_config",
+      title: "填写 screening-config.json（baseUrl / apiKey / model）",
+      blocked_by: [],
+      commands: [
+        `打开并填写：${configCheck?.path || "~/.boss-recommend-mcp/screening-config.json"}`,
+        "确认 baseUrl、apiKey、model 都是可用值（不要保留模板占位符）。"
+      ]
+    });
+  }
   if (needNode) {
     ordered_steps.push({
       id: "install_nodejs",
       title: "安装 Node.js >= 18",
       blocked_by: [],
-      commands: [
-        "winget install OpenJS.NodeJS.LTS",
-        "node --version"
-      ]
+      commands: getNodeInstallCommands()
     });
   }
   if (needNpm) {
@@ -84,10 +224,7 @@ function buildPreflightRecovery(checks = [], workspaceRoot) {
       id: "install_python",
       title: "安装 Python（确保 python 命令可用）",
       blocked_by: [],
-      commands: [
-        "winget install Python.Python.3.12",
-        "python --version"
-      ]
+      commands: getPythonInstallCommands()
     });
   }
   if (needPillow) {
@@ -110,6 +247,13 @@ function buildPreflightRecovery(checks = [], workspaceRoot) {
     "4) python_pillow 失败 -> 最后安装 Pillow。",
     "每一步完成后都重新运行 doctor，直到所有检查通过后再重试流水线。"
   ];
+  if (needScreenConfig) {
+    promptLines.splice(
+      1,
+      0,
+      "0) 若 screen_config 失败：先让用户提供并填写 baseUrl、apiKey、model（不得使用模板占位符）。"
+    );
+  }
 
   if (needNpm) {
     const npmCommands = buildNpmInstallCommands(checks, workspaceRoot);
@@ -173,6 +317,18 @@ function buildNeedConfirmationResponse(parsedResult) {
   };
 }
 
+function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob }) {
+  return {
+    field: "final_review",
+    question: "开始执行搜索和筛选前，请最后确认全部参数（岗位/筛选条件/筛选 criteria/目标人数/post_action/max_greet_count）无误。",
+    value: {
+      job: selectedJob?.title || selectedJob?.label || selectedJob?.value || null,
+      search_params: searchParams,
+      screen_params: screenParams
+    }
+  };
+}
+
 function buildFailedResponse(code, message, extra = {}) {
   return {
     status: "FAILED",
@@ -185,25 +341,184 @@ function buildFailedResponse(code, message, extra = {}) {
   };
 }
 
+function buildPausedResponse(message, extra = {}) {
+  return {
+    status: "PAUSED",
+    message: normalizeText(message || "") || "Recommend 流水线已暂停。",
+    ...extra
+  };
+}
+
+class PipelineAbortError extends Error {
+  constructor(message = "Pipeline execution aborted") {
+    super(message);
+    this.name = "PipelineAbortError";
+    this.code = "PIPELINE_ABORTED";
+  }
+}
+
+function isAbortSignalTriggered(signal) {
+  return Boolean(signal && signal.aborted);
+}
+
+function ensurePipelineNotAborted(signal) {
+  if (isAbortSignalTriggered(signal)) {
+    throw new PipelineAbortError("Pipeline execution aborted by caller.");
+  }
+}
+
+function safeInvokeRuntimeCallback(callback, payload) {
+  if (typeof callback !== "function") return;
+  try {
+    callback(payload);
+  } catch {
+    // Keep pipeline stable even if runtime callback fails.
+  }
+}
+
+function createPipelineRuntime(runtime = null) {
+  const signal = runtime?.signal;
+  const heartbeatIntervalMs = Number.isFinite(runtime?.heartbeatIntervalMs) && runtime.heartbeatIntervalMs > 0
+    ? runtime.heartbeatIntervalMs
+    : 10_000;
+  const isPauseRequested = typeof runtime?.isPauseRequested === "function"
+    ? runtime.isPauseRequested
+    : () => false;
+
+  function setStage(stage, message = null) {
+    safeInvokeRuntimeCallback(runtime?.onStage, {
+      stage,
+      message: normalizeText(message || "") || null,
+      at: new Date().toISOString()
+    });
+  }
+
+  function heartbeat(stage, details = null) {
+    safeInvokeRuntimeCallback(runtime?.onHeartbeat, {
+      stage,
+      details: details || null,
+      at: new Date().toISOString()
+    });
+  }
+
+  function output(stage, event) {
+    safeInvokeRuntimeCallback(runtime?.onOutput, {
+      stage,
+      ...(event || {}),
+      at: new Date().toISOString()
+    });
+  }
+
+  function progress(stage, payload) {
+    safeInvokeRuntimeCallback(runtime?.onProgress, {
+      stage,
+      ...(payload || {}),
+      at: new Date().toISOString()
+    });
+  }
+
+  function adapterRuntime(stage) {
+    return {
+      signal,
+      heartbeatIntervalMs,
+      onOutput: (event) => output(stage, event),
+      onHeartbeat: (event) => heartbeat(stage, event),
+      onProgress: (payload) => progress(stage, payload)
+    };
+  }
+
+  return {
+    signal,
+    heartbeatIntervalMs,
+    isPauseRequested,
+    setStage,
+    heartbeat,
+    output,
+    progress,
+    adapterRuntime
+  };
+}
+
+function isProcessAbortError(errorLike) {
+  const code = normalizeText(errorLike?.code || "").toUpperCase();
+  return code === "PROCESS_ABORTED" || code === "ABORTED";
+}
+
+function isPauseRequested(runtimeHooks) {
+  try {
+    return runtimeHooks?.isPauseRequested?.() === true;
+  } catch {
+    return false;
+  }
+}
+
+function buildChromeSetupGuidance({ debugPort, pageState }) {
+  const expectedUrl = pageState?.expected_url || "https://www.zhipin.com/web/chat/recommend";
+  const loginUrl = pageState?.login_url || "https://www.zhipin.com/web/user/?ka=bticket";
+  const currentUrl = pageState?.current_url || null;
+  const state = pageState?.state || "UNKNOWN";
+  const isPortIssue = state === "DEBUG_PORT_UNREACHABLE";
+  const needsLogin = state === "LOGIN_REQUIRED" || state === "LOGIN_REQUIRED_AFTER_REDIRECT";
+  const launchAttempt = pageState?.launch_attempt || null;
+  const launchLine = launchAttempt?.ok
+    ? `已自动启动 Chrome（--remote-debugging-port=${debugPort}，--user-data-dir=${launchAttempt.user_data_dir || "auto"}）。`
+    : null;
+  const launchExample = process.platform === "win32"
+    ? `chrome.exe --remote-debugging-port=${debugPort} --user-data-dir=<profile-dir>`
+    : process.platform === "darwin"
+      ? `'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' --remote-debugging-port=${debugPort} --user-data-dir=<profile-dir>`
+      : `google-chrome --remote-debugging-port=${debugPort} --user-data-dir=<profile-dir>`;
+  const steps = [
+    `请先在可连接到 DevTools 端口 ${debugPort} 的 Chrome 实例中完成以下操作：`,
+    ...(launchLine ? [launchLine] : []),
+    "1) 确认当前 Chrome 与本次运行使用同一个远程调试端口。",
+    isPortIssue
+      ? `2) 若端口不可连接，请用远程调试方式启动 Chrome（示例：${launchExample}）。`
+      : "2) 确认端口可连接且浏览器窗口保持打开。",
+    needsLogin
+      ? `3) 当前检测到 Boss 未登录，请先打开并完成登录：${loginUrl}`
+      : "3) 如 Boss 登录态失效，请先重新登录。",
+    `4) 登录完成后先导航并停留在推荐页：${expectedUrl}`,
+    "5) 完成后回复“已就绪”，我会继续执行并优先自动导航到推荐页。"
+  ];
+  return {
+    debug_port: debugPort,
+    expected_url: expectedUrl,
+    current_url: currentUrl,
+    page_state: state,
+    agent_prompt: steps.join("\n")
+  };
+}
+
 const defaultDependencies = {
+  attemptPipelineAutoRepair,
   parseRecommendInstruction,
   ensureBossRecommendPageReady,
+  listRecommendJobs,
   runPipelinePreflight,
   runRecommendSearchCli,
   runRecommendScreenCli
 };
 
 export async function runRecommendPipeline(
-  { workspaceRoot, instruction, confirmation, overrides },
-  dependencies = defaultDependencies
+  { workspaceRoot, instruction, confirmation, overrides, resume = null },
+  dependencies = defaultDependencies,
+  runtime = null
 ) {
+  const injectedDependencies = dependencies || {};
+  const resolvedDependencies = { ...defaultDependencies, ...(dependencies || {}) };
   const {
+    attemptPipelineAutoRepair: attemptAutoRepair,
     parseRecommendInstruction: parseInstruction,
     ensureBossRecommendPageReady: ensureRecommendPageReady,
+    listRecommendJobs: listJobs,
     runPipelinePreflight: runPreflight,
     runRecommendSearchCli: searchCli,
     runRecommendScreenCli: screenCli
-  } = dependencies;
+  } = resolvedDependencies;
+  const runtimeHooks = createPipelineRuntime(runtime);
+  ensurePipelineNotAborted(runtimeHooks.signal);
+
   const startedAt = Date.now();
   const parsed = parseInstruction({ instruction, confirmation, overrides });
 
@@ -225,8 +540,38 @@ export async function runRecommendPipeline(
     return buildNeedConfirmationResponse(parsed);
   }
 
-  const preflight = runPreflight(workspaceRoot);
+  ensurePipelineNotAborted(runtimeHooks.signal);
+  runtimeHooks.setStage("preflight", "开始执行 preflight 检查。");
+  runtimeHooks.heartbeat("preflight");
+
+  let preflight = runPreflight(workspaceRoot);
+  let autoRepair = null;
+  const shouldAttemptAutoRepair = (
+    dependencies === defaultDependencies
+    || Object.prototype.hasOwnProperty.call(injectedDependencies, "attemptPipelineAutoRepair")
+  );
   if (!preflight.ok) {
+    if (shouldAttemptAutoRepair && typeof attemptAutoRepair === "function") {
+      autoRepair = attemptAutoRepair(workspaceRoot, preflight);
+      if (autoRepair?.preflight) {
+        preflight = autoRepair.preflight;
+      }
+    }
+  }
+
+  if (!preflight.ok) {
+    runtimeHooks.heartbeat("preflight", {
+      status: "failed"
+    });
+    const screenConfigCheck = preflight.checks?.find((item) => item?.key === "screen_config" && item?.ok === false);
+    const screenConfigPath = String(screenConfigCheck?.path || "");
+    const screenConfigDir = screenConfigPath ? path.dirname(screenConfigPath) : null;
+    const screenConfigReason = String(screenConfigCheck?.reason || "").trim().toUpperCase();
+    const screenConfigMessage = String(screenConfigCheck?.message || "");
+    const screenConfigHasPlaceholder = (
+      screenConfigReason.includes("PLACEHOLDER")
+      || /占位符|默认模板值|replace-with-openai-api-key/i.test(screenConfigMessage)
+    );
     const recovery = buildPreflightRecovery(preflight.checks, workspaceRoot);
     return buildFailedResponse(
       "PIPELINE_PREFLIGHT_FAILED",
@@ -234,28 +579,75 @@ export async function runRecommendPipeline(
       {
         search_params: parsed.searchParams,
         screen_params: parsed.screenParams,
+        required_user_action: screenConfigCheck
+          ? (screenConfigHasPlaceholder ? "confirm_screening_config_updated" : "provide_screening_config")
+          : undefined,
+        guidance: screenConfigCheck
+          ? {
+              config_path: screenConfigCheck.path,
+              config_dir: screenConfigDir,
+              agent_prompt: [
+                ...(screenConfigHasPlaceholder
+                  ? [
+                      "检测到 screening-config.json 仍包含默认占位词，当前禁止继续执行。",
+                      `请引导用户在以下目录修改配置文件：${screenConfigDir || "(unknown)"}`,
+                      `配置文件路径：${screenConfigCheck.path}`,
+                      "必须替换为真实可用值：baseUrl、apiKey、model（不要保留任何模板占位符）。",
+                      "修改完成后，必须先让用户明确回复“已修改完成”，再继续下一步。"
+                    ]
+                  : [
+                      "请先让用户填写 screening-config.json 的以下字段：",
+                      "1) baseUrl",
+                      "2) apiKey",
+                      "3) model",
+                      `配置文件路径：${screenConfigCheck.path}`,
+                      "注意：不要使用模板占位符（例如 replace-with-openai-api-key），也不要由 agent 自行猜测或代填示例值。必须向用户逐项确认真实可用值后再重试。"
+                    ])
+              ].join("\n")
+            }
+          : undefined,
         diagnostics: {
           checks: preflight.checks,
           debug_port: preflight.debug_port,
+          config_resolution: preflight.config_resolution,
+          auto_repair: autoRepair,
           recovery
         }
       }
     );
   }
 
+  ensurePipelineNotAborted(runtimeHooks.signal);
+  runtimeHooks.setStage("page_ready", "preflight 完成，开始检查 recommend 页面就绪状态。");
+  runtimeHooks.heartbeat("page_ready");
+
   const pageCheck = await ensureRecommendPageReady(workspaceRoot, {
     port: preflight.debug_port
   });
+  ensurePipelineNotAborted(runtimeHooks.signal);
   if (!pageCheck.ok) {
     const loginRelated = new Set(["LOGIN_REQUIRED", "LOGIN_REQUIRED_AFTER_REDIRECT"]);
+    const connectivityRelated = new Set(["DEBUG_PORT_UNREACHABLE"]);
+    const guidance = buildChromeSetupGuidance({
+      debugPort: preflight.debug_port,
+      pageState: pageCheck.page_state
+    });
     return buildFailedResponse(
-      loginRelated.has(pageCheck.state) ? "BOSS_LOGIN_REQUIRED" : "BOSS_RECOMMEND_PAGE_NOT_READY",
+      connectivityRelated.has(pageCheck.state)
+        ? "BOSS_CHROME_NOT_CONNECTED"
+        : loginRelated.has(pageCheck.state)
+          ? "BOSS_LOGIN_REQUIRED"
+          : "BOSS_RECOMMEND_PAGE_NOT_READY",
       loginRelated.has(pageCheck.state)
-        ? "Boss 页面未稳定停留在 recommend 页面，疑似未登录或登录态失效。"
-        : "无法确认 Boss recommend 页面已就绪，请检查 Chrome 调试端口和页面状态。",
+        ? `开始执行搜索和筛选前，请先在端口 ${preflight.debug_port} 的 Chrome 完成 Boss 登录并停留在 recommend 页面。`
+        : connectivityRelated.has(pageCheck.state)
+          ? `开始执行搜索和筛选前，需要先连接到端口 ${preflight.debug_port} 的 Chrome 远程调试实例。`
+          : `开始执行搜索和筛选前，请先在端口 ${preflight.debug_port} 的 Chrome 停留在 Boss recommend 页面。`,
       {
         search_params: parsed.searchParams,
         screen_params: parsed.screenParams,
+        required_user_action: "prepare_boss_recommend_page",
+        guidance,
         diagnostics: {
           debug_port: preflight.debug_port,
           page_state: pageCheck.page_state
@@ -264,31 +656,276 @@ export async function runRecommendPipeline(
     );
   }
 
-  const searchResult = await searchCli({
+  runtimeHooks.setStage("job_list", "页面就绪，开始读取岗位列表。");
+  runtimeHooks.heartbeat("job_list");
+  const jobListResult = await listJobs({
     workspaceRoot,
-    searchParams: parsed.searchParams
+    port: preflight.debug_port,
+    runtime: runtimeHooks.adapterRuntime("job_list")
   });
-  if (!searchResult.ok) {
+  ensurePipelineNotAborted(runtimeHooks.signal);
+  if (isProcessAbortError(jobListResult.error)) {
+    throw new PipelineAbortError(jobListResult.error?.message || "岗位列表读取已取消。");
+  }
+  if (!jobListResult.ok) {
+    const jobListErrorCode = String(jobListResult.error?.code || "");
+    const jobListErrorMessage = String(jobListResult.error?.message || "");
+    const pageReadinessFailure = (
+      jobListErrorCode === "JOB_TRIGGER_NOT_FOUND"
+      || jobListErrorCode === "NO_RECOMMEND_IFRAME"
+      || jobListErrorCode === "LOGIN_REQUIRED"
+      || jobListErrorMessage.includes("JOB_TRIGGER_NOT_FOUND")
+      || jobListErrorMessage.includes("NO_RECOMMEND_IFRAME")
+      || jobListErrorMessage.includes("LOGIN_REQUIRED")
+    );
+    if (pageReadinessFailure) {
+      const recheck = await ensureRecommendPageReady(workspaceRoot, {
+        port: preflight.debug_port
+      });
+      const loginRelated = new Set(["LOGIN_REQUIRED", "LOGIN_REQUIRED_AFTER_REDIRECT"]);
+      const connectivityRelated = new Set(["DEBUG_PORT_UNREACHABLE"]);
+      const guidance = buildChromeSetupGuidance({
+        debugPort: preflight.debug_port,
+        pageState: recheck.page_state
+      });
+      if (!recheck.ok || loginRelated.has(recheck.state) || connectivityRelated.has(recheck.state)) {
+        return buildFailedResponse(
+          connectivityRelated.has(recheck.state)
+            ? "BOSS_CHROME_NOT_CONNECTED"
+            : loginRelated.has(recheck.state)
+              ? "BOSS_LOGIN_REQUIRED"
+              : "BOSS_RECOMMEND_PAGE_NOT_READY",
+          loginRelated.has(recheck.state)
+            ? `检测到当前 Boss 处于未登录状态，请先登录后再继续。登录页：https://www.zhipin.com/web/user/?ka=bticket`
+            : connectivityRelated.has(recheck.state)
+              ? `读取岗位列表前需要先连接到端口 ${preflight.debug_port} 的 Chrome 远程调试实例。`
+              : `读取岗位列表前，请先在端口 ${preflight.debug_port} 的 Chrome 停留在 Boss recommend 页面。`,
+          {
+            search_params: parsed.searchParams,
+            screen_params: parsed.screenParams,
+            required_user_action: "prepare_boss_recommend_page",
+            guidance,
+            diagnostics: {
+              debug_port: preflight.debug_port,
+              page_state: recheck.page_state,
+              stdout: jobListResult.stdout?.slice(-1000),
+              stderr: jobListResult.stderr?.slice(-1000),
+              result: jobListResult.structured || null
+            }
+          }
+        );
+      }
+    }
     return buildFailedResponse(
-      searchResult.error?.code || "RECOMMEND_SEARCH_FAILED",
-      searchResult.error?.message || "推荐页筛选执行失败。",
+      jobListResult.error?.code || "RECOMMEND_JOB_LIST_FAILED",
+      jobListResult.error?.message || "读取推荐岗位列表失败，无法开始筛选。",
       {
         search_params: parsed.searchParams,
         screen_params: parsed.screenParams,
         diagnostics: {
           debug_port: preflight.debug_port,
-          stdout: searchResult.stdout?.slice(-1000),
-          stderr: searchResult.stderr?.slice(-1000),
-          result: searchResult.structured || null
+          stdout: jobListResult.stdout?.slice(-1000),
+          stderr: jobListResult.stderr?.slice(-1000),
+          result: jobListResult.structured || null
+        }
+      }
+    );
+  }
+  const jobOptions = normalizeJobOptions(jobListResult.jobs);
+  if (jobOptions.length === 0) {
+    return buildFailedResponse(
+      "RECOMMEND_JOB_LIST_EMPTY",
+      "未识别到可选岗位，暂时无法开始筛选。",
+      {
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams,
+        diagnostics: {
+          debug_port: preflight.debug_port,
+          result: jobListResult.structured || null
         }
       }
     );
   }
 
+  const selectedJobHint = normalizeText(confirmation?.job_value || parsed.job_selection_hint || "");
+  const selectedJobResolution = resolveSelectedJob(jobOptions, selectedJobHint);
+  const jobConfirmed = confirmation?.job_confirmed === true;
+  if (!jobConfirmed || !selectedJobResolution.job) {
+    const reason = selectedJobResolution.ambiguous
+      ? `你提供的岗位“${selectedJobHint}”匹配到多个选项：${selectedJobResolution.candidates.join(" / ")}。请明确选择其中一个岗位。`
+      : selectedJobHint
+        ? `未在当前岗位列表中找到“${selectedJobHint}”，请从以下岗位中重新确认一个。`
+        : "已识别当前推荐页岗位列表，请先确认本次要执行的岗位；确认后会先点击该岗位，再开始 search 和 screen。";
+    const pendingQuestions = (parsed.pending_questions || []).filter((item) => item?.field !== "job");
+    pendingQuestions.push(buildJobPendingQuestion(jobOptions, selectedJobHint, reason));
+    const requiredConfirmations = dedupe([...buildRequiredConfirmations(parsed), "job"]);
+    return {
+      status: "NEED_CONFIRMATION",
+      required_confirmations: requiredConfirmations,
+      search_params: parsed.searchParams,
+      screen_params: {
+        ...parsed.screenParams,
+        target_count: parsed.proposed_target_count ?? parsed.screenParams.target_count,
+        post_action: parsed.proposed_post_action || parsed.screenParams.post_action,
+        max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
+      },
+      pending_questions: pendingQuestions,
+      review: parsed.review,
+      job_options: jobOptions
+    };
+  }
+  const selectedJob = selectedJobResolution.job;
+  const selectedJobToken = selectedJob.value || selectedJob.title || selectedJob.label;
+  if (confirmation?.final_confirmed !== true) {
+    const pendingQuestions = (parsed.pending_questions || []).filter((item) => item?.field !== "final_review");
+    pendingQuestions.push(buildFinalReviewQuestion({
+      searchParams: parsed.searchParams,
+      screenParams: {
+        ...parsed.screenParams,
+        target_count: parsed.proposed_target_count ?? parsed.screenParams.target_count,
+        post_action: parsed.proposed_post_action || parsed.screenParams.post_action,
+        max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
+      },
+      selectedJob
+    }));
+    return {
+      status: "NEED_CONFIRMATION",
+      required_confirmations: dedupe([...buildRequiredConfirmations(parsed), "final_review"]),
+      search_params: parsed.searchParams,
+      screen_params: {
+        ...parsed.screenParams,
+        target_count: parsed.proposed_target_count ?? parsed.screenParams.target_count,
+        post_action: parsed.proposed_post_action || parsed.screenParams.post_action,
+        max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
+      },
+      selected_job: selectedJob,
+      pending_questions: pendingQuestions,
+      review: parsed.review,
+      job_options: jobOptions
+    };
+  }
+
+  const resumeCompletionReason = normalizeText(resume?.previous_completion_reason || "").toLowerCase();
+  const isResumeRun = resume?.resume === true;
+  const resumeFromPausedBeforeScreen = isResumeRun && resumeCompletionReason === "paused_before_screen";
+  const skipSearchOnResume = isResumeRun && !resumeFromPausedBeforeScreen;
+  let searchSummary = null;
+
+  if (!skipSearchOnResume) {
+    ensurePipelineNotAborted(runtimeHooks.signal);
+    runtimeHooks.setStage("search", "岗位已确认，开始执行 recommend search。");
+    runtimeHooks.heartbeat("search");
+    const searchResult = await searchCli({
+      workspaceRoot,
+      searchParams: parsed.searchParams,
+      selectedJob: selectedJobToken,
+      runtime: runtimeHooks.adapterRuntime("search")
+    });
+    ensurePipelineNotAborted(runtimeHooks.signal);
+    if (isProcessAbortError(searchResult.error)) {
+      throw new PipelineAbortError(searchResult.error?.message || "推荐筛选已取消。");
+    }
+    if (!searchResult.ok) {
+      const searchErrorCode = String(searchResult.error?.code || "");
+      const searchErrorMessage = String(searchResult.error?.message || "");
+      const loginRelatedSearchFailure = (
+        searchErrorCode === "LOGIN_REQUIRED"
+        || searchErrorCode === "NO_RECOMMEND_IFRAME"
+        || searchErrorMessage.includes("LOGIN_REQUIRED")
+        || searchErrorMessage.includes("NO_RECOMMEND_IFRAME")
+      );
+      if (loginRelatedSearchFailure) {
+        const recheck = await ensureRecommendPageReady(workspaceRoot, {
+          port: preflight.debug_port
+        });
+        if (recheck.state === "LOGIN_REQUIRED" || recheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT") {
+          const guidance = buildChromeSetupGuidance({
+            debugPort: preflight.debug_port,
+            pageState: recheck.page_state
+          });
+          return buildFailedResponse(
+            "BOSS_LOGIN_REQUIRED",
+            "检测到当前 Boss 处于未登录状态，请先登录后再继续。登录页：https://www.zhipin.com/web/user/?ka=bticket",
+            {
+              search_params: parsed.searchParams,
+              screen_params: parsed.screenParams,
+              selected_job: selectedJob,
+              required_user_action: "prepare_boss_recommend_page",
+              guidance,
+              diagnostics: {
+                debug_port: preflight.debug_port,
+                page_state: recheck.page_state,
+                stdout: searchResult.stdout?.slice(-1000),
+                stderr: searchResult.stderr?.slice(-1000),
+                result: searchResult.structured || null
+              }
+            }
+          );
+        }
+      }
+      return buildFailedResponse(
+        searchResult.error?.code || "RECOMMEND_SEARCH_FAILED",
+        searchResult.error?.message || "推荐页筛选执行失败。",
+        {
+          search_params: parsed.searchParams,
+          screen_params: parsed.screenParams,
+          selected_job: selectedJob,
+          diagnostics: {
+            debug_port: preflight.debug_port,
+            stdout: searchResult.stdout?.slice(-1000),
+            stderr: searchResult.stderr?.slice(-1000),
+            result: searchResult.structured || null
+          }
+        }
+      );
+    }
+
+    searchSummary = searchResult.summary || {};
+    if (isPauseRequested(runtimeHooks)) {
+      return buildPausedResponse("已在 screen 阶段开始前暂停 Recommend 流水线。", {
+        search_params: parsed.searchParams,
+        screen_params: parsed.screenParams,
+        selected_job: selectedJob,
+        partial_result: {
+          candidate_count: searchSummary.candidate_count ?? null,
+          applied_filters: searchSummary.applied_filters || parsed.searchParams,
+          output_csv: resume?.output_csv || null,
+          completion_reason: "paused_before_screen"
+        }
+      });
+    }
+    ensurePipelineNotAborted(runtimeHooks.signal);
+    runtimeHooks.setStage("screen", "search 完成，开始执行 recommend screen。");
+  } else {
+    ensurePipelineNotAborted(runtimeHooks.signal);
+    runtimeHooks.setStage("screen", "检测到可续跑 checkpoint，跳过 search，直接恢复 recommend screen。");
+  }
+
+  runtimeHooks.heartbeat("screen");
   const screenResult = await screenCli({
     workspaceRoot,
-    screenParams: parsed.screenParams
+    screenParams: parsed.screenParams,
+    resume: {
+      checkpoint_path: resume?.checkpoint_path || null,
+      pause_control_path: resume?.pause_control_path || null,
+      output_csv: resume?.output_csv || null,
+      resume: resume?.resume === true,
+      require_checkpoint: skipSearchOnResume
+    },
+    runtime: runtimeHooks.adapterRuntime("screen")
   });
+  ensurePipelineNotAborted(runtimeHooks.signal);
+  if (isProcessAbortError(screenResult.error)) {
+    throw new PipelineAbortError(screenResult.error?.message || "推荐筛选已取消。");
+  }
+  if (screenResult.paused) {
+    return buildPausedResponse("Recommend 流水线已暂停，可使用 resume 继续。", {
+      search_params: parsed.searchParams,
+      screen_params: parsed.screenParams,
+      selected_job: selectedJob,
+      partial_result: screenResult.summary || screenResult.structured?.result || null
+    });
+  }
   if (!screenResult.ok) {
     const partialScreenResult = screenResult.summary || screenResult.structured?.result || null;
     return buildFailedResponse(
@@ -297,6 +934,7 @@ export async function runRecommendPipeline(
       {
         search_params: parsed.searchParams,
         screen_params: parsed.screenParams,
+        selected_job: selectedJob,
         partial_result: partialScreenResult,
         diagnostics: {
           debug_port: preflight.debug_port,
@@ -308,29 +946,40 @@ export async function runRecommendPipeline(
     );
   }
 
+  runtimeHooks.setStage("finalize", "screen 完成，正在汇总结果。");
+  runtimeHooks.heartbeat("finalize");
   const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const searchSummary = searchResult.summary || {};
+  const finalSearchSummary = searchSummary || {};
   const screenSummary = screenResult.summary || {};
+  runtimeHooks.progress("finalize", {
+    processed: screenSummary.processed_count ?? 0,
+    passed: screenSummary.passed_count ?? 0,
+    skipped: screenSummary.skipped_count ?? 0,
+    greet_count: screenSummary.greet_count ?? 0
+  });
 
   return {
     status: "COMPLETED",
     search_params: parsed.searchParams,
     screen_params: parsed.screenParams,
     result: {
-      candidate_count: searchSummary.candidate_count ?? null,
-      applied_filters: searchSummary.applied_filters || parsed.searchParams,
+      candidate_count: finalSearchSummary.candidate_count ?? null,
+      applied_filters: finalSearchSummary.applied_filters || parsed.searchParams,
       processed_count: screenSummary.processed_count ?? 0,
       passed_count: screenSummary.passed_count ?? 0,
       skipped_count: screenSummary.skipped_count ?? 0,
       duration_sec: durationSec,
       output_csv: screenSummary.output_csv || null,
       completion_reason: screenSummary.completion_reason || "screen_completed",
-      page_state: searchSummary.page_state || pageCheck.page_state,
+      page_state: finalSearchSummary.page_state || pageCheck.page_state,
+      selected_job: finalSearchSummary.selected_job || selectedJob,
       post_action: parsed.screenParams.post_action,
       max_greet_count: parsed.screenParams.max_greet_count,
       greet_count: screenSummary.greet_count ?? 0,
       greet_limit_fallback_count: screenSummary.greet_limit_fallback_count ?? 0
     },
-    message: "Recommend 流水线已完成。post_action 在运行开始时已一次性确认；若选择打招呼并设置上限，超出上限后会自动改为收藏。"
+    message: parsed.screenParams.post_action === "none"
+      ? "Recommend 流水线已完成。本次 post_action=none：符合条件的人选仅记录到 CSV，不执行收藏或打招呼。"
+      : "Recommend 流水线已完成。post_action 在运行开始时已一次性确认；若选择打招呼并设置上限，超出上限后会自动改为收藏。"
   };
 }

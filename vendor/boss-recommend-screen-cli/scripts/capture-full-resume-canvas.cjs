@@ -39,6 +39,36 @@ function pickTarget(targets, targetPattern) {
   );
 }
 
+function oneLineJson(value, maxLength = 1200) {
+  try {
+    const text = JSON.stringify(value);
+    if (text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength)}...`;
+  } catch {
+    return "\"<unserializable>\"";
+  }
+}
+
+function summarizeProbeReason(probe) {
+  if (!probe || typeof probe !== "object") return "NO_PROBE";
+  if (probe.ok === true) return "INVALID_CLIP";
+  return String(probe.reason || "UNKNOWN");
+}
+
+function buildResumeProbeTimeoutMessage(waitResumeMs, probe) {
+  const reason = summarizeProbeReason(probe);
+  const payload = {
+    reason,
+    clip: probe?.clip || null,
+    scroll_top: Number.isFinite(Number(probe?.scrollTop)) ? Number(probe.scrollTop) : null,
+    client_height: Number.isFinite(Number(probe?.clientHeight)) ? Number(probe.clientHeight) : null,
+    scroll_height: Number.isFinite(Number(probe?.scrollHeight)) ? Number(probe.scrollHeight) : null,
+    max_scroll: Number.isFinite(Number(probe?.maxScroll)) ? Number(probe.maxScroll) : null,
+    debug: probe?.debug || null
+  };
+  return `Resume canvas not found: wait_resume_ms=${waitResumeMs}; last_reason=${reason}; probe=${oneLineJson(payload)}`;
+}
+
 function buildResumeProbeExpr({ init, targetScroll }) {
   const initLiteral = init ? "true" : "false";
   const scrollLiteral = typeof targetScroll === "number" && Number.isFinite(targetScroll)
@@ -110,12 +140,22 @@ function buildResumeProbeExpr({ init, targetScroll }) {
         || document.querySelector('iframe');
       const recommendDoc = recommendFrame && recommendFrame.contentDocument;
       if (!recommendFrame || !recommendDoc) {
-        return { ok: false, reason: 'NO_RECOMMEND_IFRAME' };
+        return {
+          ok: false,
+          reason: 'NO_RECOMMEND_IFRAME',
+          debug: {
+            topIframeCount: document.querySelectorAll('iframe').length
+          }
+        };
       }
 
       const scopes = Array.from(
         recommendDoc.querySelectorAll('.dialog-wrap.active, .boss-popup__wrapper.boss-dialog, .boss-dialog__wrapper')
       ).filter(isVisible);
+      const allResumeFrames = Array.from(
+        recommendDoc.querySelectorAll('iframe[src*="/web/frame/c-resume/"], iframe[name*="resume"]')
+      );
+      const visibleResumeFrames = allResumeFrames.filter(isVisible);
 
       let resumeFrame = null;
       for (const scope of scopes) {
@@ -127,13 +167,22 @@ function buildResumeProbeExpr({ init, targetScroll }) {
       }
 
       if (!resumeFrame) {
-        resumeFrame = Array.from(
-          recommendDoc.querySelectorAll('iframe[src*="/web/frame/c-resume/"], iframe[name*="resume"]')
-        ).find(isVisible) || null;
+        resumeFrame = visibleResumeFrames[0] || null;
       }
 
       if (!resumeFrame) {
-        return { ok: false, reason: 'NO_CRESUME_IFRAME' };
+        return {
+          ok: false,
+          reason: 'NO_CRESUME_IFRAME',
+          debug: {
+            activeScopeCount: scopes.length,
+            totalResumeIframes: allResumeFrames.length,
+            visibleResumeIframes: visibleResumeFrames.length,
+            recommendFrameUrl: (() => {
+              try { return String(recommendFrame.contentWindow.location.href || ''); } catch { return ''; }
+            })()
+          }
+        };
       }
 
       const resumeDoc = resumeFrame.contentDocument;
@@ -143,7 +192,19 @@ function buildResumeProbeExpr({ init, targetScroll }) {
         || chooseScrollableAncestor(resumeFrame)
         || null;
       if (!scroller || !isVisible(scroller)) {
-        return { ok: false, reason: 'NO_SCROLL_CONTAINER' };
+        return {
+          ok: false,
+          reason: 'NO_SCROLL_CONTAINER',
+          debug: {
+            activeScopeCount: scopes.length,
+            totalResumeIframes: allResumeFrames.length,
+            visibleResumeIframes: visibleResumeFrames.length,
+            resumeFrameSrc: String(resumeFrame.src || ''),
+            scrollerFound: Boolean(scroller),
+            scrollerVisible: Boolean(scroller && isVisible(scroller)),
+            scrollerClass: scroller ? String(scroller.className || '') : ''
+          }
+        };
       }
 
       return {
@@ -285,9 +346,23 @@ async function captureFullResumeCanvas(options = {}) {
     await send("Page.bringToFront");
 
     let probe = null;
+    let lastProbe = null;
     const startTime = Date.now();
     while (Date.now() - startTime < waitResumeMs) {
-      probe = await evaluate(buildResumeProbeExpr({ init: true, targetScroll: 0 }));
+      try {
+        probe = await evaluate(buildResumeProbeExpr({ init: true, targetScroll: 0 }));
+      } catch (error) {
+        probe = {
+          ok: false,
+          reason: "PROBE_EVALUATE_FAILED",
+          debug: {
+            message: String(error?.message || error || "unknown")
+          }
+        };
+      }
+      if (probe && typeof probe === "object") {
+        lastProbe = probe;
+      }
       if (probe?.ok && probe.clip?.height > 80 && probe.clip?.width > 120) {
         break;
       }
@@ -295,7 +370,7 @@ async function captureFullResumeCanvas(options = {}) {
     }
 
     if (!probe?.ok) {
-      throw new Error(`Resume canvas not found in ${waitResumeMs}ms.`);
+      throw new Error(buildResumeProbeTimeoutMessage(waitResumeMs, lastProbe || probe));
     }
 
     const maxScroll = Math.max(0, Number(probe.maxScroll || 0));
