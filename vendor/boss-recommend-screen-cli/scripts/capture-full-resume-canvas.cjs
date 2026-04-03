@@ -9,6 +9,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS = 5000;
+const EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS = 4;
+
 function getJson(url) {
   return new Promise((resolve, reject) => {
     http
@@ -67,6 +70,25 @@ function buildResumeProbeTimeoutMessage(waitResumeMs, probe) {
     debug: probe?.debug || null
   };
   return `Resume canvas not found: wait_resume_ms=${waitResumeMs}; last_reason=${reason}; probe=${oneLineJson(payload)}`;
+}
+
+function isStableNoResumeIframeProbe(probe) {
+  if (!probe || probe.ok === true || probe.reason !== "NO_CRESUME_IFRAME") {
+    return false;
+  }
+  const activeScopeCount = Number(probe?.debug?.activeScopeCount ?? -1);
+  const totalResumeIframes = Number(probe?.debug?.totalResumeIframes ?? -1);
+  const visibleResumeIframes = Number(probe?.debug?.visibleResumeIframes ?? -1);
+  return activeScopeCount === 0 && totalResumeIframes === 0 && visibleResumeIframes === 0;
+}
+
+function shouldAbortResumeProbeEarly({ probe, stableNoResumeIframePolls, elapsedMs, waitResumeMs }) {
+  if (!isStableNoResumeIframeProbe(probe)) {
+    return false;
+  }
+  const minWaitMs = Math.min(waitResumeMs, EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS);
+  return stableNoResumeIframePolls >= EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS
+    && elapsedMs >= minWaitMs;
 }
 
 function buildResumeProbeExpr({ init, targetScroll }) {
@@ -347,6 +369,7 @@ async function captureFullResumeCanvas(options = {}) {
 
     let probe = null;
     let lastProbe = null;
+    let stableNoResumeIframePolls = 0;
     const startTime = Date.now();
     while (Date.now() - startTime < waitResumeMs) {
       try {
@@ -366,11 +389,38 @@ async function captureFullResumeCanvas(options = {}) {
       if (probe?.ok && probe.clip?.height > 80 && probe.clip?.width > 120) {
         break;
       }
+      if (isStableNoResumeIframeProbe(probe)) {
+        stableNoResumeIframePolls += 1;
+      } else {
+        stableNoResumeIframePolls = 0;
+      }
+      const elapsedMs = Date.now() - startTime;
+      if (shouldAbortResumeProbeEarly({
+        probe,
+        stableNoResumeIframePolls,
+        elapsedMs,
+        waitResumeMs
+      })) {
+        if (probe && typeof probe === "object") {
+          probe = {
+            ...probe,
+            debug: {
+              ...(probe.debug && typeof probe.debug === "object" ? probe.debug : {}),
+              earlyAbort: true,
+              stableNoResumeIframePolls,
+              elapsedMs
+            }
+          };
+          lastProbe = probe;
+        }
+        break;
+      }
       await sleep(700);
     }
 
     if (!probe?.ok) {
-      throw new Error(buildResumeProbeTimeoutMessage(waitResumeMs, lastProbe || probe));
+      const elapsedMs = Math.max(0, Date.now() - startTime);
+      throw new Error(buildResumeProbeTimeoutMessage(Math.min(waitResumeMs, elapsedMs), lastProbe || probe));
     }
 
     const maxScroll = Math.max(0, Number(probe.maxScroll || 0));
@@ -467,7 +517,13 @@ async function captureFullResumeCanvas(options = {}) {
 }
 
 module.exports = {
-  captureFullResumeCanvas
+  captureFullResumeCanvas,
+  __testables: {
+    EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS,
+    EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS,
+    isStableNoResumeIframeProbe,
+    shouldAbortResumeProbeEarly
+  }
 };
 
 if (require.main === module) {

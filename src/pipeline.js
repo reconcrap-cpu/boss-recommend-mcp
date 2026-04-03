@@ -4,10 +4,15 @@ import {
   attemptPipelineAutoRepair,
   ensureBossRecommendPageReady,
   listRecommendJobs,
+  refreshBossRecommendList,
+  reloadBossRecommendPage,
   runPipelinePreflight,
   runRecommendSearchCli,
   runRecommendScreenCli
 } from "./adapters.js";
+
+const FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY = "近14天没有";
+const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 5;
 
 function dedupe(values = []) {
   return [...new Set(values.filter(Boolean))];
@@ -495,6 +500,8 @@ const defaultDependencies = {
   parseRecommendInstruction,
   ensureBossRecommendPageReady,
   listRecommendJobs,
+  refreshBossRecommendList,
+  reloadBossRecommendPage,
   runPipelinePreflight,
   runRecommendSearchCli,
   runRecommendScreenCli
@@ -512,6 +519,8 @@ export async function runRecommendPipeline(
     parseRecommendInstruction: parseInstruction,
     ensureBossRecommendPageReady: ensureRecommendPageReady,
     listRecommendJobs: listJobs,
+    refreshBossRecommendList: refreshRecommendList,
+    reloadBossRecommendPage: reloadRecommendPage,
     runPipelinePreflight: runPreflight,
     runRecommendSearchCli: searchCli,
     runRecommendScreenCli: screenCli
@@ -809,177 +818,409 @@ export async function runRecommendPipeline(
   const isResumeRun = resume?.resume === true;
   const resumeFromPausedBeforeScreen = isResumeRun && resumeCompletionReason === "paused_before_screen";
   const skipSearchOnResume = isResumeRun && !resumeFromPausedBeforeScreen;
+  let effectiveSearchParams = { ...parsed.searchParams };
   let searchSummary = null;
+  let shouldRunSearch = !skipSearchOnResume;
+  let screenAutoRecoveryCount = 0;
+  let lastAutoRecovery = null;
+  let currentResumeConfig = {
+    checkpoint_path: resume?.checkpoint_path || null,
+    pause_control_path: resume?.pause_control_path || null,
+    output_csv: resume?.output_csv || null,
+    resume: resume?.resume === true,
+    require_checkpoint: skipSearchOnResume
+  };
 
-  if (!skipSearchOnResume) {
-    ensurePipelineNotAborted(runtimeHooks.signal);
-    runtimeHooks.setStage("search", "岗位已确认，开始执行 recommend search。");
-    runtimeHooks.heartbeat("search");
-    const searchResult = await searchCli({
+  while (true) {
+    if (shouldRunSearch) {
+      ensurePipelineNotAborted(runtimeHooks.signal);
+      runtimeHooks.setStage(
+        "search",
+        screenAutoRecoveryCount > 0
+          ? `自动恢复第 ${screenAutoRecoveryCount} 次：重新执行 recommend search（强制 recent_not_view=${FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY}）。`
+          : "岗位已确认，开始执行 recommend search。"
+      );
+      runtimeHooks.heartbeat("search", lastAutoRecovery);
+      const searchResult = await searchCli({
+        workspaceRoot,
+        searchParams: effectiveSearchParams,
+        selectedJob: selectedJobToken,
+        runtime: runtimeHooks.adapterRuntime("search")
+      });
+      ensurePipelineNotAborted(runtimeHooks.signal);
+      if (isProcessAbortError(searchResult.error)) {
+        throw new PipelineAbortError(searchResult.error?.message || "推荐筛选已取消。");
+      }
+      if (!searchResult.ok) {
+        const searchErrorCode = String(searchResult.error?.code || "");
+        const searchErrorMessage = String(searchResult.error?.message || "");
+        const loginRelatedSearchFailure = (
+          searchErrorCode === "LOGIN_REQUIRED"
+          || searchErrorCode === "NO_RECOMMEND_IFRAME"
+          || searchErrorMessage.includes("LOGIN_REQUIRED")
+          || searchErrorMessage.includes("NO_RECOMMEND_IFRAME")
+        );
+        if (loginRelatedSearchFailure) {
+          const recheck = await ensureRecommendPageReady(workspaceRoot, {
+            port: preflight.debug_port
+          });
+          if (recheck.state === "LOGIN_REQUIRED" || recheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT") {
+            const guidance = buildChromeSetupGuidance({
+              debugPort: preflight.debug_port,
+              pageState: recheck.page_state
+            });
+            return buildFailedResponse(
+              "BOSS_LOGIN_REQUIRED",
+              "检测到当前 Boss 处于未登录状态，请先登录后再继续。登录页：https://www.zhipin.com/web/user/?ka=bticket",
+              {
+                search_params: effectiveSearchParams,
+                screen_params: parsed.screenParams,
+                selected_job: selectedJob,
+                required_user_action: "prepare_boss_recommend_page",
+                guidance,
+                diagnostics: {
+                  debug_port: preflight.debug_port,
+                  page_state: recheck.page_state,
+                  stdout: searchResult.stdout?.slice(-1000),
+                  stderr: searchResult.stderr?.slice(-1000),
+                  result: searchResult.structured || null,
+                  auto_recovery: lastAutoRecovery
+                }
+              }
+            );
+          }
+        }
+        return buildFailedResponse(
+          searchResult.error?.code || "RECOMMEND_SEARCH_FAILED",
+          searchResult.error?.message || "推荐页筛选执行失败。",
+          {
+            search_params: effectiveSearchParams,
+            screen_params: parsed.screenParams,
+            selected_job: selectedJob,
+            diagnostics: {
+              debug_port: preflight.debug_port,
+              stdout: searchResult.stdout?.slice(-1000),
+              stderr: searchResult.stderr?.slice(-1000),
+              result: searchResult.structured || null,
+              auto_recovery: lastAutoRecovery
+            }
+          }
+        );
+      }
+
+      searchSummary = searchResult.summary || {};
+      if (isPauseRequested(runtimeHooks)) {
+        return buildPausedResponse("已在 screen 阶段开始前暂停 Recommend 流水线。", {
+          search_params: effectiveSearchParams,
+          screen_params: parsed.screenParams,
+          selected_job: selectedJob,
+          partial_result: {
+            candidate_count: searchSummary.candidate_count ?? null,
+            applied_filters: searchSummary.applied_filters || effectiveSearchParams,
+            output_csv: currentResumeConfig.output_csv || null,
+            completion_reason: "paused_before_screen"
+          }
+        });
+      }
+      ensurePipelineNotAborted(runtimeHooks.signal);
+      runtimeHooks.setStage("screen", "search 完成，开始执行 recommend screen。");
+    } else {
+      ensurePipelineNotAborted(runtimeHooks.signal);
+      runtimeHooks.setStage("screen", "检测到可续跑 checkpoint，跳过 search，直接恢复 recommend screen。");
+    }
+
+    runtimeHooks.heartbeat("screen", lastAutoRecovery);
+    const screenResult = await screenCli({
       workspaceRoot,
-      searchParams: parsed.searchParams,
-      selectedJob: selectedJobToken,
-      runtime: runtimeHooks.adapterRuntime("search")
+      screenParams: parsed.screenParams,
+      resume: currentResumeConfig,
+      runtime: runtimeHooks.adapterRuntime("screen")
     });
     ensurePipelineNotAborted(runtimeHooks.signal);
-    if (isProcessAbortError(searchResult.error)) {
-      throw new PipelineAbortError(searchResult.error?.message || "推荐筛选已取消。");
+    if (isProcessAbortError(screenResult.error)) {
+      throw new PipelineAbortError(screenResult.error?.message || "推荐筛选已取消。");
     }
-    if (!searchResult.ok) {
-      const searchErrorCode = String(searchResult.error?.code || "");
-      const searchErrorMessage = String(searchResult.error?.message || "");
-      const loginRelatedSearchFailure = (
-        searchErrorCode === "LOGIN_REQUIRED"
-        || searchErrorCode === "NO_RECOMMEND_IFRAME"
-        || searchErrorMessage.includes("LOGIN_REQUIRED")
-        || searchErrorMessage.includes("NO_RECOMMEND_IFRAME")
-      );
-      if (loginRelatedSearchFailure) {
-        const recheck = await ensureRecommendPageReady(workspaceRoot, {
+    if (screenResult.paused) {
+      return buildPausedResponse("Recommend 流水线已暂停，可使用 resume 继续。", {
+        search_params: effectiveSearchParams,
+        screen_params: parsed.screenParams,
+        selected_job: selectedJob,
+        partial_result: screenResult.summary || screenResult.structured?.result || null
+      });
+    }
+    if (!screenResult.ok) {
+      const screenErrorCode = String(screenResult.error?.code || "");
+      const partialScreenResult = screenResult.summary || screenResult.structured?.result || null;
+      const resumeOutputCsv = normalizeText(partialScreenResult?.output_csv || currentResumeConfig.output_csv || "");
+      const hasCheckpointForRecovery = Boolean(normalizeText(currentResumeConfig.checkpoint_path || ""));
+      const screenPartialForRecovery = partialScreenResult
+        ? {
+            processed_count: partialScreenResult.processed_count ?? null,
+            passed_count: partialScreenResult.passed_count ?? null,
+            skipped_count: partialScreenResult.skipped_count ?? null,
+            output_csv: partialScreenResult.output_csv || currentResumeConfig.output_csv || null,
+            checkpoint_path: partialScreenResult.checkpoint_path || currentResumeConfig.checkpoint_path || null,
+            completion_reason: partialScreenResult.completion_reason || null
+          }
+        : null;
+      const isResumeCaptureRecovery = screenErrorCode === "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT";
+      const isPageExhaustedRecovery = screenErrorCode === "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED";
+      const isRecoverableScreenFailure = isResumeCaptureRecovery || isPageExhaustedRecovery;
+      const canRecoverSafely = hasCheckpointForRecovery && Boolean(resumeOutputCsv);
+      const hasRecoveryAttemptsRemaining = screenAutoRecoveryCount < MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS;
+
+      if (isRecoverableScreenFailure && !canRecoverSafely) {
+        return buildFailedResponse(
+          "SCREEN_AUTO_RECOVERY_UNSAFE",
+          "检测到 recommend 自动恢复触发，但缺少 checkpoint 或 output_csv，无法安全续跑。",
+          {
+            search_params: effectiveSearchParams,
+            screen_params: parsed.screenParams,
+            selected_job: selectedJob,
+            partial_result: partialScreenResult,
+            diagnostics: {
+              debug_port: preflight.debug_port,
+              stdout: screenResult.stdout?.slice(-1000),
+              stderr: screenResult.stderr?.slice(-1000),
+              result: screenResult.structured || null,
+              auto_recovery: {
+                trigger: screenErrorCode,
+                attempt: screenAutoRecoveryCount,
+                max_attempts: MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS,
+                original_recent_not_view: parsed.searchParams.recent_not_view,
+                effective_recent_not_view: effectiveSearchParams.recent_not_view,
+                partial_result: screenPartialForRecovery
+              }
+            }
+          }
+        );
+      }
+
+      if (isRecoverableScreenFailure && !hasRecoveryAttemptsRemaining) {
+        return buildFailedResponse(
+          screenResult.error?.code || "RECOMMEND_SCREEN_FAILED",
+          `${screenResult.error?.message || "推荐页筛选执行失败。"} 已达到自动恢复上限 ${MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS} 次。`,
+          {
+            search_params: effectiveSearchParams,
+            screen_params: parsed.screenParams,
+            selected_job: selectedJob,
+            partial_result: partialScreenResult,
+            diagnostics: {
+              debug_port: preflight.debug_port,
+              stdout: screenResult.stdout?.slice(-1000),
+              stderr: screenResult.stderr?.slice(-1000),
+              result: screenResult.structured || null,
+              auto_recovery: lastAutoRecovery
+            }
+          }
+        );
+      }
+
+      if (isRecoverableScreenFailure && canRecoverSafely && hasRecoveryAttemptsRemaining) {
+        screenAutoRecoveryCount += 1;
+        lastAutoRecovery = {
+          trigger: screenErrorCode,
+          attempt: screenAutoRecoveryCount,
+          max_attempts: MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS,
+          original_recent_not_view: parsed.searchParams.recent_not_view,
+          effective_recent_not_view: effectiveSearchParams.recent_not_view,
+          partial_result: screenPartialForRecovery,
+          page_exhaustion: screenResult.error?.page_exhaustion || null
+        };
+
+        if (isPageExhaustedRecovery) {
+          runtimeHooks.setStage(
+            "screen_recovery",
+            `推荐列表已到底但未达目标，开始自动补货（第 ${screenAutoRecoveryCount} 次）：优先尝试页内刷新。`
+          );
+          runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
+
+          const refreshResult = typeof refreshRecommendList === "function"
+            ? await refreshRecommendList(workspaceRoot, {
+                port: preflight.debug_port
+              })
+            : {
+                ok: false,
+                action: "in_page_refresh",
+                state: "REFRESH_ADAPTER_MISSING",
+                message: "缺少页内刷新适配器。"
+              };
+          ensurePipelineNotAborted(runtimeHooks.signal);
+
+          lastAutoRecovery = {
+            ...lastAutoRecovery,
+            refresh: refreshResult
+              ? {
+                  ok: refreshResult.ok,
+                  state: refreshResult.state || null,
+                  message: refreshResult.message || null,
+                  before_state: refreshResult.before_state || null,
+                  after_state: refreshResult.after_state || null
+                }
+              : null
+          };
+
+          if (refreshResult?.ok) {
+            lastAutoRecovery = {
+              ...lastAutoRecovery,
+              action: "in_page_refresh"
+            };
+            currentResumeConfig = {
+              checkpoint_path: currentResumeConfig.checkpoint_path || null,
+              pause_control_path: currentResumeConfig.pause_control_path || null,
+              output_csv: resumeOutputCsv || null,
+              resume: true,
+              require_checkpoint: true
+            };
+            shouldRunSearch = false;
+            searchSummary = null;
+            continue;
+          }
+
+          runtimeHooks.setStage(
+            "screen_recovery",
+            `页内刷新不可用（${refreshResult?.state || "unknown"}），改为刷新 recommend 页面并重跑 search。`
+          );
+          runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
+        } else {
+          runtimeHooks.setStage(
+            "screen_recovery",
+            `screen 连续截图失败，开始自动恢复（第 ${screenAutoRecoveryCount} 次）：刷新 recommend 页面并重跑 search。`
+          );
+          runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
+        }
+
+        effectiveSearchParams = {
+          ...effectiveSearchParams,
+          recent_not_view: FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY
+        };
+        lastAutoRecovery = {
+          ...lastAutoRecovery,
+          action: "reload_page_and_rerun_search",
+          effective_recent_not_view: effectiveSearchParams.recent_not_view
+        };
+
+        const reloadResult = typeof reloadRecommendPage === "function"
+          ? await reloadRecommendPage(workspaceRoot, {
+              port: preflight.debug_port
+            })
+          : null;
+        ensurePipelineNotAborted(runtimeHooks.signal);
+
+        lastAutoRecovery = {
+          ...lastAutoRecovery,
+          reload: reloadResult
+            ? {
+                ok: reloadResult.ok,
+                state: reloadResult.state || null,
+                message: reloadResult.message || null,
+                reloaded_url: reloadResult.reloaded_url || null
+              }
+            : null
+        };
+
+        const recoveryPageCheck = await ensureRecommendPageReady(workspaceRoot, {
           port: preflight.debug_port
         });
-        if (recheck.state === "LOGIN_REQUIRED" || recheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT") {
+        ensurePipelineNotAborted(runtimeHooks.signal);
+        if (!recoveryPageCheck.ok) {
           const guidance = buildChromeSetupGuidance({
             debugPort: preflight.debug_port,
-            pageState: recheck.page_state
+            pageState: recoveryPageCheck.page_state
           });
           return buildFailedResponse(
-            "BOSS_LOGIN_REQUIRED",
-            "检测到当前 Boss 处于未登录状态，请先登录后再继续。登录页：https://www.zhipin.com/web/user/?ka=bticket",
+            recoveryPageCheck.state === "LOGIN_REQUIRED" || recoveryPageCheck.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+              ? "BOSS_LOGIN_REQUIRED"
+              : recoveryPageCheck.state === "DEBUG_PORT_UNREACHABLE"
+                ? "BOSS_CHROME_NOT_CONNECTED"
+                : "BOSS_RECOMMEND_PAGE_NOT_READY",
+            "自动恢复时无法重新就绪 recommend 页面，请先处理页面状态后再继续。",
             {
-              search_params: parsed.searchParams,
+              search_params: effectiveSearchParams,
               screen_params: parsed.screenParams,
               selected_job: selectedJob,
+              partial_result: partialScreenResult,
               required_user_action: "prepare_boss_recommend_page",
               guidance,
               diagnostics: {
                 debug_port: preflight.debug_port,
-                page_state: recheck.page_state,
-                stdout: searchResult.stdout?.slice(-1000),
-                stderr: searchResult.stderr?.slice(-1000),
-                result: searchResult.structured || null
+                page_state: recoveryPageCheck.page_state,
+                stdout: screenResult.stdout?.slice(-1000),
+                stderr: screenResult.stderr?.slice(-1000),
+                result: screenResult.structured || null,
+                auto_recovery: lastAutoRecovery
               }
             }
           );
         }
+
+        currentResumeConfig = {
+          checkpoint_path: currentResumeConfig.checkpoint_path || null,
+          pause_control_path: currentResumeConfig.pause_control_path || null,
+          output_csv: resumeOutputCsv || null,
+          resume: true,
+          require_checkpoint: true
+        };
+        shouldRunSearch = true;
+        searchSummary = null;
+        continue;
       }
+
       return buildFailedResponse(
-        searchResult.error?.code || "RECOMMEND_SEARCH_FAILED",
-        searchResult.error?.message || "推荐页筛选执行失败。",
+        screenResult.error?.code || "RECOMMEND_SCREEN_FAILED",
+        screenResult.error?.message || "推荐页筛选执行失败。",
         {
-          search_params: parsed.searchParams,
+          search_params: effectiveSearchParams,
           screen_params: parsed.screenParams,
           selected_job: selectedJob,
+          partial_result: partialScreenResult,
           diagnostics: {
             debug_port: preflight.debug_port,
-            stdout: searchResult.stdout?.slice(-1000),
-            stderr: searchResult.stderr?.slice(-1000),
-            result: searchResult.structured || null
+            stdout: screenResult.stdout?.slice(-1000),
+            stderr: screenResult.stderr?.slice(-1000),
+            result: screenResult.structured || null,
+            auto_recovery: lastAutoRecovery
           }
         }
       );
     }
 
-    searchSummary = searchResult.summary || {};
-    if (isPauseRequested(runtimeHooks)) {
-      return buildPausedResponse("已在 screen 阶段开始前暂停 Recommend 流水线。", {
-        search_params: parsed.searchParams,
-        screen_params: parsed.screenParams,
-        selected_job: selectedJob,
-        partial_result: {
-          candidate_count: searchSummary.candidate_count ?? null,
-          applied_filters: searchSummary.applied_filters || parsed.searchParams,
-          output_csv: resume?.output_csv || null,
-          completion_reason: "paused_before_screen"
-        }
-      });
-    }
-    ensurePipelineNotAborted(runtimeHooks.signal);
-    runtimeHooks.setStage("screen", "search 完成，开始执行 recommend screen。");
-  } else {
-    ensurePipelineNotAborted(runtimeHooks.signal);
-    runtimeHooks.setStage("screen", "检测到可续跑 checkpoint，跳过 search，直接恢复 recommend screen。");
-  }
-
-  runtimeHooks.heartbeat("screen");
-  const screenResult = await screenCli({
-    workspaceRoot,
-    screenParams: parsed.screenParams,
-    resume: {
-      checkpoint_path: resume?.checkpoint_path || null,
-      pause_control_path: resume?.pause_control_path || null,
-      output_csv: resume?.output_csv || null,
-      resume: resume?.resume === true,
-      require_checkpoint: skipSearchOnResume
-    },
-    runtime: runtimeHooks.adapterRuntime("screen")
-  });
-  ensurePipelineNotAborted(runtimeHooks.signal);
-  if (isProcessAbortError(screenResult.error)) {
-    throw new PipelineAbortError(screenResult.error?.message || "推荐筛选已取消。");
-  }
-  if (screenResult.paused) {
-    return buildPausedResponse("Recommend 流水线已暂停，可使用 resume 继续。", {
-      search_params: parsed.searchParams,
-      screen_params: parsed.screenParams,
-      selected_job: selectedJob,
-      partial_result: screenResult.summary || screenResult.structured?.result || null
+    runtimeHooks.setStage("finalize", "screen 完成，正在汇总结果。");
+    runtimeHooks.heartbeat("finalize");
+    const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    const finalSearchSummary = searchSummary || {};
+    const screenSummary = screenResult.summary || {};
+    runtimeHooks.progress("finalize", {
+      processed: screenSummary.processed_count ?? 0,
+      passed: screenSummary.passed_count ?? 0,
+      skipped: screenSummary.skipped_count ?? 0,
+      greet_count: screenSummary.greet_count ?? 0
     });
-  }
-  if (!screenResult.ok) {
-    const partialScreenResult = screenResult.summary || screenResult.structured?.result || null;
-    return buildFailedResponse(
-      screenResult.error?.code || "RECOMMEND_SCREEN_FAILED",
-      screenResult.error?.message || "推荐页筛选执行失败。",
-      {
-        search_params: parsed.searchParams,
-        screen_params: parsed.screenParams,
-        selected_job: selectedJob,
-        partial_result: partialScreenResult,
-        diagnostics: {
-          debug_port: preflight.debug_port,
-          stdout: screenResult.stdout?.slice(-1000),
-          stderr: screenResult.stderr?.slice(-1000),
-          result: screenResult.structured || null
-        }
-      }
-    );
-  }
 
-  runtimeHooks.setStage("finalize", "screen 完成，正在汇总结果。");
-  runtimeHooks.heartbeat("finalize");
-  const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-  const finalSearchSummary = searchSummary || {};
-  const screenSummary = screenResult.summary || {};
-  runtimeHooks.progress("finalize", {
-    processed: screenSummary.processed_count ?? 0,
-    passed: screenSummary.passed_count ?? 0,
-    skipped: screenSummary.skipped_count ?? 0,
-    greet_count: screenSummary.greet_count ?? 0
-  });
-
-  return {
-    status: "COMPLETED",
-    search_params: parsed.searchParams,
-    screen_params: parsed.screenParams,
-    result: {
-      candidate_count: finalSearchSummary.candidate_count ?? null,
-      applied_filters: finalSearchSummary.applied_filters || parsed.searchParams,
-      processed_count: screenSummary.processed_count ?? 0,
-      passed_count: screenSummary.passed_count ?? 0,
-      skipped_count: screenSummary.skipped_count ?? 0,
-      duration_sec: durationSec,
-      output_csv: screenSummary.output_csv || null,
-      completion_reason: screenSummary.completion_reason || "screen_completed",
-      page_state: finalSearchSummary.page_state || pageCheck.page_state,
-      selected_job: finalSearchSummary.selected_job || selectedJob,
-      post_action: parsed.screenParams.post_action,
-      max_greet_count: parsed.screenParams.max_greet_count,
-      greet_count: screenSummary.greet_count ?? 0,
-      greet_limit_fallback_count: screenSummary.greet_limit_fallback_count ?? 0
-    },
-    message: parsed.screenParams.post_action === "none"
-      ? "Recommend 流水线已完成。本次 post_action=none：符合条件的人选仅记录到 CSV，不执行收藏或打招呼。"
-      : "Recommend 流水线已完成。post_action 在运行开始时已一次性确认；若选择打招呼并设置上限，超出上限后会自动改为收藏。"
-  };
+    return {
+      status: "COMPLETED",
+      search_params: effectiveSearchParams,
+      screen_params: parsed.screenParams,
+      result: {
+        candidate_count: finalSearchSummary.candidate_count ?? null,
+        applied_filters: finalSearchSummary.applied_filters || effectiveSearchParams,
+        processed_count: screenSummary.processed_count ?? 0,
+        passed_count: screenSummary.passed_count ?? 0,
+        skipped_count: screenSummary.skipped_count ?? 0,
+        duration_sec: durationSec,
+        output_csv: screenSummary.output_csv || null,
+        completion_reason: screenSummary.completion_reason || "screen_completed",
+        page_state: finalSearchSummary.page_state || pageCheck.page_state,
+        selected_job: finalSearchSummary.selected_job || selectedJob,
+        post_action: parsed.screenParams.post_action,
+        max_greet_count: parsed.screenParams.max_greet_count,
+        greet_count: screenSummary.greet_count ?? 0,
+        greet_limit_fallback_count: screenSummary.greet_limit_fallback_count ?? 0,
+        auto_recovery: lastAutoRecovery
+      },
+      message: parsed.screenParams.post_action === "none"
+        ? "Recommend 流水线已完成。本次 post_action=none：符合条件的人选仅记录到 CSV，不执行收藏或打招呼。"
+        : "Recommend 流水线已完成。post_action 在运行开始时已一次性确认；若选择打招呼并设置上限，超出上限后会自动改为收藏。"
+    };
+  }
 }

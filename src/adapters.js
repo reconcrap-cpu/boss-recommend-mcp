@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import CDP from "chrome-remote-interface";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const packagedMcpDir = path.resolve(path.dirname(currentFilePath), "..");
@@ -1381,6 +1382,290 @@ async function verifyRecommendPageStable(port, options = {}) {
     });
   }
   return recheck;
+}
+
+function pickBossRecommendReloadTarget(tabs = []) {
+  return tabs.find(
+    (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/recommend")
+  ) || tabs.find(
+    (tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")
+  ) || null;
+}
+
+async function evaluateCdpExpression(client, expression) {
+  const result = await client.Runtime.evaluate({
+    expression,
+    returnByValue: true,
+    awaitPromise: true
+  });
+  if (result.exceptionDetails) {
+    throw new Error(result.exceptionDetails.exception?.description || "Runtime.evaluate failed");
+  }
+  return result.result?.value;
+}
+
+function buildRecommendRefreshStateExpression() {
+  return `(() => {
+    const frame = document.querySelector('iframe[name="recommendFrame"]')
+      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+      || document.querySelector('iframe');
+    if (!frame || !frame.contentDocument) {
+      return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+    }
+    const doc = frame.contentDocument;
+    const isVisible = (el) => {
+      if (!el) return false;
+      const win = doc.defaultView;
+      if (!win) return el.offsetParent !== null;
+      const style = win.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2 && el.offsetParent !== null;
+    };
+    const finishedWrap = Array.from(doc.querySelectorAll('.finished-wrap')).find((el) => isVisible(el)) || null;
+    const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
+      .find((el) => isVisible(el)) || null;
+    const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
+    const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
+    const finishedText = finishedWrap ? String(finishedWrap.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+    const buttonText = refreshButton ? String(refreshButton.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+    return {
+      ok: true,
+      frame_url: (() => {
+        try { return String(frame.contentWindow.location.href || ''); } catch { return ''; }
+      })(),
+      finished_wrap_visible: Boolean(finishedWrap),
+      finished_wrap_text: finishedText || null,
+      refresh_button_visible: Boolean(refreshButton),
+      refresh_button_text: buttonText || null,
+      candidate_count: candidateCards.length,
+      total_card_count: cards.length,
+      list_ready: candidateCards.length > 0
+    };
+  })()`;
+}
+
+function buildRecommendRefreshClickExpression() {
+  return `(() => {
+    const frame = document.querySelector('iframe[name="recommendFrame"]')
+      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+      || document.querySelector('iframe');
+    if (!frame || !frame.contentDocument) {
+      return { ok: false, state: 'NO_RECOMMEND_IFRAME' };
+    }
+    const doc = frame.contentDocument;
+    const isVisible = (el) => {
+      if (!el) return false;
+      const win = doc.defaultView;
+      if (!win) return el.offsetParent !== null;
+      const style = win.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2 && el.offsetParent !== null;
+    };
+    const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
+      .find((el) => isVisible(el)) || null;
+    if (!refreshButton) {
+      return { ok: false, state: 'REFRESH_BUTTON_NOT_FOUND' };
+    }
+    try {
+      refreshButton.click();
+      return {
+        ok: true,
+        state: 'REFRESH_BUTTON_CLICKED',
+        refresh_button_text: String(refreshButton.textContent || '').replace(/\\s+/g, ' ').trim() || null
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        state: 'REFRESH_BUTTON_CLICK_FAILED',
+        message: error?.message || String(error)
+      };
+    }
+  })()`;
+}
+
+export async function refreshBossRecommendList(workspaceRoot, options = {}) {
+  const debugPort = Number.isFinite(options.port)
+    ? options.port
+    : resolveWorkspaceDebugPort(workspaceRoot);
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 600;
+  const reloadTimeoutMs = Number.isFinite(options.reloadTimeoutMs) ? options.reloadTimeoutMs : 10000;
+
+  let client = null;
+  try {
+    const tabs = await listChromeTabs(debugPort);
+    const target = pickBossRecommendReloadTarget(tabs);
+    if (!target) {
+      return {
+        ok: false,
+        action: "in_page_refresh",
+        debug_port: debugPort,
+        state: "BOSS_TAB_NOT_FOUND",
+        message: "未找到可操作的 Boss recommend 标签页。",
+        before_state: null,
+        after_state: null
+      };
+    }
+
+    client = await CDP({ port: debugPort, target });
+    const { Page, Runtime } = client;
+    if (Runtime && typeof Runtime.enable === "function") {
+      await Runtime.enable();
+    }
+    if (Page && typeof Page.enable === "function") {
+      await Page.enable();
+    }
+    if (Page && typeof Page.bringToFront === "function") {
+      await Page.bringToFront();
+    }
+
+    const beforeState = await evaluateCdpExpression(client, buildRecommendRefreshStateExpression());
+    if (!beforeState?.ok) {
+      return {
+        ok: false,
+        action: "in_page_refresh",
+        debug_port: debugPort,
+        state: beforeState?.error || "NO_RECOMMEND_IFRAME",
+        message: "未能读取 recommend iframe，无法执行页内刷新。",
+        before_state: beforeState || null,
+        after_state: null
+      };
+    }
+    if (!beforeState.refresh_button_visible) {
+      return {
+        ok: false,
+        action: "in_page_refresh",
+        debug_port: debugPort,
+        state: "REFRESH_BUTTON_NOT_FOUND",
+        message: "推荐列表到底后未发现可点击的刷新按钮。",
+        before_state: beforeState,
+        after_state: beforeState
+      };
+    }
+
+    const clickResult = await evaluateCdpExpression(client, buildRecommendRefreshClickExpression());
+    if (!clickResult?.ok) {
+      return {
+        ok: false,
+        action: "in_page_refresh",
+        debug_port: debugPort,
+        state: clickResult?.state || "REFRESH_BUTTON_CLICK_FAILED",
+        message: clickResult?.message || "页内刷新按钮点击失败。",
+        before_state: beforeState,
+        after_state: null
+      };
+    }
+
+    const deadline = Date.now() + reloadTimeoutMs;
+    let lastState = beforeState;
+    while (Date.now() < deadline) {
+      await sleep(pollMs);
+      lastState = await evaluateCdpExpression(client, buildRecommendRefreshStateExpression());
+      if (lastState?.ok && lastState.finished_wrap_visible === false && lastState.list_ready === true) {
+        return {
+          ok: true,
+          action: "in_page_refresh",
+          debug_port: debugPort,
+          state: "RECOMMEND_READY",
+          message: "已点击页内刷新按钮并重新拿到候选人列表。",
+          before_state: beforeState,
+          after_state: lastState
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      action: "in_page_refresh",
+      debug_port: debugPort,
+      state: "LIST_NOT_RELOADED",
+      message: "已点击页内刷新按钮，但候选人列表未在超时内重新就绪。",
+      before_state: beforeState,
+      after_state: lastState
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      action: "in_page_refresh",
+      debug_port: debugPort,
+      state: "REFRESH_BUTTON_CLICK_FAILED",
+      message: error?.message || "页内刷新失败。",
+      before_state: null,
+      after_state: null
+    };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
+}
+
+export async function reloadBossRecommendPage(workspaceRoot, options = {}) {
+  const debugPort = Number.isFinite(options.port)
+    ? options.port
+    : resolveWorkspaceDebugPort(workspaceRoot);
+  const settleMs = Number.isFinite(options.settleMs) ? options.settleMs : 1200;
+  const recheckTimeoutMs = Number.isFinite(options.recheckTimeoutMs) ? options.recheckTimeoutMs : 4000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 600;
+
+  let client = null;
+  try {
+    const tabs = await listChromeTabs(debugPort);
+    const target = pickBossRecommendReloadTarget(tabs);
+    if (!target) {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: "BOSS_TAB_NOT_FOUND",
+        page_state: null,
+        message: "未找到可刷新的 Boss 标签页。"
+      };
+    }
+
+    client = await CDP({ port: debugPort, target });
+    const { Page } = client;
+    if (Page && typeof Page.enable === "function") {
+      await Page.enable();
+    }
+    if (Page && typeof Page.bringToFront === "function") {
+      await Page.bringToFront();
+    }
+    await Page.reload({ ignoreCache: true });
+
+    const stableState = await verifyRecommendPageStable(debugPort, {
+      settleMs,
+      recheckTimeoutMs,
+      pollMs
+    });
+    return {
+      ok: stableState.state === "RECOMMEND_READY",
+      debug_port: debugPort,
+      state: stableState.state,
+      page_state: stableState,
+      reloaded_url: target.url || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "RELOAD_FAILED",
+      page_state: null,
+      message: error?.message || "刷新 Boss recommend 页面失败。"
+    };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
 }
 
 export async function ensureBossRecommendPageReady(workspaceRoot, options = {}) {

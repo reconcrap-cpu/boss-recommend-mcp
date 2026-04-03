@@ -12,6 +12,7 @@ const CSV_HEADER = ["姓名", "最高学历学校", "最高学历专业", "最�
 const RESUME_CAPTURE_WAIT_MS = 60000;
 const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
 const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
+const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
 
 function log(...args) {
   console.error(...args);
@@ -449,6 +450,20 @@ const jsDetectBottom = `(() => {
     return { isBottom: false, error: 'NO_RECOMMEND_IFRAME' };
   }
   const doc = frame.contentDocument;
+  const isVisible = (el) => {
+    if (!el) return false;
+    const win = doc.defaultView;
+    if (!win) return el.offsetParent !== null;
+    const style = win.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2 && el.offsetParent !== null;
+  };
+  const finishedWrap = Array.from(doc.querySelectorAll('.finished-wrap')).find((el) => isVisible(el)) || null;
+  const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
+    .find((el) => isVisible(el)) || null;
   const keywords = ['没有更多', '已显示全部', '已经到底', '暂无更多', '推荐完了', '没有更多人选'];
   const elements = Array.from(doc.querySelectorAll('div,span,p'));
   for (const el of elements) {
@@ -457,11 +472,23 @@ const jsDetectBottom = `(() => {
     if (!text || text.length > 40) continue;
     for (const keyword of keywords) {
       if (text.includes(keyword)) {
-        return { isBottom: true, reason: keyword };
+        return {
+          isBottom: true,
+          reason: keyword,
+          finished_wrap_visible: Boolean(finishedWrap),
+          refresh_button_visible: Boolean(refreshButton),
+          refresh_button_text: refreshButton ? String(refreshButton.textContent || '').replace(/\s+/g, ' ').trim() : null
+        };
       }
     }
   }
-  return { isBottom: false };
+  return {
+    isBottom: Boolean(finishedWrap),
+    reason: finishedWrap ? 'finished-wrap' : null,
+    finished_wrap_visible: Boolean(finishedWrap),
+    refresh_button_visible: Boolean(refreshButton),
+    refresh_button_text: refreshButton ? String(refreshButton.textContent || '').replace(/\s+/g, ' ').trim() : null
+  };
 })()`;
 const jsWaitForDetail = `(() => {
   const frame = document.querySelector('iframe[name="recommendFrame"]')
@@ -1053,6 +1080,8 @@ class RecommendScreenCli {
     this.skippedCount = 0;
     this.greetCount = 0;
     this.greetLimitFallbackCount = 0;
+    this.consecutiveResumeCaptureFailures = 0;
+    this.resumeCaptureFailureStreakKeys = [];
     this.restCounter = 0;
     this.restThreshold = 25 + Math.floor(Math.random() * 8);
     this.checkpointPath = this.args.checkpointPath ? path.resolve(this.args.checkpointPath) : null;
@@ -1107,6 +1136,67 @@ class RecommendScreenCli {
         summary: item?.summary || "",
         imagePath: item?.imagePath || ""
       }))
+    };
+  }
+
+  buildProgressSnapshot(completionReason = null) {
+    const snapshot = {
+      processed_count: this.processedCount,
+      passed_count: this.passedCandidates.length,
+      skipped_count: this.skippedCount,
+      output_csv: this.args.output,
+      checkpoint_path: this.checkpointPath,
+      post_action: this.args.postAction,
+      max_greet_count: this.args.postAction === "greet" ? this.args.maxGreetCount : null,
+      greet_count: this.greetCount,
+      greet_limit_fallback_count: this.greetLimitFallbackCount
+    };
+    if (completionReason) {
+      snapshot.completion_reason = completionReason;
+    }
+    return snapshot;
+  }
+
+  resetResumeCaptureFailureStreak() {
+    this.consecutiveResumeCaptureFailures = 0;
+    this.resumeCaptureFailureStreakKeys = [];
+  }
+
+  recordResumeCaptureFailure(candidateKey) {
+    this.consecutiveResumeCaptureFailures += 1;
+    if (candidateKey) {
+      this.resumeCaptureFailureStreakKeys.push(candidateKey);
+    }
+  }
+
+  rollbackResumeCaptureFailureStreak(currentCandidateKey = null) {
+    const streakKeys = Array.from(new Set([
+      ...this.resumeCaptureFailureStreakKeys,
+      ...(currentCandidateKey ? [currentCandidateKey] : [])
+    ].filter(Boolean)));
+    const rollbackCount = streakKeys.length;
+    if (rollbackCount <= 0) {
+      this.resetResumeCaptureFailureStreak();
+      return {
+        rollback_count: 0,
+        processed_count: this.processedCount,
+        skipped_count: this.skippedCount,
+        rolled_back_keys: []
+      };
+    }
+
+    this.processedCount = Math.max(0, this.processedCount - rollbackCount);
+    this.skippedCount = Math.max(0, this.skippedCount - rollbackCount);
+    for (const key of streakKeys) {
+      this.processedKeys.delete(key);
+      this.discoveredKeys.delete(key);
+    }
+    this.resetResumeCaptureFailureStreak();
+    return {
+      rollback_count: rollbackCount,
+      processed_count: this.processedCount,
+      skipped_count: this.skippedCount,
+      rolled_back_keys: streakKeys
     };
   }
 
@@ -1870,24 +1960,14 @@ class RecommendScreenCli {
         this.sortCandidateQueue();
       }
 
+      let pageExhaustion = null;
       while (!this.args.targetCount || this.processedCount < this.args.targetCount) {
         if (this.shouldPauseAtBoundary()) {
           this.saveCsv();
           this.saveCheckpoint();
           return {
             status: "PAUSED",
-            result: {
-              processed_count: this.processedCount,
-              passed_count: this.passedCandidates.length,
-              skipped_count: this.skippedCount,
-              output_csv: this.args.output,
-              checkpoint_path: this.checkpointPath,
-              completion_reason: "paused",
-              post_action: this.args.postAction,
-              max_greet_count: this.args.postAction === "greet" ? this.args.maxGreetCount : null,
-              greet_count: this.greetCount,
-              greet_limit_fallback_count: this.greetLimitFallbackCount
-            }
+            result: this.buildProgressSnapshot("paused")
           };
         }
         const periodicDiscovery = await this.discoverCandidates();
@@ -1912,6 +1992,18 @@ class RecommendScreenCli {
           const didScroll = Number(scroll.after?.scrollTop || 0) !== Number(scroll.before?.scrollTop || 0)
             || Number(scroll.after?.scrollHeight || 0) !== Number(scroll.before?.scrollHeight || 0);
           if (scroll.bottom?.isBottom) {
+            pageExhaustion = {
+              reason: "bottom_reached",
+              bottom: scroll.bottom || null,
+              scroll: scroll.scrollResult || null,
+              before: scroll.before || null,
+              after: scroll.after || null,
+              discovery: {
+                added: discovery.added ?? 0,
+                candidate_count: discovery.candidate_count ?? null,
+                total_cards: discovery.total_cards ?? null
+              }
+            };
             break;
           }
           if (didGrow || didDiscover) {
@@ -1921,12 +2013,36 @@ class RecommendScreenCli {
           if (!didScroll) {
             this.scrollRetryCount += 1;
             if (this.scrollRetryCount >= this.maxScrollRetries) {
+              pageExhaustion = {
+                reason: "scroll_stalled",
+                bottom: scroll.bottom || null,
+                scroll: scroll.scrollResult || null,
+                before: scroll.before || null,
+                after: scroll.after || null,
+                discovery: {
+                  added: discovery.added ?? 0,
+                  candidate_count: discovery.candidate_count ?? null,
+                  total_cards: discovery.total_cards ?? null
+                }
+              };
               break;
             }
             continue;
           }
           this.scrollRetryCount += 1;
           if (this.scrollRetryCount >= this.maxScrollRetries) {
+            pageExhaustion = {
+              reason: "scroll_retry_exhausted",
+              bottom: scroll.bottom || null,
+              scroll: scroll.scrollResult || null,
+              before: scroll.before || null,
+              after: scroll.after || null,
+              discovery: {
+                added: discovery.added ?? 0,
+                candidate_count: discovery.candidate_count ?? null,
+                total_cards: discovery.total_cards ?? null
+              }
+            };
             break;
           }
           continue;
@@ -1935,6 +2051,7 @@ class RecommendScreenCli {
         this.scrollRetryCount = 0;
         this.processedCount += 1;
         log(`处理第 ${this.processedCount} 位候选人: ${nextCandidate.name || nextCandidate.geek_id}`);
+        let shouldMarkProcessed = true;
 
         try {
           await this.clickCandidate(nextCandidate);
@@ -1944,6 +2061,7 @@ class RecommendScreenCli {
           }
 
           const capture = await this.captureResumeImage(nextCandidate);
+          this.resetResumeCaptureFailureStreak();
           const screening = await this.callVisionModel(capture.stitchedImage);
           log(`筛选结果: ${screening.passed ? "通过" : "不通过"}`);
 
@@ -1984,7 +2102,30 @@ class RecommendScreenCli {
         } catch (error) {
           this.skippedCount += 1;
           log(`候选人处理失败: ${error.code || error.message}`);
-          if (["RESUME_CAPTURE_FAILED", "VISION_MODEL_FAILED"].includes(error.code)) {
+          if (error.code === "RESUME_CAPTURE_FAILED") {
+            this.recordResumeCaptureFailure(nextCandidate.key);
+            log(
+              `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} 简历截图失败，` +
+              `已跳过当前候选人；连续失败 ${this.consecutiveResumeCaptureFailures}/${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES}`
+            );
+            if (this.consecutiveResumeCaptureFailures >= MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES) {
+              shouldMarkProcessed = false;
+              const rollback = this.rollbackResumeCaptureFailureStreak(nextCandidate.key);
+              throw this.buildError(
+                "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT",
+                `连续 ${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES} 位候选人简历捕获失败，已停止运行以避免错误跳过。` +
+                `已回滚这 ${rollback.rollback_count} 个失败样本的计数；最后错误: ${error.message || error}`,
+                true,
+                {
+                  cause_code: error.code,
+                  rollback
+                }
+              );
+            }
+          } else {
+            this.resetResumeCaptureFailureStreak();
+          }
+          if (["VISION_MODEL_FAILED"].includes(error.code)) {
             throw error;
           }
         } finally {
@@ -1992,7 +2133,9 @@ class RecommendScreenCli {
           if (!closed) {
             throw this.buildError("DETAIL_CLOSE_FAILED", "详情页未能正确关闭");
           }
-          this.processedKeys.add(nextCandidate.key);
+          if (shouldMarkProcessed) {
+            this.processedKeys.add(nextCandidate.key);
+          }
         }
 
         await this.takeBreakIfNeeded();
@@ -2001,6 +2144,18 @@ class RecommendScreenCli {
         } catch (checkpointError) {
           log(`[保存checkpoint失败] ${checkpointError.message || checkpointError}`);
         }
+      }
+
+      if (this.args.targetCount && this.processedCount < this.args.targetCount) {
+        throw this.buildError(
+          "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED",
+          `推荐列表已到底，但当前仅处理 ${this.processedCount} 位，尚未达到目标 ${this.args.targetCount} 位。`,
+          true,
+          {
+            partial_result: this.buildProgressSnapshot("page_exhausted_before_target_count"),
+            page_exhaustion: pageExhaustion
+          }
+        );
       }
 
       this.saveCsv();
@@ -2012,17 +2167,14 @@ class RecommendScreenCli {
       return {
         status: "COMPLETED",
         result: {
-          processed_count: this.processedCount,
-          passed_count: this.passedCandidates.length,
-          skipped_count: this.skippedCount,
-          output_csv: this.args.output,
+          ...this.buildProgressSnapshot(
+            this.args.targetCount && this.processedCount >= this.args.targetCount
+              ? "target_count_reached"
+              : "page_exhausted"
+          ),
           completion_reason: this.args.targetCount && this.processedCount >= this.args.targetCount
             ? "target_count_reached"
             : "page_exhausted",
-          post_action: this.args.postAction,
-          max_greet_count: this.args.postAction === "greet" ? this.args.maxGreetCount : null,
-          greet_count: this.greetCount,
-          greet_limit_fallback_count: this.greetLimitFallbackCount
         }
       };
     } catch (error) {
@@ -2037,12 +2189,7 @@ class RecommendScreenCli {
         log(`[保存checkpoint失败] ${checkpointError.message || checkpointError}`);
       }
       if (!error.partial_result) {
-        error.partial_result = {
-          processed_count: this.processedCount,
-          passed_count: this.passedCandidates.length,
-          skipped_count: this.skippedCount,
-          output_csv: this.args.output
-        };
+        error.partial_result = this.buildProgressSnapshot();
       }
       throw error;
     } finally {
@@ -2069,17 +2216,35 @@ async function main() {
   console.log(JSON.stringify(result));
 }
 
-main().catch((error) => {
-  const payload = {
-    status: "FAILED",
-    error: {
+if (require.main === module) {
+  main().catch((error) => {
+    const errorPayload = {
       code: error.code || "RECOMMEND_SCREEN_FAILED",
       message: error.message || "推荐页筛选执行失败。",
       retryable: error.retryable !== false
-    },
-    result: error.partial_result || null
+    };
+    for (const [key, value] of Object.entries(error || {})) {
+      if (["code", "message", "retryable", "partial_result", "stack"].includes(key)) continue;
+      errorPayload[key] = value;
+    }
+    const payload = {
+      status: "FAILED",
+      error: errorPayload,
+      result: error.partial_result || null
+    };
+    console.log(JSON.stringify(payload));
+    process.exitCode = 1;
+  });
+} else {
+  module.exports = {
+    RecommendScreenCli,
+    parseArgs,
+    promptMissingInputs,
+    __testables: {
+      MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES,
+      RESUME_CAPTURE_MAX_ATTEMPTS,
+      RESUME_CAPTURE_WAIT_MS
+    }
   };
-  console.log(JSON.stringify(payload));
-  process.exitCode = 1;
-});
+}
 

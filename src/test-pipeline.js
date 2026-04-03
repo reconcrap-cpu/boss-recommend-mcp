@@ -252,6 +252,607 @@ async function testResumeFromPausedBeforeScreenShouldRerunSearch() {
   assert.equal(result.result.candidate_count, 9);
 }
 
+async function testConsecutiveResumeCaptureFailuresShouldRefreshAndRerunSearchWithForcedRecentFilter() {
+  const searchCalls = [];
+  const screenCalls = [];
+  let reloadCalls = 0;
+  let pageReadyCalls = 0;
+  const parsed = createParsed();
+  parsed.searchParams = {
+    ...parsed.searchParams,
+    recent_not_view: "不限"
+  };
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      resume: {
+        resume: false,
+        output_csv: "C:/temp/resume.csv",
+        checkpoint_path: "C:/temp/checkpoint.json",
+        pause_control_path: "C:/temp/run.json",
+        previous_completion_reason: ""
+      }
+    },
+    {
+      parseRecommendInstruction: () => parsed,
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => {
+        pageReadyCalls += 1;
+        return { ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } };
+      },
+      listRecommendJobs: async () => createJobListResult(),
+      reloadBossRecommendPage: async () => {
+        reloadCalls += 1;
+        return {
+          ok: true,
+          state: "RECOMMEND_READY",
+          reloaded_url: "https://www.zhipin.com/web/chat/recommend"
+        };
+      },
+      runRecommendSearchCli: async ({ searchParams, selectedJob }) => {
+        searchCalls.push({
+          searchParams,
+          selectedJob
+        });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 9,
+            applied_filters: searchParams,
+            selected_job: selectedJob,
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      runRecommendScreenCli: async ({ resume }) => {
+        screenCalls.push(resume);
+        if (screenCalls.length === 1) {
+          return {
+            ok: false,
+            error: {
+              code: "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT",
+              message: "连续 10 位候选人截图失败"
+            },
+            summary: {
+              processed_count: 216,
+              passed_count: 83,
+              skipped_count: 133,
+              output_csv: "C:/temp/resume.csv"
+            }
+          };
+        }
+        return {
+          ok: true,
+          summary: {
+            processed_count: 240,
+            passed_count: 90,
+            skipped_count: 150,
+            output_csv: "C:/temp/resume.csv",
+            completion_reason: "page_exhausted"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(searchCalls.length, 2);
+  assert.equal(searchCalls[0].searchParams.recent_not_view, "不限");
+  assert.equal(searchCalls[1].searchParams.recent_not_view, "近14天没有");
+  assert.equal(screenCalls.length, 2);
+  assert.equal(screenCalls[0].resume, false);
+  assert.equal(screenCalls[1].resume, true);
+  assert.equal(screenCalls[1].require_checkpoint, true);
+  assert.equal(screenCalls[1].output_csv, "C:/temp/resume.csv");
+  assert.equal(reloadCalls, 1);
+  assert.equal(pageReadyCalls, 2);
+  assert.equal(result.result.output_csv, "C:/temp/resume.csv");
+  assert.equal(result.result.auto_recovery.reload.ok, true);
+  assert.equal(result.search_params.recent_not_view, "近14天没有");
+}
+
+async function testPageExhaustedBeforeTargetShouldRefreshInPageAndResumeScreen() {
+  const searchCalls = [];
+  const screenCalls = [];
+  let refreshCalls = 0;
+  let reloadCalls = 0;
+  let pageReadyCalls = 0;
+  const parsed = createParsed();
+  parsed.searchParams = {
+    ...parsed.searchParams,
+    recent_not_view: "不限"
+  };
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      resume: {
+        resume: false,
+        output_csv: "C:/temp/resume.csv",
+        checkpoint_path: "C:/temp/checkpoint.json",
+        pause_control_path: "C:/temp/run.json",
+        previous_completion_reason: ""
+      }
+    },
+    {
+      parseRecommendInstruction: () => parsed,
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => {
+        pageReadyCalls += 1;
+        return { ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } };
+      },
+      listRecommendJobs: async () => createJobListResult(),
+      refreshBossRecommendList: async () => {
+        refreshCalls += 1;
+        return {
+          ok: true,
+          action: "in_page_refresh",
+          state: "RECOMMEND_READY",
+          before_state: {
+            finished_wrap_visible: true,
+            refresh_button_visible: true
+          },
+          after_state: {
+            finished_wrap_visible: false,
+            list_ready: true
+          }
+        };
+      },
+      reloadBossRecommendPage: async () => {
+        reloadCalls += 1;
+        return {
+          ok: true,
+          state: "RECOMMEND_READY",
+          reloaded_url: "https://www.zhipin.com/web/chat/recommend"
+        };
+      },
+      runRecommendSearchCli: async ({ searchParams }) => {
+        searchCalls.push({ ...searchParams });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 9,
+            applied_filters: searchParams,
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      runRecommendScreenCli: async ({ resume }) => {
+        screenCalls.push({ ...resume });
+        if (screenCalls.length === 1) {
+          return {
+            ok: false,
+            error: {
+              code: "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED",
+              message: "推荐列表已到底，但尚未达到目标数。",
+              page_exhaustion: {
+                reason: "bottom_reached",
+                bottom: {
+                  isBottom: true,
+                  finished_wrap_visible: true,
+                  refresh_button_visible: true
+                }
+              }
+            },
+            summary: {
+              processed_count: 4,
+              passed_count: 1,
+              skipped_count: 3,
+              output_csv: "C:/temp/resume.csv",
+              checkpoint_path: "C:/temp/checkpoint.json",
+              completion_reason: "page_exhausted_before_target_count"
+            }
+          };
+        }
+        return {
+          ok: true,
+          summary: {
+            processed_count: 10,
+            passed_count: 3,
+            skipped_count: 7,
+            output_csv: "C:/temp/resume.csv",
+            checkpoint_path: "C:/temp/checkpoint.json",
+            completion_reason: "target_count_reached"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(searchCalls.length, 1);
+  assert.equal(searchCalls[0].recent_not_view, "不限");
+  assert.equal(screenCalls.length, 2);
+  assert.equal(screenCalls[0].resume, false);
+  assert.equal(screenCalls[1].resume, true);
+  assert.equal(screenCalls[1].require_checkpoint, true);
+  assert.equal(screenCalls[1].output_csv, "C:/temp/resume.csv");
+  assert.equal(refreshCalls, 1);
+  assert.equal(reloadCalls, 0);
+  assert.equal(pageReadyCalls, 1);
+  assert.equal(result.result.candidate_count, null);
+  assert.equal(result.result.completion_reason, "target_count_reached");
+  assert.equal(result.result.auto_recovery.action, "in_page_refresh");
+  assert.equal(result.result.auto_recovery.refresh.ok, true);
+  assert.equal(result.result.auto_recovery.page_exhaustion.reason, "bottom_reached");
+  assert.equal(result.search_params.recent_not_view, "不限");
+}
+
+async function testPageExhaustedBeforeTargetShouldReloadWhenRefreshButtonMissing() {
+  const searchCalls = [];
+  const screenCalls = [];
+  let refreshCalls = 0;
+  let reloadCalls = 0;
+  let pageReadyCalls = 0;
+  const parsed = createParsed();
+  parsed.searchParams = {
+    ...parsed.searchParams,
+    recent_not_view: "不限"
+  };
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      resume: {
+        resume: false,
+        output_csv: "C:/temp/resume.csv",
+        checkpoint_path: "C:/temp/checkpoint.json",
+        pause_control_path: "C:/temp/run.json",
+        previous_completion_reason: ""
+      }
+    },
+    {
+      parseRecommendInstruction: () => parsed,
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => {
+        pageReadyCalls += 1;
+        return { ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } };
+      },
+      listRecommendJobs: async () => createJobListResult(),
+      refreshBossRecommendList: async () => {
+        refreshCalls += 1;
+        return {
+          ok: false,
+          action: "in_page_refresh",
+          state: "REFRESH_BUTTON_NOT_FOUND",
+          message: "未找到页内刷新按钮。"
+        };
+      },
+      reloadBossRecommendPage: async () => {
+        reloadCalls += 1;
+        return {
+          ok: true,
+          state: "RECOMMEND_READY",
+          reloaded_url: "https://www.zhipin.com/web/chat/recommend"
+        };
+      },
+      runRecommendSearchCli: async ({ searchParams }) => {
+        searchCalls.push({ ...searchParams });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: searchCalls.length === 1 ? 9 : 12,
+            applied_filters: searchParams,
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      runRecommendScreenCli: async ({ resume }) => {
+        screenCalls.push({ ...resume });
+        if (screenCalls.length === 1) {
+          return {
+            ok: false,
+            error: {
+              code: "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED",
+              message: "推荐列表已到底，但尚未达到目标数。",
+              page_exhaustion: {
+                reason: "bottom_reached",
+                bottom: {
+                  isBottom: true,
+                  finished_wrap_visible: true,
+                  refresh_button_visible: false
+                }
+              }
+            },
+            summary: {
+              processed_count: 4,
+              passed_count: 1,
+              skipped_count: 3,
+              output_csv: "C:/temp/resume.csv",
+              checkpoint_path: "C:/temp/checkpoint.json",
+              completion_reason: "page_exhausted_before_target_count"
+            }
+          };
+        }
+        return {
+          ok: true,
+          summary: {
+            processed_count: 10,
+            passed_count: 3,
+            skipped_count: 7,
+            output_csv: "C:/temp/resume.csv",
+            checkpoint_path: "C:/temp/checkpoint.json",
+            completion_reason: "target_count_reached"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(searchCalls.length, 2);
+  assert.equal(searchCalls[0].recent_not_view, "不限");
+  assert.equal(searchCalls[1].recent_not_view, "近14天没有");
+  assert.equal(screenCalls.length, 2);
+  assert.equal(screenCalls[0].resume, false);
+  assert.equal(screenCalls[1].resume, true);
+  assert.equal(screenCalls[1].require_checkpoint, true);
+  assert.equal(refreshCalls, 1);
+  assert.equal(reloadCalls, 1);
+  assert.equal(pageReadyCalls, 2);
+  assert.equal(result.result.candidate_count, 12);
+  assert.equal(result.result.auto_recovery.action, "reload_page_and_rerun_search");
+  assert.equal(result.result.auto_recovery.refresh.state, "REFRESH_BUTTON_NOT_FOUND");
+  assert.equal(result.result.auto_recovery.reload.ok, true);
+  assert.equal(result.search_params.recent_not_view, "近14天没有");
+}
+
+async function testPageExhaustedBeforeTargetShouldReloadWhenRefreshDoesNotRecoverList() {
+  const searchCalls = [];
+  const screenCalls = [];
+  let refreshCalls = 0;
+  let reloadCalls = 0;
+  const parsed = createParsed();
+  parsed.searchParams = {
+    ...parsed.searchParams,
+    recent_not_view: "不限"
+  };
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      resume: {
+        resume: false,
+        output_csv: "C:/temp/resume.csv",
+        checkpoint_path: "C:/temp/checkpoint.json",
+        pause_control_path: "C:/temp/run.json",
+        previous_completion_reason: ""
+      }
+    },
+    {
+      parseRecommendInstruction: () => parsed,
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } }),
+      listRecommendJobs: async () => createJobListResult(),
+      refreshBossRecommendList: async () => {
+        refreshCalls += 1;
+        return {
+          ok: false,
+          action: "in_page_refresh",
+          state: "LIST_NOT_RELOADED",
+          message: "点击刷新后列表没有重新就绪。"
+        };
+      },
+      reloadBossRecommendPage: async () => {
+        reloadCalls += 1;
+        return {
+          ok: true,
+          state: "RECOMMEND_READY",
+          reloaded_url: "https://www.zhipin.com/web/chat/recommend"
+        };
+      },
+      runRecommendSearchCli: async ({ searchParams }) => {
+        searchCalls.push({ ...searchParams });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: searchCalls.length === 1 ? 9 : 11,
+            applied_filters: searchParams,
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      runRecommendScreenCli: async ({ resume }) => {
+        screenCalls.push({ ...resume });
+        if (screenCalls.length === 1) {
+          return {
+            ok: false,
+            error: {
+              code: "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED",
+              message: "推荐列表已到底，但尚未达到目标数。"
+            },
+            summary: {
+              processed_count: 4,
+              passed_count: 1,
+              skipped_count: 3,
+              output_csv: "C:/temp/resume.csv",
+              checkpoint_path: "C:/temp/checkpoint.json",
+              completion_reason: "page_exhausted_before_target_count"
+            }
+          };
+        }
+        return {
+          ok: true,
+          summary: {
+            processed_count: 10,
+            passed_count: 3,
+            skipped_count: 7,
+            output_csv: "C:/temp/resume.csv",
+            checkpoint_path: "C:/temp/checkpoint.json",
+            completion_reason: "target_count_reached"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(searchCalls.length, 2);
+  assert.equal(searchCalls[1].recent_not_view, "近14天没有");
+  assert.equal(screenCalls.length, 2);
+  assert.equal(screenCalls[1].resume, true);
+  assert.equal(refreshCalls, 1);
+  assert.equal(reloadCalls, 1);
+  assert.equal(result.result.candidate_count, 11);
+  assert.equal(result.result.auto_recovery.action, "reload_page_and_rerun_search");
+  assert.equal(result.result.auto_recovery.refresh.state, "LIST_NOT_RELOADED");
+  assert.equal(result.search_params.recent_not_view, "近14天没有");
+}
+
+async function testPageExhaustedBeforeTargetShouldFailAfterFiveRecoveryAttempts() {
+  const searchCalls = [];
+  const screenCalls = [];
+  let refreshCalls = 0;
+  const parsed = createParsed();
+  parsed.searchParams = {
+    ...parsed.searchParams,
+    recent_not_view: "不限"
+  };
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      resume: {
+        resume: false,
+        output_csv: "C:/temp/resume.csv",
+        checkpoint_path: "C:/temp/checkpoint.json",
+        pause_control_path: "C:/temp/run.json",
+        previous_completion_reason: ""
+      }
+    },
+    {
+      parseRecommendInstruction: () => parsed,
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } }),
+      listRecommendJobs: async () => createJobListResult(),
+      refreshBossRecommendList: async () => {
+        refreshCalls += 1;
+        return {
+          ok: true,
+          action: "in_page_refresh",
+          state: "RECOMMEND_READY",
+          before_state: {
+            finished_wrap_visible: true,
+            refresh_button_visible: true
+          },
+          after_state: {
+            finished_wrap_visible: false,
+            list_ready: true
+          }
+        };
+      },
+      runRecommendSearchCli: async ({ searchParams }) => {
+        searchCalls.push({ ...searchParams });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 9,
+            applied_filters: searchParams,
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      runRecommendScreenCli: async ({ resume }) => {
+        screenCalls.push({ ...resume });
+        return {
+          ok: false,
+          error: {
+            code: "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED",
+            message: "推荐列表已到底，但尚未达到目标数。",
+            page_exhaustion: {
+              reason: "bottom_reached",
+              bottom: {
+                isBottom: true,
+                finished_wrap_visible: true,
+                refresh_button_visible: true
+              }
+            }
+          },
+          summary: {
+            processed_count: 4,
+            passed_count: 1,
+            skipped_count: 3,
+            output_csv: "C:/temp/resume.csv",
+            checkpoint_path: "C:/temp/checkpoint.json",
+            completion_reason: "page_exhausted_before_target_count"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.error.code, "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED");
+  assert.match(result.error.message, /已达到自动恢复上限 5 次/);
+  assert.equal(searchCalls.length, 1);
+  assert.equal(screenCalls.length, 6);
+  assert.equal(refreshCalls, 5);
+  assert.equal(result.partial_result.output_csv, "C:/temp/resume.csv");
+  assert.equal(result.diagnostics.auto_recovery.attempt, 5);
+  assert.equal(result.diagnostics.auto_recovery.action, "in_page_refresh");
+  assert.equal(result.diagnostics.auto_recovery.partial_result.checkpoint_path, "C:/temp/checkpoint.json");
+}
+
+async function testNullTargetCountShouldKeepPageExhaustedCompletion() {
+  const parsed = createParsed();
+  parsed.screenParams = {
+    ...parsed.screenParams,
+    target_count: null
+  };
+  let receivedScreenParams = null;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => parsed,
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => ({
+        ok: true,
+        summary: {
+          candidate_count: 9,
+          applied_filters: {},
+          page_state: { state: "RECOMMEND_READY" }
+        }
+      }),
+      runRecommendScreenCli: async ({ screenParams }) => {
+        receivedScreenParams = screenParams;
+        return {
+          ok: true,
+          summary: {
+            processed_count: 4,
+            passed_count: 1,
+            skipped_count: 3,
+            output_csv: "C:/temp/resume.csv",
+            completion_reason: "page_exhausted"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(receivedScreenParams.target_count, null);
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.completion_reason, "page_exhausted");
+  assert.equal(result.result.auto_recovery, null);
+}
+
 async function testNeedConfirmationGate() {
   let preflightCalled = false;
   const result = await runRecommendPipeline(
@@ -933,6 +1534,12 @@ async function main() {
   await testPausedScreenResultShouldBubbleUp();
   await testResumeFromScreenPauseShouldSkipSearch();
   await testResumeFromPausedBeforeScreenShouldRerunSearch();
+  await testConsecutiveResumeCaptureFailuresShouldRefreshAndRerunSearchWithForcedRecentFilter();
+  await testPageExhaustedBeforeTargetShouldRefreshInPageAndResumeScreen();
+  await testPageExhaustedBeforeTargetShouldReloadWhenRefreshButtonMissing();
+  await testPageExhaustedBeforeTargetShouldReloadWhenRefreshDoesNotRecoverList();
+  await testPageExhaustedBeforeTargetShouldFailAfterFiveRecoveryAttempts();
+  await testNullTargetCountShouldKeepPageExhaustedCompletion();
   await testNeedConfirmationGate();
   await testNeedSchoolTagConfirmationGate();
   await testNeedTargetCountConfirmationGate();
