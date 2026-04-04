@@ -39,6 +39,16 @@ const FRAMING_UNKNOWN = "unknown";
 const FRAMING_HEADER = "header";
 const FRAMING_LINE = "line";
 const ASYNC_WORKER_FLAG = "--async-worker";
+const AGENT_RUNTIME_HINT_KEYS = [
+  "CODEX_CI",
+  "CODEX_THREAD_ID",
+  "CODEX_HOME",
+  "OPENCLAW_HOME",
+  "OPENCLAW",
+  "TRAE_CN",
+  "TRAE_HOME",
+  "TRAE_AGENT"
+];
 const thisFilePath = fileURLToPath(import.meta.url);
 
 const activeAsyncRuns = new Map();
@@ -64,8 +74,25 @@ function decodeWorkerPayload(encoded) {
   }
 }
 
+function isLikelyAgentRuntime() {
+  for (const key of AGENT_RUNTIME_HINT_KEYS) {
+    if (normalizeText(process.env[key] || "")) {
+      return true;
+    }
+  }
+  const originHints = [
+    normalizeText(process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || ""),
+    normalizeText(process.env.TERM_PROGRAM || "")
+  ].join(" ").toLowerCase();
+  return /codex|openclaw|trae/.test(originHints);
+}
+
 function shouldUseInProcessAsyncRunner() {
-  return normalizeText(process.env.BOSS_RECOMMEND_ASYNC_INPROC || "") === "1";
+  const inprocRequested = normalizeText(process.env.BOSS_RECOMMEND_ASYNC_INPROC || "") === "1";
+  if (!inprocRequested) return false;
+  const allowInprocInAgent = normalizeText(process.env.BOSS_RECOMMEND_ALLOW_INPROC_IN_AGENT || "") === "1";
+  if (allowInprocInAgent) return true;
+  return !isLikelyAgentRuntime();
 }
 
 function parsePositiveInteger(raw, fallback) {
