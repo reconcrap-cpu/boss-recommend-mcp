@@ -1,4 +1,6 @@
+import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -36,6 +38,8 @@ const SERVER_NAME = "boss-recommend-mcp";
 const FRAMING_UNKNOWN = "unknown";
 const FRAMING_HEADER = "header";
 const FRAMING_LINE = "line";
+const ASYNC_WORKER_FLAG = "--async-worker";
+const thisFilePath = fileURLToPath(import.meta.url);
 
 const activeAsyncRuns = new Map();
 let runPipelineImpl = runRecommendPipeline;
@@ -43,6 +47,25 @@ const TERMINAL_RUN_STATES = new Set([RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function encodeWorkerPayload(payload) {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+}
+
+function decodeWorkerPayload(encoded) {
+  try {
+    const raw = Buffer.from(String(encoded || ""), "base64").toString("utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function shouldUseInProcessAsyncRunner() {
+  return normalizeText(process.env.BOSS_RECOMMEND_ASYNC_INPROC || "") === "1";
 }
 
 function parsePositiveInteger(raw, fallback) {
@@ -424,6 +447,84 @@ function safeUpdateRunProgress(runId, patch, message = null) {
   }
 }
 
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCheckpointProgress(checkpointPath) {
+  const normalized = normalizeText(checkpointPath || "");
+  if (!normalized) return null;
+  try {
+    const raw = fs.readFileSync(normalized, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      processed_count: Number.isInteger(parsed.processed_count) ? parsed.processed_count : 0,
+      passed_count: Array.isArray(parsed.passed_candidates) ? parsed.passed_candidates.length : 0,
+      skipped_count: Number.isInteger(parsed.skipped_count) ? parsed.skipped_count : 0,
+      output_csv: normalizeText(parsed.output_csv || "") || null,
+      checkpoint_path: normalized
+    };
+  } catch {
+    return null;
+  }
+}
+
+function reconcileOrphanRunIfNeeded(runId, snapshot) {
+  if (!snapshot || TERMINAL_RUN_STATES.has(snapshot.state)) {
+    return snapshot;
+  }
+  if (snapshot.state === RUN_STATE_PAUSED) {
+    return snapshot;
+  }
+  if (activeAsyncRuns.has(runId)) {
+    return snapshot;
+  }
+  if (isProcessAlive(snapshot.pid)) {
+    return snapshot;
+  }
+
+  const checkpointPath = normalizeText(snapshot?.resume?.checkpoint_path || getRunArtifacts(runId).checkpoint_path);
+  const checkpointProgress = readCheckpointProgress(checkpointPath);
+  const partialResult = checkpointProgress
+    ? {
+        processed_count: checkpointProgress.processed_count,
+        passed_count: checkpointProgress.passed_count,
+        skipped_count: checkpointProgress.skipped_count,
+        output_csv: checkpointProgress.output_csv,
+        checkpoint_path: checkpointProgress.checkpoint_path
+      }
+    : null;
+  const error = {
+    code: "RUN_PROCESS_EXITED",
+    message: `检测到运行进程已退出（pid=${snapshot.pid || "unknown"}），已自动纠正状态。`,
+    retryable: true
+  };
+  const recovered = safeUpdateRunState(runId, {
+    state: RUN_STATE_FAILED,
+    stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
+    last_message: "运行进程已退出，状态已自动标记为失败。",
+    resume: {
+      ...snapshot.resume,
+      checkpoint_path: checkpointPath,
+      output_csv: checkpointProgress?.output_csv || snapshot?.resume?.output_csv || null
+    },
+    error,
+    result: {
+      status: "FAILED",
+      error,
+      partial_result: partialResult
+    }
+  });
+  return recovered || readRunState(runId) || snapshot;
+}
+
 function createRuntimeCallbacks(runId, heartbeatIntervalMs) {
   let lastStage = RUN_STAGE_PREFLIGHT;
   let lastOutputPersistAt = 0;
@@ -647,14 +748,14 @@ async function executeTrackedPipeline({
   };
 }
 
-function initializeRunStateOrThrow(runId, mode, workspaceRoot, args) {
+function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = process.pid) {
   const artifacts = getRunArtifacts(runId);
   const snapshot = createRunStateSnapshot({
     runId,
     mode,
     state: "queued",
     stage: RUN_STAGE_PREFLIGHT,
-    pid: process.pid,
+    pid,
     lastMessage: "流水线任务已创建，等待执行。",
     context: buildRunContext(workspaceRoot, args),
     control: {
@@ -694,6 +795,77 @@ function launchAsyncRun({ runId, mode, workspaceRoot, args, resumeRun = false })
   return { abortController, promise };
 }
 
+function launchDetachedAsyncRun({ runId, mode, workspaceRoot, args, resumeRun = false }) {
+  const payload = encodeWorkerPayload({
+    runId,
+    mode,
+    workspaceRoot,
+    args,
+    resumeRun
+  });
+  const child = spawn(
+    process.execPath,
+    [thisFilePath, ASYNC_WORKER_FLAG, payload],
+    {
+      detached: true,
+      stdio: "ignore",
+      cwd: path.resolve(workspaceRoot),
+      env: process.env
+    }
+  );
+  child.unref();
+  return child;
+}
+
+async function runAsyncWorkerMain(encodedPayload) {
+  const payload = decodeWorkerPayload(encodedPayload);
+  if (!payload) return;
+  const runId = normalizeText(payload.runId);
+  const mode = normalizeText(payload.mode) || RUN_MODE_ASYNC;
+  const workspaceRoot = normalizeText(payload.workspaceRoot);
+  const args = payload.args && typeof payload.args === "object" ? payload.args : {};
+  const resumeRun = payload.resumeRun === true;
+  if (!runId || !workspaceRoot || typeof args.instruction !== "string") return;
+
+  const existing = readRunState(runId);
+  if (!existing) {
+    try {
+      initializeRunStateOrThrow(runId, mode, workspaceRoot, args, process.pid);
+    } catch {
+      return;
+    }
+  } else {
+    safeUpdateRunState(runId, { mode, pid: process.pid });
+  }
+
+  try {
+    await executeTrackedPipeline({
+      runId,
+      mode,
+      workspaceRoot,
+      args,
+      signal: null,
+      resumeRun
+    });
+  } catch (error) {
+    const failedResult = {
+      status: "FAILED",
+      error: {
+        code: "UNEXPECTED_ERROR",
+        message: error?.message || "Unexpected worker error",
+        retryable: true
+      }
+    };
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: RUN_STAGE_PREFLIGHT,
+      last_message: failedResult.error.message,
+      error: failedResult.error,
+      result: failedResult
+    });
+  }
+}
+
 async function handleStartRunTool({ workspaceRoot, args }) {
   const precheckArgs = buildAsyncPrecheckArgs(args);
   let precheckResult;
@@ -729,7 +901,7 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   cleanupExpiredRuns();
   const runId = createRunId();
   try {
-    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args);
+    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
   } catch (error) {
     return {
       status: "FAILED",
@@ -741,12 +913,41 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     };
   }
 
-  launchAsyncRun({
-    runId,
-    mode: RUN_MODE_ASYNC,
-    workspaceRoot,
-    args
-  });
+  try {
+    if (shouldUseInProcessAsyncRunner()) {
+      launchAsyncRun({
+        runId,
+        mode: RUN_MODE_ASYNC,
+        workspaceRoot,
+        args
+      });
+    } else {
+      const worker = launchDetachedAsyncRun({
+        runId,
+        mode: RUN_MODE_ASYNC,
+        workspaceRoot,
+        args
+      });
+      safeUpdateRunState(runId, { pid: worker.pid || process.pid });
+    }
+  } catch (error) {
+    const failed = {
+      status: "FAILED",
+      error: {
+        code: "RUN_START_FAILED",
+        message: error?.message || "无法启动异步 worker 进程。",
+        retryable: true
+      }
+    };
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: RUN_STAGE_PREFLIGHT,
+      last_message: failed.error.message,
+      error: failed.error,
+      result: failed
+    });
+    return failed;
+  }
 
   return {
     status: "ACCEPTED",
@@ -781,9 +982,10 @@ function handleGetRunTool(args) {
       }
     };
   }
+  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot);
   return {
     status: "RUN_STATUS",
-    run: snapshot
+    run: reconciled
   };
 }
 
@@ -849,7 +1051,8 @@ function handleCancelRunTool(args) {
   }
 
   const activeRun = activeAsyncRuns.get(runId);
-  if (!activeRun) {
+  const hasLiveDetachedWorker = isProcessAlive(snapshot.pid);
+  if (!activeRun && !hasLiveDetachedWorker) {
     const canceledResult = {
       status: "FAILED",
       error: {
@@ -1032,13 +1235,43 @@ function handleResumeRunTool(args) {
     }
   })) || readRunState(runId) || snapshot;
 
-  launchAsyncRun({
-    runId,
-    mode: RUN_MODE_ASYNC,
-    workspaceRoot: executionContext.workspaceRoot,
-    args: executionContext.args,
-    resumeRun: true
-  });
+  try {
+    if (shouldUseInProcessAsyncRunner()) {
+      launchAsyncRun({
+        runId,
+        mode: RUN_MODE_ASYNC,
+        workspaceRoot: executionContext.workspaceRoot,
+        args: executionContext.args,
+        resumeRun: true
+      });
+    } else {
+      const worker = launchDetachedAsyncRun({
+        runId,
+        mode: RUN_MODE_ASYNC,
+        workspaceRoot: executionContext.workspaceRoot,
+        args: executionContext.args,
+        resumeRun: true
+      });
+      safeUpdateRunState(runId, { pid: worker.pid || updated.pid || process.pid });
+    }
+  } catch (error) {
+    const failed = {
+      status: "FAILED",
+      error: {
+        code: "RUN_RESUME_FAILED",
+        message: error?.message || "无法启动继续执行 worker 进程。",
+        retryable: true
+      }
+    };
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: updated.stage || RUN_STAGE_PREFLIGHT,
+      last_message: failed.error.message,
+      error: failed.error,
+      result: failed
+    });
+    return failed;
+  }
 
   return {
     status: "RESUME_REQUESTED",
@@ -1243,12 +1476,18 @@ export function startServer() {
 export const __testables = {
   handleRequest,
   activeAsyncRuns,
+  runAsyncWorkerMain,
   setRunPipelineImplForTests(nextImpl) {
     runPipelineImpl = typeof nextImpl === "function" ? nextImpl : runRecommendPipeline;
   }
 };
 
-const thisFilePath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === thisFilePath) {
-  startServer();
+  const workerFlagIndex = process.argv.indexOf(ASYNC_WORKER_FLAG);
+  if (workerFlagIndex !== -1) {
+    const payloadArg = process.argv[workerFlagIndex + 1] || "";
+    runAsyncWorkerMain(payloadArg).catch(() => {});
+  } else {
+    startServer();
+  }
 }
