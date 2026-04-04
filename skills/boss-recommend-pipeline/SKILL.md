@@ -127,6 +127,9 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
 长耗时宿主兼容（推荐）：
 
 - 默认调用 `start_recommend_pipeline_run` 启动异步流程（状态查询按“用户触发”执行，不自动轮询）。
+- 异步执行后端默认使用 detached worker（跨会话可继续）；在 AI agent 宿主（OpenClaw/Codex/Trae-CN）必须保持该默认。
+- 禁止在 AI agent 宿主设置 `BOSS_RECOMMEND_ASYNC_INPROC=1`；若环境继承了该变量，必须先清空或移除再启动 run。
+- `BOSS_RECOMMEND_ASYNC_INPROC=1` 仅用于非 agent 的受限宿主应急兜底，常规流程不要启用。
 - `start_recommend_pipeline_run` 会先走同步一致的前置门禁（登录/页面就绪/岗位确认/最终确认）。
 - 只有门禁通过后才会返回 `ACCEPTED + run_id`；否则会先返回 `NEED_INPUT/NEED_CONFIRMATION/FAILED`，必须先按提示补齐。
 - 若宿主要显式拆成三步，也可使用：
