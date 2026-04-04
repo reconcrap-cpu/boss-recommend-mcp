@@ -1296,8 +1296,7 @@ async function testPreflightRecoveryPlanOrder() {
         checks: [
           { key: "node_cli", ok: false },
           { key: "npm_dep_ws", ok: false, install_cwd: "C:/workspace/boss-recommend-mcp" },
-          { key: "python_cli", ok: false },
-          { key: "python_pillow", ok: false }
+          { key: "npm_dep_sharp", ok: false, install_cwd: "C:/workspace/boss-recommend-mcp" }
         ]
       }),
       ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
@@ -1310,10 +1309,9 @@ async function testPreflightRecoveryPlanOrder() {
   assert.equal(result.error.code, "PIPELINE_PREFLIGHT_FAILED");
   assert.deepEqual(
     result.diagnostics.recovery.ordered_steps.map((item) => item.id),
-    ["install_nodejs", "install_npm_dependencies", "install_python", "install_pillow"]
+    ["install_nodejs", "install_npm_dependencies"]
   );
   assert.deepEqual(result.diagnostics.recovery.ordered_steps[1].blocked_by, ["install_nodejs"]);
-  assert.deepEqual(result.diagnostics.recovery.ordered_steps[3].blocked_by, ["install_python"]);
   assert.equal(result.diagnostics.recovery.agent_prompt.includes("不要并行跳步"), true);
 }
 

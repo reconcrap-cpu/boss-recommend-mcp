@@ -4,6 +4,7 @@ const path = require("node:path");
 const http = require("node:http");
 const { spawnSync } = require("node:child_process");
 const WebSocket = require("ws");
+let sharpFactory = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -11,6 +12,17 @@ function sleep(ms) {
 
 const EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS = 5000;
 const EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS = 4;
+
+function clampInteger(value, low, high) {
+  return Math.max(low, Math.min(high, value));
+}
+
+function loadSharp() {
+  if (!sharpFactory) {
+    sharpFactory = require("sharp");
+  }
+  return sharpFactory;
+}
 
 function getJson(url) {
   return new Promise((resolve, reject) => {
@@ -89,6 +101,180 @@ function shouldAbortResumeProbeEarly({ probe, stableNoResumeIframePolls, elapsed
   const minWaitMs = Math.min(waitResumeMs, EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS);
   return stableNoResumeIframePolls >= EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS
     && elapsedMs >= minWaitMs;
+}
+
+async function stitchWithSharp(metadataFile, stitchedImage) {
+  const sharp = loadSharp();
+  let metadata;
+  try {
+    metadata = JSON.parse(fs.readFileSync(metadataFile, "utf8"));
+  } catch (error) {
+    throw new Error(`Invalid stitch metadata: ${error.message || error}`);
+  }
+  const rawChunks = Array.isArray(metadata?.chunks) ? metadata.chunks : [];
+  if (rawChunks.length === 0) {
+    throw new Error("No chunks found in metadata.");
+  }
+
+  const chunks = rawChunks.map((chunk, index) => {
+    const file = path.resolve(String(chunk?.file || ""));
+    if (!file || !fs.existsSync(file)) {
+      throw new Error(`Chunk image missing: ${file || "<empty>"}`);
+    }
+    return {
+      index: Number.isInteger(chunk?.index) ? chunk.index : index,
+      file,
+      scrollTop: Number(chunk?.scrollTop || 0),
+      clipHeightCss: Number(chunk?.clipHeightCss || 0)
+    };
+  }).sort((a, b) => {
+    if (a.scrollTop !== b.scrollTop) return a.scrollTop - b.scrollTop;
+    return a.index - b.index;
+  });
+
+  const composites = [];
+  const used = [];
+  let outWidth = 1;
+  let outHeight = 0;
+  let prevChunk = null;
+
+  for (const chunk of chunks) {
+    const info = await sharp(chunk.file).metadata();
+    const width = Number(info?.width || 0);
+    const height = Number(info?.height || 0);
+    if (width <= 0 || height <= 0) {
+      throw new Error(`Invalid chunk image size: ${chunk.file}`);
+    }
+
+    if (prevChunk) {
+      const deltaCss = chunk.scrollTop - prevChunk.scrollTop;
+      if (!(deltaCss > 0.5)) {
+        prevChunk = chunk;
+        continue;
+      }
+      const clipHeightCss = chunk.clipHeightCss > 1 ? chunk.clipHeightCss : prevChunk.clipHeightCss;
+      const ratio = clipHeightCss > 1 ? (height / clipHeightCss) : 1;
+      const newPixels = clampInteger(Math.round(deltaCss * ratio), 1, height);
+      const cropTop = clampInteger(height - newPixels, 0, height - 1);
+      const segHeight = height - cropTop;
+      const segment = await sharp(chunk.file)
+        .removeAlpha()
+        .extract({
+          left: 0,
+          top: cropTop,
+          width,
+          height: segHeight
+        })
+        .png()
+        .toBuffer();
+      composites.push({
+        input: segment,
+        top: outHeight,
+        left: 0
+      });
+      used.push({
+        file: chunk.file,
+        scrollTop: chunk.scrollTop,
+        cropTopPx: cropTop,
+        keptHeightPx: segHeight
+      });
+      outWidth = Math.max(outWidth, width);
+      outHeight += segHeight;
+      prevChunk = chunk;
+      continue;
+    }
+
+    const segment = await sharp(chunk.file)
+      .removeAlpha()
+      .png()
+      .toBuffer();
+    composites.push({
+      input: segment,
+      top: outHeight,
+      left: 0
+    });
+    used.push({
+      file: chunk.file,
+      scrollTop: chunk.scrollTop,
+      cropTopPx: 0,
+      keptHeightPx: height
+    });
+    outWidth = Math.max(outWidth, width);
+    outHeight += height;
+    prevChunk = chunk;
+  }
+
+  if (composites.length === 0 || outHeight <= 0 || outWidth <= 0) {
+    throw new Error("No valid segments to stitch with sharp.");
+  }
+
+  await sharp({
+    create: {
+      width: outWidth,
+      height: outHeight,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 }
+    }
+  })
+    .composite(composites)
+    .png()
+    .toFile(stitchedImage);
+
+  return {
+    ok: true,
+    engine: "sharp",
+    output: path.resolve(stitchedImage),
+    segments: composites.length,
+    size: {
+      width: outWidth,
+      height: outHeight
+    },
+    used
+  };
+}
+
+function stitchWithAvailablePython(stitchScript, metadataFile, stitchedImage, spawnSyncImpl = spawnSync) {
+  const candidates = ["python3", "python"];
+  const attempts = [];
+  if (!fs.existsSync(stitchScript)) {
+    return {
+      ok: false,
+      attempts: candidates.map((command) => ({
+        command,
+        status: null,
+        signal: null,
+        error: `Missing stitch script: ${stitchScript}`,
+        stderr: "",
+        stdout: ""
+      }))
+    };
+  }
+  for (const command of candidates) {
+    const result = spawnSyncImpl(command, [stitchScript, metadataFile, stitchedImage], {
+      encoding: "utf8"
+    });
+    attempts.push({
+      command,
+      status: Number.isInteger(result.status) ? result.status : null,
+      signal: result.signal || null,
+      error: result.error ? String(result.error.message || result.error) : null,
+      stderr: result.stderr || "",
+      stdout: result.stdout || ""
+    });
+    if (result.status === 0) {
+      return {
+        ok: true,
+        engine: "python",
+        command,
+        result,
+        attempts
+      };
+    }
+  }
+  return {
+    ok: false,
+    attempts
+  };
 }
 
 function buildResumeProbeExpr({ init, targetScroll }) {
@@ -303,9 +489,6 @@ async function captureFullResumeCanvas(options = {}) {
   const metadataFile = `${outPrefix}_chunks.json`;
   const stitchedImage = `${outPrefix}.png`;
 
-  if (!fs.existsSync(stitchScript)) {
-    throw new Error(`Missing stitch script: ${stitchScript}`);
-  }
   fs.mkdirSync(chunkDir, { recursive: true });
 
   const targets = await getJson(`http://${host}:${port}/json/list`);
@@ -492,11 +675,23 @@ async function captureFullResumeCanvas(options = {}) {
     };
     fs.writeFileSync(metadataFile, JSON.stringify(metadata, null, 2), "utf8");
 
-    const stitch = spawnSync("python", [stitchScript, metadataFile, stitchedImage], {
-      encoding: "utf8"
-    });
-    if (stitch.status !== 0) {
-      throw new Error(`Stitch failed: ${stitch.stderr || stitch.stdout}`);
+    let stitchEngine = "sharp";
+    try {
+      await stitchWithSharp(metadataFile, stitchedImage);
+    } catch (sharpError) {
+      const fallback = stitchWithAvailablePython(stitchScript, metadataFile, stitchedImage);
+      if (!fallback.ok) {
+        const fallbackSummary = fallback.attempts
+          .map((item) => {
+            const message = item.stderr || item.stdout || item.error || "unknown error";
+            return `${item.command}(status=${item.status ?? "null"}): ${message}`;
+          })
+          .join(" | ");
+        throw new Error(
+          `Stitch failed (sharp + python fallback). sharp=${sharpError?.message || sharpError}; fallback=${fallbackSummary}`
+        );
+      }
+      stitchEngine = fallback.command || "python";
     }
 
     return {
@@ -504,6 +699,7 @@ async function captureFullResumeCanvas(options = {}) {
       metadataFile,
       chunkDir,
       chunkCount: chunks.length,
+      stitch_engine: stitchEngine,
       target: {
         title: target.title,
         url: target.url
@@ -522,7 +718,9 @@ module.exports = {
     EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS,
     EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS,
     isStableNoResumeIframeProbe,
-    shouldAbortResumeProbeEarly
+    shouldAbortResumeProbeEarly,
+    stitchWithAvailablePython,
+    stitchWithSharp
   }
 };
 

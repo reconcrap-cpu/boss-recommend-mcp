@@ -213,16 +213,13 @@ CLI fallback 的状态机与 MCP 保持一致：
 ```text
 你是环境修复 agent。请根据 diagnostics.checks 修复依赖，必须串行执行：
 1) 若 node_cli 失败：先安装 Node.js >=18，未成功前禁止执行 npm install。
-2) 若任意 npm_dep_* 失败：再安装 npm 依赖（chrome-remote-interface / ws）。
-3) 若 python_cli 失败：安装 Python，并确保 python 命令可用。
-4) 若 python_pillow 失败：最后执行 python -m pip install pillow。
+2) 若任意 npm_dep_* 失败：再安装 npm 依赖（chrome-remote-interface / ws / sharp）。
 每一步完成后重新运行 doctor，全部通过后再重试 start_recommend_pipeline_run。
 ```
 
 安装顺序约束（必须遵守）：
 
 - 没有 Node.js 时，不能先装 npm 包
-- 没有 Python 时，不能先装 Pillow
 
 ## Response Style
 

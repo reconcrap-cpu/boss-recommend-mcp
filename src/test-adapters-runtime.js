@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runRecommendScreenCli, __testables as adapterTestables } from "./adapters.js";
+import { runPipelinePreflight, runRecommendScreenCli, __testables as adapterTestables } from "./adapters.js";
 
 const {
   runProcess,
@@ -149,6 +149,14 @@ async function testResumeRequiresCheckpointFile() {
   }
 }
 
+function testPreflightShouldCheckSharpInsteadOfPython() {
+  const preflight = runPipelinePreflight(process.cwd());
+  const keys = new Set((preflight.checks || []).map((item) => item?.key));
+  assert.equal(keys.has("npm_dep_sharp"), true);
+  assert.equal(keys.has("python_cli"), false);
+  assert.equal(keys.has("python_pillow"), false);
+}
+
 async function main() {
   await testRunProcessHeartbeatAndOutput();
   await testRunProcessAbortSignal();
@@ -157,6 +165,7 @@ async function main() {
   testResolveScreenTimeoutDefaultsTo24Hours();
   testBuildRecommendScreenProcessErrorMapsTimeout();
   await testResumeRequiresCheckpointFile();
+  testPreflightShouldCheckSharpInsteadOfPython();
   console.log("adapters runtime tests passed");
 }
 

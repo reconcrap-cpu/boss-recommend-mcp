@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const sharp = require("sharp");
 
 const { RecommendScreenCli, __testables } = require("./boss-recommend-screen-cli.cjs");
 const { __testables: captureTestables } = require("./scripts/capture-full-resume-canvas.cjs");
@@ -303,12 +304,106 @@ async function testPageExhaustedWithoutTargetShouldStillComplete() {
   assert.equal(result.result.completion_reason, "page_exhausted");
 }
 
+async function testStitchWithSharpShouldComposeExpectedImage() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-sharp-stitch-"));
+  const chunkA = path.join(tempDir, "chunk_000.png");
+  const chunkB = path.join(tempDir, "chunk_001.png");
+  const chunkC = path.join(tempDir, "chunk_002.png");
+  const metadataPath = path.join(tempDir, "chunks.json");
+  const outputPath = path.join(tempDir, "stitched.png");
+
+  await sharp({
+    create: { width: 20, height: 100, channels: 3, background: { r: 255, g: 0, b: 0 } }
+  }).png().toFile(chunkA);
+  await sharp({
+    create: { width: 20, height: 100, channels: 3, background: { r: 0, g: 255, b: 0 } }
+  }).png().toFile(chunkB);
+  await sharp({
+    create: { width: 20, height: 100, channels: 3, background: { r: 0, g: 0, b: 255 } }
+  }).png().toFile(chunkC);
+
+  fs.writeFileSync(
+    metadataPath,
+    JSON.stringify({
+      chunks: [
+        { index: 0, file: chunkA, scrollTop: 0, clipHeightCss: 100 },
+        { index: 1, file: chunkB, scrollTop: 80, clipHeightCss: 100 },
+        { index: 2, file: chunkC, scrollTop: 160, clipHeightCss: 100 }
+      ]
+    }),
+    "utf8"
+  );
+
+  const stitched = await captureTestables.stitchWithSharp(metadataPath, outputPath);
+  const outputMeta = await sharp(outputPath).metadata();
+
+  assert.equal(stitched.ok, true);
+  assert.equal(stitched.engine, "sharp");
+  assert.equal(stitched.segments, 3);
+  assert.equal(outputMeta.width, 20);
+  assert.equal(outputMeta.height, 260);
+  assert.equal(Array.isArray(stitched.used), true);
+  assert.equal(stitched.used.length, 3);
+}
+
+function testStitchWithAvailablePythonShouldFallbackToPython() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-python-fallback-"));
+  const stitchScript = path.join(tempDir, "stitch.py");
+  fs.writeFileSync(stitchScript, "print('ok')", "utf8");
+  const calls = [];
+  const result = captureTestables.stitchWithAvailablePython(
+    stitchScript,
+    path.join(tempDir, "meta.json"),
+    path.join(tempDir, "out.png"),
+    (command) => {
+      calls.push(command);
+      if (command === "python3") {
+        return {
+          status: 1,
+          signal: null,
+          error: null,
+          stderr: "python3 failed",
+          stdout: ""
+        };
+      }
+      return {
+        status: 0,
+        signal: null,
+        error: null,
+        stderr: "",
+        stdout: "ok"
+      };
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.command, "python");
+  assert.deepEqual(calls, ["python3", "python"]);
+}
+
+function testStitchWithAvailablePythonShouldFailWhenScriptMissing() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-python-missing-"));
+  const result = captureTestables.stitchWithAvailablePython(
+    path.join(tempDir, "missing.py"),
+    path.join(tempDir, "meta.json"),
+    path.join(tempDir, "out.png")
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(Array.isArray(result.attempts), true);
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts[0].command, "python3");
+}
+
 async function main() {
   testShouldAbortResumeProbeEarly();
   await testSingleResumeCaptureFailureIsSkipped();
   await testConsecutiveResumeCaptureFailuresStillAbort();
   await testPageExhaustedBeforeTargetShouldRaiseRecoverableError();
   await testPageExhaustedWithoutTargetShouldStillComplete();
+  await testStitchWithSharpShouldComposeExpectedImage();
+  testStitchWithAvailablePythonShouldFallbackToPython();
+  testStitchWithAvailablePythonShouldFailWhenScriptMissing();
   console.log("recoverable resume failure tests passed");
 }
 

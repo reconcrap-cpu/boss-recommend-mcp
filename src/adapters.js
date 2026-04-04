@@ -679,88 +679,6 @@ function buildNodeCommandCheck() {
   };
 }
 
-function detectPythonCommand() {
-  const python = runProcessSync({
-    command: "python",
-    args: ["--version"]
-  });
-  if (python.ok) {
-    return {
-      ok: true,
-      command: "python",
-      probe: python
-    };
-  }
-  const python3 = runProcessSync({
-    command: "python3",
-    args: ["--version"]
-  });
-  if (python3.ok) {
-    return {
-      ok: false,
-      command: null,
-      probe: python,
-      fallback: python3
-    };
-  }
-  return {
-    ok: false,
-    command: null,
-    probe: python,
-    fallback: null
-  };
-}
-
-function buildPythonCommandCheck() {
-  const detected = detectPythonCommand();
-  if (detected.ok) {
-    return {
-      key: "python_cli",
-      ok: true,
-      path: "python --version",
-      message: `Python 命令可用 (${detected.probe.output || "unknown version"})`
-    };
-  }
-  if (detected.fallback) {
-    return {
-      key: "python_cli",
-      ok: false,
-      path: "python --version",
-      message: `检测到 ${detected.fallback.output || "python3"}，但当前流程依赖 python 命令；请创建 python 别名后重试。`
-    };
-  }
-  return {
-    key: "python_cli",
-    ok: false,
-    path: "python --version",
-    message: "未找到 python 命令，请安装 Python 并确保 python 在 PATH 中。"
-  };
-}
-
-function buildPillowCheck() {
-  const detected = detectPythonCommand();
-  if (!detected.ok || !detected.command) {
-    return {
-      key: "python_pillow",
-      ok: false,
-      path: "python -c \"import PIL\"",
-      message: "无法校验 Pillow：python 命令不可用。"
-    };
-  }
-  const probe = runProcessSync({
-    command: detected.command,
-    args: ["-c", "import PIL, PIL.Image; print(PIL.__version__)"]
-  });
-  return {
-    key: "python_pillow",
-    ok: probe.ok,
-    path: `${detected.command} -c "import PIL"`,
-    message: probe.ok
-      ? `Pillow 可用 (${probe.output || "version unknown"})`
-      : "Pillow 未安装。请执行 `python -m pip install pillow`。"
-  };
-}
-
 function buildNodePackageCheck({ key, moduleName, cwd, missingMessage }) {
   if (!cwd || !pathExists(cwd)) {
     return {
@@ -792,8 +710,6 @@ function buildNodePackageCheck({ key, moduleName, cwd, missingMessage }) {
 function buildRuntimeDependencyChecks({ searchDir, screenDir }) {
   return [
     buildNodeCommandCheck(),
-    buildPythonCommandCheck(),
-    buildPillowCheck(),
     buildNodePackageCheck({
       key: "npm_dep_chrome_remote_interface_search",
       moduleName: "chrome-remote-interface",
@@ -811,6 +727,12 @@ function buildRuntimeDependencyChecks({ searchDir, screenDir }) {
       moduleName: "ws",
       cwd: screenDir,
       missingMessage: "无法校验 ws：boss-recommend-screen-cli 目录不存在。"
+    }),
+    buildNodePackageCheck({
+      key: "npm_dep_sharp",
+      moduleName: "sharp",
+      cwd: screenDir,
+      missingMessage: "无法校验 sharp：boss-recommend-screen-cli 目录不存在。"
     })
   ];
 }
@@ -1065,7 +987,8 @@ function collectNpmInstallDirsFromChecks(checks = [], workspaceRoot) {
   const npmKeys = new Set([
     "npm_dep_chrome_remote_interface_search",
     "npm_dep_chrome_remote_interface_screen",
-    "npm_dep_ws"
+    "npm_dep_ws",
+    "npm_dep_sharp"
   ]);
   const dirs = checks
     .filter((item) => item && item.ok === false && npmKeys.has(item.key))
@@ -1104,28 +1027,6 @@ function installNpmDependencies(checks, workspaceRoot) {
   };
 }
 
-function installPillowIfPossible() {
-  const detected = detectPythonCommand();
-  if (!detected.ok || !detected.command) {
-    return {
-      ok: false,
-      action: "install_pillow",
-      changed: false,
-      message: "未检测到可用 python 命令，无法自动安装 Pillow。"
-    };
-  }
-  const install = runProcessSync({
-    command: detected.command,
-    args: ["-m", "pip", "install", "pillow"]
-  });
-  return {
-    ok: install.ok,
-    action: "install_pillow",
-    changed: install.ok,
-    message: install.ok ? "Pillow 自动安装完成。" : `Pillow 自动安装失败：${install.output || install.error_message || "unknown"}`
-  };
-}
-
 export function attemptPipelineAutoRepair(workspaceRoot, preflight = {}) {
   const checks = Array.isArray(preflight.checks) ? preflight.checks : [];
   const failed = collectFailedCheckKeys(checks);
@@ -1135,6 +1036,7 @@ export function attemptPipelineAutoRepair(workspaceRoot, preflight = {}) {
     failed.has("npm_dep_chrome_remote_interface_search")
     || failed.has("npm_dep_chrome_remote_interface_screen")
     || failed.has("npm_dep_ws")
+    || failed.has("npm_dep_sharp")
   ) {
     if (!failed.has("node_cli")) {
       actions.push(installNpmDependencies(checks, workspaceRoot));
@@ -1144,19 +1046,6 @@ export function attemptPipelineAutoRepair(workspaceRoot, preflight = {}) {
         action: "install_npm_dependencies",
         changed: false,
         message: "Node 命令不可用，跳过 npm 自动安装。"
-      });
-    }
-  }
-
-  if (failed.has("python_pillow")) {
-    if (!failed.has("python_cli")) {
-      actions.push(installPillowIfPossible());
-    } else {
-      actions.push({
-        ok: false,
-        action: "install_pillow",
-        changed: false,
-        message: "python 命令不可用，跳过 Pillow 自动安装。"
       });
     }
   }

@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "1.1.4",
+  "version": "1.1.6",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -39,6 +39,7 @@
   ],
   "dependencies": {
     "chrome-remote-interface": "^0.33.3",
+    "sharp": "^0.34.4",
     "ws": "^8.19.0"
   },
   "engines": {
@@ -47,5 +48,15 @@
   "publishConfig": {
     "access": "public"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reconcrap-cpu/boss-recommend-mcp.git"
+  },
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/reconcrap-cpu/boss-recommend-mcp/issues"
+  },
+  "homepage": "https://github.com/reconcrap-cpu/boss-recommend-mcp#readme"
 }
