@@ -1116,7 +1116,7 @@ const jsClickFavoriteFallback = `(() => {
   return { ok: true };
 })()`;
 
-const jsGetGreetState = `(() => {
+const jsGetGreetStateRecommend = `(() => {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const isVisible = (doc, el) => {
     if (!el) return false;
@@ -1161,7 +1161,7 @@ const jsGetGreetState = `(() => {
   return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
 })()`;
 
-const jsClickGreetFallback = `(() => {
+const jsClickGreetFallbackRecommend = `(() => {
   const topButton = Array.from(document.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button, button.btn-v2.btn-sure-v2'))
     .find((item) => item && item.offsetParent !== null && /沟通|打招呼|聊一聊/.test(String(item.textContent || '').replace(/\\s+/g, ' ')));
   if (topButton) {
@@ -1174,6 +1174,70 @@ const jsClickGreetFallback = `(() => {
   if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   const doc = frame.contentDocument;
   const button = doc.querySelector('button.btn-v2.btn-sure-v2.btn-greet');
+  if (!button || button.offsetParent === null) return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
+  button.click();
+  return { ok: true };
+})()`;
+
+const jsGetGreetStateFeatured = `(() => {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (doc, el) => {
+    if (!el) return false;
+    const view = doc.defaultView || window;
+    const style = view.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
+  const resolveGreet = (doc, offsetX, offsetY, scope) => {
+    if (!doc) return null;
+    const candidates = [
+      ...Array.from(doc.querySelectorAll('button.btn-v2.position-rights.btn-sure-v2')),
+      ...Array.from(doc.querySelectorAll('button.btn-v2.btn-sure-v2.position-rights')),
+      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button.btn-v2, .resume-footer-wrap button.btn-v2')),
+      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button'))
+    ];
+    const button = candidates.find((item) => isVisible(doc, item) && /立即沟通|沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
+    if (!button) return null;
+    const rect = button.getBoundingClientRect();
+    return {
+      ok: true,
+      disabled: Boolean(button.disabled),
+      x: offsetX + rect.left + rect.width / 2,
+      y: offsetY + rect.top + rect.height / 2,
+      scope
+    };
+  };
+  const topResult = resolveGreet(document, 0, 0, 'top');
+  if (topResult) return topResult;
+
+  const frame = document.querySelector('iframe[name="recommendFrame"]')
+    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+    || document.querySelector('iframe');
+  if (!frame || !frame.contentDocument) {
+    return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+  }
+  const frameRect = frame.getBoundingClientRect();
+  const frameResult = resolveGreet(frame.contentDocument, frameRect.left, frameRect.top, 'frame');
+  if (frameResult) return frameResult;
+  return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
+})()`;
+
+const jsClickGreetFallbackFeatured = `(() => {
+  const topButton = Array.from(document.querySelectorAll('button.btn-v2.position-rights.btn-sure-v2, button.btn-v2.btn-sure-v2.position-rights, .resume-footer.item-operate button, .resume-footer-wrap button'))
+    .find((item) => item && item.offsetParent !== null && /立即沟通|沟通|打招呼|聊一聊/.test(String(item.textContent || '').replace(/\\s+/g, ' ')));
+  if (topButton) {
+    topButton.click();
+    return { ok: true, scope: 'top' };
+  }
+  const frame = document.querySelector('iframe[name="recommendFrame"]')
+    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+    || document.querySelector('iframe');
+  if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+  const doc = frame.contentDocument;
+  const button = doc.querySelector('button.btn-v2.position-rights.btn-sure-v2, button.btn-v2.btn-sure-v2.position-rights');
   if (!button || button.offsetParent === null) return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
   button.click();
   return { ok: true };
@@ -2433,7 +2497,11 @@ class RecommendScreenCli {
   }
 
   async greetCandidate() {
-    const greet = await this.evaluate(jsGetGreetState);
+    const greetStateScript = this.args.pageScope === "featured" ? jsGetGreetStateFeatured : jsGetGreetStateRecommend;
+    const greetClickFallbackScript = this.args.pageScope === "featured"
+      ? jsClickGreetFallbackFeatured
+      : jsClickGreetFallbackRecommend;
+    const greet = await this.evaluate(greetStateScript);
     if (!greet?.ok || greet.disabled) {
       throw this.buildError("GREET_BUTTON_FAILED", greet?.error || "打招呼按钮不可用");
     }
@@ -2441,7 +2509,7 @@ class RecommendScreenCli {
     try {
       await this.simulateHumanClick(greet.x, greet.y);
     } catch {
-      const fallback = await this.evaluate(jsClickGreetFallback);
+      const fallback = await this.evaluate(greetClickFallbackScript);
       if (!fallback?.ok) {
         throw this.buildError("GREET_BUTTON_FAILED", fallback?.error || "打招呼点击失败");
       }
