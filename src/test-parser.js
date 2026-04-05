@@ -476,6 +476,47 @@ function testMcpMentionShouldStayInCriteria() {
   assert.equal(result.screenParams.criteria, "有 AI Agent 或 MCP 工具开发经验");
 }
 
+function testFeaturedKeywordShouldProposeFeaturedPageScope() {
+  const result = parseRecommendInstruction({
+    instruction: "在推荐页精选里筛选候选人，有 Agent 经验，符合标准收藏",
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.equal(result.proposed_page_scope, "featured");
+  assert.equal(result.needs_page_confirmation, true);
+  assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
+}
+
+function testConfirmedPageScopeShouldBeResolved() {
+  const result = parseRecommendInstruction({
+    instruction: "在推荐页筛选候选人，有 Agent 经验，符合标准收藏",
+    confirmation: {
+      page_confirmed: true,
+      page_value: "featured"
+    },
+    overrides: null
+  });
+
+  assert.equal(result.page_scope, "featured");
+  assert.equal(result.needs_page_confirmation, false);
+}
+
+function testPageScopeOverrideShouldNotBypassConfirmation() {
+  const result = parseRecommendInstruction({
+    instruction: "在推荐页筛选候选人，有 Agent 经验，符合标准收藏",
+    confirmation: null,
+    overrides: {
+      page_scope: "featured"
+    }
+  });
+
+  assert.equal(result.proposed_page_scope, "featured");
+  assert.equal(result.page_scope, null);
+  assert.equal(result.needs_page_confirmation, true);
+  assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
+}
+
 function main() {
   testNeedConfirmationIncludesPostAction();
   testConfirmedPostActionAndOverrides();
@@ -501,6 +542,9 @@ function main() {
   testTargetCountCanBeSkippedAfterConfirmation();
   testPostActionNoneCanBeConfirmed();
   testJobSelectionHintCanComeFromOverrides();
+  testFeaturedKeywordShouldProposeFeaturedPageScope();
+  testConfirmedPageScopeShouldBeResolved();
+  testPageScopeOverrideShouldNotBypassConfirmation();
   console.log("parser tests passed");
 }
 

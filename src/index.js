@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import process from "node:process";
@@ -147,6 +148,11 @@ function createRunInputSchema() {
       confirmation: {
         type: "object",
         properties: {
+          page_confirmed: { type: "boolean" },
+          page_value: {
+            type: "string",
+            enum: ["recommend", "featured"]
+          },
           filters_confirmed: { type: "boolean" },
           school_tag_confirmed: { type: "boolean" },
           school_tag_value: {
@@ -219,6 +225,10 @@ function createRunInputSchema() {
       overrides: {
         type: "object",
         properties: {
+          page_scope: {
+            type: "string",
+            enum: ["recommend", "featured"]
+          },
           school_tag: {
             oneOf: [
               {
@@ -422,6 +432,84 @@ function safeUpdateRunProgress(runId, patch, message = null) {
   } catch {
     return null;
   }
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readCheckpointProgress(checkpointPath) {
+  const normalized = normalizeText(checkpointPath || "");
+  if (!normalized) return null;
+  try {
+    const raw = fs.readFileSync(normalized, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      processed_count: Number.isInteger(parsed.processed_count) ? parsed.processed_count : 0,
+      passed_count: Array.isArray(parsed.passed_candidates) ? parsed.passed_candidates.length : 0,
+      skipped_count: Number.isInteger(parsed.skipped_count) ? parsed.skipped_count : 0,
+      output_csv: normalizeText(parsed.output_csv || "") || null,
+      checkpoint_path: normalized
+    };
+  } catch {
+    return null;
+  }
+}
+
+function reconcileOrphanRunIfNeeded(runId, snapshot) {
+  if (!snapshot || TERMINAL_RUN_STATES.has(snapshot.state)) {
+    return snapshot;
+  }
+  if (snapshot.state === RUN_STATE_PAUSED) {
+    return snapshot;
+  }
+  if (activeAsyncRuns.has(runId)) {
+    return snapshot;
+  }
+  if (isProcessAlive(snapshot.pid)) {
+    return snapshot;
+  }
+
+  const checkpointPath = normalizeText(snapshot?.resume?.checkpoint_path || getRunArtifacts(runId).checkpoint_path);
+  const checkpointProgress = readCheckpointProgress(checkpointPath);
+  const partialResult = checkpointProgress
+    ? {
+        processed_count: checkpointProgress.processed_count,
+        passed_count: checkpointProgress.passed_count,
+        skipped_count: checkpointProgress.skipped_count,
+        output_csv: checkpointProgress.output_csv,
+        checkpoint_path: checkpointProgress.checkpoint_path
+      }
+    : null;
+  const error = {
+    code: "RUN_PROCESS_EXITED",
+    message: `检测到运行进程已退出（pid=${snapshot.pid || "unknown"}），已自动纠正状态。`,
+    retryable: true
+  };
+  const recovered = safeUpdateRunState(runId, {
+    state: RUN_STATE_FAILED,
+    stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
+    last_message: "运行进程已退出，状态已自动标记为失败。",
+    resume: {
+      ...snapshot.resume,
+      checkpoint_path: checkpointPath,
+      output_csv: checkpointProgress?.output_csv || snapshot?.resume?.output_csv || null
+    },
+    error,
+    result: {
+      status: "FAILED",
+      error,
+      partial_result: partialResult
+    }
+  });
+  return recovered || readRunState(runId) || snapshot;
 }
 
 function createRuntimeCallbacks(runId, heartbeatIntervalMs) {
@@ -781,9 +869,10 @@ function handleGetRunTool(args) {
       }
     };
   }
+  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot);
   return {
     status: "RUN_STATUS",
-    run: snapshot
+    run: reconciled
   };
 }
 

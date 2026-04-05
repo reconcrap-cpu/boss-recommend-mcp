@@ -139,6 +139,7 @@ function createArgs(tempDir) {
     criteria: "test criteria",
     targetCount: null,
     maxGreetCount: null,
+    pageScope: "recommend",
     port: 9222,
     output: path.join(tempDir, "result.csv"),
     checkpointPath: path.join(tempDir, "checkpoint.json"),
@@ -154,6 +155,7 @@ function createArgs(tempDir) {
       criteria: true,
       targetCount: true,
       maxGreetCount: false,
+      pageScope: true,
       port: true,
       postAction: true,
       postActionConfirmed: true
@@ -304,6 +306,149 @@ async function testPageExhaustedWithoutTargetShouldStillComplete() {
   assert.equal(result.result.completion_reason, "page_exhausted");
 }
 
+async function testFeaturedShouldUseNetworkResumeOnly() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-network-first-"));
+  const candidate = { key: "net-1", geek_id: "net-1", name: "network candidate" };
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [candidate]
+  });
+
+  cli.waitForNetworkResumeCandidateInfo = async () => ({
+    name: "network candidate",
+    school: "测试大学",
+    major: "计算机",
+    company: "OpenClaw",
+    position: "工程师",
+    resumeText: "有丰富 MCP 经验"
+  });
+  cli.callTextModel = async () => ({
+    passed: true,
+    reason: "network pass",
+    summary: "network summary"
+  });
+  cli.captureResumeImage = async () => {
+    throw new Error("capture should not be called");
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.resume_source, "network");
+}
+
+async function testRecommendShouldKeepImageCaptureEvenWhenNetworkResumeExists() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-recommend-image-main-"));
+  const candidate = { key: "img-main-1", geek_id: "img-main-1", name: "recommend image main candidate" };
+  const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
+    candidates: [candidate],
+    captureOutcomes: new Map([
+      ["img-main-1", { stitchedImage: path.join(tempDir, "img-main-1.png") }]
+    ]),
+    screeningByKey: new Map([
+      ["img-main-1", { passed: true, reason: "image path used", summary: "image path used" }]
+    ])
+  });
+  cli.waitForNetworkResumeCandidateInfo = async () => ({
+    resumeText: "这段 network 文本在 recommend 页面不应被用于筛选"
+  });
+  cli.callTextModel = async () => {
+    throw new Error("text model should not be called for recommend scope");
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.resume_source, "image_fallback");
+}
+
+async function testNetworkMissShouldFallbackToImageCapture() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-network-fallback-"));
+  const candidate = { key: "img-1", geek_id: "img-1", name: "image candidate" };
+  const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
+    candidates: [candidate],
+    captureOutcomes: new Map([
+      ["img-1", { stitchedImage: path.join(tempDir, "img-1.png") }]
+    ]),
+    screeningByKey: new Map([
+      ["img-1", { passed: false, reason: "image path used", summary: "image path used" }]
+    ])
+  });
+  cli.waitForNetworkResumeCandidateInfo = async () => null;
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.resume_source, "image_fallback");
+}
+
+async function testFeaturedNetworkMissShouldSkipWithoutImageCapture() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-network-only-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  const candidate = { key: "featured-no-network", geek_id: "featured-no-network", name: "featured no network" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [candidate]
+  });
+  cli.waitForNetworkResumeCandidateInfo = async () => null;
+  cli.captureResumeImage = async () => {
+    throw new Error("capture should not be called for featured scope");
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 1);
+  assert.equal(result.result.passed_count, 0);
+  assert.equal(result.result.skipped_count, 1);
+  assert.equal(result.result.resume_source, "network");
+}
+
+async function testFeaturedFavoriteShouldNotUseDomFallback() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-favorite-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  const calibrationPath = path.join(tempDir, "favorite-calibration.json");
+  fs.writeFileSync(calibrationPath, JSON.stringify({
+    favoritePosition: {
+      pageX: 120,
+      pageY: 220,
+      canvasX: 0,
+      canvasY: 0
+    }
+  }, null, 2));
+  args.calibrationPath = calibrationPath;
+  const cli = new RecommendScreenCli(args);
+  let evaluateCalls = 0;
+  let clickCalls = 0;
+  cli.evaluate = async () => {
+    evaluateCalls += 1;
+    return { ok: true };
+  };
+  cli.simulateHumanClick = async () => {
+    clickCalls += 1;
+    cli.favoriteActionEvents.push({ action: "add", ts: Date.now(), source: "test", url: "userMark/add" });
+  };
+  const result = await cli.favoriteCandidate();
+  assert.equal(result.actionTaken, "favorite");
+  assert.equal(clickCalls, 1);
+  assert.equal(evaluateCalls, 0);
+}
+
+async function testFeaturedFavoriteWithoutCalibrationShouldFail() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-favorite-missing-cal-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  args.calibrationPath = path.join(tempDir, "missing-calibration.json");
+  const cli = new RecommendScreenCli(args);
+  await assert.rejects(
+    () => cli.favoriteCandidate(),
+    (error) => {
+      assert.equal(error.code, "FAVORITE_CALIBRATION_REQUIRED");
+      return true;
+    }
+  );
+}
+
 async function testStitchWithSharpShouldComposeExpectedImage() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-sharp-stitch-"));
   const chunkA = path.join(tempDir, "chunk_000.png");
@@ -401,6 +546,12 @@ async function main() {
   await testConsecutiveResumeCaptureFailuresStillAbort();
   await testPageExhaustedBeforeTargetShouldRaiseRecoverableError();
   await testPageExhaustedWithoutTargetShouldStillComplete();
+  await testFeaturedShouldUseNetworkResumeOnly();
+  await testRecommendShouldKeepImageCaptureEvenWhenNetworkResumeExists();
+  await testNetworkMissShouldFallbackToImageCapture();
+  await testFeaturedNetworkMissShouldSkipWithoutImageCapture();
+  await testFeaturedFavoriteShouldNotUseDomFallback();
+  await testFeaturedFavoriteWithoutCalibrationShouldFail();
   await testStitchWithSharpShouldComposeExpectedImage();
   testStitchWithAvailablePythonShouldFallbackToPython();
   testStitchWithAvailablePythonShouldFailWhenScriptMissing();

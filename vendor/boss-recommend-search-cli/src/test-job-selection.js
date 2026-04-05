@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { RecommendSearchCli, normalizeJobTitle } from "./cli.js";
+import { RecommendSearchCli, normalizeJobTitle, parseArgs } from "./cli.js";
 
 const JOBS = [
   {
@@ -22,6 +22,7 @@ function createArgs(overrides = {}) {
     degree: ["不限"],
     gender: "不限",
     recentNotView: "不限",
+    pageScope: "recommend",
     port: 9222,
     listJobs: false,
     job: null,
@@ -31,11 +32,17 @@ function createArgs(overrides = {}) {
       degree: true,
       gender: true,
       recentNotView: true,
+      pageScope: true,
       port: true,
       job: true
     },
     ...overrides
   };
+}
+
+function testParseArgsPageScope() {
+  const parsed = parseArgs(["--page-scope", "featured"]);
+  assert.equal(parsed.pageScope, "featured");
 }
 
 class SelectJobCliMock extends RecommendSearchCli {
@@ -189,6 +196,7 @@ async function testRunListJobsModePrintsJobsAndSkipsFilter() {
 }
 
 async function main() {
+  testParseArgsPageScope();
   testNormalizeJobTitle();
   testFindJobMatchByValueTitleLabelAndPartial();
   testFindJobMatchAmbiguousThrows();

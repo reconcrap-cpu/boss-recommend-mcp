@@ -18,6 +18,10 @@ const screenConfigTemplateDefaults = {
   model: "gpt-4.1-mini"
 };
 const DEFAULT_RECOMMEND_SCREEN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const PAGE_SCOPE_TO_TAB_STATUS = {
+  recommend: "0",
+  featured: "3"
+};
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -37,6 +41,10 @@ function getUserConfigPath() {
 
 function getLegacyUserConfigPath() {
   return path.join(getCodexHome(), "boss-recommend-mcp", "screening-config.json");
+}
+
+function getUserCalibrationPath() {
+  return path.join(getCodexHome(), "boss-recommend-mcp", "favorite-calibration.json");
 }
 
 function getDesktopDir() {
@@ -62,6 +70,23 @@ function parsePositiveInteger(raw) {
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizePageScope(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
+  return null;
+}
+
+function shouldBringChromeToFront() {
+  const envValue = normalizeText(process.env.BOSS_RECOMMEND_BRING_TO_FRONT || "").toLowerCase();
+  if (envValue) {
+    if (["1", "true", "yes", "y", "on"].includes(envValue)) return true;
+    if (["0", "false", "no", "n", "off"].includes(envValue)) return false;
+  }
+  return false;
 }
 
 function isRootDirectory(targetPath) {
@@ -429,6 +454,70 @@ function resolveRecommendSearchCliEntry(searchDir) {
     path.join(searchDir, "src", "cli.cjs")
   ];
   return candidates.find((candidate) => pathExists(candidate)) || candidates[0];
+}
+
+function parseKeyValueOutput(text) {
+  const result = {};
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const sep = trimmed.indexOf("=");
+    if (sep <= 0) continue;
+    const key = trimmed.slice(0, sep).trim();
+    const value = trimmed.slice(sep + 1).trim();
+    if (!key) continue;
+    result[key] = value;
+  }
+  return result;
+}
+
+function runBossRecruitWhere() {
+  const direct = runProcessSync({
+    command: "boss-recruit-mcp",
+    args: ["where"]
+  });
+  if (direct.ok) {
+    return parseKeyValueOutput(direct.stdout);
+  }
+
+  if (process.platform !== "win32") {
+    return null;
+  }
+
+  const fallback = runProcessSync({
+    command: "cmd.exe",
+    args: ["/d", "/s", "/c", "boss-recruit-mcp where"]
+  });
+  if (!fallback.ok) return null;
+  return parseKeyValueOutput(fallback.stdout);
+}
+
+function resolveRecruitCalibrationScriptPath(workspaceRoot) {
+  const fromEnv = normalizeText(process.env.BOSS_RECOMMEND_RECRUIT_CALIBRATION_SCRIPT || "");
+  const fromWhere = runBossRecruitWhere();
+  const packageRootFromWhere = normalizeText(fromWhere?.package_root || "");
+  const workspaceResolved = path.resolve(String(workspaceRoot || process.cwd()));
+  const candidates = [
+    fromEnv,
+    packageRootFromWhere
+      ? path.join(packageRootFromWhere, "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs")
+      : null,
+    path.join(workspaceResolved, "..", "boss-recruit-mcp-main", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs"),
+    path.join(packagedMcpDir, "..", "boss-recruit-mcp-main", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs")
+  ].filter(Boolean).map((item) => path.resolve(item));
+
+  for (const candidate of new Set(candidates)) {
+    if (pathExists(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function getCalibrationTimeoutMs(raw) {
+  const parsed = parsePositiveInteger(raw);
+  if (!parsed) return 60000;
+  return Math.max(5000, parsed);
 }
 
 function safeInvokeCallback(callback, payload) {
@@ -907,7 +996,133 @@ function localDirHint(workspaceRoot, dirName) {
   return path.join(workspaceRoot, dirName);
 }
 
-export function runPipelinePreflight(workspaceRoot) {
+export function getFeaturedCalibrationResolution(workspaceRoot) {
+  const calibration_path = resolveFavoriteCalibrationPath(workspaceRoot);
+  const calibration_exists = pathExists(calibration_path);
+  const calibration_usable = isUsableCalibrationFile(calibration_path);
+  const calibration_script_path = resolveRecruitCalibrationScriptPath(workspaceRoot);
+  return {
+    calibration_path,
+    calibration_exists,
+    calibration_usable,
+    calibration_script_path
+  };
+}
+
+export async function runRecommendCalibration(
+  workspaceRoot,
+  options = {}
+) {
+  const debugPort = parsePositiveInteger(options.port) || resolveWorkspaceDebugPort(workspaceRoot);
+  const calibrationPath = options.output
+    ? path.resolve(String(options.output))
+    : resolveFavoriteCalibrationPath(workspaceRoot);
+  const timeoutMs = getCalibrationTimeoutMs(options.timeoutMs);
+  const calibrationScriptPath = resolveRecruitCalibrationScriptPath(workspaceRoot);
+
+  if (!calibrationScriptPath) {
+    return {
+      ok: false,
+      stdout: "",
+      stderr: "",
+      calibration_path: calibrationPath,
+      calibration_script_path: null,
+      debug_port: debugPort,
+      error: {
+        code: "CALIBRATION_SCRIPT_MISSING",
+        message: "未找到 boss-recruit-mcp 校准脚本 calibrate-favorite-position-v2.cjs。"
+      }
+    };
+  }
+
+  ensureDir(path.dirname(calibrationPath));
+  const result = await runProcess({
+    command: "node",
+    args: [
+      calibrationScriptPath,
+      "--port",
+      String(debugPort),
+      "--output",
+      calibrationPath,
+      "--timeout-ms",
+      String(timeoutMs)
+    ],
+    cwd: path.dirname(calibrationScriptPath),
+    timeoutMs: timeoutMs + 15_000,
+    heartbeatIntervalMs: options.runtime?.heartbeatIntervalMs,
+    signal: options.runtime?.signal,
+    onOutput: (event) => {
+      safeInvokeCallback(options.runtime?.onOutput, event);
+    },
+    onHeartbeat: (event) => {
+      safeInvokeCallback(options.runtime?.onHeartbeat, event);
+    }
+  });
+
+  const usable = isUsableCalibrationFile(calibrationPath);
+  const ok = result.code === 0 && usable;
+  return {
+    ok,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    calibration_path: calibrationPath,
+    calibration_script_path: calibrationScriptPath,
+    debug_port: debugPort,
+    auto_started: true,
+    error: ok
+      ? null
+      : {
+          code: result.error_code === "ABORTED"
+            ? "CALIBRATION_ABORTED"
+            : result.error_code === "TIMEOUT"
+              ? "CALIBRATION_TIMEOUT"
+              : "CALIBRATION_FAILED",
+          message: usable
+            ? "校准脚本执行异常。"
+            : "校准脚本未生成可用的 favorite-calibration.json。"
+        }
+  };
+}
+
+export async function ensureFeaturedCalibrationReady(
+  workspaceRoot,
+  options = {}
+) {
+  const calibrationPath = resolveFavoriteCalibrationPath(workspaceRoot);
+  if (isUsableCalibrationFile(calibrationPath)) {
+    return {
+      ok: true,
+      calibration_path: calibrationPath,
+      auto_started: false
+    };
+  }
+  if (options.autoCalibrate === false) {
+    return {
+      ok: false,
+      calibration_path: calibrationPath,
+      auto_started: false,
+      error: {
+        code: "CALIBRATION_REQUIRED",
+        message: "精选页收藏缺少可用校准文件，需先在推荐页精选 tab 完成校准。"
+      }
+    };
+  }
+  const calibrationRun = await runRecommendCalibration(workspaceRoot, options);
+  if (calibrationRun.ok) {
+    return calibrationRun;
+  }
+  return {
+    ...calibrationRun,
+    ok: false,
+    error: {
+      code: "CALIBRATION_REQUIRED",
+      message: calibrationRun.error?.message || "精选页收藏校准失败，请在推荐页精选 tab 重试校准。"
+    }
+  };
+}
+
+export function runPipelinePreflight(workspaceRoot, options = {}) {
+  const pageScope = normalizePageScope(options.pageScope) || "recommend";
   const searchDir = resolveRecommendSearchCliDir(workspaceRoot);
   const screenDir = resolveRecommendScreenCliDir(workspaceRoot);
   const searchDirExists = Boolean(searchDir && pathExists(searchDir));
@@ -924,6 +1139,8 @@ export function runPipelinePreflight(workspaceRoot) {
   const screenConfigPath = configResolution.resolved_path;
   const screenConfigParsed = readJsonFile(screenConfigPath);
   const screenConfigValidation = validateScreenConfig(screenConfigParsed);
+  const calibrationPath = resolveFavoriteCalibrationPath(workspaceRoot);
+  const calibrationUsable = isUsableCalibrationFile(calibrationPath);
   const checks = [
     {
       key: "recommend_search_cli_dir",
@@ -963,15 +1180,42 @@ export function runPipelinePreflight(workspaceRoot) {
       path: screenConfigPath,
       reason: screenConfigValidation.reason || null,
       message: screenConfigValidation.ok ? "screening-config.json 可用" : screenConfigValidation.message
+    },
+    {
+      key: "favorite_calibration",
+      ok: calibrationUsable,
+      path: calibrationPath,
+      optional: pageScope !== "featured",
+      message: calibrationUsable
+        ? "favorite-calibration.json 可用"
+        : "favorite-calibration.json 不存在或无效（精选页收藏仅支持校准坐标点击）"
     }
   ];
   checks.push(...buildRuntimeDependencyChecks({ searchDir, screenDir }));
 
+  const requiredCheckKeys = new Set([
+    "recommend_search_cli_dir",
+    "recommend_search_cli_entry",
+    "recommend_screen_cli_dir",
+    "recommend_screen_cli_entry",
+    "screen_config",
+    "node_cli",
+    "npm_dep_chrome_remote_interface_search",
+    "npm_dep_chrome_remote_interface_screen",
+    "npm_dep_ws",
+    "npm_dep_sharp"
+  ]);
+  if (pageScope === "featured") {
+    requiredCheckKeys.add("favorite_calibration");
+  }
+
   return {
-    ok: checks.every((item) => item.ok),
+    ok: checks.every((item) => !requiredCheckKeys.has(item.key) || item.ok),
     checks,
     debug_port: resolveWorkspaceDebugPort(workspaceRoot),
-    config_resolution: configResolution
+    config_resolution: configResolution,
+    calibration_path: calibrationPath,
+    page_scope: pageScope
   };
 }
 
@@ -1051,7 +1295,9 @@ export function attemptPipelineAutoRepair(workspaceRoot, preflight = {}) {
   }
 
   const attempted = actions.length > 0;
-  const nextPreflight = runPipelinePreflight(workspaceRoot);
+  const nextPreflight = runPipelinePreflight(workspaceRoot, {
+    pageScope: preflight?.page_scope
+  });
   return {
     attempted,
     actions,
@@ -1293,6 +1539,402 @@ async function evaluateCdpExpression(client, expression) {
   return result.result?.value;
 }
 
+function buildRecommendTabStateExpression() {
+  return `(() => {
+    const frame = document.querySelector('iframe[name="recommendFrame"]')
+      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+      || document.querySelector('iframe');
+    if (!frame || !frame.contentDocument) {
+      return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
+    }
+    const doc = frame.contentDocument;
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]')).map((node) => {
+      const status = normalize(node.getAttribute('data-status'));
+      const className = normalize(node.className);
+      const active = (
+        /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(className)
+        || normalize(node.getAttribute('aria-selected')) === 'true'
+        || normalize(node.getAttribute('data-selected')) === 'true'
+      );
+      return {
+        status: status || null,
+        title: normalize(node.getAttribute('title')) || null,
+        label: normalize(node.textContent) || null,
+        active,
+        class_name: className || null
+      };
+    });
+    const activeTab = tabs.find((item) => item.active && item.status) || null;
+    const featuredCount = doc.querySelectorAll('li.geek-info-card').length;
+    const recommendCount = doc.querySelectorAll('ul.card-list > li.card-item').length;
+    let inferredStatus = activeTab?.status || null;
+    if (!inferredStatus) {
+      if (featuredCount > 0 && recommendCount === 0) inferredStatus = '3';
+      else if (recommendCount > 0 && featuredCount === 0) inferredStatus = '0';
+    }
+    return {
+      ok: true,
+      active_status: inferredStatus,
+      tabs,
+      layout: {
+        featured_count: featuredCount,
+        recommend_count: recommendCount
+      }
+    };
+  })()`;
+}
+
+function buildRecommendTabSwitchExpression(targetStatus) {
+  return `((targetStatus) => {
+    const frame = document.querySelector('iframe[name="recommendFrame"]')
+      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+      || document.querySelector('iframe');
+    if (!frame || !frame.contentDocument) {
+      return { ok: false, state: 'NO_RECOMMEND_IFRAME' };
+    }
+    const doc = frame.contentDocument;
+    const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+    const target = tabs.find((node) => normalize(node.getAttribute('data-status')) === String(targetStatus)) || null;
+    if (!target) {
+      return { ok: false, state: 'TAB_NOT_FOUND', target_status: String(targetStatus) };
+    }
+    try {
+      target.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' });
+    } catch {}
+    try {
+      target.click();
+    } catch (error) {
+      return {
+        ok: false,
+        state: 'TAB_CLICK_FAILED',
+        message: error?.message || String(error),
+        target_status: String(targetStatus)
+      };
+    }
+    return {
+      ok: true,
+      state: 'TAB_CLICKED',
+      target_status: String(targetStatus)
+    };
+  })(${JSON.stringify(String(targetStatus || ""))})`;
+}
+
+function buildRecommendDetailStateExpression() {
+  return `(() => {
+    const selectors = [
+      '.dialog-wrap.active',
+      '.boss-popup__wrapper',
+      '.boss-popup_wrapper',
+      '.boss-dialog_wrapper',
+      '.boss-dialog',
+      '.resume-item-detail',
+      '.geek-detail-modal',
+      'iframe[src*="/web/frame/c-resume/"]',
+      'iframe[name*="resume"]',
+      '[class*="popup"][class*="wrapper"]',
+      '[class*="dialog"][class*="wrapper"]'
+    ];
+    const isVisible = (node) => {
+      if (!node || !node.getBoundingClientRect) return false;
+      const rect = node.getBoundingClientRect();
+      if (!rect || rect.width < 4 || rect.height < 4) return false;
+      const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
+      if (style) {
+        if (style.display === 'none') return false;
+        if (style.visibility === 'hidden') return false;
+        if (Number(style.opacity || '1') <= 0) return false;
+      }
+      return true;
+    };
+    const findVisibleDetail = (doc, source) => {
+      if (!doc) return null;
+      for (const selector of selectors) {
+        const nodes = doc.querySelectorAll(selector);
+        for (const node of nodes) {
+          if (isVisible(node)) {
+            return {
+              ok: true,
+              open: true,
+              source,
+              selector
+            };
+          }
+        }
+      }
+      return null;
+    };
+
+    const topDetail = findVisibleDetail(document, 'top');
+    if (topDetail) return topDetail;
+
+    const frame = document.querySelector('iframe[name="recommendFrame"]')
+      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+      || null;
+    if (!frame || !frame.contentDocument) {
+      return { ok: true, open: false, reason: 'NO_RECOMMEND_IFRAME' };
+    }
+    const frameDetail = findVisibleDetail(frame.contentDocument, 'recommendFrame');
+    if (frameDetail) return frameDetail;
+
+    return { ok: true, open: false, reason: 'DETAIL_NOT_VISIBLE' };
+  })()`;
+}
+
+export async function waitRecommendFeaturedDetailReady(workspaceRoot, options = {}) {
+  const debugPort = Number.isFinite(options.port)
+    ? options.port
+    : resolveWorkspaceDebugPort(workspaceRoot);
+  const timeoutMs = Number.isFinite(options.timeoutMs)
+    ? Math.max(5000, options.timeoutMs)
+    : 120000;
+  const pollMs = Number.isFinite(options.pollMs)
+    ? Math.max(150, options.pollMs)
+    : 400;
+
+  let client = null;
+  try {
+    const tabs = await listChromeTabs(debugPort);
+    const target = pickBossRecommendReloadTarget(tabs);
+    if (!target) {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: "BOSS_TAB_NOT_FOUND",
+        message: "未找到可检测详情页状态的 Boss recommend 标签页。"
+      };
+    }
+    client = await CDP({ port: debugPort, target });
+    const { Runtime, Page } = client;
+    if (Runtime && typeof Runtime.enable === "function") {
+      await Runtime.enable();
+    }
+    if (Page && typeof Page.enable === "function") {
+      await Page.enable();
+    }
+    if (shouldBringChromeToFront() && Page && typeof Page.bringToFront === "function") {
+      await Page.bringToFront();
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let lastState = null;
+    while (Date.now() < deadline) {
+      lastState = await evaluateCdpExpression(client, buildRecommendDetailStateExpression());
+      if (lastState?.ok && lastState.open) {
+        return {
+          ok: true,
+          debug_port: debugPort,
+          state: "DETAIL_READY",
+          detail_state: lastState
+        };
+      }
+      await sleep(pollMs);
+    }
+
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "DETAIL_NOT_READY_TIMEOUT",
+      message: "未在超时内检测到候选人详情页，请先打开精选候选人详情后重试。",
+      detail_state: lastState || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "DETAIL_STATE_CHECK_FAILED",
+      message: error?.message || "检测候选人详情页状态失败。"
+    };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
+}
+
+export async function readRecommendTabState(workspaceRoot, options = {}) {
+  const debugPort = Number.isFinite(options.port)
+    ? options.port
+    : resolveWorkspaceDebugPort(workspaceRoot);
+
+  let client = null;
+  try {
+    const tabs = await listChromeTabs(debugPort);
+    const target = pickBossRecommendReloadTarget(tabs);
+    if (!target) {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: "BOSS_TAB_NOT_FOUND",
+        message: "未找到可读取 tab 状态的 Boss recommend 标签页。"
+      };
+    }
+    client = await CDP({ port: debugPort, target });
+    const { Runtime } = client;
+    if (Runtime && typeof Runtime.enable === "function") {
+      await Runtime.enable();
+    }
+    const tabState = await evaluateCdpExpression(client, buildRecommendTabStateExpression());
+    if (!tabState?.ok) {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: tabState?.error || "RECOMMEND_TAB_STATE_FAILED",
+        message: "读取 recommend tab 状态失败。",
+        tab_state: tabState || null
+      };
+    }
+    return {
+      ok: true,
+      debug_port: debugPort,
+      active_status: normalizeText(tabState.active_status),
+      tab_state: tabState
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "RECOMMEND_TAB_STATE_FAILED",
+      message: error?.message || "读取 recommend tab 状态失败。"
+    };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
+}
+
+function isUsableCalibrationFile(filePath) {
+  if (!filePath || !pathExists(filePath)) return false;
+  const parsed = readJsonFile(filePath);
+  return Boolean(
+    parsed
+    && parsed.favoritePosition
+    && Number.isFinite(parsed.favoritePosition.pageX)
+    && Number.isFinite(parsed.favoritePosition.pageY)
+  );
+}
+
+function resolveFavoriteCalibrationPath(workspaceRoot) {
+  const fromEnv = normalizeText(process.env.BOSS_RECOMMEND_CALIBRATION_FILE || "");
+  if (fromEnv) return path.resolve(fromEnv);
+
+  const screenConfigPath = resolveScreenConfigPath(workspaceRoot);
+  const screenConfig = readJsonFile(screenConfigPath);
+  const calibrationFile = normalizeText(screenConfig?.calibrationFile || "");
+  if (calibrationFile) {
+    return path.resolve(path.dirname(screenConfigPath), calibrationFile);
+  }
+  return getUserCalibrationPath();
+}
+
+export async function switchRecommendTab(workspaceRoot, options = {}) {
+  const debugPort = Number.isFinite(options.port)
+    ? options.port
+    : resolveWorkspaceDebugPort(workspaceRoot);
+  const targetScope = normalizePageScope(options.page_scope);
+  const targetStatus = normalizeText(options.target_status || PAGE_SCOPE_TO_TAB_STATUS[targetScope] || "");
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 8000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 350;
+  if (!targetStatus) {
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "TAB_STATUS_REQUIRED",
+      message: "切换 recommend tab 失败：缺少 target_status。"
+    };
+  }
+
+  let client = null;
+  try {
+    const tabs = await listChromeTabs(debugPort);
+    const target = pickBossRecommendReloadTarget(tabs);
+    if (!target) {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: "BOSS_TAB_NOT_FOUND",
+        message: "未找到可操作的 Boss recommend 标签页。"
+      };
+    }
+    client = await CDP({ port: debugPort, target });
+    const { Runtime, Page } = client;
+    if (Runtime && typeof Runtime.enable === "function") {
+      await Runtime.enable();
+    }
+    if (Page && typeof Page.enable === "function") {
+      await Page.enable();
+    }
+    if (shouldBringChromeToFront() && Page && typeof Page.bringToFront === "function") {
+      await Page.bringToFront();
+    }
+
+    const beforeState = await evaluateCdpExpression(client, buildRecommendTabStateExpression());
+    if (beforeState?.ok && normalizeText(beforeState.active_status) === targetStatus) {
+      return {
+        ok: true,
+        debug_port: debugPort,
+        state: "TAB_ALREADY_ACTIVE",
+        active_status: targetStatus,
+        tab_state: beforeState
+      };
+    }
+
+    const clickResult = await evaluateCdpExpression(client, buildRecommendTabSwitchExpression(targetStatus));
+    if (!clickResult?.ok) {
+      return {
+        ok: false,
+        debug_port: debugPort,
+        state: clickResult?.state || "TAB_CLICK_FAILED",
+        message: clickResult?.message || "点击 tab 失败。",
+        tab_state: beforeState || null
+      };
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let lastState = beforeState || null;
+    while (Date.now() < deadline) {
+      await sleep(pollMs);
+      lastState = await evaluateCdpExpression(client, buildRecommendTabStateExpression());
+      if (lastState?.ok && normalizeText(lastState.active_status) === targetStatus) {
+        return {
+          ok: true,
+          debug_port: debugPort,
+          state: "TAB_SWITCHED",
+          active_status: targetStatus,
+          tab_state: lastState
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "TAB_SWITCH_NOT_APPLIED",
+      message: "点击 tab 后未在超时内确认激活状态。",
+      tab_state: lastState || null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      debug_port: debugPort,
+      state: "RECOMMEND_TAB_SWITCH_FAILED",
+      message: error?.message || "切换 recommend tab 失败。"
+    };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
+}
+
 function buildRecommendRefreshStateExpression() {
   return `(() => {
     const frame = document.querySelector('iframe[name="recommendFrame"]')
@@ -1409,7 +2051,7 @@ export async function refreshBossRecommendList(workspaceRoot, options = {}) {
     if (Page && typeof Page.enable === "function") {
       await Page.enable();
     }
-    if (Page && typeof Page.bringToFront === "function") {
+    if (shouldBringChromeToFront() && Page && typeof Page.bringToFront === "function") {
       await Page.bringToFront();
     }
 
@@ -1523,7 +2165,7 @@ export async function reloadBossRecommendPage(workspaceRoot, options = {}) {
     if (Page && typeof Page.enable === "function") {
       await Page.enable();
     }
-    if (Page && typeof Page.bringToFront === "function") {
+    if (shouldBringChromeToFront() && Page && typeof Page.bringToFront === "function") {
       await Page.bringToFront();
     }
     await Page.reload({ ignoreCache: true });
@@ -1742,7 +2384,13 @@ export async function listRecommendJobs({ workspaceRoot, port, runtime = null })
   };
 }
 
-export async function runRecommendSearchCli({ workspaceRoot, searchParams, selectedJob, runtime = null }) {
+export async function runRecommendSearchCli({
+  workspaceRoot,
+  searchParams,
+  selectedJob,
+  pageScope = "recommend",
+  runtime = null
+}) {
   const searchDir = resolveRecommendSearchCliDir(workspaceRoot);
   if (!searchDir) {
     return {
@@ -1769,6 +2417,11 @@ export async function runRecommendSearchCli({ workspaceRoot, searchParams, selec
     "--port",
     String(resolveWorkspaceDebugPort(workspaceRoot))
   ];
+  const normalizedPageScope = normalizePageScope(pageScope) || "recommend";
+  args.push("--page-scope", normalizedPageScope);
+  if (normalizedPageScope === "featured") {
+    args.push("--calibration", resolveFavoriteCalibrationPath(workspaceRoot));
+  }
   const normalizedSelectedJob = String(selectedJob || "").trim();
   if (normalizedSelectedJob) {
     args.push("--job", normalizedSelectedJob);
@@ -1816,7 +2469,13 @@ export async function runRecommendSearchCli({ workspaceRoot, searchParams, selec
   };
 }
 
-export async function runRecommendScreenCli({ workspaceRoot, screenParams, resume = null, runtime = null }) {
+export async function runRecommendScreenCli({
+  workspaceRoot,
+  screenParams,
+  pageScope = "recommend",
+  resume = null,
+  runtime = null
+}) {
   const screenDir = resolveRecommendScreenCliDir(workspaceRoot);
   if (!screenDir) {
     return {
@@ -1919,6 +2578,8 @@ export async function runRecommendScreenCli({ workspaceRoot, screenParams, resum
     "--output",
     outputPath
   ];
+  const normalizedPageScope = normalizePageScope(pageScope) || "recommend";
+  args.push("--page-scope", normalizedPageScope);
 
   if (loaded.config.openaiOrganization) {
     args.push("--openai-organization", loaded.config.openaiOrganization);
@@ -2010,5 +2671,8 @@ export const __testables = {
   parseJsonOutput,
   parseScreenProgressLine,
   resolveRecommendScreenTimeoutMs,
-  buildRecommendScreenProcessError
+  buildRecommendScreenProcessError,
+  normalizePageScope,
+  buildRecommendTabStateExpression,
+  buildRecommendTabSwitchExpression
 };

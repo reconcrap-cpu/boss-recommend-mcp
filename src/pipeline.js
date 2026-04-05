@@ -3,16 +3,31 @@ import { parseRecommendInstruction } from "./parser.js";
 import {
   attemptPipelineAutoRepair,
   ensureBossRecommendPageReady,
+  ensureFeaturedCalibrationReady,
   listRecommendJobs,
+  readRecommendTabState,
   refreshBossRecommendList,
   reloadBossRecommendPage,
   runPipelinePreflight,
   runRecommendSearchCli,
-  runRecommendScreenCli
+  runRecommendScreenCli,
+  switchRecommendTab
 } from "./adapters.js";
 
 const FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY = "近14天没有";
 const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 5;
+const PAGE_SCOPE_TO_TAB_STATUS = {
+  recommend: "0",
+  featured: "3"
+};
+const TAB_STATUS_TO_PAGE_SCOPE = {
+  "0": "recommend",
+  "3": "featured"
+};
+const PAGE_SCOPE_LABELS = {
+  recommend: "推荐",
+  featured: "精选"
+};
 
 function dedupe(values = []) {
   return [...new Set(values.filter(Boolean))];
@@ -20,6 +35,30 @@ function dedupe(values = []) {
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizePageScope(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
+  return null;
+}
+
+function resolvePipelinePageScope(parsed, confirmation, overrides) {
+  const parsedResolved = normalizePageScope(parsed?.page_scope);
+  if (parsedResolved) return parsedResolved;
+  const fromConfirmation = normalizePageScope(confirmation?.page_value);
+  if (fromConfirmation) return fromConfirmation;
+  return "recommend";
+}
+
+function pageScopeToTabStatus(scope) {
+  return PAGE_SCOPE_TO_TAB_STATUS[scope] || "0";
+}
+
+function tabStatusToPageScope(status) {
+  return TAB_STATUS_TO_PAGE_SCOPE[String(status || "")] || "recommend";
 }
 
 function normalizeJobTitle(value) {
@@ -236,6 +275,7 @@ function buildPreflightRecovery(checks = [], workspaceRoot) {
 
 function buildRequiredConfirmations(parsedResult) {
   const confirmations = [];
+  if (parsedResult.needs_page_confirmation) confirmations.push("page_scope");
   if (parsedResult.needs_filters_confirmation) confirmations.push("filters");
   if (parsedResult.needs_school_tag_confirmation) confirmations.push("school_tag");
   if (parsedResult.needs_degree_confirmation) confirmations.push("degree");
@@ -253,6 +293,7 @@ function buildNeedInputResponse(parsedResult) {
     status: "NEED_INPUT",
     missing_fields: parsedResult.missing_fields,
     required_confirmations: buildRequiredConfirmations(parsedResult),
+    selected_page: parsedResult.proposed_page_scope || parsedResult.page_scope || "recommend",
     search_params: parsedResult.searchParams,
     screen_params: parsedResult.screenParams,
     pending_questions: parsedResult.pending_questions,
@@ -269,6 +310,7 @@ function buildNeedConfirmationResponse(parsedResult) {
   return {
     status: "NEED_CONFIRMATION",
     required_confirmations: buildRequiredConfirmations(parsedResult),
+    selected_page: parsedResult.proposed_page_scope || parsedResult.page_scope || "recommend",
     search_params: parsedResult.searchParams,
     screen_params: {
       ...parsedResult.screenParams,
@@ -281,12 +323,13 @@ function buildNeedConfirmationResponse(parsedResult) {
   };
 }
 
-function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob }) {
+function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob, selectedPage }) {
   return {
     field: "final_review",
-    question: "开始执行搜索和筛选前，请最后确认全部参数（岗位/筛选条件/筛选 criteria/目标人数/post_action/max_greet_count）无误。",
+    question: "开始执行搜索和筛选前，请最后确认全部参数（岗位/页面/筛选条件/筛选 criteria/目标人数/post_action/max_greet_count）无误。",
     value: {
       job: selectedJob?.title || selectedJob?.label || selectedJob?.value || null,
+      page_scope: selectedPage || "recommend",
       search_params: searchParams,
       screen_params: screenParams
     }
@@ -458,12 +501,15 @@ const defaultDependencies = {
   attemptPipelineAutoRepair,
   parseRecommendInstruction,
   ensureBossRecommendPageReady,
+  ensureFeaturedCalibrationReady,
   listRecommendJobs,
+  readRecommendTabState,
   refreshBossRecommendList,
   reloadBossRecommendPage,
   runPipelinePreflight,
   runRecommendSearchCli,
-  runRecommendScreenCli
+  runRecommendScreenCli,
+  switchRecommendTab
 };
 
 export async function runRecommendPipeline(
@@ -477,25 +523,30 @@ export async function runRecommendPipeline(
     attemptPipelineAutoRepair: attemptAutoRepair,
     parseRecommendInstruction: parseInstruction,
     ensureBossRecommendPageReady: ensureRecommendPageReady,
+    ensureFeaturedCalibrationReady: ensureCalibrationReady,
     listRecommendJobs: listJobs,
+    readRecommendTabState: readTabState,
     refreshBossRecommendList: refreshRecommendList,
     reloadBossRecommendPage: reloadRecommendPage,
     runPipelinePreflight: runPreflight,
     runRecommendSearchCli: searchCli,
-    runRecommendScreenCli: screenCli
+    runRecommendScreenCli: screenCli,
+    switchRecommendTab: switchTab
   } = resolvedDependencies;
   const runtimeHooks = createPipelineRuntime(runtime);
   ensurePipelineNotAborted(runtimeHooks.signal);
 
   const startedAt = Date.now();
   const parsed = parseInstruction({ instruction, confirmation, overrides });
+  const selectedPage = resolvePipelinePageScope(parsed, confirmation, overrides);
 
   if (parsed.missing_fields.length > 0) {
     return buildNeedInputResponse(parsed);
   }
 
   if (
-    parsed.needs_filters_confirmation
+    parsed.needs_page_confirmation
+    || parsed.needs_filters_confirmation
     || parsed.needs_school_tag_confirmation
     || parsed.needs_degree_confirmation
     || parsed.needs_gender_confirmation
@@ -512,7 +563,7 @@ export async function runRecommendPipeline(
   runtimeHooks.setStage("preflight", "开始执行 preflight 检查。");
   runtimeHooks.heartbeat("preflight");
 
-  let preflight = runPreflight(workspaceRoot);
+  let preflight = runPreflight(workspaceRoot, { pageScope: selectedPage });
   let autoRepair = null;
   const shouldAttemptAutoRepair = (
     dependencies === defaultDependencies
@@ -525,6 +576,51 @@ export async function runRecommendPipeline(
         preflight = autoRepair.preflight;
       }
     }
+  }
+
+  const shouldCheckFeaturedCalibration = (
+    dependencies === defaultDependencies
+    || Object.prototype.hasOwnProperty.call(injectedDependencies, "ensureFeaturedCalibrationReady")
+  );
+  const featuredCalibrationCheck = preflight.checks?.find((item) => item?.key === "favorite_calibration");
+  if (
+    selectedPage === "featured"
+    && shouldCheckFeaturedCalibration
+    && featuredCalibrationCheck
+    && featuredCalibrationCheck.ok === false
+  ) {
+    runtimeHooks.setStage("calibration", "检测到精选页缺少可用收藏校准文件，开始自动执行校准。");
+    runtimeHooks.heartbeat("calibration");
+    const calibrationResult = await ensureCalibrationReady(workspaceRoot, {
+      port: preflight.debug_port,
+      timeoutMs: 60000,
+      autoCalibrate: true,
+      runtime: runtimeHooks.adapterRuntime("calibration")
+    });
+    ensurePipelineNotAborted(runtimeHooks.signal);
+    if (!calibrationResult?.ok) {
+      return buildFailedResponse(
+        "CALIBRATION_REQUIRED",
+        calibrationResult?.error?.message || "精选页收藏校准失败，请先完成校准后重试。",
+        {
+          selected_page: selectedPage,
+          search_params: parsed.searchParams,
+          screen_params: parsed.screenParams,
+          required_user_action: "run_featured_calibration",
+          guidance: {
+            calibration_path: calibrationResult?.calibration_path || featuredCalibrationCheck.path || null,
+            debug_port: calibrationResult?.debug_port || preflight.debug_port,
+            calibration_script_path: calibrationResult?.calibration_script_path || null,
+            tip: "请在 Boss 推荐页切换到精选 tab 后打开候选人详情，按提示先收藏再取消收藏完成校准后重试。"
+          },
+          diagnostics: {
+            checks: preflight.checks,
+            calibration: calibrationResult || null
+          }
+        }
+      );
+    }
+    preflight = runPreflight(workspaceRoot, { pageScope: selectedPage });
   }
 
   if (!preflight.ok) {
@@ -718,6 +814,7 @@ export async function runRecommendPipeline(
   const selectedJobHint = normalizeText(confirmation?.job_value || parsed.job_selection_hint || "");
   const selectedJobResolution = resolveSelectedJob(jobOptions, selectedJobHint);
   const jobConfirmed = confirmation?.job_confirmed === true;
+  const selectedTabStatus = pageScopeToTabStatus(selectedPage);
   if (!jobConfirmed || !selectedJobResolution.job) {
     const reason = selectedJobResolution.ambiguous
       ? `你提供的岗位“${selectedJobHint}”匹配到多个选项：${selectedJobResolution.candidates.join(" / ")}。请明确选择其中一个岗位。`
@@ -730,6 +827,7 @@ export async function runRecommendPipeline(
     return {
       status: "NEED_CONFIRMATION",
       required_confirmations: requiredConfirmations,
+      selected_page: selectedPage,
       search_params: parsed.searchParams,
       screen_params: {
         ...parsed.screenParams,
@@ -754,11 +852,13 @@ export async function runRecommendPipeline(
         post_action: parsed.proposed_post_action || parsed.screenParams.post_action,
         max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
       },
-      selectedJob
+      selectedJob,
+      selectedPage
     }));
     return {
       status: "NEED_CONFIRMATION",
       required_confirmations: dedupe([...buildRequiredConfirmations(parsed), "final_review"]),
+      selected_page: selectedPage,
       search_params: parsed.searchParams,
       screen_params: {
         ...parsed.screenParams,
@@ -782,12 +882,74 @@ export async function runRecommendPipeline(
   let shouldRunSearch = !skipSearchOnResume;
   let screenAutoRecoveryCount = 0;
   let lastAutoRecovery = null;
+  let activeTabStatus = null;
   let currentResumeConfig = {
     checkpoint_path: resume?.checkpoint_path || null,
     pause_control_path: resume?.pause_control_path || null,
     output_csv: resume?.output_csv || null,
     resume: resume?.resume === true,
     require_checkpoint: skipSearchOnResume
+  };
+
+  const ensureSelectedPageTab = async () => {
+    if (selectedPage !== "featured") {
+      activeTabStatus = selectedTabStatus;
+      return {
+        ok: true,
+        switched: false,
+        before_state: null,
+        after_state: null
+      };
+    }
+    const expectedStatus = selectedTabStatus;
+    let beforeState = null;
+    if (typeof readTabState === "function") {
+      beforeState = await readTabState(workspaceRoot, { port: preflight.debug_port });
+      if (beforeState?.ok && normalizeText(beforeState.active_status)) {
+        activeTabStatus = normalizeText(beforeState.active_status);
+      }
+    }
+    if (String(activeTabStatus || "") === String(expectedStatus)) {
+      return {
+        ok: true,
+        switched: false,
+        before_state: beforeState || null,
+        after_state: beforeState || null
+      };
+    }
+    if (typeof switchTab !== "function") {
+      return {
+        ok: false,
+        error: {
+          code: "RECOMMEND_TAB_SWITCH_ADAPTER_MISSING",
+          message: "缺少 recommend tab 切换适配器。"
+        },
+        before_state: beforeState || null,
+        after_state: null
+      };
+    }
+    const switchResult = await switchTab(workspaceRoot, {
+      port: preflight.debug_port,
+      target_status: expectedStatus
+    });
+    if (!switchResult?.ok) {
+      return {
+        ok: false,
+        error: {
+          code: switchResult?.state || "RECOMMEND_TAB_SWITCH_FAILED",
+          message: switchResult?.message || `切换到${PAGE_SCOPE_LABELS[selectedPage]} tab 失败。`
+        },
+        before_state: beforeState || null,
+        after_state: switchResult?.tab_state || null
+      };
+    }
+    activeTabStatus = normalizeText(switchResult.active_status || switchResult.tab_state?.active_status || expectedStatus);
+    return {
+      ok: true,
+      switched: true,
+      before_state: beforeState || null,
+      after_state: switchResult.tab_state || null
+    };
   };
 
   while (true) {
@@ -804,6 +966,7 @@ export async function runRecommendPipeline(
         workspaceRoot,
         searchParams: effectiveSearchParams,
         selectedJob: selectedJobToken,
+        pageScope: selectedPage,
         runtime: runtimeHooks.adapterRuntime("search")
       });
       ensurePipelineNotAborted(runtimeHooks.signal);
@@ -870,6 +1033,8 @@ export async function runRecommendPipeline(
       searchSummary = searchResult.summary || {};
       if (isPauseRequested(runtimeHooks)) {
         return buildPausedResponse("已在 screen 阶段开始前暂停 Recommend 流水线。", {
+          selected_page: selectedPage,
+          active_tab_status: activeTabStatus || null,
           search_params: effectiveSearchParams,
           screen_params: parsed.screenParams,
           selected_job: selectedJob,
@@ -881,9 +1046,62 @@ export async function runRecommendPipeline(
           }
         });
       }
+      const tabSwitchResult = await ensureSelectedPageTab();
+      if (!tabSwitchResult.ok) {
+        return buildFailedResponse(
+          tabSwitchResult.error?.code || "RECOMMEND_TAB_SWITCH_FAILED",
+          tabSwitchResult.error?.message || `切换到${PAGE_SCOPE_LABELS[selectedPage]} tab 失败。`,
+          {
+            selected_page: selectedPage,
+            active_tab_status: activeTabStatus || null,
+            search_params: effectiveSearchParams,
+            screen_params: parsed.screenParams,
+            selected_job: selectedJob,
+            required_user_action: "retry_switch_recommend_tab",
+            guidance: {
+              expected_tab_status: selectedTabStatus,
+              expected_page_scope: selectedPage,
+              expected_page_label: PAGE_SCOPE_LABELS[selectedPage]
+            },
+            diagnostics: {
+              debug_port: preflight.debug_port,
+              tab_switch: tabSwitchResult
+            }
+          }
+        );
+      }
       ensurePipelineNotAborted(runtimeHooks.signal);
-      runtimeHooks.setStage("screen", "search 完成，开始执行 recommend screen。");
+      runtimeHooks.setStage(
+        "screen",
+        selectedPage === "featured"
+          ? "search 完成，已切换到精选 tab，开始执行 recommend screen。"
+          : "search 完成，开始执行 recommend screen。"
+      );
     } else {
+      const tabSwitchResult = await ensureSelectedPageTab();
+      if (!tabSwitchResult.ok) {
+        return buildFailedResponse(
+          tabSwitchResult.error?.code || "RECOMMEND_TAB_SWITCH_FAILED",
+          tabSwitchResult.error?.message || `切换到${PAGE_SCOPE_LABELS[selectedPage]} tab 失败。`,
+          {
+            selected_page: selectedPage,
+            active_tab_status: activeTabStatus || null,
+            search_params: effectiveSearchParams,
+            screen_params: parsed.screenParams,
+            selected_job: selectedJob,
+            required_user_action: "retry_switch_recommend_tab",
+            guidance: {
+              expected_tab_status: selectedTabStatus,
+              expected_page_scope: selectedPage,
+              expected_page_label: PAGE_SCOPE_LABELS[selectedPage]
+            },
+            diagnostics: {
+              debug_port: preflight.debug_port,
+              tab_switch: tabSwitchResult
+            }
+          }
+        );
+      }
       ensurePipelineNotAborted(runtimeHooks.signal);
       runtimeHooks.setStage("screen", "检测到可续跑 checkpoint，跳过 search，直接恢复 recommend screen。");
     }
@@ -892,6 +1110,7 @@ export async function runRecommendPipeline(
     const screenResult = await screenCli({
       workspaceRoot,
       screenParams: parsed.screenParams,
+      pageScope: selectedPage,
       resume: currentResumeConfig,
       runtime: runtimeHooks.adapterRuntime("screen")
     });
@@ -901,6 +1120,8 @@ export async function runRecommendPipeline(
     }
     if (screenResult.paused) {
       return buildPausedResponse("Recommend 流水线已暂停，可使用 resume 继续。", {
+        selected_page: selectedPage,
+        active_tab_status: activeTabStatus || null,
         search_params: effectiveSearchParams,
         screen_params: parsed.screenParams,
         selected_job: selectedJob,
@@ -1042,9 +1263,10 @@ export async function runRecommendPipeline(
           );
           runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
         } else {
+          const recoveryFailureText = selectedPage === "featured" ? "network 简历获取失败" : "截图失败";
           runtimeHooks.setStage(
             "screen_recovery",
-            `screen 连续截图失败，开始自动恢复（第 ${screenAutoRecoveryCount} 次）：刷新 recommend 页面并重跑 search。`
+            `screen 连续${recoveryFailureText}，开始自动恢复（第 ${screenAutoRecoveryCount} 次）：刷新 recommend 页面并重跑 search。`
           );
           runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
         }
@@ -1149,6 +1371,24 @@ export async function runRecommendPipeline(
     const durationSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     const finalSearchSummary = searchSummary || {};
     const screenSummary = screenResult.summary || {};
+    const resolvedActiveTabStatus = normalizeText(
+      screenSummary.active_tab_status
+      || finalSearchSummary.active_tab_status
+      || activeTabStatus
+      || selectedTabStatus
+    ) || selectedTabStatus;
+    const resolvedSelectedPage = normalizePageScope(
+      screenSummary.selected_page
+      || finalSearchSummary.selected_page
+      || selectedPage
+      || tabStatusToPageScope(resolvedActiveTabStatus)
+    ) || selectedPage;
+    const resolvedResumeSourceRaw = normalizeText(screenSummary.resume_source || "").toLowerCase();
+    const resolvedResumeSource = resolvedResumeSourceRaw === "network"
+      ? "network"
+      : resolvedSelectedPage === "featured"
+        ? "network"
+        : "image_fallback";
     runtimeHooks.progress("finalize", {
       processed: screenSummary.processed_count ?? 0,
       passed: screenSummary.passed_count ?? 0,
@@ -1171,6 +1411,9 @@ export async function runRecommendPipeline(
         completion_reason: screenSummary.completion_reason || "screen_completed",
         page_state: finalSearchSummary.page_state || pageCheck.page_state,
         selected_job: finalSearchSummary.selected_job || selectedJob,
+        selected_page: resolvedSelectedPage,
+        active_tab_status: resolvedActiveTabStatus,
+        resume_source: resolvedResumeSource,
         post_action: parsed.screenParams.post_action,
         max_greet_count: parsed.screenParams.max_greet_count,
         greet_count: screenSummary.greet_count ?? 0,

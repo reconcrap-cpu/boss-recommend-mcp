@@ -31,6 +31,8 @@ function createJobListResult() {
 
 function createJobConfirmedConfirmation() {
   return {
+    page_confirmed: true,
+    page_value: "recommend",
     job_confirmed: true,
     job_value: "数据分析实习生 _ 杭州",
     final_confirmed: true
@@ -39,6 +41,8 @@ function createJobConfirmedConfirmation() {
 
 function createJobConfirmedWithoutFinalConfirmation() {
   return {
+    page_confirmed: true,
+    page_value: "recommend",
     job_confirmed: true,
     job_value: "数据分析实习生 _ 杭州"
   };
@@ -69,6 +73,9 @@ function createParsed(overrides = {}) {
     needs_target_count_confirmation: false,
     needs_post_action_confirmation: false,
     needs_max_greet_count_confirmation: false,
+    needs_page_confirmation: false,
+    page_scope: "recommend",
+    proposed_page_scope: "recommend",
     proposed_post_action: "favorite",
     proposed_max_greet_count: null,
     job_selection_hint: null,
@@ -878,6 +885,38 @@ async function testNeedConfirmationGate() {
   assert.equal(preflightCalled, false);
 }
 
+async function testNeedPageScopeConfirmationGate() {
+  let preflightCalled = false;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {},
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        needs_page_confirmation: true,
+        page_scope: null,
+        proposed_page_scope: "featured",
+        pending_questions: [{ field: "page_scope" }]
+      }),
+      runPipelinePreflight: () => {
+        preflightCalled = true;
+        return { ok: true, checks: [], debug_port: 9222 };
+      },
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      runRecommendSearchCli: async () => ({ ok: true, summary: {} }),
+      runRecommendScreenCli: async () => ({ ok: true, summary: {} })
+    }
+  );
+
+  assert.equal(result.status, "NEED_CONFIRMATION");
+  assert.equal(result.required_confirmations.includes("page_scope"), true);
+  assert.equal(result.selected_page, "featured");
+  assert.equal(preflightCalled, false);
+}
+
 async function testNeedTargetCountConfirmationGate() {
   let preflightCalled = false;
   const result = await runRecommendPipeline(
@@ -986,6 +1025,277 @@ async function testNeedInputGate() {
   );
 
   assert.equal(result.status, "NEED_INPUT");
+}
+
+async function testFeaturedPipelineShouldRunSearchThenSwitchTabThenScreen() {
+  const calls = [];
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {
+        ...createJobConfirmedConfirmation(),
+        page_confirmed: true,
+        page_value: "featured"
+      },
+      overrides: {
+        page_scope: "featured"
+      }
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        page_scope: "featured",
+        proposed_page_scope: "featured"
+      }),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async ({ pageScope }) => {
+        calls.push({ type: "search", pageScope });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 6,
+            applied_filters: { degree: ["本科"] },
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      readRecommendTabState: async () => ({
+        ok: true,
+        active_status: "0",
+        tab_state: { active_status: "0" }
+      }),
+      switchRecommendTab: async ({ target_status }) => {
+        calls.push({ type: "switch", target_status });
+        return {
+          ok: true,
+          state: "TAB_SWITCHED",
+          active_status: "3",
+          tab_state: { active_status: "3" }
+        };
+      },
+      runRecommendScreenCli: async ({ pageScope }) => {
+        calls.push({ type: "screen", pageScope });
+        return {
+          ok: true,
+          summary: {
+            processed_count: 6,
+            passed_count: 2,
+            skipped_count: 4,
+            output_csv: "C:/temp/result.csv",
+            completion_reason: "page_exhausted",
+            active_tab_status: "3",
+            resume_source: "network"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.deepEqual(calls.map((item) => item.type), ["search", "switch", "screen"]);
+  assert.equal(calls[0].pageScope, "featured");
+  assert.equal(calls[2].pageScope, "featured");
+  assert.equal(result.result.selected_page, "featured");
+  assert.equal(result.result.active_tab_status, "3");
+  assert.equal(result.result.resume_source, "network");
+}
+
+async function testFeaturedMissingCalibrationShouldAutoCalibrateThenContinue() {
+  const calls = [];
+  let preflightCallCount = 0;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {
+        ...createJobConfirmedConfirmation(),
+        page_confirmed: true,
+        page_value: "featured"
+      },
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        page_scope: "featured",
+        proposed_page_scope: "featured"
+      }),
+      runPipelinePreflight: () => {
+        preflightCallCount += 1;
+        if (preflightCallCount === 1) {
+          return {
+            ok: false,
+            debug_port: 9222,
+            page_scope: "featured",
+            checks: [
+              {
+                key: "favorite_calibration",
+                ok: false,
+                path: "C:/Users/test/.codex/boss-recommend-mcp/favorite-calibration.json",
+                message: "favorite-calibration.json 不存在或无效"
+              }
+            ]
+          };
+        }
+        return {
+          ok: true,
+          debug_port: 9222,
+          page_scope: "featured",
+          checks: []
+        };
+      },
+      ensureFeaturedCalibrationReady: async () => {
+        calls.push({ type: "calibrate" });
+        return {
+          ok: true,
+          calibration_path: "C:/Users/test/.codex/boss-recommend-mcp/favorite-calibration.json",
+          auto_started: true
+        };
+      },
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => {
+        calls.push({ type: "search" });
+        return {
+          ok: true,
+          summary: { candidate_count: 2, applied_filters: {} }
+        };
+      },
+      readRecommendTabState: async () => ({
+        ok: true,
+        active_status: "3",
+        tab_state: { active_status: "3" }
+      }),
+      switchRecommendTab: async () => ({
+        ok: true,
+        state: "TAB_SWITCHED",
+        active_status: "3",
+        tab_state: { active_status: "3" }
+      }),
+      runRecommendScreenCli: async () => {
+        calls.push({ type: "screen" });
+        return {
+          ok: true,
+          summary: {
+            processed_count: 2,
+            passed_count: 1,
+            skipped_count: 1,
+            output_csv: "C:/temp/result.csv",
+            active_tab_status: "3",
+            resume_source: "network"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(preflightCallCount, 2);
+  assert.deepEqual(calls.map((item) => item.type), ["calibrate", "search", "screen"]);
+}
+
+async function testFeaturedCalibrationFailureShouldReturnCalibrationRequired() {
+  let searchCalled = false;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {
+        ...createJobConfirmedConfirmation(),
+        page_confirmed: true,
+        page_value: "featured"
+      },
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        page_scope: "featured",
+        proposed_page_scope: "featured"
+      }),
+      runPipelinePreflight: () => ({
+        ok: false,
+        debug_port: 9222,
+        page_scope: "featured",
+        checks: [
+          {
+            key: "favorite_calibration",
+            ok: false,
+            path: "C:/Users/test/.codex/boss-recommend-mcp/favorite-calibration.json",
+            message: "favorite-calibration.json 不存在或无效"
+          }
+        ]
+      }),
+      ensureFeaturedCalibrationReady: async () => ({
+        ok: false,
+        calibration_path: "C:/Users/test/.codex/boss-recommend-mcp/favorite-calibration.json",
+        calibration_script_path: "C:/Users/test/boss-recruit-mcp/vendor/boss-screen-cli/calibrate-favorite-position-v2.cjs",
+        error: {
+          code: "CALIBRATION_REQUIRED",
+          message: "校准失败"
+        }
+      }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => {
+        searchCalled = true;
+        return { ok: true, summary: {} };
+      },
+      runRecommendScreenCli: async () => ({ ok: true, summary: {} })
+    }
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.error.code, "CALIBRATION_REQUIRED");
+  assert.equal(result.required_user_action, "run_featured_calibration");
+  assert.equal(result.guidance.calibration_path.includes("favorite-calibration.json"), true);
+  assert.equal(searchCalled, false);
+}
+
+async function testFeaturedTabSwitchFailureShouldReturnRetryableError() {
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {
+        ...createJobConfirmedConfirmation(),
+        page_confirmed: true,
+        page_value: "featured"
+      },
+      overrides: {
+        page_scope: "featured"
+      }
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        page_scope: "featured",
+        proposed_page_scope: "featured"
+      }),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => ({
+        ok: true,
+        summary: { candidate_count: 3, applied_filters: {} }
+      }),
+      readRecommendTabState: async () => ({
+        ok: true,
+        active_status: "0",
+        tab_state: { active_status: "0" }
+      }),
+      switchRecommendTab: async () => ({
+        ok: false,
+        state: "TAB_NOT_FOUND",
+        message: "未找到精选 tab。"
+      }),
+      runRecommendScreenCli: async () => ({ ok: true, summary: {} })
+    }
+  );
+
+  assert.equal(result.status, "FAILED");
+  assert.equal(result.error.code, "TAB_NOT_FOUND");
+  assert.equal(result.required_user_action, "retry_switch_recommend_tab");
+  assert.equal(result.selected_page, "featured");
 }
 
 async function testCompletedPipeline() {
@@ -1539,10 +1849,15 @@ async function main() {
   await testPageExhaustedBeforeTargetShouldFailAfterFiveRecoveryAttempts();
   await testNullTargetCountShouldKeepPageExhaustedCompletion();
   await testNeedConfirmationGate();
+  await testNeedPageScopeConfirmationGate();
   await testNeedSchoolTagConfirmationGate();
   await testNeedTargetCountConfirmationGate();
   await testNeedMaxGreetCountConfirmationGate();
   await testNeedInputGate();
+  await testFeaturedPipelineShouldRunSearchThenSwitchTabThenScreen();
+  await testFeaturedMissingCalibrationShouldAutoCalibrateThenContinue();
+  await testFeaturedCalibrationFailureShouldReturnCalibrationRequired();
+  await testFeaturedTabSwitchFailureShouldReturnRetryableError();
   await testNeedJobConfirmationGate();
   await testNeedFinalReviewConfirmationGate();
   await testCompletedPipeline();

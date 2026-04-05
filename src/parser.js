@@ -34,6 +34,11 @@ const POST_ACTION_LABELS = {
   greet: "直接沟通",
   none: "什么也不做"
 };
+const PAGE_SCOPE_OPTIONS = ["recommend", "featured"];
+const PAGE_SCOPE_LABELS = {
+  recommend: "推荐",
+  featured: "精选"
+};
 const LEADING_NOISE_PATTERNS = [
   /^使用boss-recommend-pipeline skills/i,
   /^使用boss recommend pipeline skills/i,
@@ -97,6 +102,8 @@ const META_CLAUSE_PATTERNS = [
   /推荐页|推荐页面|boss推荐/i,
   /帮我|请|运行|skill/i
 ];
+const FEATURED_SCOPE_PATTERN = /(?:精选牛人|精选页|精选页面|精选tab|精选标签|tab[^。；;\n]{0,6}精选|精选)/i;
+const RECOMMEND_SCOPE_PATTERN = /(?:推荐页|推荐页面|推荐tab|推荐标签|tab[^。；;\n]{0,6}推荐|推荐)/i;
 
 function normalizeText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
@@ -263,6 +270,20 @@ function normalizePostAction(value) {
   if (["none", "noop", "no-op", "什么也不做", "不做任何操作", "不操作", "仅筛选", "只筛选"].includes(normalized)) {
     return "none";
   }
+  return null;
+}
+
+function normalizePageScope(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
+  return PAGE_SCOPE_OPTIONS.includes(normalized) ? normalized : null;
+}
+
+function extractPageScope(text) {
+  if (FEATURED_SCOPE_PATTERN.test(text)) return "featured";
+  if (RECOMMEND_SCOPE_PATTERN.test(text)) return "recommend";
   return null;
 }
 
@@ -461,6 +482,19 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
   };
 }
 
+function resolvePageScope({ instruction, confirmation, overrides }) {
+  const confirmed = confirmation?.page_confirmed === true;
+  const confirmationValue = normalizePageScope(confirmation?.page_value);
+  const overrideValue = normalizePageScope(overrides?.page_scope);
+  const instructionValue = extractPageScope(instruction);
+  const proposed = overrideValue || confirmationValue || instructionValue || "recommend";
+  return {
+    page_scope: confirmed && confirmationValue ? confirmationValue : null,
+    proposed_page_scope: proposed,
+    needs_page_confirmation: !(confirmed && Boolean(confirmationValue))
+  };
+}
+
 function collectSuspiciousFields({ invalidOverrideSchoolTags, maxGreetCountResolution }) {
   const suspicious = [];
   if (Array.isArray(invalidOverrideSchoolTags) && invalidOverrideSchoolTags.length > 0) {
@@ -495,6 +529,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const confirmationRecentNotView = normalizeRecentNotView(confirmation?.recent_not_view_value);
   const overrideCriteria = overrides?.criteria;
   const jobSelectionHint = normalizeText(overrides?.job || confirmation?.job_value || "");
+  const pageScopeResolution = resolvePageScope({ instruction: text, confirmation, overrides });
 
   const inferredSchoolTag = detectedSchoolTags.length > 0
     ? sortSchoolTagSelections(detectedSchoolTags)
@@ -571,7 +606,20 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const needs_target_count_confirmation = targetCountResolution.needs_target_count_confirmation;
   const needs_post_action_confirmation = postActionResolution.needs_post_action_confirmation;
   const needs_max_greet_count_confirmation = maxGreetCountResolution.needs_max_greet_count_confirmation;
+  const needs_page_confirmation = pageScopeResolution.needs_page_confirmation;
   const pending_questions = [];
+
+  if (needs_page_confirmation) {
+    pending_questions.push({
+      field: "page_scope",
+      question: "请确认本次在推荐里的哪个页面执行筛选：推荐 或 精选。",
+      value: pageScopeResolution.proposed_page_scope,
+      options: [
+        { label: PAGE_SCOPE_LABELS.recommend, value: "recommend" },
+        { label: PAGE_SCOPE_LABELS.featured, value: "featured" }
+      ]
+    });
+  }
 
   if (needs_school_tag_confirmation) {
     const schoolTagQuestion = detectedSchoolTags.length > 1
@@ -679,12 +727,16 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     needs_target_count_confirmation,
     needs_post_action_confirmation,
     needs_max_greet_count_confirmation,
+    needs_page_confirmation,
     proposed_target_count: targetCountResolution.proposed_target_count,
     proposed_post_action: postActionResolution.proposed_post_action,
     proposed_max_greet_count: maxGreetCountResolution.proposed_max_greet_count,
+    page_scope: pageScopeResolution.page_scope,
+    proposed_page_scope: pageScopeResolution.proposed_page_scope,
     job_selection_hint: jobSelectionHint || null,
     pending_questions,
     review: {
+      extracted_page_scope: pageScopeResolution.proposed_page_scope,
       extracted_search_params: searchParams,
       extracted_screen_params: {
         criteria: screenParams.criteria,
@@ -692,6 +744,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
         post_action: postActionResolution.proposed_post_action,
         max_greet_count: maxGreetCountResolution.proposed_max_greet_count
       },
+      current_page_scope: pageScopeResolution.page_scope,
       current_search_params: searchParams,
       current_screen_params: screenParams,
       missing_fields,

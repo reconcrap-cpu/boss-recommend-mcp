@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { runPipelinePreflight, runRecommendScreenCli, __testables as adapterTestables } from "./adapters.js";
+import {
+  ensureFeaturedCalibrationReady,
+  runPipelinePreflight,
+  runRecommendSearchCli,
+  runRecommendScreenCli,
+  __testables as adapterTestables
+} from "./adapters.js";
 
 const {
   runProcess,
@@ -157,6 +163,185 @@ function testPreflightShouldCheckSharpInsteadOfPython() {
   assert.equal(keys.has("python_pillow"), false);
 }
 
+function testPreflightFeaturedShouldRequireFavoriteCalibration() {
+  const preflight = runPipelinePreflight(process.cwd(), { pageScope: "featured" });
+  const check = (preflight.checks || []).find((item) => item?.key === "favorite_calibration");
+  assert.equal(Boolean(check), true);
+  assert.equal(check.optional, false);
+}
+
+function testPreflightRecommendShouldKeepFavoriteCalibrationOptional() {
+  const preflight = runPipelinePreflight(process.cwd(), { pageScope: "recommend" });
+  const check = (preflight.checks || []).find((item) => item?.key === "favorite_calibration");
+  assert.equal(Boolean(check), true);
+  assert.equal(check.optional, true);
+}
+
+async function testEnsureFeaturedCalibrationReadyShouldAutoCalibrate() {
+  const previousHome = process.env.BOSS_RECOMMEND_HOME;
+  const previousCodexHome = process.env.CODEX_HOME;
+  const previousScript = process.env.BOSS_RECOMMEND_RECRUIT_CALIBRATION_SCRIPT;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-featured-cal-home-"));
+  const tempCodex = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-featured-cal-codex-"));
+  process.env.BOSS_RECOMMEND_HOME = tempHome;
+  process.env.CODEX_HOME = tempCodex;
+
+  const configPath = path.join(tempHome, "screening-config.json");
+  const scriptPath = path.join(tempHome, "fake-calibrate.cjs");
+  fs.writeFileSync(configPath, JSON.stringify({
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-valid",
+    model: "gpt-4.1-mini",
+    calibrationFile: "favorite-calibration.json"
+  }, null, 2));
+  fs.writeFileSync(scriptPath, [
+    "#!/usr/bin/env node",
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const args = process.argv.slice(2).reduce((acc, token, idx, arr) => {",
+    "  if (token.startsWith('--')) {",
+    "    const key = token.slice(2);",
+    "    const next = arr[idx + 1];",
+    "    acc[key] = next && !next.startsWith('--') ? next : true;",
+    "  }",
+    "  return acc;",
+    "}, {});",
+    "const output = path.resolve(String(args.output || 'favorite-calibration.json'));",
+    "fs.mkdirSync(path.dirname(output), { recursive: true });",
+    "fs.writeFileSync(output, JSON.stringify({ favoritePosition: { pageX: 100, pageY: 200, canvasX: 0, canvasY: 0 } }, null, 2));",
+    "console.log('calibrated');"
+  ].join("\n"), "utf8");
+  process.env.BOSS_RECOMMEND_RECRUIT_CALIBRATION_SCRIPT = scriptPath;
+
+  try {
+    const result = await ensureFeaturedCalibrationReady(process.cwd(), {
+      port: 9222,
+      timeoutMs: 5000
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.auto_started, true);
+    assert.equal(String(result.calibration_path || "").endsWith("favorite-calibration.json"), true);
+    assert.equal(fs.existsSync(result.calibration_path), true);
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.BOSS_RECOMMEND_HOME;
+    } else {
+      process.env.BOSS_RECOMMEND_HOME = previousHome;
+    }
+    if (previousCodexHome === undefined) {
+      delete process.env.CODEX_HOME;
+    } else {
+      process.env.CODEX_HOME = previousCodexHome;
+    }
+    if (previousScript === undefined) {
+      delete process.env.BOSS_RECOMMEND_RECRUIT_CALIBRATION_SCRIPT;
+    } else {
+      process.env.BOSS_RECOMMEND_RECRUIT_CALIBRATION_SCRIPT = previousScript;
+    }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+    fs.rmSync(tempCodex, { recursive: true, force: true });
+  }
+}
+
+async function testSearchCliShouldPassPageScopeArgument() {
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-search-page-scope-"));
+  const cliDir = path.join(workspaceRoot, "boss-recommend-search-cli", "src");
+  fs.mkdirSync(cliDir, { recursive: true });
+  const cliPath = path.join(cliDir, "cli.js");
+  fs.writeFileSync(
+    cliPath,
+    [
+      "#!/usr/bin/env node",
+      "console.log(JSON.stringify({ status: 'COMPLETED', result: { argv: process.argv.slice(2) } }));"
+    ].join("\n"),
+    "utf8"
+  );
+
+  try {
+    const result = await runRecommendSearchCli({
+      workspaceRoot,
+      searchParams: {
+        school_tag: ["不限"],
+        degree: ["不限"],
+        gender: "不限",
+        recent_not_view: "不限"
+      },
+      selectedJob: null,
+      pageScope: "featured"
+    });
+    assert.equal(result.ok, true);
+    const argv = result.summary?.argv || [];
+    const pageScopeIndex = argv.indexOf("--page-scope");
+    assert.equal(pageScopeIndex >= 0, true);
+    assert.equal(argv[pageScopeIndex + 1], "featured");
+    const calibrationIndex = argv.indexOf("--calibration");
+    assert.equal(calibrationIndex >= 0, true);
+    assert.equal(String(argv[calibrationIndex + 1] || "").includes("favorite-calibration.json"), true);
+  } finally {
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+async function testScreenCliShouldPassPageScopeArgument() {
+  const previousHome = process.env.BOSS_RECOMMEND_HOME;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-page-scope-home-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-page-scope-workspace-"));
+  const cliDir = path.join(workspaceRoot, "boss-recommend-screen-cli");
+  fs.mkdirSync(cliDir, { recursive: true });
+  const cliPath = path.join(cliDir, "boss-recommend-screen-cli.cjs");
+  fs.writeFileSync(
+    cliPath,
+    [
+      "#!/usr/bin/env node",
+      "console.log(JSON.stringify({",
+      "  status: 'COMPLETED',",
+      "  result: {",
+      "    processed_count: 0,",
+      "    passed_count: 0,",
+      "    skipped_count: 0,",
+      "    argv: process.argv.slice(2),",
+      "    resume_source: 'network',",
+      "    active_tab_status: '3'",
+      "  }",
+      "}));"
+    ].join("\n"),
+    "utf8"
+  );
+
+  process.env.BOSS_RECOMMEND_HOME = tempHome;
+  fs.writeFileSync(path.join(tempHome, "screening-config.json"), JSON.stringify({
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-valid-test",
+    model: "gpt-4.1-mini"
+  }, null, 2));
+
+  try {
+    const result = await runRecommendScreenCli({
+      workspaceRoot,
+      screenParams: {
+        criteria: "有 MCP 经验",
+        target_count: null,
+        post_action: "none",
+        max_greet_count: null
+      },
+      pageScope: "featured"
+    });
+    assert.equal(result.ok, true);
+    const argv = result.summary?.argv || [];
+    const pageScopeIndex = argv.indexOf("--page-scope");
+    assert.equal(pageScopeIndex >= 0, true);
+    assert.equal(argv[pageScopeIndex + 1], "featured");
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.BOSS_RECOMMEND_HOME;
+    } else {
+      process.env.BOSS_RECOMMEND_HOME = previousHome;
+    }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   await testRunProcessHeartbeatAndOutput();
   await testRunProcessAbortSignal();
@@ -166,6 +351,11 @@ async function main() {
   testBuildRecommendScreenProcessErrorMapsTimeout();
   await testResumeRequiresCheckpointFile();
   testPreflightShouldCheckSharpInsteadOfPython();
+  testPreflightFeaturedShouldRequireFavoriteCalibration();
+  testPreflightRecommendShouldKeepFavoriteCalibrationOptional();
+  await testEnsureFeaturedCalibrationReadyShouldAutoCalibrate();
+  await testSearchCliShouldPassPageScopeArgument();
+  await testScreenCliShouldPassPageScopeArgument();
   console.log("adapters runtime tests passed");
 }
 

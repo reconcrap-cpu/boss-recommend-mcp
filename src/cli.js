@@ -8,9 +8,13 @@ import { fileURLToPath } from "node:url";
 import { startServer } from "./index.js";
 import {
   ensureBossRecommendPageReady,
+  getFeaturedCalibrationResolution,
   getScreenConfigResolution,
   inspectBossRecommendPageState,
-  runPipelinePreflight
+  runRecommendCalibration,
+  runPipelinePreflight,
+  switchRecommendTab,
+  waitRecommendFeaturedDetailReady
 } from "./adapters.js";
 import { runRecommendPipeline } from "./pipeline.js";
 
@@ -177,6 +181,14 @@ function parseOptions(args) {
 function parsePositivePort(raw) {
   const port = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(port) && port > 0 ? port : null;
+}
+
+function normalizePageScope(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return null;
+  if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
+  return null;
 }
 
 function isEphemeralWorkspaceRoot(rootPath) {
@@ -853,6 +865,108 @@ async function launchChrome(options = {}) {
   }
 }
 
+function getCalibrationTimeoutMs(options = {}) {
+  const parsed = Number.parseInt(String(options["timeout-ms"] || options.timeoutMs || options.timeout || ""), 10);
+  if (!Number.isFinite(parsed)) return 60000;
+  return Math.max(5000, parsed);
+}
+
+async function calibrate(options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
+  process.env.BOSS_RECOMMEND_CHROME_PORT = String(port);
+  persistDebugPortSelection(port, options);
+  const timeoutMs = getCalibrationTimeoutMs(options);
+  const outputPath = String(options.output || "").trim()
+    ? path.resolve(String(options.output))
+    : null;
+
+  console.log("Calibration checklist:");
+  console.log("0. 本校准仅用于推荐页“精选(tab)”的收藏点击定位。");
+  console.log("1. 工具会优先复用当前调试端口 Chrome，并确保 recommend 页面可访问。");
+  console.log("2. 工具会尝试自动切换到推荐页“精选”tab；校准过程中请不要再切换 tab。");
+  console.log("3. 先点一次收藏，再点一次取消收藏。");
+  console.log("4. 关闭详情页。");
+  console.log(`5. 校准监听窗口约 ${Math.round(timeoutMs / 1000)} 秒。`);
+  console.log("");
+
+  const preState = await inspectBossRecommendPageState(port, { timeoutMs: 2000, pollMs: 500 });
+  if (preState.state === "DEBUG_PORT_UNREACHABLE") {
+    await launchChrome({ ...options, port: String(port) });
+    if (process.exitCode && process.exitCode !== 0) {
+      return;
+    }
+  } else {
+    console.log(`Detected existing Chrome debug instance on port ${port}; calibration will reuse it.`);
+  }
+
+  const pageReady = await ensureBossRecommendPageReady(workspaceRoot, {
+    port,
+    attempts: 4
+  });
+  if (pageReady.ok) {
+    const switchResult = await switchRecommendTab(workspaceRoot, {
+      port,
+      target_status: "3"
+    });
+    if (switchResult?.ok) {
+      console.log("已自动切换到推荐页“精选”tab，请直接在当前页面打开人选详情并完成收藏/取消收藏。");
+    } else {
+      console.log("未能自动切换到“精选”tab，请手动切换到精选后再执行收藏/取消收藏。");
+    }
+  } else {
+    console.log("未能确认 recommend 页面就绪，请手动进入推荐页并切换到精选 tab 后再继续校准操作。");
+  }
+
+  console.log(`等待你打开“精选”候选人详情页（最多 ${Math.round(timeoutMs / 1000)} 秒），检测到后自动开始校准监听...`);
+  const detailReady = await waitRecommendFeaturedDetailReady(workspaceRoot, {
+    port,
+    timeoutMs,
+    pollMs: 400
+  });
+  if (!detailReady.ok) {
+    console.error(detailReady.message || "未检测到可校准的精选详情页。");
+    console.error("请先打开任意精选候选人详情页并保持在前台，然后重新运行 calibrate。");
+    process.exitCode = 1;
+    return;
+  }
+  const detailSource = detailReady.detail_state?.source || "unknown";
+  const detailSelector = detailReady.detail_state?.selector || "unknown";
+  console.log(`已检测到详情页（source=${detailSource}, selector=${detailSelector}），即将启动校准脚本。`);
+  await new Promise((resolve) => setTimeout(resolve, 600));
+
+  const result = await runRecommendCalibration(workspaceRoot, {
+    port,
+    output: outputPath,
+    timeoutMs,
+    runtime: {
+      onOutput: (event) => {
+        const text = String(event?.text || "");
+        if (!text) return;
+        if (event?.stream === "stderr") {
+          process.stderr.write(text);
+        } else {
+          process.stdout.write(text);
+        }
+      }
+    }
+  });
+  if (result.ok) {
+    console.log(`Calibration saved: ${result.calibration_path}`);
+    return;
+  }
+
+  console.error(result.error?.message || "Calibration failed.");
+  console.error("如果你在校准开始后才从推荐切到精选，请先切到精选 tab 后重新运行 calibrate。");
+  if (result.calibration_script_path) {
+    console.error(`Calibration script: ${result.calibration_script_path}`);
+  }
+  if (result.calibration_path) {
+    console.error(`Calibration target: ${result.calibration_path}`);
+  }
+  process.exitCode = 1;
+}
+
 function inspectAgentIntegration(agentRaw) {
   const agent = normalizeAgentName(agentRaw);
   if (!supportedExternalAgents.includes(agent)) {
@@ -920,9 +1034,11 @@ function inspectAgentIntegration(agentRaw) {
 async function printDoctor(options = {}) {
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
   const workspaceRoot = getWorkspaceRoot(options);
-  const preflight = runPipelinePreflight(workspaceRoot);
+  const pageScope = normalizePageScope(options["page-scope"] || options.pageScope) || "recommend";
+  const preflight = runPipelinePreflight(workspaceRoot, { pageScope });
   const checks = preflight.checks.slice();
   const configResolution = getScreenConfigResolution(workspaceRoot);
+  const calibrationResolution = getFeaturedCalibrationResolution(workspaceRoot);
   const pageState = await inspectBossRecommendPageState(port, { timeoutMs: 2000, pollMs: 500 });
   const resolvedConfigPath = configResolution.resolved_path || configResolution.writable_path;
   const userConfigExists = (
@@ -945,6 +1061,23 @@ async function printDoctor(options = {}) {
     message: pageState.state === "DEBUG_PORT_UNREACHABLE"
       ? `无法连接 Chrome 调试端口 ${port}`
       : `Chrome 调试端口 ${port} 可连接`
+  });
+  checks.push({
+    key: "featured_calibration_script",
+    ok: Boolean(calibrationResolution.calibration_script_path),
+    path: calibrationResolution.calibration_script_path,
+    message: calibrationResolution.calibration_script_path
+      ? "已检测到 boss-recruit-mcp 校准脚本。"
+      : "未检测到 boss-recruit-mcp 校准脚本，精选页自动校准不可用。"
+  });
+  checks.push({
+    key: "featured_calibration_file",
+    ok: calibrationResolution.calibration_usable,
+    path: calibrationResolution.calibration_path,
+    optional: pageScope !== "featured",
+    message: calibrationResolution.calibration_usable
+      ? "favorite-calibration.json 可用。"
+      : "favorite-calibration.json 不存在或无效。"
   });
   checks.push(pageState);
 
@@ -1015,8 +1148,11 @@ async function printDoctor(options = {}) {
     config_resolution: configResolution,
     preflight: {
       debug_port: preflight.debug_port,
-      config_resolution: preflight.config_resolution
+      config_resolution: preflight.config_resolution,
+      calibration_path: preflight.calibration_path,
+      page_scope: preflight.page_scope
     },
+    calibration_resolution: calibrationResolution,
     agent_integration: agentIntegration
   });
 }
@@ -1024,6 +1160,7 @@ async function printDoctor(options = {}) {
 function printPaths() {
   const codexHome = getCodexHome();
   const stateHome = getStateHome();
+  const calibrationResolution = getFeaturedCalibrationResolution(process.cwd());
   console.log(`package_root=${packageRoot}`);
   console.log(`skill_source=${skillSourceDir}`);
   console.log(`codex_home=${codexHome}`);
@@ -1031,6 +1168,8 @@ function printPaths() {
   console.log(`skill_target=${path.join(codexHome, "skills", skillName)}`);
   console.log(`config_target=${getUserConfigPath()}`);
   console.log(`legacy_config_target=${getLegacyUserConfigPath()}`);
+  console.log(`calibration_target=${calibrationResolution.calibration_path}`);
+  console.log(`calibration_script=${calibrationResolution.calibration_script_path || ""}`);
   console.log(`desktop_output_default=${getDesktopDir()}`);
 }
 
@@ -1047,7 +1186,8 @@ function printHelp() {
   console.log("  boss-recommend-mcp config set   Write baseUrl/apiKey/model (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
   console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae(含 trae-cn)/Claude Code/OpenClaw");
-  console.log("  boss-recommend-mcp doctor       Check config and runtime prerequisites (supports --agent trae-cn/cursor/...)");
+  console.log("  boss-recommend-mcp doctor       Check config/runtime/calibration prerequisites (supports --agent trae-cn/cursor/...)");
+  console.log("  boss-recommend-mcp calibrate    Run featured favorite calibration via recruit calibration script");
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("");
@@ -1055,7 +1195,8 @@ function printHelp() {
   console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}']");
   console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
-  console.log("  boss-recommend-mcp doctor --agent trae-cn");
+  console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");
+  console.log("  boss-recommend-mcp calibrate --port 9222 [--timeout-ms 60000] [--output <path>]");
 }
 
 function printMcpConfig(options = {}) {
@@ -1218,6 +1359,9 @@ switch (command) {
     break;
   case "doctor":
     await printDoctor(options);
+    break;
+  case "calibrate":
+    await calibrate(options);
     break;
   case "launch-chrome":
     await launchChrome(options);

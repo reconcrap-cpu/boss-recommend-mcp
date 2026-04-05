@@ -10,6 +10,17 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function shouldBringChromeToFront() {
+  const envValue = String(process.env.BOSS_RECOMMEND_BRING_TO_FRONT || "").trim().toLowerCase();
+  if (envValue) {
+    if (["1", "true", "yes", "y", "on"].includes(envValue)) return true;
+    if (["0", "false", "no", "n", "off"].includes(envValue)) return false;
+  }
+  return false;
+}
+
+const SHOULD_BRING_TO_FRONT = shouldBringChromeToFront();
+
 const EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS = 5000;
 const EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS = 4;
 
@@ -548,7 +559,9 @@ async function captureFullResumeCanvas(options = {}) {
   try {
     await send("Page.enable");
     await send("Runtime.enable");
-    await send("Page.bringToFront");
+    if (SHOULD_BRING_TO_FRONT) {
+      await send("Page.bringToFront");
+    }
 
     let probe = null;
     let lastProbe = null;

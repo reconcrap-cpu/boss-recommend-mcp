@@ -13,6 +13,20 @@ const RESUME_CAPTURE_WAIT_MS = 60000;
 const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
 const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
 const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
+const PAGE_SCOPE_TAB_STATUS = {
+  recommend: "0",
+  featured: "3"
+};
+
+function getCodexHome() {
+  return process.env.CODEX_HOME
+    ? path.resolve(process.env.CODEX_HOME)
+    : path.join(os.homedir(), ".codex");
+}
+
+function getDefaultCalibrationPath() {
+  return path.join(getCodexHome(), "boss-recommend-mcp", "favorite-calibration.json");
+}
 
 function log(...args) {
   console.error(...args);
@@ -38,6 +52,14 @@ function normalizePostAction(value) {
   return null;
 }
 
+function normalizePageScope(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
+  return null;
+}
+
 function parseBoolean(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
@@ -45,6 +67,41 @@ function parseBoolean(value) {
   if (["0", "false", "no", "n", "否"].includes(normalized)) return false;
   return null;
 }
+
+function loadCalibrationPosition(filePath) {
+  try {
+    const resolved = path.resolve(String(filePath || ""));
+    if (!resolved || !fs.existsSync(resolved)) {
+      return null;
+    }
+    const parsed = JSON.parse(fs.readFileSync(resolved, "utf8"));
+    const favoritePosition = parsed?.favoritePosition;
+    if (!favoritePosition) return null;
+    if (!Number.isFinite(favoritePosition.pageX) || !Number.isFinite(favoritePosition.pageY)) {
+      return null;
+    }
+    return {
+      path: resolved,
+      position: {
+        pageX: Number(favoritePosition.pageX),
+        pageY: Number(favoritePosition.pageY)
+      }
+    };
+  } catch {
+    return null;
+  }
+}
+
+function shouldBringChromeToFront() {
+  const envValue = normalizeText(process.env.BOSS_RECOMMEND_BRING_TO_FRONT || "").toLowerCase();
+  if (envValue) {
+    if (["1", "true", "yes", "y", "on"].includes(envValue)) return true;
+    if (["0", "false", "no", "n", "off"].includes(envValue)) return false;
+  }
+  return false;
+}
+
+const SHOULD_BRING_TO_FRONT = shouldBringChromeToFront();
 
 function parseArgs(argv) {
   const parsed = {
@@ -56,6 +113,8 @@ function parseArgs(argv) {
     criteria: null,
     targetCount: null,
     maxGreetCount: null,
+    pageScope: "recommend",
+    calibrationPath: getDefaultCalibrationPath(),
     port: DEFAULT_PORT,
     output: path.resolve(process.cwd(), `筛选结果_${Date.now()}.csv`),
     checkpointPath: null,
@@ -71,6 +130,8 @@ function parseArgs(argv) {
       criteria: false,
       targetCount: false,
       maxGreetCount: false,
+      pageScope: false,
+      calibrationPath: false,
       port: false,
       postAction: false,
       postActionConfirmed: false
@@ -109,6 +170,14 @@ function parseArgs(argv) {
     } else if (token === "--max-greet-count" && next) {
       parsed.maxGreetCount = parsePositiveInteger(next);
       parsed.__provided.maxGreetCount = true;
+      index += 1;
+    } else if (token === "--page-scope" && next) {
+      parsed.pageScope = normalizePageScope(next) || "recommend";
+      parsed.__provided.pageScope = true;
+      index += 1;
+    } else if (token === "--calibration" && next) {
+      parsed.calibrationPath = path.resolve(next);
+      parsed.__provided.calibrationPath = true;
       index += 1;
     } else if (token === "--port" && next) {
       parsed.port = parsePositiveInteger(next) || DEFAULT_PORT;
@@ -273,6 +342,119 @@ function csvEscape(value) {
   return `"${String(value || "").replace(/"/g, '""')}"`;
 }
 
+function stripHtml(value) {
+  return String(value || "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseGeekIdFromUrl(url) {
+  const raw = normalizeText(url);
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    const keys = ["geekId", "geek_id", "gid", "encryptGeekId", "securityId"];
+    for (const key of keys) {
+      const value = normalizeText(parsed.searchParams.get(key) || "");
+      if (value) return value;
+    }
+  } catch {}
+  const matched = raw.match(/[?&](?:geekId|geek_id|gid|encryptGeekId|securityId)=([^&]+)/i);
+  if (matched?.[1]) return decodeURIComponent(matched[1]);
+  return null;
+}
+
+function formatResumeApiData(data) {
+  const parts = [];
+  const geekDetail = data?.geekDetail || data || {};
+  const baseInfo = geekDetail.geekBaseInfo || {};
+  const expectList = geekDetail.geekExpectList || [];
+  const workExpList = geekDetail.geekWorkExpList || [];
+  const projExpList = geekDetail.geekProjExpList || [];
+  const eduExpList = geekDetail.geekEduExpList || geekDetail.geekEducationList || [];
+  const advantage = geekDetail.geekAdvantage || baseInfo.userDesc || baseInfo.userDescription || "";
+  const skillList = geekDetail.geekSkillList || geekDetail.skillList || [];
+
+  parts.push("=== 基本信息 ===");
+  if (baseInfo.name) parts.push(`姓名: ${baseInfo.name}`);
+  if (baseInfo.ageDesc) parts.push(`年龄: ${baseInfo.ageDesc}`);
+  if (baseInfo.gender !== undefined) parts.push(`性别: ${baseInfo.gender === 1 ? "男" : "女"}`);
+  if (baseInfo.degreeCategory) parts.push(`学历: ${baseInfo.degreeCategory}`);
+  if (baseInfo.workYearDesc) parts.push(`工作经验: ${baseInfo.workYearDesc}`);
+  if (baseInfo.activeTimeDesc) parts.push(`活跃状态: ${baseInfo.activeTimeDesc}`);
+  if (baseInfo.applyStatusContent) parts.push(`求职状态: ${baseInfo.applyStatusContent}`);
+
+  if (expectList.length > 0) {
+    parts.push("\n=== 期望工作 ===");
+    expectList.forEach((expect, index) => {
+      parts.push(`${index + 1}. 期望城市: ${expect.locationName || "未知"}`);
+      if (expect.positionName) parts.push(`   期望职位: ${expect.positionName}`);
+      if (expect.salaryDesc) parts.push(`   期望薪资: ${expect.salaryDesc}`);
+      if (expect.industryDesc) parts.push(`   期望行业: ${expect.industryDesc}`);
+    });
+  }
+
+  if (advantage) {
+    parts.push("\n=== 个人优势 ===");
+    parts.push(stripHtml(advantage));
+  }
+
+  if (workExpList.length > 0) {
+    parts.push("\n=== 工作经历 ===");
+    workExpList.forEach((exp, index) => {
+      const company = exp.company || "";
+      const position = stripHtml(exp.positionName || "");
+      parts.push(`${index + 1}. ${company} - ${position}`);
+      if (exp.startYearMonStr) {
+        parts.push(`   时间: ${exp.startYearMonStr} ~ ${exp.endYearMonStr || "至今"}`);
+      }
+      if (exp.responsibility) {
+        parts.push(`   职责: ${stripHtml(exp.responsibility)}`);
+      }
+    });
+  }
+
+  if (projExpList.length > 0) {
+    parts.push("\n=== 项目经历 ===");
+    projExpList.forEach((proj, index) => {
+      parts.push(`${index + 1}. ${proj.name || "未知项目"}`);
+      if (proj.roleName) parts.push(`   角色: ${proj.roleName}`);
+      if (proj.startYearMonStr) {
+        parts.push(`   时间: ${proj.startYearMonStr} ~ ${proj.endYearMonStr || "至今"}`);
+      }
+      if (proj.description) parts.push(`   描述: ${stripHtml(proj.description)}`);
+      if (proj.performance) parts.push(`   成果: ${stripHtml(proj.performance)}`);
+    });
+  }
+
+  if (eduExpList.length > 0) {
+    parts.push("\n=== 教育经历 ===");
+    eduExpList.forEach((edu, index) => {
+      parts.push(`${index + 1}. ${edu.school || edu.schoolName || "未知学校"}`);
+      if (edu.major || edu.majorName) parts.push(`   专业: ${edu.major || edu.majorName}`);
+      const eduDegree = edu.degree || edu.degreeCategory || edu.degreeName;
+      if (eduDegree) parts.push(`   学历: ${eduDegree}`);
+      const eduStart = edu.startYearMonStr || edu.startYearStr;
+      if (eduStart) {
+        const eduEnd = edu.endYearMonStr || edu.endYearStr || "";
+        parts.push(`   时间: ${eduStart} ~ ${eduEnd}`);
+      }
+    });
+  }
+
+  if (skillList.length > 0) {
+    parts.push("\n=== 技能标签 ===");
+    skillList.forEach((skill) => {
+      if (skill.skillName || skill.name) {
+        parts.push(`- ${skill.skillName || skill.name}${skill.level ? ` (${skill.level})` : ""}`);
+      }
+    });
+  }
+
+  return parts.join("\n");
+}
+
 function extractJsonObject(text) {
   const raw = String(text || "");
   const start = raw.indexOf("{");
@@ -338,8 +520,12 @@ function buildListCandidatesExpr(processedKeys) {
     const frameRect = frame.getBoundingClientRect();
     const processed = new Set(processedKeys || []);
     const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
+    const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
     const textOf = (el) => String(el ? el.textContent : '').replace(/\s+/g, ' ').trim();
-    const candidates = cards.map((card, index) => {
+    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+    const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
+    const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
+    const recommendCandidates = cards.map((card, index) => {
       const inner = card.querySelector('.card-inner[data-geekid]');
       if (!inner) return null;
       const geekId = inner.getAttribute('data-geekid');
@@ -367,14 +553,53 @@ function buildListCandidatesExpr(processedKeys) {
         x: frameRect.left + rect.left + Math.min(Math.max(rect.width / 2, 80), rect.width - 40),
         y: frameRect.top + rect.top + Math.min(Math.max(rect.height / 2, 24), rect.height - 12),
         width: rect.width,
-        height: rect.height
+        height: rect.height,
+        layout: 'recommend'
       };
     }).filter(Boolean);
+    const featuredCandidates = featuredCards.map((card, index) => {
+      const anchor = card.querySelector('a[data-geekid]');
+      if (!anchor) return null;
+      const geekId = anchor.getAttribute('data-geekid');
+      if (!geekId) return null;
+      const rect = card.getBoundingClientRect();
+      const nameEl = card.querySelector('.name, .geek-name, .name-wrap .name');
+      const tags = Array.from(card.querySelectorAll('.base-info span, .desc span, .tag-wrap span, .edu-wrap span'))
+        .map((item) => textOf(item))
+        .filter(Boolean);
+      return {
+        found: true,
+        index,
+        key: geekId,
+        geek_id: geekId,
+        name: textOf(nameEl),
+        school: tags[0] || '',
+        major: tags[1] || '',
+        degree: tags[2] || '',
+        last_company: '',
+        last_position: '',
+        x: frameRect.left + rect.left + Math.min(Math.max(rect.width / 2, 80), Math.max(rect.width - 40, 80)),
+        y: frameRect.top + rect.top + Math.min(Math.max(rect.height / 2, 24), Math.max(rect.height - 12, 24)),
+        width: rect.width,
+        height: rect.height,
+        layout: 'featured'
+      };
+    }).filter(Boolean);
+    const inferredStatus = activeStatus
+      || (featuredCandidates.length > 0 && recommendCandidates.length === 0 ? '3' : recommendCandidates.length > 0 ? '0' : '');
+    const activeLayout = inferredStatus === '3'
+      ? 'featured'
+      : inferredStatus === '0'
+        ? 'recommend'
+        : (featuredCandidates.length > 0 && recommendCandidates.length === 0 ? 'featured' : 'recommend');
+    const candidates = activeLayout === 'featured' ? featuredCandidates : recommendCandidates;
     return {
       ok: true,
       candidates: candidates.filter((candidate) => !processed.has(candidate.key)),
       candidate_count: candidates.length,
-      total_cards: cards.length
+      total_cards: activeLayout === 'featured' ? featuredCards.length : cards.length,
+      active_tab_status: inferredStatus || null,
+      layout: activeLayout
     };
   })(${JSON.stringify(processedKeys)})`;
 }
@@ -391,6 +616,18 @@ const jsGetListState = `(() => {
   const frameRect = frame.getBoundingClientRect();
   const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
   const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
+  const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
+  const featuredCandidates = featuredCards.filter((card) => card.querySelector('a[data-geekid]'));
+  const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+  const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
+  const activeTabStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
+  const inferredStatus = activeTabStatus
+    || (featuredCandidates.length > 0 && candidateCards.length === 0 ? '3' : candidateCards.length > 0 ? '0' : '');
+  const effectiveCount = inferredStatus === '3'
+    ? featuredCandidates.length
+    : inferredStatus === '0'
+      ? candidateCards.length
+      : Math.max(candidateCards.length, featuredCandidates.length);
   return {
     ok: true,
     scrollTop: body ? body.scrollTop : 0,
@@ -405,8 +642,11 @@ const jsGetListState = `(() => {
       width: (doc.defaultView && Number.isFinite(doc.defaultView.innerWidth)) ? doc.defaultView.innerWidth : 0,
       height: (doc.defaultView && Number.isFinite(doc.defaultView.innerHeight)) ? doc.defaultView.innerHeight : 0
     },
-    candidateCount: candidateCards.length,
-    totalCards: cards.length
+    candidateCount: effectiveCount,
+    recommendCandidateCount: candidateCards.length,
+    featuredCandidateCount: featuredCandidates.length,
+    totalCards: Math.max(cards.length, featuredCards.length),
+    activeTabStatus: inferredStatus || null
   };
 })()`;
 
@@ -419,8 +659,15 @@ const jsScrollList = `(() => {
   }
   const doc = frame.contentDocument;
   const body = doc.body;
-  const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item')).filter((card) => card.querySelector('.card-inner[data-geekid]'));
-  const lastCard = cards[cards.length - 1];
+  const recommendCards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item')).filter((card) => card.querySelector('.card-inner[data-geekid]'));
+  const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card')).filter((card) => card.querySelector('a[data-geekid]'));
+  const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+  const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
+  const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
+  const inferredStatus = activeStatus
+    || (featuredCards.length > 0 && recommendCards.length === 0 ? '3' : recommendCards.length > 0 ? '0' : '');
+  const activeCards = inferredStatus === '3' ? featuredCards : recommendCards;
+  const lastCard = activeCards[activeCards.length - 1];
   const before = {
     scrollTop: body ? body.scrollTop : 0,
     scrollHeight: body ? body.scrollHeight : 0
@@ -491,6 +738,30 @@ const jsDetectBottom = `(() => {
   };
 })()`;
 const jsWaitForDetail = `(() => {
+  const topVisible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
+  const topSignals = [
+    '.dialog-wrap.active',
+    '.boss-popup__wrapper',
+    '.boss-popup_wrapper',
+    'iframe[src*="/web/frame/c-resume/"]',
+    'iframe[name*="resume"]'
+  ];
+  for (const sel of topSignals) {
+    const nodes = Array.from(document.querySelectorAll(sel));
+    for (const node of nodes) {
+      if (topVisible(node)) {
+        return { open: true, scope: 'top', selector: sel };
+      }
+    }
+  }
   const frame = document.querySelector('iframe[name="recommendFrame"]')
     || document.querySelector('iframe[src*="/web/frame/recommend/"]')
     || document.querySelector('iframe');
@@ -526,7 +797,7 @@ const jsWaitForDetail = `(() => {
     || isVisibleInViewport(greet)
     || isVisibleInViewport(resumeFrame)
   );
-  return { open };
+  return { open, scope: 'frame' };
 })()`;
 
 const jsCloseDetail = `(() => {
@@ -541,6 +812,36 @@ const jsCloseDetail = `(() => {
   if (topKnow) {
     topKnow.click();
     return { ok: true, method: 'know-top' };
+  }
+
+  const topVisible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
+  const topCloseSelectors = [
+    '.boss-popup__close',
+    '.popup-close',
+    '.modal-close',
+    '.dialog-close',
+    '.close-btn',
+    'button[aria-label*="关闭"]',
+    'button[title*="关闭"]',
+    '.icon-close'
+  ];
+  for (const sel of topCloseSelectors) {
+    const nodes = Array.from(document.querySelectorAll(sel));
+    for (const node of nodes) {
+      if (!topVisible(node)) continue;
+      try {
+        node.click();
+        return { ok: true, method: 'top-close', selector: sel };
+      } catch {}
+    }
   }
 
   const frame = document.querySelector('iframe[name="recommendFrame"]')
@@ -746,28 +1047,61 @@ const jsIsDetailClosed = `(() => {
 })()`;
 
 const jsGetFavoriteState = `(() => {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (doc, el) => {
+    if (!el) return false;
+    const view = doc.defaultView || window;
+    const style = view.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
+  const resolveFavorite = (doc, offsetX, offsetY, scope) => {
+    if (!doc) return null;
+    const direct = Array.from(doc.querySelectorAll('.like-icon-and-text')).find((node) => isVisible(doc, node)) || null;
+    const footer = doc.querySelector('.resume-footer.item-operate, .resume-footer-wrap, .resume-footer');
+    const fromFooter = footer
+      ? Array.from(footer.querySelectorAll('[class*="collect"], [class*="favorite"], button, .btn, span'))
+        .find((node) => isVisible(doc, node) && /收藏|已收藏|感兴趣|已感兴趣/.test(normalize(node.textContent) + normalize(node.className)))
+      : null;
+    const fallback = Array.from(doc.querySelectorAll('button, .btn, span, div, a'))
+      .filter((node) => isVisible(doc, node))
+      .find((node) => /收藏|已收藏|感兴趣|已感兴趣/.test(normalize(node.textContent) + normalize(node.className))) || null;
+    const root = direct || fromFooter || fallback;
+    if (!root) return null;
+    const rect = root.getBoundingClientRect();
+    const label = normalize((root.querySelector ? root.querySelector('.btn-text') : null)?.textContent || root.textContent);
+    const className = normalize(root.className || '');
+    const active = (
+      /已收藏|已感兴趣/.test(label)
+      || /(?:^|\\s)(?:active|curr|current|selected|checked)(?:\\s|$)/i.test(className)
+      || Boolean(root.querySelector && root.querySelector('.like-icon.like-icon-active, .active, .selected, .curr'))
+    );
+    return {
+      ok: true,
+      active,
+      label: label || null,
+      x: offsetX + rect.left + rect.width / 2,
+      y: offsetY + rect.top + rect.height / 2,
+      scope
+    };
+  };
+
+  const topResult = resolveFavorite(document, 0, 0, 'top');
+  if (topResult) return topResult;
+
   const frame = document.querySelector('iframe[name="recommendFrame"]')
     || document.querySelector('iframe[src*="/web/frame/recommend/"]')
     || document.querySelector('iframe');
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
-  const doc = frame.contentDocument;
-  const root = doc.querySelector('.like-icon-and-text');
-  if (!root || root.offsetParent === null) {
-    return { ok: false, error: 'FAVORITE_BUTTON_NOT_FOUND' };
-  }
   const frameRect = frame.getBoundingClientRect();
-  const rect = root.getBoundingClientRect();
-  const text = String((root.querySelector('.btn-text') || {}).textContent || '').replace(/\s+/g, ' ').trim();
-  const active = Boolean(root.querySelector('.like-icon.like-icon-active')) || text.includes('已收藏');
-  return {
-    ok: true,
-    active,
-    label: text,
-    x: frameRect.left + rect.left + rect.width / 2,
-    y: frameRect.top + rect.top + rect.height / 2
-  };
+  const frameResult = resolveFavorite(frame.contentDocument, frameRect.left, frameRect.top, 'frame');
+  if (frameResult) return frameResult;
+  return { ok: false, error: 'FAVORITE_BUTTON_NOT_FOUND' };
 })()`;
 
 const jsClickFavoriteFallback = `(() => {
@@ -783,28 +1117,57 @@ const jsClickFavoriteFallback = `(() => {
 })()`;
 
 const jsGetGreetState = `(() => {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (doc, el) => {
+    if (!el) return false;
+    const view = doc.defaultView || window;
+    const style = view.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
+  const resolveGreet = (doc, offsetX, offsetY, scope) => {
+    if (!doc) return null;
+    const candidates = [
+      ...Array.from(doc.querySelectorAll('button.btn-v2.btn-sure-v2.btn-greet')),
+      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button.btn-v2, .resume-footer-wrap button.btn-v2')),
+      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button'))
+    ];
+    const button = candidates.find((item) => isVisible(doc, item) && /沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
+    if (!button) return null;
+    const rect = button.getBoundingClientRect();
+    return {
+      ok: true,
+      disabled: Boolean(button.disabled),
+      x: offsetX + rect.left + rect.width / 2,
+      y: offsetY + rect.top + rect.height / 2,
+      scope
+    };
+  };
+  const topResult = resolveGreet(document, 0, 0, 'top');
+  if (topResult) return topResult;
+
   const frame = document.querySelector('iframe[name="recommendFrame"]')
     || document.querySelector('iframe[src*="/web/frame/recommend/"]')
     || document.querySelector('iframe');
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
-  const doc = frame.contentDocument;
-  const button = doc.querySelector('button.btn-v2.btn-sure-v2.btn-greet');
-  if (!button || button.offsetParent === null) {
-    return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
-  }
   const frameRect = frame.getBoundingClientRect();
-  const rect = button.getBoundingClientRect();
-  return {
-    ok: true,
-    disabled: Boolean(button.disabled),
-    x: frameRect.left + rect.left + rect.width / 2,
-    y: frameRect.top + rect.top + rect.height / 2
-  };
+  const frameResult = resolveGreet(frame.contentDocument, frameRect.left, frameRect.top, 'frame');
+  if (frameResult) return frameResult;
+  return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
 })()`;
 
 const jsClickGreetFallback = `(() => {
+  const topButton = Array.from(document.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button, button.btn-v2.btn-sure-v2'))
+    .find((item) => item && item.offsetParent !== null && /沟通|打招呼|聊一聊/.test(String(item.textContent || '').replace(/\\s+/g, ' ')));
+  if (topButton) {
+    topButton.click();
+    return { ok: true, scope: 'top' };
+  }
   const frame = document.querySelector('iframe[name="recommendFrame"]')
     || document.querySelector('iframe[src*="/web/frame/recommend/"]')
     || document.querySelector('iframe');
@@ -1065,6 +1428,7 @@ class RecommendScreenCli {
     this.Input = null;
     this.Page = null;
     this.Browser = null;
+    this.Network = null;
     this.target = null;
     this.windowId = null;
     this.discoveredKeys = new Set();
@@ -1082,6 +1446,20 @@ class RecommendScreenCli {
     this.greetLimitFallbackCount = 0;
     this.consecutiveResumeCaptureFailures = 0;
     this.resumeCaptureFailureStreakKeys = [];
+    this.currentCandidateKey = null;
+    this.resumeNetworkRequests = new Map();
+    this.resumeNetworkByGeekId = new Map();
+    this.latestResumeNetworkPayload = null;
+    this.favoriteActionEvents = [];
+    this.favoriteClickPendingSince = 0;
+    this.resumeSourceStats = {
+      network: 0,
+      image_fallback: 0
+    };
+    this.lastActiveTabStatus = PAGE_SCOPE_TAB_STATUS[this.args.pageScope] || null;
+    this.featuredCalibration = this.args.pageScope === "featured"
+      ? loadCalibrationPosition(this.args.calibrationPath)
+      : null;
     this.restCounter = 0;
     this.restThreshold = 25 + Math.floor(Math.random() * 8);
     this.checkpointPath = this.args.checkpointPath ? path.resolve(this.args.checkpointPath) : null;
@@ -1134,18 +1512,27 @@ class RecommendScreenCli {
         action: item?.action || "",
         geekId: item?.geekId || "",
         summary: item?.summary || "",
-        imagePath: item?.imagePath || ""
+        imagePath: item?.imagePath || "",
+        resumeSource: item?.resumeSource || ""
       }))
     };
   }
 
   buildProgressSnapshot(completionReason = null) {
+    const defaultResumeSource = this.args.pageScope === "featured" ? "network" : "image_fallback";
     const snapshot = {
       processed_count: this.processedCount,
       passed_count: this.passedCandidates.length,
       skipped_count: this.skippedCount,
       output_csv: this.args.output,
       checkpoint_path: this.checkpointPath,
+      selected_page: this.args.pageScope || "recommend",
+      active_tab_status: this.lastActiveTabStatus || PAGE_SCOPE_TAB_STATUS[this.args.pageScope] || null,
+      resume_source: this.resumeSourceStats.image_fallback > 0
+        ? "image_fallback"
+        : this.resumeSourceStats.network > 0
+          ? "network"
+          : defaultResumeSource,
       post_action: this.args.postAction,
       max_greet_count: this.args.postAction === "greet" ? this.args.maxGreetCount : null,
       greet_count: this.greetCount,
@@ -1155,6 +1542,143 @@ class RecommendScreenCli {
       snapshot.completion_reason = completionReason;
     }
     return snapshot;
+  }
+
+  markFavoriteClickPending() {
+    this.favoriteClickPendingSince = Date.now();
+  }
+
+  consumeFavoriteActionResult(since = 0) {
+    const timestamp = Number.isFinite(since) ? since : 0;
+    const matched = this.favoriteActionEvents.find((item) => Number(item?.ts || 0) >= timestamp) || null;
+    if (!matched) {
+      if (this.favoriteClickPendingSince > 0 && (Date.now() - this.favoriteClickPendingSince) > 8000) {
+        this.favoriteClickPendingSince = 0;
+      }
+      return null;
+    }
+    this.favoriteActionEvents = this.favoriteActionEvents.filter((item) => item !== matched);
+    this.favoriteClickPendingSince = 0;
+    return matched.action || null;
+  }
+
+  cacheResumeNetworkPayload(payload, fallbackGeekId = null) {
+    if (!payload || typeof payload !== "object") return;
+    const geekDetail = payload.geekDetail || payload;
+    const baseInfo = geekDetail.geekBaseInfo || {};
+    const geekId = normalizeText(
+      fallbackGeekId
+      || baseInfo.geekId
+      || baseInfo.encryptGeekId
+      || geekDetail.geekId
+      || payload.geekId
+      || ""
+    ) || null;
+    const candidateInfo = {
+      name: baseInfo.name || geekDetail.geekName || payload.geekName || "",
+      school: (geekDetail.geekEduExpList && geekDetail.geekEduExpList[0]?.school)
+        || (geekDetail.geekEducationList && geekDetail.geekEducationList[0]?.school)
+        || "",
+      major: (geekDetail.geekEduExpList && geekDetail.geekEduExpList[0]?.major)
+        || (geekDetail.geekEducationList && geekDetail.geekEducationList[0]?.major)
+        || "",
+      company: (geekDetail.geekWorkExpList && geekDetail.geekWorkExpList[0]?.company) || "",
+      position: (geekDetail.geekWorkExpList && geekDetail.geekWorkExpList[0]?.positionName) || "",
+      resumeText: formatResumeApiData(payload),
+      alreadyInterested: payload.alreadyInterested === true
+    };
+    const wrapped = {
+      ts: Date.now(),
+      geekId: geekId || null,
+      data: payload,
+      candidateInfo
+    };
+    this.latestResumeNetworkPayload = wrapped;
+    if (geekId) {
+      this.resumeNetworkByGeekId.set(geekId, wrapped);
+    }
+  }
+
+  tryExtractNetworkResumeForCandidate(candidate) {
+    const candidateKey = normalizeText(candidate?.key || candidate?.geek_id || "");
+    if (candidateKey && this.resumeNetworkByGeekId.has(candidateKey)) {
+      return this.resumeNetworkByGeekId.get(candidateKey)?.candidateInfo || null;
+    }
+    if (this.latestResumeNetworkPayload) {
+      const ageMs = Date.now() - Number(this.latestResumeNetworkPayload.ts || 0);
+      if (ageMs <= 12000) {
+        return this.latestResumeNetworkPayload.candidateInfo || null;
+      }
+    }
+    return null;
+  }
+
+  async waitForNetworkResumeCandidateInfo(candidate, timeoutMs = 2200) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const info = this.tryExtractNetworkResumeForCandidate(candidate);
+      if (info && normalizeText(info.resumeText)) {
+        return info;
+      }
+      await sleep(120);
+    }
+    return null;
+  }
+
+  handleNetworkRequestWillBeSent(params) {
+    const url = normalizeText(params?.request?.url || "");
+    if (!url) return;
+    if (url.includes("/wapi/zpitem/web/boss/search/geek/info")) {
+      const geekId = parseGeekIdFromUrl(url);
+      this.resumeNetworkRequests.set(params.requestId, {
+        ts: Date.now(),
+        url,
+        geekId
+      });
+      return;
+    }
+
+    if (this.favoriteClickPendingSince <= 0) return;
+    const requestTs = Date.now();
+    if (requestTs < this.favoriteClickPendingSince - 1000) return;
+
+    if (url.includes("userMark")) {
+      const action = /\/add(?:\/|$)|[?&]action=add/i.test(url)
+        ? "add"
+        : /\/del(?:\/|$)|[?&]action=del/i.test(url)
+          ? "del"
+          : null;
+      if (action) {
+        this.favoriteActionEvents.push({ action, ts: requestTs, source: "userMark", url });
+      }
+      return;
+    }
+
+    if (url.includes("actionLog/common.json")) {
+      try {
+        const payload = JSON.parse(params?.request?.postData || "{}");
+        if (payload?.action === "star-interest-click") {
+          const action = Number(payload?.p3) === 1 ? "add" : Number(payload?.p3) === 0 ? "del" : null;
+          if (action) {
+            this.favoriteActionEvents.push({ action, ts: requestTs, source: "actionLog", url });
+          }
+        }
+      } catch {}
+    }
+  }
+
+  async handleNetworkLoadingFinished(params) {
+    const requestMeta = this.resumeNetworkRequests.get(params?.requestId);
+    if (!requestMeta) return;
+    this.resumeNetworkRequests.delete(params.requestId);
+    try {
+      const responseBody = await this.Network.getResponseBody({ requestId: params.requestId });
+      if (!responseBody?.body) return;
+      const parsed = JSON.parse(responseBody.body);
+      if (parsed?.zpData) {
+        this.cacheResumeNetworkPayload(parsed.zpData, requestMeta.geekId);
+      }
+    } catch {}
   }
 
   resetResumeCaptureFailureStreak() {
@@ -1255,9 +1779,24 @@ class RecommendScreenCli {
           action: item?.action || "",
           geekId: item?.geekId || "",
           summary: item?.summary || "",
-          imagePath: item?.imagePath || ""
+          imagePath: item?.imagePath || "",
+          resumeSource: item?.resumeSource || ""
         }))
       : [];
+    const networkCount = this.passedCandidates.filter((item) => item?.resumeSource === "network").length;
+    const imageFallbackCount = this.passedCandidates.filter((item) => item?.resumeSource === "image_fallback").length;
+    this.resumeSourceStats = {
+      network: networkCount,
+      image_fallback: this.args.pageScope === "featured" ? 0 : imageFallbackCount
+    };
+    if (this.resumeSourceStats.network <= 0 && this.resumeSourceStats.image_fallback <= 0) {
+      const snapshotSource = normalizeText(parsed.resume_source || "").toLowerCase();
+      if (snapshotSource === "network") {
+        this.resumeSourceStats.network = 1;
+      } else if (snapshotSource === "image_fallback" && this.args.pageScope !== "featured") {
+        this.resumeSourceStats.image_fallback = 1;
+      }
+    }
 
     return true;
   }
@@ -1271,13 +1810,29 @@ class RecommendScreenCli {
       throw this.buildError("RECOMMEND_PAGE_NOT_READY", "No debuggable recommend page target found.");
     }
     this.client = await CDP({ port: this.args.port, target: this.target });
-    const { Runtime, Input, Page, Browser } = this.client;
+    const { Runtime, Input, Page, Browser, Network } = this.client;
     this.Runtime = Runtime;
     this.Input = Input;
     this.Page = Page;
     this.Browser = Browser || null;
+    this.Network = Network || null;
     await Runtime.enable();
     await Page.enable();
+    if (this.Network && typeof this.Network.enable === "function") {
+      await this.Network.enable();
+      if (typeof this.Network.requestWillBeSent === "function") {
+        this.Network.requestWillBeSent((params) => {
+          try {
+            this.handleNetworkRequestWillBeSent(params);
+          } catch {}
+        });
+      }
+      if (typeof this.Network.loadingFinished === "function") {
+        this.Network.loadingFinished((params) => {
+          this.handleNetworkLoadingFinished(params).catch(() => {});
+        });
+      }
+    }
     if (this.Browser && typeof this.Browser.getWindowForTarget === "function") {
       try {
         const windowInfo = await this.Browser.getWindowForTarget();
@@ -1286,7 +1841,9 @@ class RecommendScreenCli {
         }
       } catch {}
     }
-    await Page.bringToFront();
+    if (SHOULD_BRING_TO_FRONT && Page && typeof Page.bringToFront === "function") {
+      await Page.bringToFront();
+    }
   }
 
   async disconnect() {
@@ -1295,6 +1852,12 @@ class RecommendScreenCli {
         await this.client.close();
       } catch {}
     }
+    this.client = null;
+    this.Runtime = null;
+    this.Input = null;
+    this.Page = null;
+    this.Browser = null;
+    this.Network = null;
   }
 
   buildError(code, message, retryable = true, extra = {}) {
@@ -1384,7 +1947,13 @@ class RecommendScreenCli {
 
   async getListState() {
     const state = await this.evaluate(jsGetListState);
-    if (state && typeof state === "object") return state;
+    if (state && typeof state === "object") {
+      const activeStatus = normalizeText(state.activeTabStatus || "");
+      if (activeStatus) {
+        this.lastActiveTabStatus = activeStatus;
+      }
+      return state;
+    }
     return { ok: false, error: "INVALID_LIST_STATE" };
   }
 
@@ -1452,7 +2021,7 @@ class RecommendScreenCli {
         await sleep(humanDelay(520, 80));
       }
     }
-    if (applied && this.Page && typeof this.Page.bringToFront === "function") {
+    if (applied && SHOULD_BRING_TO_FRONT && this.Page && typeof this.Page.bringToFront === "function") {
       try {
         await this.Page.bringToFront();
       } catch {}
@@ -1511,11 +2080,16 @@ class RecommendScreenCli {
       this.insertedAt.set(key, this.insertCounter);
       added += 1;
     }
+    if (normalizeText(scan.active_tab_status)) {
+      this.lastActiveTabStatus = normalizeText(scan.active_tab_status);
+    }
     return {
       ok: true,
       added,
       candidate_count: scan.candidate_count ?? null,
-      total_cards: scan.total_cards ?? null
+      total_cards: scan.total_cards ?? null,
+      active_tab_status: scan.active_tab_status || null,
+      layout: scan.layout || null
     };
   }
 
@@ -1569,11 +2143,14 @@ class RecommendScreenCli {
       }
       const doc = frame.contentDocument;
       const inner = Array.from(doc.querySelectorAll('.card-inner[data-geekid]'))
-        .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey));
-      if (!inner) {
-        return { ok: false, error: 'CANDIDATE_NOT_FOUND' };
-      }
-      const card = inner.closest('li.card-item') || inner.closest('.card-item');
+        .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey)) || null;
+      const featuredAnchor = inner
+        ? null
+        : Array.from(doc.querySelectorAll('li.geek-info-card a[data-geekid], a[data-geekid]'))
+          .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey)) || null;
+      const card = inner
+        ? (inner.closest('li.card-item') || inner.closest('.card-item'))
+        : (featuredAnchor ? (featuredAnchor.closest('li.geek-info-card') || featuredAnchor.closest('.geek-info-card')) : null);
       if (!card) {
         return { ok: false, error: 'CANDIDATE_CARD_NOT_FOUND' };
       }
@@ -1721,7 +2298,103 @@ class RecommendScreenCli {
     };
   }
 
-  async favoriteCandidate() {
+  async callTextModel(resumeText) {
+    const safeResumeText = String(resumeText || "").slice(0, 28000);
+    const baseUrl = this.args.baseUrl.replace(/\/$/, "");
+    const payload = {
+      model: this.args.model,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: "你是一位严谨的招聘筛选助手。你只能返回 JSON，不要输出任何额外文字。"
+        },
+        {
+          role: "user",
+          content: `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${this.args.criteria}\n\n简历内容:\n${safeResumeText}\n\n请返回严格 JSON: {"passed": true/false, "reason": "...", "summary": "..."}`
+        }
+      ]
+    };
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.args.apiKey}`
+    };
+    if (this.args.openaiOrganization) headers["OpenAI-Organization"] = this.args.openaiOrganization;
+    if (this.args.openaiProject) headers["OpenAI-Project"] = this.args.openaiProject;
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw this.buildError("TEXT_MODEL_FAILED", `Text model request failed: ${response.status} ${body.slice(0, 400)}`);
+    }
+    const json = await response.json();
+    const content = Array.isArray(json?.choices?.[0]?.message?.content)
+      ? json.choices[0].message.content.map((item) => item?.text || "").join("\n")
+      : json?.choices?.[0]?.message?.content || "";
+    const parsed = extractJsonObject(content);
+    return {
+      passed: parsed.passed === true,
+      reason: normalizeText(parsed.reason),
+      summary: normalizeText(parsed.summary)
+    };
+  }
+
+  async favoriteCandidate(options = {}) {
+    if (this.args.pageScope === "featured") {
+      if (options.alreadyInterested === true) {
+        return { actionTaken: "already_favorited" };
+      }
+      if (!this.featuredCalibration?.position) {
+        throw this.buildError(
+          "FAVORITE_CALIBRATION_REQUIRED",
+          "精选页收藏缺少可用校准文件（favorite-calibration.json）。请先运行 boss-recommend-mcp calibrate。",
+          true,
+          {
+            calibration_path: this.args.calibrationPath || null
+          }
+        );
+      }
+
+      const base = this.featuredCalibration.position;
+      const maxClicks = 5;
+      for (let clickIndex = 0; clickIndex < maxClicks; clickIndex += 1) {
+        const clickStartedAt = Date.now();
+        this.markFavoriteClickPending();
+        const offsetX = Math.floor(Math.random() * 7) - 3;
+        const offsetY = Math.floor(Math.random() * 7) - 3;
+        try {
+          await this.simulateHumanClick(base.pageX + offsetX, base.pageY + offsetY);
+        } catch (error) {
+          throw this.buildError(
+            "FAVORITE_BUTTON_FAILED",
+            `精选页收藏模拟点击失败：${error?.message || error}`
+          );
+        }
+
+        let sawDel = false;
+        for (let index = 0; index < 10; index += 1) {
+          await sleep(humanDelay(260, 80));
+          const networkAction = this.consumeFavoriteActionResult(clickStartedAt);
+          if (networkAction === "add") {
+            return { actionTaken: "favorite" };
+          }
+          if (networkAction === "del") {
+            sawDel = true;
+            break;
+          }
+        }
+        if (!sawDel && clickIndex === maxClicks - 1) {
+          break;
+        }
+      }
+
+      throw this.buildError("FAVORITE_BUTTON_FAILED", "精选页收藏未检测到 network add 成功信号。");
+    }
+
     const before = await this.evaluate(jsGetFavoriteState);
     if (!before?.ok) {
       throw this.buildError("FAVORITE_BUTTON_FAILED", before?.error || "收藏按钮不可用");
@@ -1729,13 +2402,18 @@ class RecommendScreenCli {
     if (before.active) {
       return { actionTaken: "already_favorited" };
     }
-
+    const clickStartedAt = Date.now();
+    this.markFavoriteClickPending();
     try {
       await this.simulateHumanClick(before.x, before.y);
     } catch {
-      const fallback = await this.evaluate(jsClickFavoriteFallback);
-      if (!fallback?.ok) {
-        throw this.buildError("FAVORITE_BUTTON_FAILED", fallback?.error || "收藏按钮点击失败");
+      if (this.args.pageScope !== "featured") {
+        const fallback = await this.evaluate(jsClickFavoriteFallback);
+        if (!fallback?.ok) {
+          throw this.buildError("FAVORITE_BUTTON_FAILED", fallback?.error || "收藏按钮点击失败");
+        }
+      } else {
+        throw this.buildError("FAVORITE_BUTTON_FAILED", "精选页收藏只允许模拟点击，点击失败。");
       }
     }
 
@@ -1743,6 +2421,10 @@ class RecommendScreenCli {
       await sleep(humanDelay(260, 80));
       const state = await this.evaluate(jsGetFavoriteState);
       if (state?.ok && state.active) {
+        return { actionTaken: "favorite" };
+      }
+      const networkAction = this.consumeFavoriteActionResult(clickStartedAt);
+      if (networkAction === "add") {
         return { actionTaken: "favorite" };
       }
     }
@@ -2054,15 +2736,43 @@ class RecommendScreenCli {
         let shouldMarkProcessed = true;
 
         try {
+          this.currentCandidateKey = nextCandidate.key || nextCandidate.geek_id || null;
           await this.clickCandidate(nextCandidate);
           const detailOpen = await this.ensureDetailOpen();
           if (!detailOpen) {
             throw this.buildError("DETAIL_OPEN_FAILED", "详情页打开超时");
           }
 
-          const capture = await this.captureResumeImage(nextCandidate);
+          const isFeaturedScope = this.args.pageScope === "featured";
+          let capture = null;
+          let screening = null;
+          let resumeSource = isFeaturedScope ? "network" : "image_fallback";
+          const networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, 2400);
+          const candidateProfile = {
+            name: networkCandidateInfo?.name || nextCandidate.name || "",
+            school: networkCandidateInfo?.school || nextCandidate.school || "",
+            major: networkCandidateInfo?.major || nextCandidate.major || "",
+            company: networkCandidateInfo?.company || nextCandidate.last_company || "",
+            position: networkCandidateInfo?.position || nextCandidate.last_position || ""
+          };
+
+          if (isFeaturedScope) {
+            if (!networkCandidateInfo?.resumeText) {
+              throw this.buildError(
+                "RESUME_NETWORK_UNAVAILABLE",
+                "精选页未获取到 network 简历数据，已跳过当前候选人。"
+              );
+            }
+            screening = await this.callTextModel(networkCandidateInfo.resumeText);
+            resumeSource = "network";
+            this.resumeSourceStats.network += 1;
+          } else {
+            capture = await this.captureResumeImage(nextCandidate);
+            screening = await this.callVisionModel(capture.stitchedImage);
+            resumeSource = "image_fallback";
+            this.resumeSourceStats.image_fallback += 1;
+          }
           this.resetResumeCaptureFailureStreak();
-          const screening = await this.callVisionModel(capture.stitchedImage);
           log(`筛选结果: ${screening.passed ? "通过" : "不通过"}`);
 
           if (screening.passed) {
@@ -2077,7 +2787,9 @@ class RecommendScreenCli {
               this.greetLimitFallbackCount += 1;
             }
             const actionResult = effectiveAction === "favorite"
-              ? await this.favoriteCandidate()
+              ? await this.favoriteCandidate({
+                alreadyInterested: networkCandidateInfo?.alreadyInterested === true
+              })
               : effectiveAction === "greet"
                 ? await this.greetCandidate()
                 : { actionTaken: "none" };
@@ -2085,16 +2797,17 @@ class RecommendScreenCli {
               this.greetCount += 1;
             }
             this.passedCandidates.push({
-              name: nextCandidate.name,
-              school: nextCandidate.school || "",
-              major: nextCandidate.major || "",
-              company: nextCandidate.last_company || "",
-              position: nextCandidate.last_position || "",
+              name: candidateProfile.name,
+              school: candidateProfile.school,
+              major: candidateProfile.major,
+              company: candidateProfile.company,
+              position: candidateProfile.position,
               reason: screening.reason || screening.summary || "",
               action: actionResult.actionTaken,
               geekId: nextCandidate.geek_id,
               summary: screening.summary,
-              imagePath: capture.stitchedImage
+              imagePath: capture?.stitchedImage || "",
+              resumeSource
             });
           } else {
             this.skippedCount += 1;
@@ -2102,18 +2815,20 @@ class RecommendScreenCli {
         } catch (error) {
           this.skippedCount += 1;
           log(`候选人处理失败: ${error.code || error.message}`);
-          if (error.code === "RESUME_CAPTURE_FAILED") {
+          if (["RESUME_CAPTURE_FAILED", "RESUME_NETWORK_UNAVAILABLE"].includes(error.code)) {
             this.recordResumeCaptureFailure(nextCandidate.key);
+            const failureLabel = error.code === "RESUME_NETWORK_UNAVAILABLE" ? "简历 network 获取失败" : "简历截图失败";
             log(
-              `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} 简历截图失败，` +
+              `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} ${failureLabel}，` +
               `已跳过当前候选人；连续失败 ${this.consecutiveResumeCaptureFailures}/${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES}`
             );
             if (this.consecutiveResumeCaptureFailures >= MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES) {
               shouldMarkProcessed = false;
               const rollback = this.rollbackResumeCaptureFailureStreak(nextCandidate.key);
+              const failureTypeText = this.args.pageScope === "featured" ? "简历 network 获取失败" : "简历捕获失败";
               throw this.buildError(
                 "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT",
-                `连续 ${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES} 位候选人简历捕获失败，已停止运行以避免错误跳过。` +
+                `连续 ${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES} 位候选人${failureTypeText}，已停止运行以避免错误跳过。` +
                 `已回滚这 ${rollback.rollback_count} 个失败样本的计数；最后错误: ${error.message || error}`,
                 true,
                 {
@@ -2125,7 +2840,7 @@ class RecommendScreenCli {
           } else {
             this.resetResumeCaptureFailureStreak();
           }
-          if (["VISION_MODEL_FAILED"].includes(error.code)) {
+          if (["VISION_MODEL_FAILED", "TEXT_MODEL_FAILED"].includes(error.code)) {
             throw error;
           }
         } finally {
@@ -2204,7 +2919,7 @@ async function main() {
     console.log(JSON.stringify({
       status: "COMPLETED",
       result: {
-        usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --port 9222 --output <csv-path> --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
+        usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --page-scope recommend|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
       }
     }));
     return;
