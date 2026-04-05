@@ -36,6 +36,29 @@ function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function sanitizeUrl(value) {
+  const raw = String(value || "").replace(/\s+/g, " ").trim();
+  const cleaned = raw
+    .replace(/^\uFEFF/, "")
+    .replace(/[\u200B-\u200F\u2028-\u202F\u2060-\u2064\uFEFF]/g, "")
+    .replace(/^["']|["']$/g, "");
+  return cleaned.replace(/\/+$/, "");
+}
+
+function validateUrlString(raw) {
+  const sanitized = sanitizeUrl(raw);
+  if (!sanitized) return { ok: false, error: "baseUrl 为空" };
+  try {
+    const url = new URL(sanitized);
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      return { ok: false, error: `协议无效: ${url.protocol} (期望 http 或 https)` };
+    }
+    return { ok: true, sanitized, full: sanitized };
+  } catch (e) {
+    return { ok: false, error: `URL 格式无效: ${e.message}`, raw };
+  }
+}
+
 function parsePositiveInteger(raw) {
   const value = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(value) && value > 0 ? value : null;
@@ -1487,6 +1510,13 @@ const jsReloadRecommendFrame = `(() => {
 class RecommendScreenCli {
   constructor(args) {
     this.args = args;
+    const baseUrlCheck = validateUrlString(this.args.baseUrl);
+    if (this.args.baseUrl && !baseUrlCheck.ok) {
+      log(`[警告] baseUrl 校验失败: ${baseUrlCheck.error}, 原始值=${JSON.stringify(this.args.baseUrl)}`);
+    }
+    if (baseUrlCheck.sanitized) {
+      this.args.baseUrl = baseUrlCheck.sanitized;
+    }
     this.client = null;
     this.Runtime = null;
     this.Input = null;
@@ -2308,7 +2338,9 @@ class RecommendScreenCli {
 
   async callVisionModel(imagePath) {
     const imageBase64 = fs.readFileSync(imagePath, "base64");
-    const baseUrl = this.args.baseUrl.replace(/\/$/, "");
+    const rawBaseUrl = this.args.baseUrl;
+    log(`[callVisionModel] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
+    const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
     const payload = {
       model: this.args.model,
       temperature: 0.1,
@@ -2364,7 +2396,9 @@ class RecommendScreenCli {
 
   async callTextModel(resumeText) {
     const safeResumeText = String(resumeText || "").slice(0, 28000);
-    const baseUrl = this.args.baseUrl.replace(/\/$/, "");
+    const rawBaseUrl = this.args.baseUrl;
+    log(`[callTextModel] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
+    const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
     const payload = {
       model: this.args.model,
       temperature: 0.1,

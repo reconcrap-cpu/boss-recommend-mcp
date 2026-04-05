@@ -1,9 +1,0 @@
-{
-  "school_tag": "211",
-  "gender": "女",
-  "recent_not_view": "近14天没有",
-  "criteria": "候选人需要有 AI Agent 或 MCP 工具开发经验",
-  "target_count": 8,
-  "post_action": "greet",
-  "max_greet_count": 5
-}

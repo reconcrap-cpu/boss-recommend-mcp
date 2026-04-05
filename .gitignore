@@ -1,3 +1,13 @@
 node_modules/
 config/screening-config.json
 output/
+.DS_Store
+*.csv
+confirmation.json
+overrides.json
+diagnose-featured-network.js
+.trae/
+.e2e/
+request.test.txt
+confirmation.test.json
+overrides.test.json

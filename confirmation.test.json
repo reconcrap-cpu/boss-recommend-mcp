@@ -1,8 +1,0 @@
-{
-  "filters_confirmed": true,
-  "criteria_confirmed": true,
-  "post_action_confirmed": true,
-  "post_action_value": "greet",
-  "max_greet_count_confirmed": true,
-  "max_greet_count_value": 6
-}
