@@ -91,6 +91,234 @@ function parseBoolean(value) {
   return null;
 }
 
+function normalizeCliOptionToken(rawToken) {
+  const token = String(rawToken || "").trim();
+  if (!token) {
+    return { token: "", inlineValue: null };
+  }
+  const normalizedDashes = token.replace(/^[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]+/, "--");
+  const eqIndex = normalizedDashes.indexOf("=");
+  if (normalizedDashes.startsWith("--") && eqIndex > 2) {
+    return {
+      token: normalizedDashes.slice(0, eqIndex),
+      inlineValue: normalizedDashes.slice(eqIndex + 1)
+    };
+  }
+  return { token: normalizedDashes, inlineValue: null };
+}
+
+function parseFavoriteActionValue(rawValue) {
+  if (rawValue === null || rawValue === undefined) return null;
+  if (typeof rawValue === "boolean") return rawValue ? "add" : "del";
+  if (typeof rawValue === "number") {
+    if (rawValue === 1) return "add";
+    if (rawValue === 0) return "del";
+  }
+  const normalized = normalizeText(rawValue).toLowerCase();
+  if (!normalized) return null;
+  if (
+    ["1", "add", "favorite", "collect", "interested", "true", "yes", "on"].includes(normalized)
+    || /(?:^|[_\W])(add|favorite|collect|interest(?:ed)?)(?:$|[_\W])/.test(normalized)
+  ) {
+    return "add";
+  }
+  if (
+    ["0", "del", "delete", "remove", "cancel", "unfavorite", "uncollect", "false", "no", "off"].includes(normalized)
+    || /(?:^|[_\W])(del|delete|remove|cancel|unfavorite|uncollect|uninterest)(?:$|[_\W])/.test(normalized)
+  ) {
+    return "del";
+  }
+  return null;
+}
+
+function parseFavoriteActionFromObject(payload, visited = new Set()) {
+  if (!payload || typeof payload !== "object") return null;
+  if (visited.has(payload)) return null;
+  visited.add(payload);
+
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const action = parseFavoriteActionFromObject(item, visited);
+      if (action) return action;
+    }
+    return null;
+  }
+
+  const keys = Object.keys(payload);
+  const strongSignalKey = (key) => /p3|status|state|favorite|collect|interested|markstatus|isfavorite|iscollect/.test(key);
+  const weakSignalKey = (key) => /action|op|operation|type|mode|mark|interest/.test(key);
+  for (const key of keys) {
+    const value = payload[key];
+    const normalizedKey = normalizeText(key).toLowerCase();
+    if (strongSignalKey(normalizedKey)) {
+      const action = parseFavoriteActionValue(value);
+      if (action) return action;
+    }
+  }
+  for (const key of keys) {
+    const value = payload[key];
+    const normalizedKey = normalizeText(key).toLowerCase();
+    if (weakSignalKey(normalizedKey)) {
+      const action = parseFavoriteActionValue(value);
+      if (action) return action;
+    }
+  }
+
+  for (const key of keys) {
+    const value = payload[key];
+    if (value && typeof value === "object") {
+      const action = parseFavoriteActionFromObject(value, visited);
+      if (action) return action;
+    }
+  }
+  return null;
+}
+
+function parseFavoriteActionFromPostData(rawPostData) {
+  const postData = normalizeText(rawPostData);
+  if (!postData) return null;
+
+  try {
+    const parsed = JSON.parse(postData);
+    const action = parseFavoriteActionFromObject(parsed);
+    if (action) return action;
+  } catch {}
+
+  try {
+    const params = new URLSearchParams(postData);
+    const strongEntries = [];
+    const weakEntries = [];
+    for (const [key, value] of params.entries()) {
+      const normalizedKey = normalizeText(key).toLowerCase();
+      if (/p3|status|state|favorite|collect|interested|markstatus|isfavorite|iscollect/.test(normalizedKey)) {
+        strongEntries.push(value);
+      } else if (/action|op|operation|type|mode|mark|interest/.test(normalizedKey)) {
+        weakEntries.push(value);
+      }
+    }
+    for (const value of strongEntries) {
+      const action = parseFavoriteActionValue(value);
+      if (action) return action;
+    }
+    for (const value of weakEntries) {
+      const action = parseFavoriteActionValue(value);
+      if (action) return action;
+    }
+  } catch {}
+
+  const fallback = parseFavoriteActionValue(postData);
+  if (fallback) return fallback;
+
+  if (/star-interest-click/i.test(postData)) {
+    if (/(?:^|[?&"'\s])p3(?:["'\s:=]){1,3}1(?:$|[&"'\s,}])/i.test(postData)) return "add";
+    if (/(?:^|[?&"'\s])p3(?:["'\s:=]){1,3}0(?:$|[&"'\s,}])/i.test(postData)) return "del";
+  }
+  return null;
+}
+
+function parseFavoriteActionFromRequest(url, postData = "") {
+  const normalizedUrl = normalizeText(url).toLowerCase();
+  if (!normalizedUrl) return null;
+
+  if (/\/add(?:\/|$)|[?&](?:action|op|operation|type)=add\b|[?&](?:status|p3|favorite|collect|interested)=1\b/i.test(normalizedUrl)) {
+    return "add";
+  }
+  if (/\/del(?:\/|$)|[?&](?:action|op|operation|type)=del\b|[?&](?:status|p3|favorite|collect|interested)=0\b/i.test(normalizedUrl)) {
+    return "del";
+  }
+
+  return parseFavoriteActionFromPostData(postData);
+}
+
+function parseFavoriteActionFromActionLog(postData = "") {
+  const raw = normalizeText(postData);
+  if (!raw) return null;
+  try {
+    const payload = JSON.parse(raw);
+    if (normalizeText(payload?.action).toLowerCase() !== "star-interest-click") return null;
+    return parseFavoriteActionValue(payload?.p3);
+  } catch {}
+
+  try {
+    const params = new URLSearchParams(raw);
+    const actionName = normalizeText(params.get("action")).toLowerCase();
+    if (actionName !== "star-interest-click") return null;
+    return parseFavoriteActionValue(params.get("p3"));
+  } catch {}
+  return null;
+}
+
+function parseFavoriteActionFromKnownRequest(url, postData = "") {
+  const normalizedUrl = normalizeText(url).toLowerCase();
+  if (!normalizedUrl) return null;
+
+  if (normalizedUrl.includes("usermark")) {
+    if (/\/add(?:\/|$)|[?&](?:action|op|operation|type)=add\b/i.test(normalizedUrl)) {
+      return "add";
+    }
+    if (/\/del(?:\/|$)|[?&](?:action|op|operation|type)=del\b/i.test(normalizedUrl)) {
+      return "del";
+    }
+    return null;
+  }
+
+  if (normalizedUrl.includes("actionlog/common.json")) {
+    return parseFavoriteActionFromActionLog(postData);
+  }
+
+  return null;
+}
+
+function parseFavoriteActionFromWsPayload(payload, depth = 0) {
+  if (depth > 3 || payload === null || payload === undefined) return null;
+
+  if (typeof payload === "object") {
+    if (normalizeText(payload?.action).toLowerCase() === "star-interest-click") {
+      const strictAction = parseFavoriteActionValue(payload?.p3);
+      if (strictAction) return strictAction;
+    }
+    const nestedCandidates = [
+      payload.data,
+      payload.payload,
+      payload.body,
+      payload.message,
+      payload.msg
+    ];
+    for (const nested of nestedCandidates) {
+      const action = parseFavoriteActionFromWsPayload(nested, depth + 1);
+      if (action) return action;
+    }
+    return null;
+  }
+
+  const text = normalizeText(payload);
+  if (!text) return null;
+
+  try {
+    const parsed = JSON.parse(text);
+    const action = parseFavoriteActionFromWsPayload(parsed, depth + 1);
+    if (action) return action;
+  } catch {}
+
+  const actionFromActionLog = parseFavoriteActionFromActionLog(text);
+  if (actionFromActionLog) return actionFromActionLog;
+  if (/usermark/i.test(text)) {
+    if (/\/add(?:\/|$)|[?&](?:action|op|operation|type)=add\b/i.test(text)) return "add";
+    if (/\/del(?:\/|$)|[?&](?:action|op|operation|type)=del\b/i.test(text)) return "del";
+  }
+
+  return null;
+}
+
+function isRecoverablePostActionError(error, action) {
+  const normalizedAction = normalizeText(action).toLowerCase();
+  const normalizedCode = normalizeText(error?.code).toUpperCase();
+  if (!normalizedAction || !normalizedCode) return false;
+  if (normalizedAction === "favorite" && normalizedCode === "FAVORITE_BUTTON_FAILED") return true;
+  if (normalizedAction === "greet" && normalizedCode === "GREET_BUTTON_FAILED") return true;
+  return false;
+}
+
 function loadCalibrationPosition(filePath) {
   try {
     const resolved = path.resolve(String(filePath || ""));
@@ -162,69 +390,71 @@ function parseArgs(argv) {
   };
 
   for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
+    const normalizedToken = normalizeCliOptionToken(argv[index]);
+    const token = normalizedToken.token;
     const next = argv[index + 1];
-    if (token === "--baseurl" && next) {
-      parsed.baseUrl = next;
+    const inlineValue = normalizedToken.inlineValue;
+    if ((token === "--baseurl" || token === "--base-url") && (inlineValue || next)) {
+      parsed.baseUrl = inlineValue || next;
       parsed.__provided.baseUrl = true;
-      index += 1;
-    } else if (token === "--apikey" && next) {
-      parsed.apiKey = next;
+      if (!inlineValue) index += 1;
+    } else if ((token === "--apikey" || token === "--api-key") && (inlineValue || next)) {
+      parsed.apiKey = inlineValue || next;
       parsed.__provided.apiKey = true;
-      index += 1;
-    } else if (token === "--model" && next) {
-      parsed.model = next;
+      if (!inlineValue) index += 1;
+    } else if (token === "--model" && (inlineValue || next)) {
+      parsed.model = inlineValue || next;
       parsed.__provided.model = true;
-      index += 1;
-    } else if (token === "--openai-organization" && next) {
-      parsed.openaiOrganization = next;
-      index += 1;
-    } else if (token === "--openai-project" && next) {
-      parsed.openaiProject = next;
-      index += 1;
-    } else if (token === "--criteria" && next) {
-      parsed.criteria = next;
+      if (!inlineValue) index += 1;
+    } else if (token === "--openai-organization" && (inlineValue || next)) {
+      parsed.openaiOrganization = inlineValue || next;
+      if (!inlineValue) index += 1;
+    } else if (token === "--openai-project" && (inlineValue || next)) {
+      parsed.openaiProject = inlineValue || next;
+      if (!inlineValue) index += 1;
+    } else if (token === "--criteria" && (inlineValue || next)) {
+      parsed.criteria = inlineValue || next;
       parsed.__provided.criteria = true;
-      index += 1;
-    } else if (token === "--targetCount" && next) {
-      parsed.targetCount = parsePositiveInteger(next);
+      if (!inlineValue) index += 1;
+    } else if ((token === "--targetCount" || token === "--target-count") && (inlineValue || next)) {
+      parsed.targetCount = parsePositiveInteger(inlineValue || next);
       parsed.__provided.targetCount = true;
-      index += 1;
-    } else if (token === "--max-greet-count" && next) {
-      parsed.maxGreetCount = parsePositiveInteger(next);
+      if (!inlineValue) index += 1;
+    } else if ((token === "--max-greet-count" || token === "--maxGreetCount") && (inlineValue || next)) {
+      parsed.maxGreetCount = parsePositiveInteger(inlineValue || next);
       parsed.__provided.maxGreetCount = true;
-      index += 1;
-    } else if (token === "--page-scope" && next) {
-      parsed.pageScope = normalizePageScope(next) || "recommend";
+      if (!inlineValue) index += 1;
+    } else if ((token === "--page-scope" || token === "--pageScope" || token === "--page_scope") && (inlineValue || next)) {
+      parsed.pageScope = normalizePageScope(inlineValue || next) || "recommend";
       parsed.__provided.pageScope = true;
-      index += 1;
-    } else if (token === "--calibration" && next) {
-      parsed.calibrationPath = path.resolve(next);
+      if (!inlineValue) index += 1;
+    } else if ((token === "--calibration" || token === "--calibration-path") && (inlineValue || next)) {
+      parsed.calibrationPath = path.resolve(inlineValue || next);
       parsed.__provided.calibrationPath = true;
-      index += 1;
-    } else if (token === "--port" && next) {
-      parsed.port = parsePositiveInteger(next) || DEFAULT_PORT;
+      if (!inlineValue) index += 1;
+    } else if (token === "--port" && (inlineValue || next)) {
+      parsed.port = parsePositiveInteger(inlineValue || next) || DEFAULT_PORT;
       parsed.__provided.port = true;
-      index += 1;
-    } else if (token === "--output" && next) {
-      parsed.output = path.resolve(next);
-      index += 1;
-    } else if (token === "--checkpoint-path" && next) {
-      parsed.checkpointPath = path.resolve(next);
-      index += 1;
-    } else if (token === "--pause-control-path" && next) {
-      parsed.pauseControlPath = path.resolve(next);
-      index += 1;
+      if (!inlineValue) index += 1;
+    } else if (token === "--output" && (inlineValue || next)) {
+      parsed.output = path.resolve(inlineValue || next);
+      if (!inlineValue) index += 1;
+    } else if (token === "--checkpoint-path" && (inlineValue || next)) {
+      parsed.checkpointPath = path.resolve(inlineValue || next);
+      if (!inlineValue) index += 1;
+    } else if (token === "--pause-control-path" && (inlineValue || next)) {
+      parsed.pauseControlPath = path.resolve(inlineValue || next);
+      if (!inlineValue) index += 1;
     } else if (token === "--resume") {
       parsed.resume = true;
-    } else if (token === "--post-action" && next) {
-      parsed.postAction = normalizePostAction(next);
+    } else if ((token === "--post-action" || token === "--postAction") && (inlineValue || next)) {
+      parsed.postAction = normalizePostAction(inlineValue || next);
       parsed.__provided.postAction = true;
-      index += 1;
-    } else if (token === "--post-action-confirmed" && next) {
-      parsed.postActionConfirmed = parseBoolean(next);
+      if (!inlineValue) index += 1;
+    } else if ((token === "--post-action-confirmed" || token === "--postActionConfirmed") && (inlineValue || next)) {
+      parsed.postActionConfirmed = parseBoolean(inlineValue || next);
       parsed.__provided.postActionConfirmed = true;
-      index += 1;
+      if (!inlineValue) index += 1;
     } else if (token === "--help" || token === "-h") {
       parsed.help = true;
     }
@@ -1546,6 +1776,8 @@ class RecommendScreenCli {
     this.latestResumeNetworkPayload = null;
     this.favoriteActionEvents = [];
     this.favoriteClickPendingSince = 0;
+    this.favoriteNetworkTraces = [];
+    this.webSocketByRequestId = new Map();
     this.resumeSourceStats = {
       network: 0,
       image_fallback: 0
@@ -1640,6 +1872,7 @@ class RecommendScreenCli {
 
   markFavoriteClickPending() {
     this.favoriteClickPendingSince = Date.now();
+    this.favoriteNetworkTraces = [];
   }
 
   consumeFavoriteActionResult(since = 0) {
@@ -1654,6 +1887,30 @@ class RecommendScreenCli {
     this.favoriteActionEvents = this.favoriteActionEvents.filter((item) => item !== matched);
     this.favoriteClickPendingSince = 0;
     return matched.action || null;
+  }
+
+  recordFavoriteNetworkTrace(entry) {
+    const trace = {
+      ts: Date.now(),
+      ...entry
+    };
+    this.favoriteNetworkTraces.push(trace);
+    if (this.favoriteNetworkTraces.length > 60) {
+      this.favoriteNetworkTraces = this.favoriteNetworkTraces.slice(-60);
+    }
+  }
+
+  summarizeFavoriteNetworkTrace(since = 0) {
+    const timestamp = Number.isFinite(since) ? since : 0;
+    return this.favoriteNetworkTraces
+      .filter((item) => Number(item?.ts || 0) >= timestamp)
+      .slice(-12)
+      .map((item) => {
+        if (item.kind === "ws") {
+          return `[ws:${item.direction}] ${item.url || "unknown"} payload=${item.payload || ""}`;
+        }
+        return `[http] ${item.method || "GET"} ${item.url || ""} body=${item.postData || ""}`;
+      });
   }
 
   cacheResumeNetworkPayload(payload, fallbackGeekId = null) {
@@ -1734,31 +1991,55 @@ class RecommendScreenCli {
 
     if (this.favoriteClickPendingSince <= 0) return;
     const requestTs = Date.now();
-    if (requestTs < this.favoriteClickPendingSince - 1000) return;
+    if (requestTs < this.favoriteClickPendingSince) return;
+    const method = normalizeText(params?.request?.method || "").toUpperCase() || "GET";
+    const postData = params?.request?.postData || "";
+    this.recordFavoriteNetworkTrace({
+      ts: requestTs,
+      kind: "http",
+      method,
+      url: url.slice(0, 240),
+      postData: normalizeText(postData).slice(0, 200)
+    });
+    const action = parseFavoriteActionFromKnownRequest(url, postData);
+    if (!action) return;
+    const source = url.includes("userMark")
+      ? "userMark"
+      : url.includes("actionLog/common.json")
+        ? "actionLog"
+        : "favorite";
+    this.favoriteActionEvents.push({ action, ts: requestTs, source, url });
+  }
 
-    if (url.includes("userMark")) {
-      const action = /\/add(?:\/|$)|[?&]action=add/i.test(url)
-        ? "add"
-        : /\/del(?:\/|$)|[?&]action=del/i.test(url)
-          ? "del"
-          : null;
-      if (action) {
-        this.favoriteActionEvents.push({ action, ts: requestTs, source: "userMark", url });
-      }
-      return;
-    }
+  handleNetworkWebSocketCreated(params) {
+    const requestId = normalizeText(params?.requestId || "");
+    if (!requestId) return;
+    const url = normalizeText(params?.url || "");
+    this.webSocketByRequestId.set(requestId, url || "");
+  }
 
-    if (url.includes("actionLog/common.json")) {
-      try {
-        const payload = JSON.parse(params?.request?.postData || "{}");
-        if (payload?.action === "star-interest-click") {
-          const action = Number(payload?.p3) === 1 ? "add" : Number(payload?.p3) === 0 ? "del" : null;
-          if (action) {
-            this.favoriteActionEvents.push({ action, ts: requestTs, source: "actionLog", url });
-          }
-        }
-      } catch {}
-    }
+  handleNetworkWebSocketFrame(params, direction = "sent") {
+    if (this.favoriteClickPendingSince <= 0) return;
+    const ts = Date.now();
+    if (ts < this.favoriteClickPendingSince) return;
+    const requestId = normalizeText(params?.requestId || "");
+    const payloadData = normalizeText(params?.response?.payloadData || "");
+    const wsUrl = this.webSocketByRequestId.get(requestId) || "";
+    this.recordFavoriteNetworkTrace({
+      ts,
+      kind: "ws",
+      direction,
+      url: wsUrl ? wsUrl.slice(0, 240) : requestId ? `ws:${requestId}` : "ws",
+      payload: payloadData.slice(0, 200)
+    });
+    const action = parseFavoriteActionFromWsPayload(payloadData);
+    if (!action) return;
+    this.favoriteActionEvents.push({
+      action,
+      ts,
+      source: `websocket_${direction}`,
+      url: wsUrl || (requestId ? `ws:${requestId}` : "websocket")
+    });
   }
 
   async handleNetworkLoadingFinished(params) {
@@ -1918,6 +2199,27 @@ class RecommendScreenCli {
         this.Network.requestWillBeSent((params) => {
           try {
             this.handleNetworkRequestWillBeSent(params);
+          } catch {}
+        });
+      }
+      if (typeof this.Network.webSocketCreated === "function") {
+        this.Network.webSocketCreated((params) => {
+          try {
+            this.handleNetworkWebSocketCreated(params);
+          } catch {}
+        });
+      }
+      if (typeof this.Network.webSocketFrameSent === "function") {
+        this.Network.webSocketFrameSent((params) => {
+          try {
+            this.handleNetworkWebSocketFrame(params, "sent");
+          } catch {}
+        });
+      }
+      if (typeof this.Network.webSocketFrameReceived === "function") {
+        this.Network.webSocketFrameReceived((params) => {
+          try {
+            this.handleNetworkWebSocketFrame(params, "received");
           } catch {}
         });
       }
@@ -2444,7 +2746,8 @@ class RecommendScreenCli {
   async favoriteCandidate(options = {}) {
     if (this.args.pageScope === "featured") {
       if (options.alreadyInterested === true) {
-        return { actionTaken: "already_favorited" };
+        log("[FAVORITE] network profile indicates alreadyInterested=true，跳过点击以避免误取消收藏。");
+        return { actionTaken: "already_favorited", source: "network_profile" };
       }
       if (!this.featuredCalibration?.position) {
         throw this.buildError(
@@ -2459,6 +2762,7 @@ class RecommendScreenCli {
 
       const base = this.featuredCalibration.position;
       const maxClicks = 5;
+      let detectedAlreadyFavoritedByNetwork = false;
       for (let clickIndex = 0; clickIndex < maxClicks; clickIndex += 1) {
         const clickStartedAt = Date.now();
         this.markFavoriteClickPending();
@@ -2474,22 +2778,38 @@ class RecommendScreenCli {
         }
 
         let sawDel = false;
-        for (let index = 0; index < 10; index += 1) {
+        for (let index = 0; index < 14; index += 1) {
           await sleep(humanDelay(260, 80));
           const networkAction = this.consumeFavoriteActionResult(clickStartedAt);
           if (networkAction === "add") {
-            return { actionTaken: "favorite" };
+            return detectedAlreadyFavoritedByNetwork
+              ? { actionTaken: "already_favorited", re_favorited: true }
+              : { actionTaken: "favorite" };
           }
           if (networkAction === "del") {
+            detectedAlreadyFavoritedByNetwork = true;
+            log("[FAVORITE] 检测到 network=del，推断该人选原本已收藏，继续点击恢复为收藏状态。");
             sawDel = true;
             break;
           }
         }
         if (!sawDel && clickIndex === maxClicks - 1) {
+          const traceSummary = this.summarizeFavoriteNetworkTrace(clickStartedAt);
+          if (traceSummary.length > 0) {
+            log(`[FAVORITE_NETWORK_TRACE] ${traceSummary.join(" | ")}`);
+          } else {
+            log("[FAVORITE_NETWORK_TRACE] 点击后未捕获到可识别的 HTTP/WS 网络信号。");
+          }
           break;
         }
       }
 
+      if (detectedAlreadyFavoritedByNetwork) {
+        throw this.buildError(
+          "FAVORITE_BUTTON_FAILED",
+          "精选页检测到 network del（原本已收藏），但后续未检测到 network add（恢复收藏）成功信号。"
+        );
+      }
       throw this.buildError("FAVORITE_BUTTON_FAILED", "精选页收藏未检测到 network add 成功信号。");
     }
 
@@ -2700,6 +3020,10 @@ class RecommendScreenCli {
     if (!this.args.baseUrl || !this.args.apiKey || !this.args.model) {
       throw this.buildError("SCREEN_CONFIG_ERROR", "Missing baseUrl/apiKey/model", false);
     }
+    log(
+      `[ARGS] page_scope=${this.args.pageScope} target_count=${this.args.targetCount ?? "none"} ` +
+      `post_action=${this.args.postAction || "unset"} port=${this.args.port}`
+    );
 
     if (!(this.args.postActionConfirmed === true && this.args.postAction)) {
       this.args.postAction = await promptPostAction();
@@ -2888,23 +3212,41 @@ class RecommendScreenCli {
               effectiveAction = "favorite";
               this.greetLimitFallbackCount += 1;
             }
-            const actionResult = effectiveAction === "favorite"
-              ? await this.favoriteCandidate({
-                alreadyInterested: networkCandidateInfo?.alreadyInterested === true
-              })
-              : effectiveAction === "greet"
-                ? await this.greetCandidate()
-                : { actionTaken: "none" };
+            let actionResult = { actionTaken: "none" };
+            try {
+              actionResult = effectiveAction === "favorite"
+                ? await this.favoriteCandidate({
+                  alreadyInterested: networkCandidateInfo?.alreadyInterested === true
+                })
+                : effectiveAction === "greet"
+                  ? await this.greetCandidate()
+                  : { actionTaken: "none" };
+            } catch (postActionError) {
+              if (!isRecoverablePostActionError(postActionError, effectiveAction)) {
+                throw postActionError;
+              }
+              log(`[POST_ACTION_WARN] ${effectiveAction} 失败，继续写入通过候选人: ${postActionError.message || postActionError}`);
+              actionResult = {
+                actionTaken: `${effectiveAction}_failed`,
+                errorCode: postActionError.code || "POST_ACTION_FAILED",
+                errorMessage: normalizeText(postActionError.message || "post action failed")
+              };
+            }
             if (actionResult.actionTaken === "greet") {
               this.greetCount += 1;
             }
+            const screeningReason = normalizeText(screening.reason || screening.summary || "");
+            const actionErrorMessage = normalizeText(actionResult.errorMessage || "");
+            const mergedReason = actionErrorMessage
+              ? `${screeningReason}${screeningReason ? " | " : ""}[${effectiveAction}失败] ${actionErrorMessage}`
+              : screeningReason;
             this.passedCandidates.push({
               name: candidateProfile.name,
               school: candidateProfile.school,
               major: candidateProfile.major,
               company: candidateProfile.company,
               position: candidateProfile.position,
-              reason: screening.reason || screening.summary || "",
+              reason: mergedReason,
               action: actionResult.actionTaken,
               geekId: nextCandidate.geek_id,
               summary: screening.summary,
@@ -3060,8 +3402,13 @@ if (require.main === module) {
     __testables: {
       MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES,
       RESUME_CAPTURE_MAX_ATTEMPTS,
-      RESUME_CAPTURE_WAIT_MS
+      RESUME_CAPTURE_WAIT_MS,
+      parseFavoriteActionFromPostData,
+      parseFavoriteActionFromRequest,
+      parseFavoriteActionFromKnownRequest,
+      parseFavoriteActionFromActionLog,
+      parseFavoriteActionFromWsPayload,
+      isRecoverablePostActionError
     }
   };
 }
-

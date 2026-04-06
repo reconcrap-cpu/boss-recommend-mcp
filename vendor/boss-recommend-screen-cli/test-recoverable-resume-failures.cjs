@@ -4,7 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const sharp = require("sharp");
 
-const { RecommendScreenCli, __testables } = require("./boss-recommend-screen-cli.cjs");
+const { RecommendScreenCli, parseArgs, __testables } = require("./boss-recommend-screen-cli.cjs");
 const { __testables: captureTestables } = require("./scripts/capture-full-resume-canvas.cjs");
 
 class FakeRecommendScreenCli extends RecommendScreenCli {
@@ -434,6 +434,62 @@ async function testFeaturedFavoriteShouldNotUseDomFallback() {
   assert.equal(evaluateCalls, 0);
 }
 
+async function testFeaturedFavoriteShouldSkipClickWhenAlreadyInterested() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-favorite-already-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  const calibrationPath = path.join(tempDir, "favorite-calibration.json");
+  fs.writeFileSync(calibrationPath, JSON.stringify({
+    favoritePosition: {
+      pageX: 120,
+      pageY: 220,
+      canvasX: 0,
+      canvasY: 0
+    }
+  }, null, 2));
+  args.calibrationPath = calibrationPath;
+  const cli = new RecommendScreenCli(args);
+  let clickCalls = 0;
+  cli.simulateHumanClick = async () => {
+    clickCalls += 1;
+  };
+  const result = await cli.favoriteCandidate({ alreadyInterested: true });
+  assert.equal(result.actionTaken, "already_favorited");
+  assert.equal(result.source, "network_profile");
+  assert.equal(clickCalls, 0);
+}
+
+async function testFeaturedFavoriteShouldRecognizeAlreadyFavoritedByDelThenAdd() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-favorite-del-add-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  const calibrationPath = path.join(tempDir, "favorite-calibration.json");
+  fs.writeFileSync(calibrationPath, JSON.stringify({
+    favoritePosition: {
+      pageX: 120,
+      pageY: 220,
+      canvasX: 0,
+      canvasY: 0
+    }
+  }, null, 2));
+  args.calibrationPath = calibrationPath;
+  const cli = new RecommendScreenCli(args);
+  let clickCalls = 0;
+  cli.simulateHumanClick = async () => {
+    clickCalls += 1;
+    cli.favoriteActionEvents.push({
+      action: clickCalls === 1 ? "del" : "add",
+      ts: Date.now(),
+      source: "test",
+      url: clickCalls === 1 ? "userMark/del" : "userMark/add"
+    });
+  };
+  const result = await cli.favoriteCandidate();
+  assert.equal(result.actionTaken, "already_favorited");
+  assert.equal(result.re_favorited, true);
+  assert.equal(clickCalls, 2);
+}
+
 async function testFeaturedFavoriteWithoutCalibrationShouldFail() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-favorite-missing-cal-"));
   const args = createArgs(tempDir);
@@ -447,6 +503,91 @@ async function testFeaturedFavoriteWithoutCalibrationShouldFail() {
       return true;
     }
   );
+}
+
+function testFavoriteActionParserShouldSupportBodySignals() {
+  const addFromJson = __testables.parseFavoriteActionFromPostData(JSON.stringify({
+    action: "star-interest-click",
+    p3: 1
+  }));
+  const delFromForm = __testables.parseFavoriteActionFromPostData("action=star-interest-click&p3=0");
+  assert.equal(addFromJson, "add");
+  assert.equal(delFromForm, "del");
+}
+
+function testFavoriteActionParserShouldSupportFallbackRequestShape() {
+  const action = __testables.parseFavoriteActionFromRequest(
+    "https://www.zhipin.com/wapi/zpgeek/favorite/operate",
+    JSON.stringify({ op: "add", geekId: "abc" })
+  );
+  assert.equal(action, "add");
+}
+
+function testFavoriteActionParserShouldSupportWebSocketPayload() {
+  const addFromWsJson = __testables.parseFavoriteActionFromWsPayload(JSON.stringify({
+    action: "star-interest-click",
+    p3: 1
+  }));
+  const delFromWsForm = __testables.parseFavoriteActionFromWsPayload("action=star-interest-click&p3=0");
+  assert.equal(addFromWsJson, "add");
+  assert.equal(delFromWsForm, "del");
+}
+
+function testFavoriteActionParserShouldOnlyTrustKnownRequestShapes() {
+  const unknown = __testables.parseFavoriteActionFromKnownRequest(
+    "https://www.zhipin.com/wapi/other/metrics",
+    JSON.stringify({ action: "add", p3: 1 })
+  );
+  const actionLog = __testables.parseFavoriteActionFromKnownRequest(
+    "https://www.zhipin.com/wapi/zplog/actionLog/common.json",
+    JSON.stringify({ action: "star-interest-click", p3: 1 })
+  );
+  const userMark = __testables.parseFavoriteActionFromKnownRequest(
+    "https://www.zhipin.com/wapi/zpgeek/userMark/add",
+    ""
+  );
+  assert.equal(unknown, null);
+  assert.equal(actionLog, "add");
+  assert.equal(userMark, "add");
+}
+
+async function testFeaturedPostActionFailureShouldStillRecordPassedCandidate() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-featured-action-failure-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "featured";
+  args.postAction = "favorite";
+  const candidate = { key: "featured-fav-fail", geek_id: "featured-fav-fail", name: "featured candidate" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [candidate]
+  });
+
+  cli.waitForNetworkResumeCandidateInfo = async () => ({
+    name: "featured candidate",
+    school: "测试大学",
+    major: "人工智能",
+    company: "测试公司",
+    position: "算法工程师",
+    resumeText: "满足测试标准"
+  });
+  cli.callTextModel = async () => ({
+    passed: true,
+    reason: "通过",
+    summary: "通过"
+  });
+  cli.favoriteCandidate = async () => {
+    const error = new Error("精选页收藏未检测到 network add 成功信号。");
+    error.code = "FAVORITE_BUTTON_FAILED";
+    throw error;
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 1);
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.skipped_count, 0);
+  assert.equal(cli.passedCandidates.length, 1);
+  assert.equal(cli.passedCandidates[0].action, "favorite_failed");
+  assert.match(cli.passedCandidates[0].reason, /\[favorite失败]/);
 }
 
 async function testStitchWithSharpShouldComposeExpectedImage() {
@@ -540,6 +681,27 @@ function testStitchWithAvailablePythonShouldFailWhenScriptMissing() {
   assert.equal(result.attempts[0].command, "python3");
 }
 
+function testParseArgsShouldSupportFeaturedAliasesAndInlinePort() {
+  const parsed = parseArgs([
+    "--criteria", "test criteria",
+    "--baseurl", "https://example.com/v1",
+    "--apikey", "key",
+    "--model", "test-model",
+    "--target-count", "3",
+    "--pageScope", "featured",
+    "--port=9222",
+    "--postAction", "favorite",
+    "--postActionConfirmed", "true"
+  ]);
+  assert.equal(parsed.pageScope, "featured");
+  assert.equal(parsed.port, 9222);
+  assert.equal(parsed.targetCount, 3);
+  assert.equal(parsed.postAction, "favorite");
+  assert.equal(parsed.postActionConfirmed, true);
+  assert.equal(parsed.__provided.pageScope, true);
+  assert.equal(parsed.__provided.port, true);
+}
+
 async function main() {
   testShouldAbortResumeProbeEarly();
   await testSingleResumeCaptureFailureIsSkipped();
@@ -551,10 +713,18 @@ async function main() {
   await testNetworkMissShouldFallbackToImageCapture();
   await testFeaturedNetworkMissShouldSkipWithoutImageCapture();
   await testFeaturedFavoriteShouldNotUseDomFallback();
+  await testFeaturedFavoriteShouldSkipClickWhenAlreadyInterested();
+  await testFeaturedFavoriteShouldRecognizeAlreadyFavoritedByDelThenAdd();
   await testFeaturedFavoriteWithoutCalibrationShouldFail();
+  testFavoriteActionParserShouldSupportBodySignals();
+  testFavoriteActionParserShouldSupportFallbackRequestShape();
+  testFavoriteActionParserShouldSupportWebSocketPayload();
+  testFavoriteActionParserShouldOnlyTrustKnownRequestShapes();
+  await testFeaturedPostActionFailureShouldStillRecordPassedCandidate();
   await testStitchWithSharpShouldComposeExpectedImage();
   testStitchWithAvailablePythonShouldFallbackToPython();
   testStitchWithAvailablePythonShouldFailWhenScriptMissing();
+  testParseArgsShouldSupportFeaturedAliasesAndInlinePort();
   console.log("recoverable resume failure tests passed");
 }
 
