@@ -1066,7 +1066,7 @@ async function testFeaturedPipelineShouldRunSearchThenSwitchTabThenScreen() {
         active_status: "0",
         tab_state: { active_status: "0" }
       }),
-      switchRecommendTab: async ({ target_status }) => {
+      switchRecommendTab: async (_workspaceRoot, { target_status }) => {
         calls.push({ type: "switch", target_status });
         return {
           ok: true,
@@ -1100,6 +1100,82 @@ async function testFeaturedPipelineShouldRunSearchThenSwitchTabThenScreen() {
   assert.equal(result.result.selected_page, "featured");
   assert.equal(result.result.active_tab_status, "3");
   assert.equal(result.result.resume_source, "network");
+}
+
+async function testLatestPipelineShouldRunSearchThenSwitchTabThenScreen() {
+  const calls = [];
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {
+        ...createJobConfirmedConfirmation(),
+        page_confirmed: true,
+        page_value: "latest"
+      },
+      overrides: {
+        page_scope: "latest"
+      }
+    },
+    {
+      parseRecommendInstruction: () => createParsed({
+        page_scope: "latest",
+        proposed_page_scope: "latest"
+      }),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: { state: "RECOMMEND_READY" } }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async ({ pageScope }) => {
+        calls.push({ type: "search", pageScope });
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 8,
+            applied_filters: { degree: ["本科"] },
+            page_state: { state: "RECOMMEND_READY" }
+          }
+        };
+      },
+      readRecommendTabState: async () => ({
+        ok: true,
+        active_status: "0",
+        tab_state: { active_status: "0" }
+      }),
+      switchRecommendTab: async (_workspaceRoot, { target_status }) => {
+        calls.push({ type: "switch", target_status });
+        return {
+          ok: true,
+          state: "TAB_SWITCHED",
+          active_status: "1",
+          tab_state: { active_status: "1" }
+        };
+      },
+      runRecommendScreenCli: async ({ pageScope }) => {
+        calls.push({ type: "screen", pageScope });
+        return {
+          ok: true,
+          summary: {
+            processed_count: 8,
+            passed_count: 3,
+            skipped_count: 5,
+            output_csv: "C:/temp/result.csv",
+            completion_reason: "page_exhausted",
+            active_tab_status: "1",
+            resume_source: "image_fallback"
+          }
+        };
+      }
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.deepEqual(calls.map((item) => item.type), ["search", "switch", "screen"]);
+  assert.equal(calls[0].pageScope, "latest");
+  assert.equal(calls[1].target_status, "1");
+  assert.equal(calls[2].pageScope, "latest");
+  assert.equal(result.result.selected_page, "latest");
+  assert.equal(result.result.active_tab_status, "1");
+  assert.equal(result.result.resume_source, "image_fallback");
 }
 
 async function testFeaturedMissingCalibrationShouldAutoCalibrateThenContinue() {
@@ -1855,6 +1931,7 @@ async function main() {
   await testNeedMaxGreetCountConfirmationGate();
   await testNeedInputGate();
   await testFeaturedPipelineShouldRunSearchThenSwitchTabThenScreen();
+  await testLatestPipelineShouldRunSearchThenSwitchTabThenScreen();
   await testFeaturedMissingCalibrationShouldAutoCalibrateThenContinue();
   await testFeaturedCalibrationFailureShouldReturnCalibrationRequired();
   await testFeaturedTabSwitchFailureShouldReturnRetryableError();

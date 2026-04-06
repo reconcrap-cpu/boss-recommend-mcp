@@ -34,10 +34,11 @@ const POST_ACTION_LABELS = {
   greet: "直接沟通",
   none: "什么也不做"
 };
-const PAGE_SCOPE_OPTIONS = ["recommend", "featured"];
+const PAGE_SCOPE_OPTIONS = ["recommend", "featured", "latest"];
 const PAGE_SCOPE_LABELS = {
   recommend: "推荐",
-  featured: "精选"
+  featured: "精选",
+  latest: "最新"
 };
 const LEADING_NOISE_PATTERNS = [
   /^使用boss-recommend-pipeline skills/i,
@@ -103,6 +104,7 @@ const META_CLAUSE_PATTERNS = [
   /帮我|请|运行|skill/i
 ];
 const FEATURED_SCOPE_PATTERN = /(?:精选牛人|精选页|精选页面|精选tab|精选标签|tab[^。；;\n]{0,6}精选|精选)/i;
+const LATEST_SCOPE_PATTERN = /(?:最新页|最新页面|最新tab|最新标签|tab[^。；;\n]{0,6}最新|最新)/i;
 const RECOMMEND_SCOPE_PATTERN = /(?:推荐页|推荐页面|推荐tab|推荐标签|tab[^。；;\n]{0,6}推荐|推荐)/i;
 
 function normalizeText(input) {
@@ -278,11 +280,13 @@ function normalizePageScope(value) {
   if (!normalized) return null;
   if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
   if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
+  if (["latest", "最新", "最新页", "最新页面"].includes(normalized)) return "latest";
   return PAGE_SCOPE_OPTIONS.includes(normalized) ? normalized : null;
 }
 
 function extractPageScope(text) {
   if (FEATURED_SCOPE_PATTERN.test(text)) return "featured";
+  if (LATEST_SCOPE_PATTERN.test(text)) return "latest";
   if (RECOMMEND_SCOPE_PATTERN.test(text)) return "recommend";
   return null;
 }
@@ -612,11 +616,12 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   if (needs_page_confirmation) {
     pending_questions.push({
       field: "page_scope",
-      question: "请确认本次在推荐里的哪个页面执行筛选：推荐 或 精选。",
+      question: "请确认本次在推荐里的哪个页面执行筛选：推荐 / 精选 / 最新。",
       value: pageScopeResolution.proposed_page_scope,
       options: [
         { label: PAGE_SCOPE_LABELS.recommend, value: "recommend" },
-        { label: PAGE_SCOPE_LABELS.featured, value: "featured" }
+        { label: PAGE_SCOPE_LABELS.featured, value: "featured" },
+        { label: PAGE_SCOPE_LABELS.latest, value: "latest" }
       ]
     });
   }

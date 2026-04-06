@@ -187,6 +187,7 @@ function normalizePageScope(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (!normalized) return null;
   if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["latest", "最新", "最新页", "最新页面"].includes(normalized)) return "latest";
   if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
   return null;
 }

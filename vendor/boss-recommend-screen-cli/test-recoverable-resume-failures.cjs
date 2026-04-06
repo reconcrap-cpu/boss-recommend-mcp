@@ -702,6 +702,21 @@ function testParseArgsShouldSupportFeaturedAliasesAndInlinePort() {
   assert.equal(parsed.__provided.port, true);
 }
 
+function testParseArgsShouldSupportLatestPageScope() {
+  const parsed = parseArgs([
+    "--criteria", "test criteria",
+    "--baseurl", "https://example.com/v1",
+    "--apikey", "key",
+    "--model", "test-model",
+    "--page-scope", "latest",
+    "--port", "9222",
+    "--post-action", "none",
+    "--post-action-confirmed", "true"
+  ]);
+  assert.equal(parsed.pageScope, "latest");
+  assert.equal(parsed.port, 9222);
+}
+
 async function main() {
   testShouldAbortResumeProbeEarly();
   await testSingleResumeCaptureFailureIsSkipped();
@@ -725,6 +740,7 @@ async function main() {
   testStitchWithAvailablePythonShouldFallbackToPython();
   testStitchWithAvailablePythonShouldFailWhenScriptMissing();
   testParseArgsShouldSupportFeaturedAliasesAndInlinePort();
+  testParseArgsShouldSupportLatestPageScope();
   console.log("recoverable resume failure tests passed");
 }
 

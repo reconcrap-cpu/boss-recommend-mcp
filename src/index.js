@@ -151,7 +151,7 @@ function createRunInputSchema() {
           page_confirmed: { type: "boolean" },
           page_value: {
             type: "string",
-            enum: ["recommend", "featured"]
+            enum: ["recommend", "featured", "latest"]
           },
           filters_confirmed: { type: "boolean" },
           school_tag_confirmed: { type: "boolean" },
@@ -227,7 +227,7 @@ function createRunInputSchema() {
         properties: {
           page_scope: {
             type: "string",
-            enum: ["recommend", "featured"]
+            enum: ["recommend", "featured", "latest"]
           },
           school_tag: {
             oneOf: [

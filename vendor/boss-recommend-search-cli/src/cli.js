@@ -41,6 +41,7 @@ function normalizePageScope(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
   if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["latest", "最新", "最新页", "最新页面"].includes(normalized)) return "latest";
   if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
   return null;
 }
@@ -1449,6 +1450,8 @@ class RecommendSearchCli {
       const recommendCandidates = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
       const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
       const featuredCandidates = featuredCards.filter((card) => card.querySelector('a[data-geekid]'));
+      const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap'));
+      const latestCandidates = latestCards.filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
       const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
       const activeTab = tabs.find((node) => {
         const className = String(node.className || '');
@@ -1457,22 +1460,27 @@ class RecommendSearchCli {
       }) || null;
       const activeTabStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
       const inferredStatus = activeTabStatus
-        || (featuredCandidates.length > 0 && recommendCandidates.length === 0
+        || (featuredCandidates.length > 0 && recommendCandidates.length === 0 && latestCandidates.length === 0
           ? '3'
-          : recommendCandidates.length > 0 && featuredCandidates.length === 0
-            ? '0'
-            : '');
+          : latestCandidates.length > 0 && recommendCandidates.length === 0 && featuredCandidates.length === 0
+            ? '1'
+            : recommendCandidates.length > 0 && featuredCandidates.length === 0 && latestCandidates.length === 0
+              ? '0'
+              : '');
       const effectiveCount = inferredStatus === '3'
         ? featuredCandidates.length
+        : inferredStatus === '1'
+          ? latestCandidates.length
         : inferredStatus === '0'
           ? recommendCandidates.length
-          : Math.max(recommendCandidates.length, featuredCandidates.length);
+          : Math.max(recommendCandidates.length, featuredCandidates.length, latestCandidates.length);
       const body = doc.body;
       return {
         ok: true,
         candidateCount: effectiveCount,
         recommendCandidateCount: recommendCandidates.length,
         featuredCandidateCount: featuredCandidates.length,
+        latestCandidateCount: latestCandidates.length,
         activeTabStatus: inferredStatus || null,
         totalCardCount: cards.length,
         scrollTop: body ? body.scrollTop : 0,
@@ -1508,7 +1516,7 @@ class RecommendSearchCli {
       console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node src/cli.js --school-tag 985/211 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --job \"算法工程师（视频/图像模型方向） _ 杭州\" --page-scope recommend|featured --port 9222",
+          usage: "node src/cli.js --school-tag 985/211 --degree 本科及以上 --gender 男 --recent-not-view 近14天没有 --job \"算法工程师（视频/图像模型方向） _ 杭州\" --page-scope recommend|latest|featured --port 9222",
           list_jobs_usage: "node src/cli.js --list-jobs --port 9222"
         }
       }));

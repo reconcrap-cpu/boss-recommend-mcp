@@ -43,6 +43,8 @@ function createArgs(overrides = {}) {
 function testParseArgsPageScope() {
   const parsed = parseArgs(["--page-scope", "featured"]);
   assert.equal(parsed.pageScope, "featured");
+  const latestParsed = parseArgs(["--page-scope", "latest"]);
+  assert.equal(latestParsed.pageScope, "latest");
 }
 
 class SelectJobCliMock extends RecommendSearchCli {

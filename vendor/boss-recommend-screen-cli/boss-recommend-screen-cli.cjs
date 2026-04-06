@@ -15,6 +15,7 @@ const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
 const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
 const PAGE_SCOPE_TAB_STATUS = {
   recommend: "0",
+  latest: "1",
   featured: "3"
 };
 
@@ -79,6 +80,7 @@ function normalizePageScope(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
   if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["latest", "最新", "最新页", "最新页面"].includes(normalized)) return "latest";
   if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
   return null;
 }
@@ -774,6 +776,7 @@ function buildListCandidatesExpr(processedKeys) {
     const processed = new Set(processedKeys || []);
     const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
     const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
+    const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap'));
     const textOf = (el) => String(el ? el.textContent : '').replace(/\s+/g, ' ').trim();
     const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
     const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
@@ -838,19 +841,71 @@ function buildListCandidatesExpr(processedKeys) {
         layout: 'featured'
       };
     }).filter(Boolean);
+    const latestCandidates = latestCards.map((card, index) => {
+      const inner = card.querySelector('.card-inner[data-geek]') || card.querySelector('[data-geek]');
+      if (!inner) return null;
+      const geekId = inner.getAttribute('data-geek');
+      if (!geekId) return null;
+      const rect = card.getBoundingClientRect();
+      const nameEl = card.querySelector('.name, .name-wrap .name, .name-wrap');
+      const tags = Array.from(card.querySelectorAll('.base-info span, .edu-wrap span, .desc span, .tag-wrap span, .tag-item'))
+        .map((item) => textOf(item))
+        .filter(Boolean);
+      const latestWork = card.querySelector('.timeline-wrap.work-exps .timeline-item');
+      const workSpans = latestWork
+        ? Array.from(latestWork.querySelectorAll('.join-text-wrap.content span')).map((item) => textOf(item)).filter(Boolean)
+        : [];
+      return {
+        found: true,
+        index,
+        key: geekId,
+        geek_id: geekId,
+        name: textOf(nameEl),
+        school: tags[0] || '',
+        major: tags[1] || '',
+        degree: tags[2] || '',
+        last_company: workSpans[0] || '',
+        last_position: workSpans[1] || '',
+        x: frameRect.left + rect.left + Math.min(Math.max(rect.width / 2, 80), Math.max(rect.width - 40, 80)),
+        y: frameRect.top + rect.top + Math.min(Math.max(rect.height / 2, 24), Math.max(rect.height - 12, 24)),
+        width: rect.width,
+        height: rect.height,
+        layout: 'latest'
+      };
+    }).filter(Boolean);
     const inferredStatus = activeStatus
-      || (featuredCandidates.length > 0 && recommendCandidates.length === 0 ? '3' : recommendCandidates.length > 0 ? '0' : '');
+      || (
+        featuredCandidates.length > 0 && recommendCandidates.length === 0 && latestCandidates.length === 0
+          ? '3'
+          : latestCandidates.length > 0 && recommendCandidates.length === 0 && featuredCandidates.length === 0
+            ? '1'
+            : recommendCandidates.length > 0 && featuredCandidates.length === 0 && latestCandidates.length === 0
+              ? '0'
+              : ''
+      );
     const activeLayout = inferredStatus === '3'
       ? 'featured'
-      : inferredStatus === '0'
-        ? 'recommend'
-        : (featuredCandidates.length > 0 && recommendCandidates.length === 0 ? 'featured' : 'recommend');
-    const candidates = activeLayout === 'featured' ? featuredCandidates : recommendCandidates;
+      : inferredStatus === '1'
+        ? 'latest'
+        : inferredStatus === '0'
+          ? 'recommend'
+          : (
+            featuredCandidates.length > 0 && recommendCandidates.length === 0 && latestCandidates.length === 0
+              ? 'featured'
+              : latestCandidates.length > 0 && featuredCandidates.length === 0 && recommendCandidates.length === 0
+                ? 'latest'
+                : 'recommend'
+          );
+    const candidates = activeLayout === 'featured'
+      ? featuredCandidates
+      : activeLayout === 'latest'
+        ? latestCandidates
+        : recommendCandidates;
     return {
       ok: true,
       candidates: candidates.filter((candidate) => !processed.has(candidate.key)),
       candidate_count: candidates.length,
-      total_cards: activeLayout === 'featured' ? featuredCards.length : cards.length,
+      total_cards: activeLayout === 'featured' ? featuredCards.length : activeLayout === 'latest' ? latestCards.length : cards.length,
       active_tab_status: inferredStatus || null,
       layout: activeLayout
     };
@@ -871,16 +926,28 @@ const jsGetListState = `(() => {
   const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
   const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
   const featuredCandidates = featuredCards.filter((card) => card.querySelector('a[data-geekid]'));
+  const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap'));
+  const latestCandidates = latestCards.filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
   const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
   const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
   const activeTabStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
   const inferredStatus = activeTabStatus
-    || (featuredCandidates.length > 0 && candidateCards.length === 0 ? '3' : candidateCards.length > 0 ? '0' : '');
+    || (
+      featuredCandidates.length > 0 && candidateCards.length === 0 && latestCandidates.length === 0
+        ? '3'
+        : latestCandidates.length > 0 && candidateCards.length === 0 && featuredCandidates.length === 0
+          ? '1'
+          : candidateCards.length > 0 && featuredCandidates.length === 0 && latestCandidates.length === 0
+            ? '0'
+            : ''
+    );
   const effectiveCount = inferredStatus === '3'
     ? featuredCandidates.length
-    : inferredStatus === '0'
-      ? candidateCards.length
-      : Math.max(candidateCards.length, featuredCandidates.length);
+    : inferredStatus === '1'
+      ? latestCandidates.length
+      : inferredStatus === '0'
+        ? candidateCards.length
+        : Math.max(candidateCards.length, featuredCandidates.length, latestCandidates.length);
   return {
     ok: true,
     scrollTop: body ? body.scrollTop : 0,
@@ -898,7 +965,8 @@ const jsGetListState = `(() => {
     candidateCount: effectiveCount,
     recommendCandidateCount: candidateCards.length,
     featuredCandidateCount: featuredCandidates.length,
-    totalCards: Math.max(cards.length, featuredCards.length),
+    latestCandidateCount: latestCandidates.length,
+    totalCards: Math.max(cards.length, featuredCards.length, latestCards.length),
     activeTabStatus: inferredStatus || null
   };
 })()`;
@@ -914,12 +982,21 @@ const jsScrollList = `(() => {
   const body = doc.body;
   const recommendCards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item')).filter((card) => card.querySelector('.card-inner[data-geekid]'));
   const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card')).filter((card) => card.querySelector('a[data-geekid]'));
+  const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap')).filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
   const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
   const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
   const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
   const inferredStatus = activeStatus
-    || (featuredCards.length > 0 && recommendCards.length === 0 ? '3' : recommendCards.length > 0 ? '0' : '');
-  const activeCards = inferredStatus === '3' ? featuredCards : recommendCards;
+    || (
+      featuredCards.length > 0 && recommendCards.length === 0 && latestCards.length === 0
+        ? '3'
+        : latestCards.length > 0 && recommendCards.length === 0 && featuredCards.length === 0
+          ? '1'
+          : recommendCards.length > 0 && featuredCards.length === 0 && latestCards.length === 0
+            ? '0'
+            : ''
+    );
+  const activeCards = inferredStatus === '3' ? featuredCards : inferredStatus === '1' ? latestCards : recommendCards;
   const lastCard = activeCards[activeCards.length - 1];
   const before = {
     scrollTop: body ? body.scrollTop : 0,
@@ -3361,11 +3438,11 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     console.log(JSON.stringify({
-      status: "COMPLETED",
-      result: {
-        usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --page-scope recommend|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
-      }
-    }));
+        status: "COMPLETED",
+        result: {
+          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
+        }
+      }));
     return;
   }
 

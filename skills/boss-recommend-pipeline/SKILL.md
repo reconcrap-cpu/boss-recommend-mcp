@@ -43,7 +43,7 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
 
 阶段 A（页面就绪前，禁止问岗位）：
 
-- 页面范围（`page_scope`）必须先确认：`recommend`（推荐）或 `featured`（精选）
+- 页面范围（`page_scope`）必须先确认：`recommend`（推荐）/ `latest`（最新）/ `featured`（精选）
   - 即使 instruction 里已出现“推荐/精选”关键词，也必须显式二次确认 `page_confirmed=true` 与 `page_value`
 - 学校标签（`school_tag`，支持多选）
   - 若输入混合了有效与无效选项（如 `985,211,qs100`），必须忽略无效项并保留有效项；不要直接回退到“不限”
@@ -97,7 +97,7 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
   - `instruction` (required)
   - `confirmation`
     - `page_confirmed`
-    - `page_value` (`recommend|featured`)
+    - `page_value` (`recommend|latest|featured`)
     - `filters_confirmed`
     - `school_tag_confirmed`
     - `school_tag_value`（建议回传最终确认值，避免二轮调用丢失）
@@ -118,7 +118,7 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
     - `max_greet_count_confirmed`
     - `max_greet_count_value` (integer)
   - `overrides`
-  - `page_scope` (`recommend|featured`)
+  - `page_scope` (`recommend|latest|featured`)
   - `school_tag`（可传单值或数组，如 `["985","211"]`）
     - `degree`（可传单值或数组；如“本科及以上”应展开为 `["本科","硕士","博士"]`）
     - `gender`
@@ -161,6 +161,7 @@ description: "Use when users ask to run Boss recommend-page filtering and screen
 - recommend-search-cli 只负责应用推荐页筛选项。
 - 若 `page_scope=featured`：必须严格按 `search -> 切换精选tab(data-status=3) -> screen` 顺序执行。
 - 若 `page_scope=featured` 且校准文件缺失：必须先触发 `boss-recommend-mcp calibrate` 自动校准，成功后再继续。
+- 若 `page_scope=latest`：执行路径与 `recommend` 一致（search + screen），但 screen 列表选择器应按最新 tab 结构读取（data-status=1）。
 - recommend-screen-cli 负责滚动推荐列表、打开详情、提取完整简历图、调用多模态模型判断，并按单次确认的 `post_action` 执行收藏或打招呼。
 - 精选页收藏仅允许“校准坐标 + 模拟点击”，成功判定仅看 network `add/del` 信号。
 - 详情页处理完成后必须关闭详情页并确认已关闭。

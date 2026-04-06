@@ -20,6 +20,7 @@ const screenConfigTemplateDefaults = {
 const DEFAULT_RECOMMEND_SCREEN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const PAGE_SCOPE_TO_TAB_STATUS = {
   recommend: "0",
+  latest: "1",
   featured: "3"
 };
 
@@ -76,6 +77,7 @@ function normalizePageScope(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
   if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["latest", "最新", "最新页", "最新页面"].includes(normalized)) return "latest";
   if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
   return null;
 }
@@ -1568,10 +1570,12 @@ function buildRecommendTabStateExpression() {
     const activeTab = tabs.find((item) => item.active && item.status) || null;
     const featuredCount = doc.querySelectorAll('li.geek-info-card').length;
     const recommendCount = doc.querySelectorAll('ul.card-list > li.card-item').length;
+    const latestCount = doc.querySelectorAll('.candidate-card-wrap .card-inner[data-geek], .candidate-card-wrap [data-geek]').length;
     let inferredStatus = activeTab?.status || null;
     if (!inferredStatus) {
-      if (featuredCount > 0 && recommendCount === 0) inferredStatus = '3';
-      else if (recommendCount > 0 && featuredCount === 0) inferredStatus = '0';
+      if (featuredCount > 0 && recommendCount === 0 && latestCount === 0) inferredStatus = '3';
+      else if (latestCount > 0 && featuredCount === 0 && recommendCount === 0) inferredStatus = '1';
+      else if (recommendCount > 0 && featuredCount === 0 && latestCount === 0) inferredStatus = '0';
     }
     return {
       ok: true,
@@ -1579,7 +1583,8 @@ function buildRecommendTabStateExpression() {
       tabs,
       layout: {
         featured_count: featuredCount,
-        recommend_count: recommendCount
+        recommend_count: recommendCount,
+        latest_count: latestCount
       }
     };
   })()`;
@@ -1960,6 +1965,13 @@ function buildRecommendRefreshStateExpression() {
       .find((el) => isVisible(el)) || null;
     const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
     const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
+    const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap .card-inner[data-geek], .candidate-card-wrap [data-geek]'));
+    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+    const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
+    const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
+    const inferredStatus = activeStatus
+      || (latestCards.length > 0 && candidateCards.length === 0 ? '1' : candidateCards.length > 0 ? '0' : '');
+    const effectiveCandidates = inferredStatus === '1' ? latestCards : candidateCards;
     const finishedText = finishedWrap ? String(finishedWrap.textContent || '').replace(/\\s+/g, ' ').trim() : '';
     const buttonText = refreshButton ? String(refreshButton.textContent || '').replace(/\\s+/g, ' ').trim() : '';
     return {
@@ -1971,9 +1983,11 @@ function buildRecommendRefreshStateExpression() {
       finished_wrap_text: finishedText || null,
       refresh_button_visible: Boolean(refreshButton),
       refresh_button_text: buttonText || null,
-      candidate_count: candidateCards.length,
-      total_card_count: cards.length,
-      list_ready: candidateCards.length > 0
+      candidate_count: effectiveCandidates.length,
+      recommend_candidate_count: candidateCards.length,
+      latest_candidate_count: latestCards.length,
+      total_card_count: Math.max(cards.length, latestCards.length),
+      list_ready: effectiveCandidates.length > 0
     };
   })()`;
 }

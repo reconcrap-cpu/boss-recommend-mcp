@@ -18,14 +18,17 @@ const FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY = "近14天没有";
 const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 5;
 const PAGE_SCOPE_TO_TAB_STATUS = {
   recommend: "0",
+  latest: "1",
   featured: "3"
 };
 const TAB_STATUS_TO_PAGE_SCOPE = {
   "0": "recommend",
+  "1": "latest",
   "3": "featured"
 };
 const PAGE_SCOPE_LABELS = {
   recommend: "推荐",
+  latest: "最新",
   featured: "精选"
 };
 
@@ -41,6 +44,7 @@ function normalizePageScope(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
   if (["recommend", "推荐", "推荐页", "推荐页面"].includes(normalized)) return "recommend";
+  if (["latest", "最新", "最新页", "最新页面"].includes(normalized)) return "latest";
   if (["featured", "精选", "精选页", "精选页面", "精选牛人"].includes(normalized)) return "featured";
   return null;
 }
@@ -892,7 +896,7 @@ export async function runRecommendPipeline(
   };
 
   const ensureSelectedPageTab = async () => {
-    if (selectedPage !== "featured") {
+    if (selectedPage === "recommend") {
       activeTabStatus = selectedTabStatus;
       return {
         ok: true,
@@ -1073,8 +1077,8 @@ export async function runRecommendPipeline(
       ensurePipelineNotAborted(runtimeHooks.signal);
       runtimeHooks.setStage(
         "screen",
-        selectedPage === "featured"
-          ? "search 完成，已切换到精选 tab，开始执行 recommend screen。"
+        selectedPage !== "recommend"
+          ? `search 完成，已切换到${PAGE_SCOPE_LABELS[selectedPage]} tab，开始执行 recommend screen。`
           : "search 完成，开始执行 recommend screen。"
       );
     } else {

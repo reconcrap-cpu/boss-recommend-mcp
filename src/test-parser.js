@@ -488,6 +488,21 @@ function testFeaturedKeywordShouldProposeFeaturedPageScope() {
   assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
 }
 
+function testLatestKeywordShouldProposeLatestPageScope() {
+  const result = parseRecommendInstruction({
+    instruction: "在推荐页最新里筛选候选人，有 Agent 经验，符合标准收藏",
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.equal(result.proposed_page_scope, "latest");
+  assert.equal(result.needs_page_confirmation, true);
+  const pageQuestion = result.pending_questions.find((item) => item.field === "page_scope");
+  assert.equal(Boolean(pageQuestion), true);
+  assert.equal(Array.isArray(pageQuestion.options), true);
+  assert.equal(pageQuestion.options.some((item) => item.value === "latest"), true);
+}
+
 function testConfirmedPageScopeShouldBeResolved() {
   const result = parseRecommendInstruction({
     instruction: "在推荐页筛选候选人，有 Agent 经验，符合标准收藏",
@@ -543,6 +558,7 @@ function main() {
   testPostActionNoneCanBeConfirmed();
   testJobSelectionHintCanComeFromOverrides();
   testFeaturedKeywordShouldProposeFeaturedPageScope();
+  testLatestKeywordShouldProposeLatestPageScope();
   testConfirmedPageScopeShouldBeResolved();
   testPageScopeOverrideShouldNotBypassConfirmation();
   console.log("parser tests passed");
