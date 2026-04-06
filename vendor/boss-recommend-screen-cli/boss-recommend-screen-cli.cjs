@@ -13,11 +13,52 @@ const RESUME_CAPTURE_WAIT_MS = 60000;
 const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
 const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
 const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
+const DEFAULT_VISION_MAX_IMAGE_PIXELS = 36000000;
+const DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS = 30000000;
+let visionSharpFactory = null;
 const PAGE_SCOPE_TAB_STATUS = {
   recommend: "0",
   latest: "1",
   featured: "3"
 };
+const BOTTOM_HINT_KEYWORDS = ["没有更多", "已显示全部", "已经到底", "暂无更多", "推荐完了", "没有更多人选"];
+const LOAD_MORE_HINT_KEYWORDS = ["滚动加载更多", "下滑加载更多", "继续下滑", "继续滑动", "滑动加载", "正在加载", "加载中"];
+
+function classifyFinishedWrapState(finishedWrapText, refreshButtonVisible = false) {
+  const normalizedText = normalizeText(finishedWrapText);
+  const matchedBottomKeyword = BOTTOM_HINT_KEYWORDS.find((keyword) => normalizedText.includes(keyword)) || null;
+  if (matchedBottomKeyword) {
+    return {
+      isBottom: true,
+      reason: matchedBottomKeyword,
+      matched_bottom_keyword: matchedBottomKeyword,
+      matched_load_more_keyword: null
+    };
+  }
+  const matchedLoadMoreKeyword = LOAD_MORE_HINT_KEYWORDS.find((keyword) => normalizedText.includes(keyword)) || null;
+  if (matchedLoadMoreKeyword) {
+    return {
+      isBottom: false,
+      reason: null,
+      matched_bottom_keyword: null,
+      matched_load_more_keyword: matchedLoadMoreKeyword
+    };
+  }
+  if (refreshButtonVisible) {
+    return {
+      isBottom: true,
+      reason: "refresh_button_visible",
+      matched_bottom_keyword: null,
+      matched_load_more_keyword: null
+    };
+  }
+  return {
+    isBottom: false,
+    reason: null,
+    matched_bottom_keyword: null,
+    matched_load_more_keyword: null
+  };
+}
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -63,6 +104,35 @@ function validateUrlString(raw) {
 function parsePositiveInteger(raw) {
   const value = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function resolveVisionPixelLimitFromEnv(envName, fallback) {
+  const parsed = parsePositiveInteger(process.env[envName]);
+  return parsed || fallback;
+}
+
+function resolveVisionRetryPixelLimit(primaryLimit) {
+  const safePrimary = parsePositiveInteger(primaryLimit) || DEFAULT_VISION_MAX_IMAGE_PIXELS;
+  const fallback = Math.max(1, Math.floor(safePrimary * 0.8));
+  const parsed = resolveVisionPixelLimitFromEnv("BOSS_RECOMMEND_VISION_RETRY_MAX_IMAGE_PIXELS", DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS);
+  const candidate = parsePositiveInteger(parsed) || fallback;
+  return Math.min(Math.max(1, candidate), Math.max(1, safePrimary - 1));
+}
+
+function loadVisionSharp() {
+  if (!visionSharpFactory) {
+    visionSharpFactory = require("sharp");
+  }
+  return visionSharpFactory;
+}
+
+function isVisionImageSizeLimitMessage(message) {
+  const text = normalizeText(message).toLowerCase();
+  if (!text) return false;
+  return (
+    /(像素|pixel|pixels|too large|image size|image dimension|too many pixels|max(?:imum)?[^a-z0-9]{0,8}(?:pixel|image)|超过|超出|上限)/i.test(text)
+    || (text.includes("image") && text.includes("limit"))
+  );
 }
 
 function normalizePostAction(value) {
@@ -1041,7 +1111,8 @@ const jsDetectBottom = `(() => {
   const finishedWrap = Array.from(doc.querySelectorAll('.finished-wrap')).find((el) => isVisible(el)) || null;
   const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
     .find((el) => isVisible(el)) || null;
-  const keywords = ['没有更多', '已显示全部', '已经到底', '暂无更多', '推荐完了', '没有更多人选'];
+  const keywords = ${JSON.stringify(BOTTOM_HINT_KEYWORDS)};
+  const loadMoreKeywords = ${JSON.stringify(LOAD_MORE_HINT_KEYWORDS)};
   const elements = Array.from(doc.querySelectorAll('div,span,p'));
   for (const el of elements) {
     if (el.offsetParent === null) continue;
@@ -1059,12 +1130,21 @@ const jsDetectBottom = `(() => {
       }
     }
   }
+  const finishedWrapText = finishedWrap ? String(finishedWrap.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  const matchedBottomKeyword = keywords.find((keyword) => finishedWrapText.includes(keyword)) || null;
+  const matchedLoadMoreKeyword = loadMoreKeywords.find((keyword) => finishedWrapText.includes(keyword)) || null;
+  const inferredBottom = matchedBottomKeyword
+    ? true
+    : (Boolean(refreshButton) && !matchedLoadMoreKeyword);
   return {
-    isBottom: Boolean(finishedWrap),
-    reason: finishedWrap ? 'finished-wrap' : null,
+    isBottom: inferredBottom,
+    reason: matchedBottomKeyword || (inferredBottom ? 'refresh_button_visible' : null),
     finished_wrap_visible: Boolean(finishedWrap),
+    finished_wrap_text: finishedWrapText || null,
     refresh_button_visible: Boolean(refreshButton),
-    refresh_button_text: refreshButton ? String(refreshButton.textContent || '').replace(/\s+/g, ' ').trim() : null
+    refresh_button_text: refreshButton ? String(refreshButton.textContent || '').replace(/\s+/g, ' ').trim() : null,
+    matched_bottom_keyword: matchedBottomKeyword,
+    matched_load_more_keyword: matchedLoadMoreKeyword
   };
 })()`;
 const jsWaitForDetail = `(() => {
@@ -2615,15 +2695,21 @@ class RecommendScreenCli {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
       const doc = frame.contentDocument;
-      const inner = Array.from(doc.querySelectorAll('.card-inner[data-geekid]'))
+      const recommendInner = Array.from(doc.querySelectorAll('.card-inner[data-geekid]'))
         .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey)) || null;
-      const featuredAnchor = inner
+      const latestInner = recommendInner
+        ? null
+        : Array.from(doc.querySelectorAll('.candidate-card-wrap .card-inner[data-geek], .candidate-card-wrap [data-geek]'))
+          .find((item) => (item.getAttribute('data-geek') || '') === String(candidateKey)) || null;
+      const featuredAnchor = (recommendInner || latestInner)
         ? null
         : Array.from(doc.querySelectorAll('li.geek-info-card a[data-geekid], a[data-geekid]'))
           .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey)) || null;
-      const card = inner
-        ? (inner.closest('li.card-item') || inner.closest('.card-item'))
-        : (featuredAnchor ? (featuredAnchor.closest('li.geek-info-card') || featuredAnchor.closest('.geek-info-card')) : null);
+      const card = recommendInner
+        ? (recommendInner.closest('li.card-item') || recommendInner.closest('.card-item'))
+        : latestInner
+          ? (latestInner.closest('.candidate-card-wrap') || latestInner.closest('li.card-item') || latestInner.closest('.card-item'))
+          : (featuredAnchor ? (featuredAnchor.closest('li.geek-info-card') || featuredAnchor.closest('.geek-info-card')) : null);
       if (!card) {
         return { ok: false, error: 'CANDIDATE_CARD_NOT_FOUND' };
       }
@@ -2716,6 +2802,130 @@ class RecommendScreenCli {
   }
 
   async callVisionModel(imagePath) {
+    const primaryLimit = resolveVisionPixelLimitFromEnv(
+      "BOSS_RECOMMEND_VISION_MAX_IMAGE_PIXELS",
+      DEFAULT_VISION_MAX_IMAGE_PIXELS
+    );
+    const retryLimit = resolveVisionRetryPixelLimit(primaryLimit);
+    const preparedPrimary = await this.prepareVisionImageForModel(imagePath, primaryLimit, "primary");
+    try {
+      return await this.requestVisionModel(preparedPrimary.imagePath);
+    } catch (error) {
+      if (!isVisionImageSizeLimitMessage(error?.message || "")) {
+        throw error;
+      }
+      log(
+        `[VISION] 检测到图片尺寸超限，准备降采样重试: ` +
+        `primary_limit=${primaryLimit} source=${preparedPrimary.source} ` +
+        `source_pixels=${preparedPrimary.sourcePixels ?? "unknown"}`
+      );
+    }
+    const preparedRetry = await this.prepareVisionImageForModel(imagePath, retryLimit, "retry");
+    try {
+      return await this.requestVisionModel(preparedRetry.imagePath);
+    } catch (retryError) {
+      if (!isVisionImageSizeLimitMessage(retryError?.message || "")) {
+        throw retryError;
+      }
+      throw this.buildError(
+        "VISION_IMAGE_SIZE_LIMIT_EXCEEDED",
+        `Vision model still rejected image after retry downscale; ` +
+          `primary_limit=${primaryLimit}; retry_limit=${retryLimit}; ` +
+          `source_pixels=${preparedRetry.sourcePixels ?? "unknown"}; ` +
+          `retry_pixels=${preparedRetry.currentPixels ?? "unknown"}; ` +
+          `last_error=${normalizeText(retryError?.message || retryError)}`
+      );
+    }
+  }
+
+  async prepareVisionImageForModel(imagePath, maxPixels, attemptTag = "primary") {
+    const resolvedMaxPixels = parsePositiveInteger(maxPixels);
+    if (!resolvedMaxPixels) {
+      return {
+        imagePath,
+        source: "no_limit",
+        sourcePixels: null,
+        currentPixels: null
+      };
+    }
+    let sharp;
+    try {
+      sharp = loadVisionSharp();
+    } catch (error) {
+      log(`[VISION] 加载 sharp 失败，跳过预缩放: ${error?.message || error}`);
+      return {
+        imagePath,
+        source: "sharp_unavailable",
+        sourcePixels: null,
+        currentPixels: null
+      };
+    }
+    let metadata;
+    try {
+      metadata = await sharp(imagePath).metadata();
+    } catch (error) {
+      log(`[VISION] 读取图片尺寸失败，跳过预缩放: ${error?.message || error}`);
+      return {
+        imagePath,
+        source: "metadata_error",
+        sourcePixels: null,
+        currentPixels: null
+      };
+    }
+    const width = Number(metadata?.width || 0);
+    const height = Number(metadata?.height || 0);
+    const sourcePixels = width > 0 && height > 0 ? width * height : null;
+    if (!sourcePixels || sourcePixels <= resolvedMaxPixels) {
+      return {
+        imagePath,
+        source: "within_limit",
+        sourcePixels,
+        currentPixels: sourcePixels
+      };
+    }
+    const scale = Math.sqrt(resolvedMaxPixels / sourcePixels);
+    const targetWidth = Math.max(1, Math.floor(width * scale));
+    const targetHeight = Math.max(1, Math.floor(height * scale));
+    const parsedPath = path.parse(imagePath);
+    const resizedPath = path.join(
+      parsedPath.dir,
+      `${parsedPath.name}.${attemptTag}.max${resolvedMaxPixels}.png`
+    );
+    try {
+      await sharp(imagePath)
+        .resize({
+          width: targetWidth,
+          height: targetHeight,
+          fit: "inside",
+          withoutEnlargement: true
+        })
+        .png()
+        .toFile(resizedPath);
+      const resizedMeta = await sharp(resizedPath).metadata();
+      const resizedPixels = Number(resizedMeta?.width || 0) * Number(resizedMeta?.height || 0);
+      log(
+        `[VISION] 图片预缩放完成: ${width}x${height}(${sourcePixels}) -> ` +
+        `${resizedMeta?.width || "?"}x${resizedMeta?.height || "?"}(${resizedPixels || "?"}); ` +
+        `limit=${resolvedMaxPixels}; attempt=${attemptTag}`
+      );
+      return {
+        imagePath: resizedPath,
+        source: "resized",
+        sourcePixels,
+        currentPixels: resizedPixels || null
+      };
+    } catch (error) {
+      log(`[VISION] 预缩放失败，继续使用原图: ${error?.message || error}`);
+      return {
+        imagePath,
+        source: "resize_failed",
+        sourcePixels,
+        currentPixels: sourcePixels
+      };
+    }
+  }
+
+  async requestVisionModel(imagePath) {
     const imageBase64 = fs.readFileSync(imagePath, "base64");
     const rawBaseUrl = this.args.baseUrl;
     log(`[callVisionModel] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
@@ -3361,8 +3571,27 @@ class RecommendScreenCli {
           } else {
             this.resetResumeCaptureFailureStreak();
           }
-          if (["VISION_MODEL_FAILED", "TEXT_MODEL_FAILED"].includes(error.code)) {
+          if (error.code === "TEXT_MODEL_FAILED") {
             throw error;
+          }
+          if (error.code === "VISION_MODEL_FAILED") {
+            if (isVisionImageSizeLimitMessage(error?.message || "")) {
+              log(
+                `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} 触发视觉模型像素限制，` +
+                "已在本轮跳过并继续处理下一位。"
+              );
+            } else {
+              log(
+                `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} 视觉模型调用失败，` +
+                "已在本轮跳过并继续处理下一位。"
+              );
+            }
+          }
+          if (error.code === "VISION_IMAGE_SIZE_LIMIT_EXCEEDED") {
+            log(
+              `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} 触发视觉模型像素限制，` +
+              "已完成预缩放和重试，仍失败，继续处理下一位。"
+            );
           }
         } finally {
           const closed = await this.closeDetailPage();
@@ -3485,7 +3714,8 @@ if (require.main === module) {
       parseFavoriteActionFromKnownRequest,
       parseFavoriteActionFromActionLog,
       parseFavoriteActionFromWsPayload,
-      isRecoverablePostActionError
+      isRecoverablePostActionError,
+      classifyFinishedWrapState
     }
   };
 }

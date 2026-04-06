@@ -382,6 +382,41 @@ async function testNetworkMissShouldFallbackToImageCapture() {
   assert.equal(result.result.resume_source, "image_fallback");
 }
 
+async function testVisionModelFailureShouldSkipCandidateAndContinue() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-vision-failure-skip-"));
+  const first = { key: "vision-fail-1", geek_id: "vision-fail-1", name: "vision-fail-1" };
+  const second = { key: "vision-pass-2", geek_id: "vision-pass-2", name: "vision-pass-2" };
+  const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
+    candidates: [first, second],
+    captureOutcomes: new Map([
+      ["vision-fail-1", { stitchedImage: path.join(tempDir, "vision-fail-1.png") }],
+      ["vision-pass-2", { stitchedImage: path.join(tempDir, "vision-pass-2.png") }]
+    ]),
+    screeningByKey: new Map([
+      ["vision-pass-2", { passed: true, reason: "ok", summary: "ok" }]
+    ])
+  });
+
+  cli.callVisionModel = async () => {
+    if (cli.lastCapturedCandidateKey === "vision-fail-1") {
+      const error = new Error("model backend timeout");
+      error.code = "VISION_MODEL_FAILED";
+      throw error;
+    }
+    return {
+      passed: true,
+      reason: "ok",
+      summary: "ok"
+    };
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 2);
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.skipped_count, 1);
+}
+
 async function testFeaturedNetworkMissShouldSkipWithoutImageCapture() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-network-only-"));
   const args = createArgs(tempDir);
@@ -549,6 +584,50 @@ function testFavoriteActionParserShouldOnlyTrustKnownRequestShapes() {
   assert.equal(unknown, null);
   assert.equal(actionLog, "add");
   assert.equal(userMark, "add");
+}
+
+function testFinishedWrapClassifierShouldNotTreatLoadMoreAsBottom() {
+  const loadMore = __testables.classifyFinishedWrapState("滚动加载更多", false);
+  const loading = __testables.classifyFinishedWrapState("正在加载数据...", false);
+  const noMore = __testables.classifyFinishedWrapState("没有更多人选", false);
+  const refreshOnly = __testables.classifyFinishedWrapState("", true);
+
+  assert.equal(loadMore.isBottom, false);
+  assert.equal(loadMore.matched_load_more_keyword, "滚动加载更多");
+  assert.equal(loading.isBottom, false);
+  assert.equal(loading.matched_load_more_keyword, "正在加载");
+  assert.equal(noMore.isBottom, true);
+  assert.equal(noMore.matched_bottom_keyword, "没有更多");
+  assert.equal(refreshOnly.isBottom, true);
+  assert.equal(refreshOnly.reason, "refresh_button_visible");
+}
+
+async function testGetCenteredCandidateClickPointShouldSupportLatestSelector() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-latest-click-locator-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "latest";
+  const cli = new RecommendScreenCli(args);
+
+  let expressionCaptured = "";
+  cli.evaluate = async (expression) => {
+    expressionCaptured = String(expression || "");
+    return {
+      ok: true,
+      x: 100,
+      y: 100,
+      width: 120,
+      height: 64
+    };
+  };
+
+  const result = await cli.getCenteredCandidateClickPoint({
+    key: "latest-test-key",
+    geek_id: "latest-test-key"
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(expressionCaptured.includes(".candidate-card-wrap .card-inner[data-geek]"), true);
+  assert.equal(expressionCaptured.includes("getAttribute('data-geek')"), true);
 }
 
 async function testFeaturedPostActionFailureShouldStillRecordPassedCandidate() {
@@ -726,6 +805,7 @@ async function main() {
   await testFeaturedShouldUseNetworkResumeOnly();
   await testRecommendShouldKeepImageCaptureEvenWhenNetworkResumeExists();
   await testNetworkMissShouldFallbackToImageCapture();
+  await testVisionModelFailureShouldSkipCandidateAndContinue();
   await testFeaturedNetworkMissShouldSkipWithoutImageCapture();
   await testFeaturedFavoriteShouldNotUseDomFallback();
   await testFeaturedFavoriteShouldSkipClickWhenAlreadyInterested();
@@ -735,6 +815,8 @@ async function main() {
   testFavoriteActionParserShouldSupportFallbackRequestShape();
   testFavoriteActionParserShouldSupportWebSocketPayload();
   testFavoriteActionParserShouldOnlyTrustKnownRequestShapes();
+  testFinishedWrapClassifierShouldNotTreatLoadMoreAsBottom();
+  await testGetCenteredCandidateClickPointShouldSupportLatestSelector();
   await testFeaturedPostActionFailureShouldStillRecordPassedCandidate();
   await testStitchWithSharpShouldComposeExpectedImage();
   testStitchWithAvailablePythonShouldFallbackToPython();
