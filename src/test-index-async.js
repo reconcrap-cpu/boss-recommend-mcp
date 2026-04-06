@@ -6,7 +6,8 @@ import { __testables } from "./index.js";
 
 const {
   handleRequest,
-  activeAsyncRuns,
+  runDetachedWorkerForTests,
+  setSpawnProcessImplForTests,
   setRunPipelineImplForTests
 } = __testables;
 
@@ -141,6 +142,35 @@ function setupPipelineMock() {
   });
 }
 
+function parseDetachedSpawnArgs(argv = []) {
+  const normalized = Array.isArray(argv) ? argv.map((item) => String(item || "")) : [];
+  const runIdFlagIndex = normalized.indexOf("--run-id");
+  return {
+    runId: runIdFlagIndex >= 0 ? String(normalized[runIdFlagIndex + 1] || "").trim() : "",
+    resumeRun: normalized.includes("--resume")
+  };
+}
+
+function setupDetachedWorkerStub() {
+  setSpawnProcessImplForTests((command, argv = []) => {
+    assert.equal(typeof command, "string");
+    const { runId, resumeRun } = parseDetachedSpawnArgs(argv);
+    assert.equal(Boolean(runId), true, "detached worker spawn must include --run-id");
+    const pid = process.pid;
+    setTimeout(() => {
+      runDetachedWorkerForTests({
+        runId,
+        resumeRun,
+        workerPid: pid
+      }).catch(() => {});
+    }, 0);
+    return {
+      pid,
+      unref() {}
+    };
+  });
+}
+
 async function testPauseAndResumeFlow() {
   const runId = await startAcceptedRun("run for pause and resume", 11);
   await waitForRunState(runId, ["running"]);
@@ -169,9 +199,6 @@ async function testResumeAfterProcessRestartSimulation() {
   const pausePayload = await callTool(TOOL_PAUSE_RUN, { run_id: runId }, 22);
   assert.equal(pausePayload.status, "PAUSE_REQUESTED");
   await waitForRunState(runId, ["paused"]);
-
-  // 模拟服务重启后内存态丢失：active map 为空，仅依赖 run-state 持久化恢复。
-  activeAsyncRuns.clear();
 
   const resumePayload = await callTool(TOOL_RESUME_RUN, { run_id: runId }, 23);
   assert.equal(resumePayload.status, "RESUME_REQUESTED");
@@ -214,6 +241,7 @@ async function main() {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-index-async-"));
   process.env.BOSS_RECOMMEND_HOME = tempHome;
   setupPipelineMock();
+  setupDetachedWorkerStub();
 
   try {
     await testPauseAndResumeFlow();
@@ -223,7 +251,7 @@ async function main() {
     console.log("index async tests passed");
   } finally {
     setRunPipelineImplForTests(null);
-    activeAsyncRuns.clear();
+    setSpawnProcessImplForTests(null);
     if (previousHome === undefined) {
       delete process.env.BOSS_RECOMMEND_HOME;
     } else {

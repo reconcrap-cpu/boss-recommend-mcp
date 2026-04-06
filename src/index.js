@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -37,9 +38,12 @@ const SERVER_NAME = "boss-recommend-mcp";
 const FRAMING_UNKNOWN = "unknown";
 const FRAMING_HEADER = "header";
 const FRAMING_LINE = "line";
+const DETACHED_WORKER_FLAG = "--detached-worker";
+const DETACHED_WORKER_RUN_ID_FLAG = "--run-id";
+const DETACHED_WORKER_RESUME_FLAG = "--resume";
 
-const activeAsyncRuns = new Map();
 let runPipelineImpl = runRecommendPipeline;
+let spawnProcessImpl = spawn;
 const TERMINAL_RUN_STATES = new Set([RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_STATE_CANCELED]);
 
 function normalizeText(value) {
@@ -470,9 +474,6 @@ function reconcileOrphanRunIfNeeded(runId, snapshot) {
   if (snapshot.state === RUN_STATE_PAUSED) {
     return snapshot;
   }
-  if (activeAsyncRuns.has(runId)) {
-    return snapshot;
-  }
   if (isProcessAlive(snapshot.pid)) {
     return snapshot;
   }
@@ -510,6 +511,71 @@ function reconcileOrphanRunIfNeeded(runId, snapshot) {
     }
   });
   return recovered || readRunState(runId) || snapshot;
+}
+
+function parseDetachedWorkerOptions(argv = process.argv.slice(2)) {
+  if (!Array.isArray(argv) || !argv.includes(DETACHED_WORKER_FLAG)) {
+    return null;
+  }
+  const runIdFlagIndex = argv.indexOf(DETACHED_WORKER_RUN_ID_FLAG);
+  const runId = runIdFlagIndex >= 0 ? normalizeText(argv[runIdFlagIndex + 1]) : "";
+  return {
+    runId,
+    resumeRun: argv.includes(DETACHED_WORKER_RESUME_FLAG)
+  };
+}
+
+function launchDetachedRunWorker({ runId, resumeRun = false }) {
+  const childArgs = [thisFilePath, DETACHED_WORKER_FLAG, DETACHED_WORKER_RUN_ID_FLAG, String(runId)];
+  if (resumeRun) {
+    childArgs.push(DETACHED_WORKER_RESUME_FLAG);
+  }
+  const child = spawnProcessImpl(process.execPath, childArgs, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: process.env
+  });
+  if (typeof child?.unref === "function") {
+    child.unref();
+  }
+  return child;
+}
+
+function buildWorkerLaunchFailedPayload(message) {
+  return {
+    status: "FAILED",
+    error: {
+      code: "RUN_WORKER_LAUNCH_FAILED",
+      message,
+      retryable: true
+    }
+  };
+}
+
+function finalizeCanceledRun(runId, snapshot) {
+  const canceledResult = {
+    status: "FAILED",
+    error: {
+      code: "PIPELINE_CANCELED",
+      message: "流水线已取消。",
+      retryable: true
+    },
+    partial_result: snapshot?.result?.partial_result || snapshot?.result?.result || null
+  };
+  return safeUpdateRunState(runId, {
+    state: RUN_STATE_CANCELED,
+    stage: snapshot?.stage || RUN_STAGE_PREFLIGHT,
+    last_message: "流水线已取消。",
+    control: {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    },
+    error: canceledResult.error,
+    result: canceledResult
+  }) || readRunState(runId) || snapshot;
 }
 
 function createRuntimeCallbacks(runId, heartbeatIntervalMs) {
@@ -735,14 +801,14 @@ async function executeTrackedPipeline({
   };
 }
 
-function initializeRunStateOrThrow(runId, mode, workspaceRoot, args) {
+function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = process.pid) {
   const artifacts = getRunArtifacts(runId);
   const snapshot = createRunStateSnapshot({
     runId,
     mode,
     state: "queued",
     stage: RUN_STAGE_PREFLIGHT,
-    pid: process.pid,
+    pid,
     lastMessage: "流水线任务已创建，等待执行。",
     context: buildRunContext(workspaceRoot, args),
     control: {
@@ -763,23 +829,54 @@ function initializeRunStateOrThrow(runId, mode, workspaceRoot, args) {
   return writeRunState(snapshot);
 }
 
-function launchAsyncRun({ runId, mode, workspaceRoot, args, resumeRun = false }) {
-  const abortController = new AbortController();
-  const promise = executeTrackedPipeline({
-    runId,
-    mode,
-    workspaceRoot,
-    args,
-    signal: abortController.signal,
+async function runDetachedWorker({ runId, resumeRun = false, workerPid = process.pid }) {
+  const normalizedRunId = normalizeText(runId);
+  if (!normalizedRunId) {
+    return { ok: false, error: "run_id is required" };
+  }
+  const snapshot = readRunState(normalizedRunId);
+  if (!snapshot) {
+    return { ok: false, error: `run_id=${normalizedRunId} not found` };
+  }
+
+  const executionContext = resolveRunContext(snapshot);
+  if (!executionContext) {
+    const failedPayload = {
+      code: "RUN_CONTEXT_MISSING",
+      message: "run 缺少可恢复的执行上下文，无法继续。",
+      retryable: false
+    };
+    safeUpdateRunState(normalizedRunId, {
+      state: RUN_STATE_FAILED,
+      stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
+      last_message: failedPayload.message,
+      error: failedPayload,
+      result: {
+        status: "FAILED",
+        error: failedPayload
+      }
+    });
+    return { ok: false, error: failedPayload.message };
+  }
+
+  safeUpdateRunState(normalizedRunId, {
+    pid: Number.isInteger(workerPid) && workerPid > 0 ? workerPid : process.pid,
+    mode: RUN_MODE_ASYNC,
+    state: "queued",
+    last_message: resumeRun
+      ? "detached worker 已启动，准备恢复执行。"
+      : "detached worker 已启动，准备执行。"
+  });
+
+  await executeTrackedPipeline({
+    runId: normalizedRunId,
+    mode: RUN_MODE_ASYNC,
+    workspaceRoot: executionContext.workspaceRoot,
+    args: executionContext.args,
+    signal: new AbortController().signal,
     resumeRun
-  }).finally(() => {
-    activeAsyncRuns.delete(runId);
   });
-  activeAsyncRuns.set(runId, {
-    abortController,
-    promise
-  });
-  return { abortController, promise };
+  return { ok: true };
 }
 
 async function handleStartRunTool({ workspaceRoot, args }) {
@@ -817,7 +914,7 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   cleanupExpiredRuns();
   const runId = createRunId();
   try {
-    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args);
+    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
   } catch (error) {
     return {
       status: "FAILED",
@@ -829,11 +926,32 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     };
   }
 
-  launchAsyncRun({
-    runId,
-    mode: RUN_MODE_ASYNC,
-    workspaceRoot,
-    args
+  let worker;
+  try {
+    worker = launchDetachedRunWorker({
+      runId,
+      resumeRun: false
+    });
+  } catch (error) {
+    const failedMessage = `无法启动 detached 运行进程：${error?.message || "unknown"}`;
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: RUN_STAGE_PREFLIGHT,
+      last_message: failedMessage,
+      error: {
+        code: "RUN_WORKER_LAUNCH_FAILED",
+        message: failedMessage,
+        retryable: true
+      },
+      result: buildWorkerLaunchFailedPayload(failedMessage)
+    });
+    return buildWorkerLaunchFailedPayload(failedMessage);
+  }
+
+  safeUpdateRunState(runId, {
+    pid: worker?.pid,
+    state: "queued",
+    last_message: "异步流水线已启动（detached）。"
   });
 
   return {
@@ -841,7 +959,7 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     run_id: runId,
     state: "queued",
     poll_after_sec: getDefaultPollAfterSec(),
-    message: "异步流水线已启动。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
+    message: "异步流水线已启动（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
   };
 }
 
@@ -899,75 +1017,25 @@ function handleCancelRunTool(args) {
       }
     };
   }
+  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot) || snapshot;
 
-  if (TERMINAL_RUN_STATES.has(snapshot.state)) {
+  if (TERMINAL_RUN_STATES.has(reconciled.state)) {
     return {
       status: "CANCEL_IGNORED",
-      run: snapshot,
+      run: reconciled,
       message: "目标任务已结束，无需取消。"
     };
   }
 
-  if (snapshot.state === RUN_STATE_PAUSED) {
-    const canceledResult = {
-      status: "FAILED",
-      error: {
-        code: "PIPELINE_CANCELED",
-        message: "流水线已取消。",
-        retryable: true
-      },
-      partial_result: snapshot.result?.partial_result || snapshot.result?.result || null
-    };
-    const canceledRun = safeUpdateRunState(runId, {
-      state: RUN_STATE_CANCELED,
-      stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
-      last_message: "流水线已取消。",
-      control: {
-        pause_requested: false,
-        pause_requested_at: null,
-        pause_requested_by: null,
-        cancel_requested: false
-      },
-      error: canceledResult.error,
-      result: canceledResult
-    }) || readRunState(runId) || snapshot;
-    return {
-      status: "CANCEL_REQUESTED",
-      run: canceledRun
-    };
-  }
-
-  const activeRun = activeAsyncRuns.get(runId);
-  if (!activeRun) {
-    const canceledResult = {
-      status: "FAILED",
-      error: {
-        code: "PIPELINE_CANCELED",
-        message: "流水线已取消。",
-        retryable: true
-      },
-      partial_result: snapshot.result?.partial_result || snapshot.result?.result || null
-    };
-    const canceledRun = safeUpdateRunState(runId, {
-      state: RUN_STATE_CANCELED,
-      stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
-      last_message: "流水线已取消。",
-      control: {
-        pause_requested: false,
-        pause_requested_at: null,
-        pause_requested_by: null,
-        cancel_requested: false
-      },
-      error: canceledResult.error,
-      result: canceledResult
-    }) || readRunState(runId) || snapshot;
+  if (reconciled.state === RUN_STATE_PAUSED || !isProcessAlive(reconciled.pid)) {
+    const canceledRun = finalizeCanceledRun(runId, reconciled);
     return {
       status: "CANCEL_REQUESTED",
       run: canceledRun
     };
   }
   safeUpdateRunState(runId, {
-    stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
+    stage: reconciled.stage || RUN_STAGE_PREFLIGHT,
     last_message: "已收到取消请求，将在当前候选人处理完成后安全停止并落盘 CSV。",
     control: {
       pause_requested: true,
@@ -977,7 +1045,7 @@ function handleCancelRunTool(args) {
     }
   });
 
-  const latest = readRunState(runId) || snapshot;
+  const latest = readRunState(runId) || reconciled;
   return {
     status: "CANCEL_REQUESTED",
     run: latest
@@ -1007,18 +1075,19 @@ function handlePauseRunTool(args) {
       }
     };
   }
+  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot) || snapshot;
 
-  if (TERMINAL_RUN_STATES.has(snapshot.state)) {
+  if (TERMINAL_RUN_STATES.has(reconciled.state)) {
     return {
       status: "PAUSE_IGNORED",
-      run: snapshot,
+      run: reconciled,
       message: "目标任务已结束，无需暂停。"
     };
   }
-  if (snapshot.state === RUN_STATE_PAUSED) {
+  if (reconciled.state === RUN_STATE_PAUSED) {
     return {
       status: "PAUSE_IGNORED",
-      run: snapshot,
+      run: reconciled,
       message: "目标任务已经处于 paused 状态。"
     };
   }
@@ -1031,7 +1100,7 @@ function handlePauseRunTool(args) {
       cancel_requested: false
     },
     last_message: "已收到暂停请求，将在当前候选人处理完成后暂停。"
-  }) || readRunState(runId) || snapshot;
+  }) || readRunState(runId) || reconciled;
   return {
     status: "PAUSE_REQUESTED",
     run: requestedRun,
@@ -1062,7 +1131,8 @@ function handleResumeRunTool(args) {
       }
     };
   }
-  if (TERMINAL_RUN_STATES.has(snapshot.state)) {
+  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot) || snapshot;
+  if (TERMINAL_RUN_STATES.has(reconciled.state)) {
     return {
       status: "FAILED",
       error: {
@@ -1072,7 +1142,7 @@ function handleResumeRunTool(args) {
       }
     };
   }
-  if (snapshot.state !== RUN_STATE_PAUSED) {
+  if (reconciled.state !== RUN_STATE_PAUSED) {
     return {
       status: "FAILED",
       error: {
@@ -1080,18 +1150,11 @@ function handleResumeRunTool(args) {
         message: "仅 paused 状态的 run 才能继续。",
         retryable: true
       },
-      run: snapshot
-    };
-  }
-  if (activeAsyncRuns.has(runId)) {
-    return {
-      status: "RESUME_IGNORED",
-      run: snapshot,
-      message: "该 run 当前已在执行，无需继续。"
+      run: reconciled
     };
   }
 
-  const executionContext = resolveRunContext(snapshot);
+  const executionContext = resolveRunContext(reconciled);
   if (!executionContext) {
     return {
       status: "FAILED",
@@ -1119,21 +1182,41 @@ function handleResumeRunTool(args) {
       resume_count: Number.isInteger(current?.resume?.resume_count) ? current.resume.resume_count + 1 : 1,
       last_resumed_at: new Date().toISOString()
     }
-  })) || readRunState(runId) || snapshot;
+  })) || readRunState(runId) || reconciled;
 
-  launchAsyncRun({
-    runId,
-    mode: RUN_MODE_ASYNC,
-    workspaceRoot: executionContext.workspaceRoot,
-    args: executionContext.args,
-    resumeRun: true
-  });
+  let worker;
+  try {
+    worker = launchDetachedRunWorker({
+      runId,
+      resumeRun: true
+    });
+  } catch (error) {
+    const failedMessage = `无法启动 detached 恢复进程：${error?.message || "unknown"}`;
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: reconciled.stage || RUN_STAGE_PREFLIGHT,
+      last_message: failedMessage,
+      error: {
+        code: "RUN_WORKER_LAUNCH_FAILED",
+        message: failedMessage,
+        retryable: true
+      },
+      result: buildWorkerLaunchFailedPayload(failedMessage)
+    });
+    return buildWorkerLaunchFailedPayload(failedMessage);
+  }
+
+  const started = safeUpdateRunState(runId, {
+    pid: worker?.pid,
+    state: "queued",
+    last_message: "已恢复 Recommend 流水线（detached）。"
+  }) || readRunState(runId) || updated;
 
   return {
     status: "RESUME_REQUESTED",
-    run: updated,
+    run: started,
     poll_after_sec: getDefaultPollAfterSec(),
-    message: "已恢复 Recommend 流水线。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
+    message: "已恢复 Recommend 流水线（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
   };
 }
 
@@ -1331,7 +1414,12 @@ export function startServer() {
 
 export const __testables = {
   handleRequest,
-  activeAsyncRuns,
+  runDetachedWorkerForTests(options = {}) {
+    return runDetachedWorker(options);
+  },
+  setSpawnProcessImplForTests(nextImpl) {
+    spawnProcessImpl = typeof nextImpl === "function" ? nextImpl : spawn;
+  },
   setRunPipelineImplForTests(nextImpl) {
     runPipelineImpl = typeof nextImpl === "function" ? nextImpl : runRecommendPipeline;
   }
@@ -1339,5 +1427,19 @@ export const __testables = {
 
 const thisFilePath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === thisFilePath) {
-  startServer();
+  const detachedWorkerOptions = parseDetachedWorkerOptions(process.argv.slice(2));
+  if (detachedWorkerOptions) {
+    runDetachedWorker({
+      runId: detachedWorkerOptions.runId,
+      resumeRun: detachedWorkerOptions.resumeRun
+    }).then((result) => {
+      if (!result?.ok) {
+        process.exitCode = 1;
+      }
+    }).catch(() => {
+      process.exitCode = 1;
+    });
+  } else {
+    startServer();
+  }
 }
