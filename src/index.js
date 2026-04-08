@@ -4,6 +4,10 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import {
+  getFeaturedCalibrationResolution,
+  runRecommendCalibration
+} from "./adapters.js";
 import { runRecommendPipeline } from "./pipeline.js";
 import {
   RUN_MODE_ASYNC,
@@ -33,6 +37,8 @@ const TOOL_GET_RUN = "get_recommend_pipeline_run";
 const TOOL_CANCEL_RUN = "cancel_recommend_pipeline_run";
 const TOOL_PAUSE_RUN = "pause_recommend_pipeline_run";
 const TOOL_RESUME_RUN = "resume_recommend_pipeline_run";
+const TOOL_RUN_FEATURED_CALIBRATION = "run_featured_calibration";
+const TOOL_GET_FEATURED_CALIBRATION_STATUS = "get_featured_calibration_status";
 
 const SERVER_NAME = "boss-recommend-mcp";
 const FRAMING_UNKNOWN = "unknown";
@@ -292,6 +298,29 @@ function createRunInputSchema() {
   };
 }
 
+function createRunFeaturedCalibrationInputSchema() {
+  return {
+    type: "object",
+    properties: {
+      port: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，Boss Chrome 远程调试端口（默认读取配置或 9222）"
+      },
+      timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，等待收藏点击的超时时间（毫秒）"
+      },
+      output: {
+        type: "string",
+        description: "可选，校准文件输出路径（默认 favorite-calibration.json）"
+      }
+    },
+    additionalProperties: false
+  };
+}
+
 function createToolsSchema() {
   return [
     {
@@ -346,6 +375,20 @@ function createToolsSchema() {
         required: ["run_id"],
         additionalProperties: false
       }
+    },
+    {
+      name: TOOL_RUN_FEATURED_CALIBRATION,
+      description: "手动执行精选页收藏按钮校准。执行前请先在 Boss 推荐页切换到精选 tab 并打开任意候选人详情页。",
+      inputSchema: createRunFeaturedCalibrationInputSchema()
+    },
+    {
+      name: TOOL_GET_FEATURED_CALIBRATION_STATUS,
+      description: "查询精选页收藏校准文件与校准脚本可用性。",
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false
+      }
     }
   ];
 }
@@ -374,6 +417,34 @@ function validateRunArgs(args) {
   if (!args.instruction || typeof args.instruction !== "string") {
     return "instruction is required and must be a string";
   }
+  return null;
+}
+
+function validateRunFeaturedCalibrationArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return "arguments must be an object";
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "port")) {
+    const port = Number.parseInt(String(args.port), 10);
+    if (!Number.isFinite(port) || port <= 0) {
+      return "port must be a positive integer";
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "timeout_ms")) {
+    const timeoutMs = Number.parseInt(String(args.timeout_ms), 10);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 1000) {
+      return "timeout_ms must be an integer >= 1000";
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "output")) {
+    if (typeof args.output !== "string" || !normalizeText(args.output)) {
+      return "output must be a non-empty string when provided";
+    }
+  }
+
   return null;
 }
 
@@ -1220,6 +1291,55 @@ function handleResumeRunTool(args) {
   };
 }
 
+function handleGetFeaturedCalibrationStatusTool(workspaceRoot) {
+  const resolution = getFeaturedCalibrationResolution(workspaceRoot);
+  return {
+    status: "CALIBRATION_STATUS",
+    ready: resolution.calibration_usable === true,
+    calibration_path: resolution.calibration_path,
+    calibration_exists: resolution.calibration_exists,
+    calibration_usable: resolution.calibration_usable,
+    calibration_script_path: resolution.calibration_script_path,
+    message: resolution.calibration_usable
+      ? "精选页收藏校准文件可用。"
+      : "精选页收藏校准文件不存在或无效。"
+  };
+}
+
+async function handleRunFeaturedCalibrationTool({ workspaceRoot, args }) {
+  const result = await runRecommendCalibration(workspaceRoot, {
+    port: args.port,
+    timeoutMs: args.timeout_ms,
+    output: args.output
+  });
+
+  if (!result?.ok) {
+    return {
+      status: "FAILED",
+      error: {
+        code: result?.error?.code || "CALIBRATION_REQUIRED",
+        message: result?.error?.message || "精选页收藏校准失败，请在推荐页精选 tab 打开候选人详情后点击收藏按钮再重试。",
+        retryable: true
+      },
+      calibration_path: result?.calibration_path || null,
+      calibration_script_path: result?.calibration_script_path || null,
+      debug_port: result?.debug_port || null,
+      diagnostics: {
+        stdout_last_line: getLastOutputLine(result?.stdout),
+        stderr_last_line: getLastOutputLine(result?.stderr)
+      }
+    };
+  }
+
+  return {
+    status: "CALIBRATED",
+    message: "精选页收藏按钮校准完成，可重新执行 start_recommend_pipeline_run。",
+    calibration_path: result.calibration_path,
+    calibration_script_path: result.calibration_script_path,
+    debug_port: result.debug_port
+  };
+}
+
 async function handleRequest(message, workspaceRoot) {
   if (!message || message.jsonrpc !== "2.0") {
     return createJsonRpcError(null, -32600, "Invalid JSON-RPC request");
@@ -1269,6 +1389,13 @@ async function handleRequest(message, workspaceRoot) {
       }
     }
 
+    if (toolName === TOOL_RUN_FEATURED_CALIBRATION) {
+      const inputError = validateRunFeaturedCalibrationArgs(args);
+      if (inputError) {
+        return createJsonRpcError(id, -32602, inputError);
+      }
+    }
+
     if ([TOOL_GET_RUN, TOOL_CANCEL_RUN, TOOL_PAUSE_RUN, TOOL_RESUME_RUN].includes(toolName)) {
       if (!args || typeof args.run_id !== "string" || !normalizeText(args.run_id)) {
         return createJsonRpcError(id, -32602, "run_id is required and must be a string");
@@ -1287,6 +1414,10 @@ async function handleRequest(message, workspaceRoot) {
         payload = handlePauseRunTool(args);
       } else if (toolName === TOOL_RESUME_RUN) {
         payload = handleResumeRunTool(args);
+      } else if (toolName === TOOL_GET_FEATURED_CALIBRATION_STATUS) {
+        payload = handleGetFeaturedCalibrationStatusTool(workspaceRoot);
+      } else if (toolName === TOOL_RUN_FEATURED_CALIBRATION) {
+        payload = await handleRunFeaturedCalibrationTool({ workspaceRoot, args });
       } else {
         return createJsonRpcError(id, -32602, `Unknown tool: ${toolName || ""}`);
       }
