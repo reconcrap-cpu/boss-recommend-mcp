@@ -679,15 +679,174 @@ function parseGeekIdFromUrl(url) {
   if (!raw) return null;
   try {
     const parsed = new URL(raw);
-    const keys = ["geekId", "geek_id", "gid", "encryptGeekId", "securityId"];
+    const keys = ["geekId", "geek_id", "gid", "encryptGeekId", "encryptJid", "jid", "securityId"];
     for (const key of keys) {
       const value = normalizeText(parsed.searchParams.get(key) || "");
       if (value) return value;
     }
   } catch {}
-  const matched = raw.match(/[?&](?:geekId|geek_id|gid|encryptGeekId|securityId)=([^&]+)/i);
+  const matched = raw.match(/[?&](?:geekId|geek_id|gid|encryptGeekId|encryptJid|jid|securityId)=([^&]+)/i);
   if (matched?.[1]) return decodeURIComponent(matched[1]);
   return null;
+}
+
+function parseGeekIdFromPostData(postData) {
+  const raw = normalizeText(postData);
+  if (!raw) return null;
+  const keys = ["geekId", "geek_id", "gid", "encryptGeekId", "encryptJid", "jid", "securityId"];
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      const queue = [parsed];
+      let depth = 0;
+      while (queue.length > 0 && depth < 5) {
+        const current = queue.shift();
+        depth += 1;
+        if (!current || typeof current !== "object") continue;
+        for (const key of keys) {
+          const value = normalizeText(current[key] || "");
+          if (value) return value;
+        }
+        for (const value of Object.values(current)) {
+          if (value && typeof value === "object") {
+            queue.push(value);
+          }
+        }
+      }
+    }
+  } catch {}
+
+  const matched = raw.match(/(?:^|[?&,\s"'])?(?:geekId|geek_id|gid|encryptGeekId|encryptJid|jid|securityId)(?:["']?\s*[:=]\s*["']?)([^&,"'\s}]+)/i);
+  if (matched?.[1]) return decodeURIComponent(matched[1]);
+  return null;
+}
+
+function collectGeekIdsFromPayload(payload, fallbackGeekId = null) {
+  if (!payload || typeof payload !== "object") return [];
+  const geekDetail = payload?.geekDetail || payload;
+  const baseInfo = geekDetail?.geekBaseInfo || {};
+  const ids = [
+    fallbackGeekId,
+    baseInfo.geekId,
+    baseInfo.encryptGeekId,
+    baseInfo.securityId,
+    geekDetail?.geekId,
+    geekDetail?.encryptGeekId,
+    geekDetail?.securityId,
+    payload?.geekId,
+    payload?.encryptGeekId,
+    payload?.securityId
+  ].map((value) => normalizeText(value)).filter(Boolean);
+  return Array.from(new Set(ids));
+}
+
+function hasResumePayloadShape(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const geekDetail = payload?.geekDetail && typeof payload.geekDetail === "object"
+    ? payload.geekDetail
+    : payload;
+  const baseInfo = geekDetail?.geekBaseInfo || {};
+  const hasIdentity = Boolean(
+    normalizeText(
+      baseInfo?.name
+      || geekDetail?.geekName
+      || payload?.geekName
+      || baseInfo?.geekId
+      || baseInfo?.encryptGeekId
+      || baseInfo?.securityId
+      || geekDetail?.geekId
+      || geekDetail?.encryptGeekId
+      || geekDetail?.securityId
+      || payload?.geekId
+      || payload?.encryptGeekId
+      || payload?.securityId
+      || ""
+    )
+  );
+  const hasResumeSections = [
+    geekDetail?.geekExpectList,
+    geekDetail?.geekWorkExpList,
+    geekDetail?.geekProjExpList,
+    geekDetail?.geekEduExpList,
+    geekDetail?.geekEducationList,
+    geekDetail?.geekSkillList
+  ].some((section) => Array.isArray(section) && section.length > 0);
+  const hasResumeTextFields = Boolean(
+    normalizeText(
+      geekDetail?.geekAdvantage
+      || baseInfo?.userDesc
+      || baseInfo?.userDescription
+      || ""
+    )
+  );
+  return hasIdentity && (hasResumeSections || hasResumeTextFields);
+}
+
+function findResumePayloadInObject(root, maxDepth = 4, visited = new Set()) {
+  if (root === null || root === undefined || maxDepth < 0) return null;
+  if (typeof root !== "object") return null;
+  if (visited.has(root)) return null;
+  visited.add(root);
+
+  if (hasResumePayloadShape(root)) {
+    return root;
+  }
+
+  if (maxDepth === 0) return null;
+
+  if (Array.isArray(root)) {
+    for (const item of root) {
+      const found = findResumePayloadInObject(item, maxDepth - 1, visited);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  const priorityKeys = [
+    "zpData",
+    "data",
+    "result",
+    "geekDetail",
+    "detail",
+    "info"
+  ];
+  for (const key of priorityKeys) {
+    if (!(key in root)) continue;
+    const found = findResumePayloadInObject(root[key], maxDepth - 1, visited);
+    if (found) return found;
+  }
+
+  for (const value of Object.values(root)) {
+    const found = findResumePayloadInObject(value, maxDepth - 1, visited);
+    if (found) return found;
+  }
+  return null;
+}
+
+function extractResumePayloadFromResponseBody(parsedBody) {
+  return findResumePayloadInObject(parsedBody, 4) || null;
+}
+
+function isResumeInfoRequestUrl(url) {
+  const normalizedUrl = normalizeText(url).toLowerCase();
+  if (!normalizedUrl || !normalizedUrl.includes("/wapi/")) return false;
+  if (!normalizedUrl.includes("geek") || !normalizedUrl.includes("info")) return false;
+  if (/\/wapi\/zpjob\/view\/geek\/info\b/.test(normalizedUrl)) return true;
+  if (/\/wapi\/zpitem\/web\/boss\/[^?#]*\/geek\/info\b/.test(normalizedUrl)) return true;
+  if (/\/boss\/[^?#]*\/geek\/info\b/.test(normalizedUrl)) return true;
+  if (/\/geek\/info\b/.test(normalizedUrl)) return true;
+  return /[?&](?:geekid|geek_id|encryptgeekid|encryptjid|jid|securityid)=/.test(normalizedUrl);
+}
+
+function isResumeRelatedWapiUrl(url) {
+  const normalizedUrl = normalizeText(url).toLowerCase();
+  if (!normalizedUrl || !normalizedUrl.includes("/wapi/")) return false;
+  return (
+    normalizedUrl.includes("geek")
+    || normalizedUrl.includes("resume")
+    || normalizedUrl.includes("candidate")
+    || normalizedUrl.includes("friend")
+  );
 }
 
 function formatResumeApiData(data) {
@@ -1929,6 +2088,8 @@ class RecommendScreenCli {
     this.resumeCaptureFailureStreakKeys = [];
     this.currentCandidateKey = null;
     this.resumeNetworkRequests = new Map();
+    this.resumeNetworkRelatedRequests = new Map();
+    this.resumeNetworkDiagnostics = [];
     this.resumeNetworkByGeekId = new Map();
     this.latestResumeNetworkPayload = null;
     this.favoriteActionEvents = [];
@@ -2002,7 +2163,7 @@ class RecommendScreenCli {
   }
 
   buildProgressSnapshot(completionReason = null) {
-    const defaultResumeSource = this.args.pageScope === "featured" ? "network" : "image_fallback";
+    const defaultResumeSource = "network";
     const snapshot = {
       processed_count: this.processedCount,
       passed_count: this.passedCandidates.length,
@@ -2070,18 +2231,95 @@ class RecommendScreenCli {
       });
   }
 
+  recordResumeNetworkDiagnostic(entry) {
+    const normalized = {
+      ts: Number.isFinite(Number(entry?.ts)) ? Number(entry.ts) : Date.now(),
+      kind: normalizeText(entry?.kind || "unknown") || "unknown",
+      request_id: normalizeText(entry?.request_id || "") || null,
+      method: normalizeText(entry?.method || "").toUpperCase() || null,
+      url: normalizeText(entry?.url || "") || null,
+      geek_id: normalizeText(entry?.geek_id || "") || null,
+      match: normalizeText(entry?.match || "") || null,
+      reason: normalizeText(entry?.reason || "") || null,
+      error: normalizeText(entry?.error || "") || null,
+      resume_text_len: Number.isFinite(Number(entry?.resume_text_len)) ? Number(entry.resume_text_len) : null,
+      candidate_key: normalizeText(entry?.candidate_key || "") || null,
+      source: normalizeText(entry?.source || "") || null,
+      waited_ms: Number.isFinite(Number(entry?.waited_ms)) ? Number(entry.waited_ms) : null
+    };
+    this.resumeNetworkDiagnostics.push(normalized);
+    if (this.resumeNetworkDiagnostics.length > 240) {
+      this.resumeNetworkDiagnostics = this.resumeNetworkDiagnostics.slice(-240);
+    }
+  }
+
+  summarizeResumeNetworkDiagnostics(since = 0) {
+    const timestamp = Number.isFinite(since) ? since : 0;
+    return this.resumeNetworkDiagnostics
+      .filter((item) => Number(item?.ts || 0) >= timestamp)
+      .slice(-20)
+      .map((item) => {
+        const prefix = `[${item.kind}]`;
+        if (item.kind === "request") {
+          return `${prefix} ${item.method || "GET"} ${item.url || ""} match=${item.match || "none"} geek=${item.geek_id || "-"}`;
+        }
+        if (item.kind === "response_hit") {
+          return `${prefix} ${item.url || ""} geek=${item.geek_id || "-"} resume_len=${item.resume_text_len ?? "?"}`;
+        }
+        if (item.kind === "response_miss") {
+          return `${prefix} ${item.url || ""} reason=${item.reason || "payload_not_found"}`;
+        }
+        if (item.kind === "response_error") {
+          return `${prefix} ${item.url || ""} error=${item.error || "unknown"}`;
+        }
+        if (item.kind === "wait_hit") {
+          return `${prefix} candidate=${item.candidate_key || "-"} source=${item.source || "-"} waited_ms=${item.waited_ms ?? "?"} resume_len=${item.resume_text_len ?? "?"}`;
+        }
+        if (item.kind === "wait_timeout") {
+          return `${prefix} candidate=${item.candidate_key || "-"} waited_ms=${item.waited_ms ?? "?"} reason=${item.reason || "timeout"}`;
+        }
+        return `${prefix} ${item.url || item.reason || "n/a"}`;
+      });
+  }
+
+  logResumeNetworkMissDiagnostics(candidate, options = {}) {
+    const candidateKey = normalizeText(candidate?.key || candidate?.geek_id || "");
+    const candidateName = normalizeText(candidate?.name || "");
+    const waitStartedAt = Number.isFinite(options.waitStartedAt) ? options.waitStartedAt : 0;
+    const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 0;
+    const now = Date.now();
+    const latestPayloadAgeMs = this.latestResumeNetworkPayload
+      ? Math.max(0, now - Number(this.latestResumeNetworkPayload.ts || 0))
+      : null;
+    const latestPayloadGeekIds = Array.isArray(this.latestResumeNetworkPayload?.geekIds)
+      ? this.latestResumeNetworkPayload.geekIds.slice(0, 4)
+      : [];
+    const recentLines = this.summarizeResumeNetworkDiagnostics(waitStartedAt);
+    const trackedResumeRequestCount = this.resumeNetworkRequests.size;
+    const trackedRelatedRequestCount = this.resumeNetworkRelatedRequests.size;
+
+    log(
+      `[network简历未命中] candidate=${candidateKey || candidateName || "unknown"} `
+      + `wait_ms=${timeoutMs || "n/a"} `
+      + `tracked_resume_requests=${trackedResumeRequestCount} `
+      + `tracked_related_requests=${trackedRelatedRequestCount} `
+      + `cached_by_geek=${this.resumeNetworkByGeekId.size} `
+      + `latest_payload_age_ms=${latestPayloadAgeMs ?? "none"} `
+      + `latest_payload_geek_ids=${latestPayloadGeekIds.length ? latestPayloadGeekIds.join("|") : "none"}`
+    );
+    if (recentLines.length > 0) {
+      log(`[network简历未命中][最近网络事件] ${recentLines.join(" || ")}`);
+    } else {
+      log("[network简历未命中][最近网络事件] none");
+    }
+  }
+
   cacheResumeNetworkPayload(payload, fallbackGeekId = null) {
     if (!payload || typeof payload !== "object") return;
     const geekDetail = payload.geekDetail || payload;
     const baseInfo = geekDetail.geekBaseInfo || {};
-    const geekId = normalizeText(
-      fallbackGeekId
-      || baseInfo.geekId
-      || baseInfo.encryptGeekId
-      || geekDetail.geekId
-      || payload.geekId
-      || ""
-    ) || null;
+    const geekIds = collectGeekIdsFromPayload(payload, fallbackGeekId);
+    const geekId = geekIds[0] || null;
     const candidateInfo = {
       name: baseInfo.name || geekDetail.geekName || payload.geekName || "",
       school: (geekDetail.geekEduExpList && geekDetail.geekEduExpList[0]?.school)
@@ -2093,17 +2331,18 @@ class RecommendScreenCli {
       company: (geekDetail.geekWorkExpList && geekDetail.geekWorkExpList[0]?.company) || "",
       position: (geekDetail.geekWorkExpList && geekDetail.geekWorkExpList[0]?.positionName) || "",
       resumeText: formatResumeApiData(payload),
-      alreadyInterested: payload.alreadyInterested === true
+      alreadyInterested: payload.alreadyInterested === true || geekDetail.alreadyInterested === true
     };
     const wrapped = {
       ts: Date.now(),
       geekId: geekId || null,
+      geekIds,
       data: payload,
       candidateInfo
     };
     this.latestResumeNetworkPayload = wrapped;
-    if (geekId) {
-      this.resumeNetworkByGeekId.set(geekId, wrapped);
+    for (const id of geekIds) {
+      this.resumeNetworkByGeekId.set(id, wrapped);
     }
   }
 
@@ -2122,35 +2361,81 @@ class RecommendScreenCli {
   }
 
   async waitForNetworkResumeCandidateInfo(candidate, timeoutMs = 2200) {
+    const waitStartedAt = Date.now();
+    const candidateKey = normalizeText(candidate?.key || candidate?.geek_id || "");
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const info = this.tryExtractNetworkResumeForCandidate(candidate);
       if (info && normalizeText(info.resumeText)) {
+        const source = candidateKey && this.resumeNetworkByGeekId.has(candidateKey)
+          ? "geek_id_map"
+          : "latest_payload";
+        this.recordResumeNetworkDiagnostic({
+          kind: "wait_hit",
+          candidate_key: candidateKey,
+          source,
+          waited_ms: Date.now() - waitStartedAt,
+          resume_text_len: normalizeText(info.resumeText).length
+        });
         return info;
       }
       await sleep(120);
     }
+    this.recordResumeNetworkDiagnostic({
+      kind: "wait_timeout",
+      candidate_key: candidateKey,
+      waited_ms: Date.now() - waitStartedAt,
+      reason: "resume_text_not_ready"
+    });
     return null;
   }
 
   handleNetworkRequestWillBeSent(params) {
     const url = normalizeText(params?.request?.url || "");
+    const postData = params?.request?.postData || "";
     if (!url) return;
-    if (url.includes("/wapi/zpitem/web/boss/search/geek/info")) {
-      const geekId = parseGeekIdFromUrl(url);
-      this.resumeNetworkRequests.set(params.requestId, {
-        ts: Date.now(),
+    const requestTs = Date.now();
+    const method = normalizeText(params?.request?.method || "").toUpperCase() || "GET";
+    const isResumeInfo = isResumeInfoRequestUrl(url);
+    const isResumeRelated = isResumeInfo || isResumeRelatedWapiUrl(url);
+    if (isResumeRelated) {
+      const geekId = parseGeekIdFromUrl(url) || parseGeekIdFromPostData(postData);
+      const meta = {
+        ts: requestTs,
         url,
-        geekId
+        geekId,
+        method,
+        isResumeInfo
+      };
+      this.resumeNetworkRelatedRequests.set(params.requestId, meta);
+      this.recordResumeNetworkDiagnostic({
+        kind: "request",
+        request_id: params.requestId,
+        method,
+        url: url.slice(0, 280),
+        geek_id: geekId,
+        match: isResumeInfo ? "resume_info_url" : "wapi_related_non_resume_info"
       });
-      return;
+      if (this.resumeNetworkRelatedRequests.size > 400) {
+        const oldest = [...this.resumeNetworkRelatedRequests.entries()]
+          .sort((a, b) => Number(a[1]?.ts || 0) - Number(b[1]?.ts || 0))
+          .slice(0, this.resumeNetworkRelatedRequests.size - 320);
+        for (const [requestId] of oldest) {
+          this.resumeNetworkRelatedRequests.delete(requestId);
+        }
+      }
+      if (isResumeInfo) {
+        this.resumeNetworkRequests.set(params.requestId, {
+          ts: requestTs,
+          url,
+          geekId
+        });
+        return;
+      }
     }
 
     if (this.favoriteClickPendingSince <= 0) return;
-    const requestTs = Date.now();
     if (requestTs < this.favoriteClickPendingSince) return;
-    const method = normalizeText(params?.request?.method || "").toUpperCase() || "GET";
-    const postData = params?.request?.postData || "";
     this.recordFavoriteNetworkTrace({
       ts: requestTs,
       kind: "http",
@@ -2200,17 +2485,60 @@ class RecommendScreenCli {
   }
 
   async handleNetworkLoadingFinished(params) {
-    const requestMeta = this.resumeNetworkRequests.get(params?.requestId);
-    if (!requestMeta) return;
-    this.resumeNetworkRequests.delete(params.requestId);
+    const requestId = params?.requestId;
+    const requestMeta = this.resumeNetworkRequests.get(requestId);
+    const relatedMeta = this.resumeNetworkRelatedRequests.get(requestId);
+    if (!requestMeta && !relatedMeta) return;
+    this.resumeNetworkRequests.delete(requestId);
+    this.resumeNetworkRelatedRequests.delete(requestId);
+    const effectiveMeta = requestMeta || relatedMeta || {};
+    const effectiveUrl = normalizeText(effectiveMeta.url || "");
+    const effectiveGeekId = normalizeText(effectiveMeta.geekId || "");
     try {
-      const responseBody = await this.Network.getResponseBody({ requestId: params.requestId });
-      if (!responseBody?.body) return;
-      const parsed = JSON.parse(responseBody.body);
-      if (parsed?.zpData) {
-        this.cacheResumeNetworkPayload(parsed.zpData, requestMeta.geekId);
+      const responseBody = await this.Network.getResponseBody({ requestId });
+      if (!responseBody?.body) {
+        this.recordResumeNetworkDiagnostic({
+          kind: "response_miss",
+          request_id: requestId,
+          url: effectiveUrl.slice(0, 280),
+          geek_id: effectiveGeekId,
+          reason: "empty_body"
+        });
+        return;
       }
-    } catch {}
+      const rawBody = responseBody.base64Encoded
+        ? Buffer.from(responseBody.body, "base64").toString("utf8")
+        : responseBody.body;
+      const parsed = JSON.parse(rawBody);
+      const resumePayload = extractResumePayloadFromResponseBody(parsed);
+      if (resumePayload) {
+        this.cacheResumeNetworkPayload(resumePayload, effectiveGeekId);
+        const formattedText = normalizeText(formatResumeApiData(resumePayload));
+        this.recordResumeNetworkDiagnostic({
+          kind: "response_hit",
+          request_id: requestId,
+          url: effectiveUrl.slice(0, 280),
+          geek_id: effectiveGeekId,
+          resume_text_len: formattedText.length
+        });
+      } else {
+        this.recordResumeNetworkDiagnostic({
+          kind: "response_miss",
+          request_id: requestId,
+          url: effectiveUrl.slice(0, 280),
+          geek_id: effectiveGeekId,
+          reason: "payload_not_found"
+        });
+      }
+    } catch (error) {
+      this.recordResumeNetworkDiagnostic({
+        kind: "response_error",
+        request_id: requestId,
+        url: effectiveUrl.slice(0, 280),
+        geek_id: effectiveGeekId,
+        error: normalizeText(error?.message || String(error)).slice(0, 240)
+      });
+    }
   }
 
   resetResumeCaptureFailureStreak() {
@@ -2319,13 +2647,13 @@ class RecommendScreenCli {
     const imageFallbackCount = this.passedCandidates.filter((item) => item?.resumeSource === "image_fallback").length;
     this.resumeSourceStats = {
       network: networkCount,
-      image_fallback: this.args.pageScope === "featured" ? 0 : imageFallbackCount
+      image_fallback: imageFallbackCount
     };
     if (this.resumeSourceStats.network <= 0 && this.resumeSourceStats.image_fallback <= 0) {
       const snapshotSource = normalizeText(parsed.resume_source || "").toLowerCase();
       if (snapshotSource === "network") {
         this.resumeSourceStats.network = 1;
-      } else if (snapshotSource === "image_fallback" && this.args.pageScope !== "featured") {
+      } else if (snapshotSource === "image_fallback") {
         this.resumeSourceStats.image_fallback = 1;
       }
     }
@@ -3456,11 +3784,18 @@ class RecommendScreenCli {
             throw this.buildError("DETAIL_OPEN_FAILED", "详情页打开超时");
           }
 
-          const isFeaturedScope = this.args.pageScope === "featured";
           let capture = null;
           let screening = null;
-          let resumeSource = isFeaturedScope ? "network" : "image_fallback";
-          const networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, 2400);
+          let resumeSource = "image_fallback";
+          const networkWaitMs = 4200;
+          const networkWaitStartedAt = Date.now();
+          const networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, networkWaitMs);
+          if (!normalizeText(networkCandidateInfo?.resumeText) && typeof this.logResumeNetworkMissDiagnostics === "function") {
+            this.logResumeNetworkMissDiagnostics(nextCandidate, {
+              timeoutMs: networkWaitMs,
+              waitStartedAt: networkWaitStartedAt
+            });
+          }
           const candidateProfile = {
             name: networkCandidateInfo?.name || nextCandidate.name || "",
             school: networkCandidateInfo?.school || nextCandidate.school || "",
@@ -3469,13 +3804,7 @@ class RecommendScreenCli {
             position: networkCandidateInfo?.position || nextCandidate.last_position || ""
           };
 
-          if (isFeaturedScope) {
-            if (!networkCandidateInfo?.resumeText) {
-              throw this.buildError(
-                "RESUME_NETWORK_UNAVAILABLE",
-                "精选页未获取到 network 简历数据，已跳过当前候选人。"
-              );
-            }
+          if (networkCandidateInfo?.resumeText) {
             screening = await this.callTextModel(networkCandidateInfo.resumeText);
             resumeSource = "network";
             this.resumeSourceStats.network += 1;
@@ -3548,7 +3877,9 @@ class RecommendScreenCli {
           log(`候选人处理失败: ${error.code || error.message}`);
           if (["RESUME_CAPTURE_FAILED", "RESUME_NETWORK_UNAVAILABLE"].includes(error.code)) {
             this.recordResumeCaptureFailure(nextCandidate.key);
-            const failureLabel = error.code === "RESUME_NETWORK_UNAVAILABLE" ? "简历 network 获取失败" : "简历截图失败";
+            const failureLabel = error.code === "RESUME_NETWORK_UNAVAILABLE"
+              ? "简历 network 获取失败且截图回退未完成"
+              : "简历截图失败";
             log(
               `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} ${failureLabel}，` +
               `已跳过当前候选人；连续失败 ${this.consecutiveResumeCaptureFailures}/${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES}`
@@ -3556,7 +3887,7 @@ class RecommendScreenCli {
             if (this.consecutiveResumeCaptureFailures >= MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES) {
               shouldMarkProcessed = false;
               const rollback = this.rollbackResumeCaptureFailureStreak(nextCandidate.key);
-              const failureTypeText = this.args.pageScope === "featured" ? "简历 network 获取失败" : "简历捕获失败";
+              const failureTypeText = "简历获取失败（network + 截图）";
               throw this.buildError(
                 "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT",
                 `连续 ${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES} 位候选人${failureTypeText}，已停止运行以避免错误跳过。` +

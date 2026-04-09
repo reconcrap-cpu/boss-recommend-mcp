@@ -225,7 +225,7 @@ async function testConsecutiveResumeCaptureFailuresStillAbort() {
     () => cli.run(),
     (error) => {
       assert.equal(error.code, "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT");
-      assert.match(error.message, /连续 .* 位候选人简历捕获失败/);
+      assert.match(error.message, /连续 .* 位候选人简历(?:捕获失败|获取失败（network \+ 截图）)/);
       assert.equal(error.rollback?.rollback_count, maxFailures);
       assert.equal(error.partial_result?.processed_count, 0);
       assert.equal(error.partial_result?.skipped_count, 0);
@@ -338,29 +338,28 @@ async function testFeaturedShouldUseNetworkResumeOnly() {
   assert.equal(result.result.resume_source, "network");
 }
 
-async function testRecommendShouldKeepImageCaptureEvenWhenNetworkResumeExists() {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-recommend-image-main-"));
-  const candidate = { key: "img-main-1", geek_id: "img-main-1", name: "recommend image main candidate" };
+async function testRecommendShouldPreferNetworkResumeWhenAvailable() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-recommend-network-main-"));
+  const candidate = { key: "net-main-1", geek_id: "net-main-1", name: "recommend network main candidate" };
   const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
-    candidates: [candidate],
-    captureOutcomes: new Map([
-      ["img-main-1", { stitchedImage: path.join(tempDir, "img-main-1.png") }]
-    ]),
-    screeningByKey: new Map([
-      ["img-main-1", { passed: true, reason: "image path used", summary: "image path used" }]
-    ])
+    candidates: [candidate]
   });
   cli.waitForNetworkResumeCandidateInfo = async () => ({
-    resumeText: "这段 network 文本在 recommend 页面不应被用于筛选"
+    resumeText: "这段 network 文本在 recommend 页面应优先用于筛选"
   });
-  cli.callTextModel = async () => {
-    throw new Error("text model should not be called for recommend scope");
+  cli.callTextModel = async () => ({
+    passed: true,
+    reason: "network used",
+    summary: "network used"
+  });
+  cli.captureResumeImage = async () => {
+    throw new Error("capture should not be called when recommend network resume exists");
   };
 
   const result = await cli.run();
   assert.equal(result.status, "COMPLETED");
   assert.equal(result.result.passed_count, 1);
-  assert.equal(result.result.resume_source, "image_fallback");
+  assert.equal(result.result.resume_source, "network");
 }
 
 async function testNetworkMissShouldFallbackToImageCapture() {
@@ -373,6 +372,53 @@ async function testNetworkMissShouldFallbackToImageCapture() {
     ]),
     screeningByKey: new Map([
       ["img-1", { passed: false, reason: "image path used", summary: "image path used" }]
+    ])
+  });
+  cli.waitForNetworkResumeCandidateInfo = async () => null;
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.resume_source, "image_fallback");
+}
+
+async function testLatestShouldPreferNetworkResumeWhenAvailable() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-latest-network-main-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "latest";
+  const candidate = { key: "latest-net-1", geek_id: "latest-net-1", name: "latest network candidate" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [candidate]
+  });
+  cli.waitForNetworkResumeCandidateInfo = async () => ({
+    resumeText: "最新页 network 简历可用"
+  });
+  cli.callTextModel = async () => ({
+    passed: true,
+    reason: "network used",
+    summary: "network used"
+  });
+  cli.captureResumeImage = async () => {
+    throw new Error("capture should not be called when latest network resume exists");
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.resume_source, "network");
+}
+
+async function testLatestNetworkMissShouldFallbackToImageCapture() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-latest-network-fallback-"));
+  const args = createArgs(tempDir);
+  args.pageScope = "latest";
+  const candidate = { key: "latest-img-1", geek_id: "latest-img-1", name: "latest image candidate" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [candidate],
+    captureOutcomes: new Map([
+      ["latest-img-1", { stitchedImage: path.join(tempDir, "latest-img-1.png") }]
+    ]),
+    screeningByKey: new Map([
+      ["latest-img-1", { passed: false, reason: "image fallback used", summary: "image fallback used" }]
     ])
   });
   cli.waitForNetworkResumeCandidateInfo = async () => null;
@@ -803,8 +849,10 @@ async function main() {
   await testPageExhaustedBeforeTargetShouldRaiseRecoverableError();
   await testPageExhaustedWithoutTargetShouldStillComplete();
   await testFeaturedShouldUseNetworkResumeOnly();
-  await testRecommendShouldKeepImageCaptureEvenWhenNetworkResumeExists();
+  await testRecommendShouldPreferNetworkResumeWhenAvailable();
   await testNetworkMissShouldFallbackToImageCapture();
+  await testLatestShouldPreferNetworkResumeWhenAvailable();
+  await testLatestNetworkMissShouldFallbackToImageCapture();
   await testVisionModelFailureShouldSkipCandidateAndContinue();
   await testFeaturedNetworkMissShouldSkipWithoutImageCapture();
   await testFeaturedFavoriteShouldNotUseDomFallback();

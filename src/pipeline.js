@@ -896,15 +896,6 @@ export async function runRecommendPipeline(
   };
 
   const ensureSelectedPageTab = async () => {
-    if (selectedPage === "recommend") {
-      activeTabStatus = selectedTabStatus;
-      return {
-        ok: true,
-        switched: false,
-        before_state: null,
-        after_state: null
-      };
-    }
     const expectedStatus = selectedTabStatus;
     let beforeState = null;
     if (typeof readTabState === "function") {
@@ -1267,11 +1258,11 @@ export async function runRecommendPipeline(
           );
           runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
         } else {
-          const recoveryFailureText = selectedPage === "featured" ? "network 简历获取失败" : "截图失败";
-          runtimeHooks.setStage(
-            "screen_recovery",
-            `screen 连续${recoveryFailureText}，开始自动恢复（第 ${screenAutoRecoveryCount} 次）：刷新 recommend 页面并重跑 search。`
-          );
+        const recoveryFailureText = "简历获取失败（network + 截图）";
+        runtimeHooks.setStage(
+          "screen_recovery",
+          `screen 连续${recoveryFailureText}，开始自动恢复（第 ${screenAutoRecoveryCount} 次）：刷新 recommend 页面并重跑 search。`
+        );
           runtimeHooks.heartbeat("screen_recovery", lastAutoRecovery);
         }
 
@@ -1388,11 +1379,9 @@ export async function runRecommendPipeline(
       || tabStatusToPageScope(resolvedActiveTabStatus)
     ) || selectedPage;
     const resolvedResumeSourceRaw = normalizeText(screenSummary.resume_source || "").toLowerCase();
-    const resolvedResumeSource = resolvedResumeSourceRaw === "network"
-      ? "network"
-      : resolvedSelectedPage === "featured"
-        ? "network"
-        : "image_fallback";
+    const resolvedResumeSource = ["network", "image_fallback"].includes(resolvedResumeSourceRaw)
+      ? resolvedResumeSourceRaw
+      : "network";
     runtimeHooks.progress("finalize", {
       processed: screenSummary.processed_count ?? 0,
       passed: screenSummary.passed_count ?? 0,

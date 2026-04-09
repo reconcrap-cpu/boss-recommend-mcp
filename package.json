@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
