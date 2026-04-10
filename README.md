@@ -14,6 +14,12 @@ MCP 工具：
 - `cancel_recommend_pipeline_run`（取消运行中任务）
 - `pause_recommend_pipeline_run`（请求暂停 run；会在当前候选人处理完成后进入 paused）
 - `resume_recommend_pipeline_run`（继续 paused run；沿用同 run_id 与同 CSV）
+- `run_recommend_self_heal`（手动运维工具；扫描 Boss recommend 的 selector / network 规则漂移，并在确认后应用高置信度修复）
+  - `validation_profile=safe`：只做非破坏性扫描与被动 network 观察
+  - `validation_profile=full`：会主动打开候选人详情，并执行收藏往返校验与一次打招呼校验；若完整交互没跑通，会明确返回验证异常而不是静默跳过
+  - 扫描会主动覆盖 recommend/latest/featured 三个 tab 的详情链路（详情打开、详情内关键 selector、popup 关闭）
+  - 搜索链路 selector 会在状态触发后验证：职位下拉、职位搜索输入、职位 label、筛选面板、筛选分组（school/degree/gender/recentNotView）、筛选滚动容器与筛选项激活态
+  - 对关闭弹层相关 selector，会同时验证 close 按钮与 fallback close 候选 selector
 
 状态机：
 
@@ -52,6 +58,7 @@ MCP 工具：
 - 不会对每位候选人重复确认
 - 推荐页详情处理完成后，会强制关闭详情页并确认已关闭
 - 简历提取采用“分段滚动截图 + 拼成长图”的方式，再交给多模态模型判断
+- 提供显式运维自愈工具：只在手动调用 `run_recommend_self_heal` 时运行，不会接入正常 run / doctor / preflight 自动链路
 - 运行前会自动做依赖体检（Node.js、Python、Pillow、`chrome-remote-interface`、`ws`），缺失时会在 `doctor` 与流水线失败诊断中明确提示
 - 若 preflight 失败，返回 `diagnostics.recovery`（含有序修复步骤与 `agent_prompt`），可直接交给 AI agent 自动按顺序安装依赖
 - 不依赖 PowerShell；Windows / macOS 均可运行（命令提示会按平台给出）

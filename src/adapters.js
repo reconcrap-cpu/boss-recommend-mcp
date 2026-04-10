@@ -4,6 +4,10 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import CDP from "chrome-remote-interface";
+import {
+  buildFirstSelectorLookupExpression,
+  getRecommendSelectorRule
+} from "./recommend-healing-config.js";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const packagedMcpDir = path.resolve(path.dirname(currentFilePath), "..");
@@ -23,6 +27,44 @@ const PAGE_SCOPE_TO_TAB_STATUS = {
   latest: "1",
   featured: "3"
 };
+const RECOMMEND_IFRAME_SELECTORS = getRecommendSelectorRule(
+  ["top", "recommend_iframe"],
+  ['iframe[name="recommendFrame"]', 'iframe[src*="/web/frame/recommend/"]', "iframe"]
+);
+const RECOMMEND_TAB_SELECTORS = getRecommendSelectorRule(
+  ["frame", "tab_items"],
+  ['li.tab-item[data-status]', 'li[data-status][class*="tab"]']
+);
+const RECOMMEND_CARD_SELECTORS = getRecommendSelectorRule(["frame", "recommend_cards"], ['ul.card-list > li.card-item']);
+const FEATURED_CARD_SELECTORS = getRecommendSelectorRule(["frame", "featured_cards"], ['li.geek-info-card']);
+const LATEST_CARD_SELECTORS = getRecommendSelectorRule(["frame", "latest_cards"], ['.candidate-card-wrap .card-inner[data-geek]', '.candidate-card-wrap [data-geek]']);
+const DETAIL_POPUP_SELECTORS = getRecommendSelectorRule(
+  ["detail", "popup"],
+  [
+    ".dialog-wrap.active",
+    ".boss-popup__wrapper",
+    ".boss-popup_wrapper",
+    ".boss-dialog_wrapper",
+    ".boss-dialog",
+    ".resume-item-detail",
+    ".geek-detail-modal",
+    '[class*="popup"][class*="wrapper"]',
+    '[class*="dialog"][class*="wrapper"]'
+  ]
+);
+const DETAIL_RESUME_IFRAME_SELECTORS = getRecommendSelectorRule(
+  ["detail", "resume_iframe"],
+  ['iframe[src*="/web/frame/c-resume/"]', 'iframe[name*="resume"]']
+);
+const REFRESH_FINISHED_WRAP_SELECTORS = getRecommendSelectorRule(["frame", "refresh_finished_wrap"], [".finished-wrap"]);
+const REFRESH_BUTTON_SELECTORS = getRecommendSelectorRule(
+  ["frame", "refresh_button"],
+  [".finished-wrap .btn.btn-refresh", ".finished-wrap .btn-refresh", ".no-data-refresh .btn-refresh"]
+);
+
+function buildRecommendIframeLookupExpression(rootExpr = "document") {
+  return buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS, rootExpr);
+}
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -1575,9 +1617,7 @@ function buildRecommendIframeProbeExpression() {
         title
       };
     }
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || document.querySelector('iframe');
+    const frame = ${buildRecommendIframeLookupExpression()};
     const frameUrl = (() => {
       try {
         return String(frame?.contentWindow?.location?.href || frame?.src || "");
@@ -1798,15 +1838,16 @@ async function evaluateCdpExpression(client, expression) {
 
 function buildRecommendTabStateExpression() {
   return `(() => {
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || document.querySelector('iframe');
+    const frame = ${buildRecommendIframeLookupExpression()};
     if (!frame || !frame.contentDocument) {
       return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
     }
     const doc = frame.contentDocument;
     const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]')).map((node) => {
+    const tabs = Array.from(new Set(${JSON.stringify(RECOMMEND_TAB_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      }))).map((node) => {
       const status = normalize(node.getAttribute('data-status'));
       const className = normalize(node.className);
       const active = (
@@ -1823,9 +1864,18 @@ function buildRecommendTabStateExpression() {
       };
     });
     const activeTab = tabs.find((item) => item.active && item.status) || null;
-    const featuredCount = doc.querySelectorAll('li.geek-info-card').length;
-    const recommendCount = doc.querySelectorAll('ul.card-list > li.card-item').length;
-    const latestCount = doc.querySelectorAll('.candidate-card-wrap .card-inner[data-geek], .candidate-card-wrap [data-geek]').length;
+    const featuredCount = ${JSON.stringify(FEATURED_CARD_SELECTORS)}
+      .reduce((sum, selector) => {
+        try { return sum + doc.querySelectorAll(selector).length; } catch { return sum; }
+      }, 0);
+    const recommendCount = ${JSON.stringify(RECOMMEND_CARD_SELECTORS)}
+      .reduce((sum, selector) => {
+        try { return sum + doc.querySelectorAll(selector).length; } catch { return sum; }
+      }, 0);
+    const latestCount = ${JSON.stringify(LATEST_CARD_SELECTORS)}
+      .reduce((sum, selector) => {
+        try { return sum + doc.querySelectorAll(selector).length; } catch { return sum; }
+      }, 0);
     let inferredStatus = activeTab?.status || null;
     if (!inferredStatus) {
       if (featuredCount > 0 && recommendCount === 0 && latestCount === 0) inferredStatus = '3';
@@ -1847,15 +1897,16 @@ function buildRecommendTabStateExpression() {
 
 function buildRecommendTabSwitchExpression(targetStatus) {
   return `((targetStatus) => {
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || document.querySelector('iframe');
+    const frame = ${buildRecommendIframeLookupExpression()};
     if (!frame || !frame.contentDocument) {
       return { ok: false, state: 'NO_RECOMMEND_IFRAME' };
     }
     const doc = frame.contentDocument;
     const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+    const tabs = Array.from(new Set(${JSON.stringify(RECOMMEND_TAB_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      })));
     const target = tabs.find((node) => normalize(node.getAttribute('data-status')) === String(targetStatus)) || null;
     if (!target) {
       return { ok: false, state: 'TAB_NOT_FOUND', target_status: String(targetStatus) };
@@ -1883,19 +1934,7 @@ function buildRecommendTabSwitchExpression(targetStatus) {
 
 function buildRecommendDetailStateExpression() {
   return `(() => {
-    const selectors = [
-      '.dialog-wrap.active',
-      '.boss-popup__wrapper',
-      '.boss-popup_wrapper',
-      '.boss-dialog_wrapper',
-      '.boss-dialog',
-      '.resume-item-detail',
-      '.geek-detail-modal',
-      'iframe[src*="/web/frame/c-resume/"]',
-      'iframe[name*="resume"]',
-      '[class*="popup"][class*="wrapper"]',
-      '[class*="dialog"][class*="wrapper"]'
-    ];
+    const selectors = ${JSON.stringify([...DETAIL_POPUP_SELECTORS, ...DETAIL_RESUME_IFRAME_SELECTORS])};
     const isVisible = (node) => {
       if (!node || !node.getBoundingClientRect) return false;
       const rect = node.getBoundingClientRect();
@@ -1929,9 +1968,7 @@ function buildRecommendDetailStateExpression() {
     const topDetail = findVisibleDetail(document, 'top');
     if (topDetail) return topDetail;
 
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || null;
+    const frame = ${buildRecommendIframeLookupExpression()} || null;
     if (!frame || !frame.contentDocument) {
       return { ok: true, open: false, reason: 'NO_RECOMMEND_IFRAME' };
     }
@@ -2197,9 +2234,7 @@ export async function switchRecommendTab(workspaceRoot, options = {}) {
 
 function buildRecommendRefreshStateExpression() {
   return `(() => {
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || document.querySelector('iframe');
+    const frame = ${buildRecommendIframeLookupExpression()};
     if (!frame || !frame.contentDocument) {
       return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
     }
@@ -2215,13 +2250,29 @@ function buildRecommendRefreshStateExpression() {
       const rect = el.getBoundingClientRect();
       return rect.width > 2 && rect.height > 2 && el.offsetParent !== null;
     };
-    const finishedWrap = Array.from(doc.querySelectorAll('.finished-wrap')).find((el) => isVisible(el)) || null;
-    const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
+    const finishedWrap = ${JSON.stringify(REFRESH_FINISHED_WRAP_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      })
       .find((el) => isVisible(el)) || null;
-    const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
+    const refreshButton = ${JSON.stringify(REFRESH_BUTTON_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      })
+      .find((el) => isVisible(el)) || null;
+    const cards = ${JSON.stringify(RECOMMEND_CARD_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      });
     const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
-    const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap .card-inner[data-geek], .candidate-card-wrap [data-geek]'));
-    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+    const latestCards = ${JSON.stringify(LATEST_CARD_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      });
+    const tabs = ${JSON.stringify(RECOMMEND_TAB_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      });
     const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
     const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
     const inferredStatus = activeStatus
@@ -2249,9 +2300,7 @@ function buildRecommendRefreshStateExpression() {
 
 function buildRecommendRefreshClickExpression() {
   return `(() => {
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || document.querySelector('iframe');
+    const frame = ${buildRecommendIframeLookupExpression()};
     if (!frame || !frame.contentDocument) {
       return { ok: false, state: 'NO_RECOMMEND_IFRAME' };
     }
@@ -2267,7 +2316,10 @@ function buildRecommendRefreshClickExpression() {
       const rect = el.getBoundingClientRect();
       return rect.width > 2 && rect.height > 2 && el.offsetParent !== null;
     };
-    const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
+    const refreshButton = ${JSON.stringify(REFRESH_BUTTON_SELECTORS)}
+      .flatMap((selector) => {
+        try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+      })
       .find((el) => isVisible(el)) || null;
     if (!refreshButton) {
       return { ok: false, state: 'REFRESH_BUTTON_NOT_FOUND' };

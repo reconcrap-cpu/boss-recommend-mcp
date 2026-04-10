@@ -24,6 +24,204 @@ const PAGE_SCOPE_TAB_STATUS = {
 const BOTTOM_HINT_KEYWORDS = ["没有更多", "已显示全部", "已经到底", "暂无更多", "推荐完了", "没有更多人选"];
 const LOAD_MORE_HINT_KEYWORDS = ["滚动加载更多", "下滑加载更多", "继续下滑", "继续滑动", "滑动加载", "正在加载", "加载中"];
 
+function getHealingRulesPath() {
+  const fromEnv = normalizeText(process.env.BOSS_RECOMMEND_HEALING_RULES_FILE || "");
+  return fromEnv
+    ? path.resolve(fromEnv)
+    : path.resolve(__dirname, "..", "..", "src", "recommend-healing-rules.json");
+}
+
+function loadHealingRules() {
+  try {
+    return JSON.parse(fs.readFileSync(getHealingRulesPath(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function getHealingValue(root, pathParts, fallback) {
+  let current = root;
+  for (const part of pathParts) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      current = undefined;
+      break;
+    }
+    current = current[part];
+  }
+  if (Array.isArray(current) && current.length > 0) {
+    return current.map((item) => String(item));
+  }
+  if (current && typeof current === "object" && !Array.isArray(current)) {
+    return JSON.parse(JSON.stringify(current));
+  }
+  if (typeof current === "string") return current;
+  return fallback;
+}
+
+function compilePatternList(patterns = []) {
+  return (Array.isArray(patterns) ? patterns : [])
+    .map((pattern) => {
+      try {
+        return new RegExp(String(pattern), "i");
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function firstMatchingPattern(text, patterns = []) {
+  const normalized = String(text || "");
+  for (const pattern of compilePatternList(patterns)) {
+    if (pattern.test(normalized)) return pattern.source;
+  }
+  return null;
+}
+
+function buildFirstSelectorLookupExpression(selectors = [], rootExpr = "document") {
+  return `(() => {
+    const selectors = ${JSON.stringify(selectors)};
+    for (const selector of selectors) {
+      try {
+        const node = ${rootExpr}.querySelector(selector);
+        if (node) return node;
+      } catch {}
+    }
+    return null;
+  })()`;
+}
+
+function buildSelectorCollectionExpression(selectors = [], rootExpr = "document") {
+  return `(() => {
+    const selectors = ${JSON.stringify(selectors)};
+    const nodes = [];
+    for (const selector of selectors) {
+      try {
+        nodes.push(...Array.from(${rootExpr}.querySelectorAll(selector)));
+      } catch {}
+    }
+    return Array.from(new Set(nodes));
+  })()`;
+}
+
+const HEALING_RULES = loadHealingRules();
+const RECOMMEND_IFRAME_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "top", "recommend_iframe"],
+  ['iframe[name="recommendFrame"]', 'iframe[src*="/web/frame/recommend/"]', "iframe"]
+);
+const RECOMMEND_CARD_SELECTORS = getHealingValue(HEALING_RULES, ["selectors", "frame", "recommend_cards"], ["ul.card-list > li.card-item"]);
+const FEATURED_CARD_SELECTORS = getHealingValue(HEALING_RULES, ["selectors", "frame", "featured_cards"], ["li.geek-info-card"]);
+const LATEST_CARD_SELECTORS = getHealingValue(HEALING_RULES, ["selectors", "frame", "latest_cards"], [".candidate-card-wrap"]);
+const RECOMMEND_TAB_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "frame", "tab_items"],
+  ["li.tab-item[data-status]", 'li[data-status][class*="tab"]']
+);
+const DETAIL_POPUP_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "popup"],
+  [
+    ".boss-popup__wrapper",
+    ".boss-popup_wrapper",
+    ".boss-dialog_wrapper",
+    ".dialog-wrap.active",
+    ".boss-dialog",
+    ".geek-detail-modal",
+    ".resume-item-detail"
+  ]
+);
+const DETAIL_RESUME_IFRAME_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "resume_iframe"],
+  ['iframe[src*="/web/frame/c-resume/"]', 'iframe[name*="resume"]']
+);
+const DETAIL_CLOSE_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "close_button"],
+  [
+    ".boss-popup__close",
+    ".popup-close",
+    ".modal-close",
+    ".dialog-close",
+    ".close-btn",
+    'button[aria-label*="关闭"]',
+    'button[title*="关闭"]',
+    ".icon-close"
+  ]
+);
+const FAVORITE_BUTTON_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "favorite_button"],
+  [".like-icon-and-text"]
+);
+const GREET_BUTTON_RECOMMEND_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "greet_button_recommend"],
+  [
+    "button.btn-v2.btn-sure-v2.btn-greet",
+    ".resume-footer.item-operate button.btn-v2",
+    ".resume-footer-wrap button.btn-v2",
+    ".resume-footer.item-operate button",
+    ".resume-footer-wrap button"
+  ]
+);
+const GREET_BUTTON_FEATURED_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "greet_button_featured"],
+  [
+    "button.btn-v2.position-rights.btn-sure-v2",
+    "button.btn-v2.btn-sure-v2.position-rights",
+    ".resume-footer.item-operate button.btn-v2",
+    ".resume-footer-wrap button.btn-v2",
+    ".resume-footer.item-operate button",
+    ".resume-footer-wrap button"
+  ]
+);
+const REFRESH_FINISHED_WRAP_SELECTORS = getHealingValue(HEALING_RULES, ["selectors", "frame", "refresh_finished_wrap"], [".finished-wrap"]);
+const REFRESH_BUTTON_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "frame", "refresh_button"],
+  [".finished-wrap .btn.btn-refresh", ".finished-wrap .btn-refresh", ".no-data-refresh .btn-refresh"]
+);
+const RESUME_INFO_URL_PATTERNS = getHealingValue(
+  HEALING_RULES,
+  ["network", "resume", "info_url_patterns"],
+  [
+    "\\/wapi\\/zpjob\\/view\\/geek\\/info\\b",
+    "\\/wapi\\/zpitem\\/web\\/boss\\/[^?#]*\\/geek\\/info\\b",
+    "\\/boss\\/[^?#]*\\/geek\\/info\\b",
+    "\\/geek\\/info\\b",
+    "[?&](?:geekid|geek_id|encryptgeekid|encryptjid|jid|securityid)="
+  ]
+);
+const RESUME_RELATED_KEYWORDS = getHealingValue(
+  HEALING_RULES,
+  ["network", "resume", "related_keywords"],
+  ["geek", "resume", "candidate", "friend"]
+);
+const FAVORITE_ADD_PATTERNS = getHealingValue(
+  HEALING_RULES,
+  ["network", "favorite", "add_patterns"],
+  [
+    "\\/add(?:\\/|$)|[?&](?:action|op|operation|type)=add\\b|[?&](?:status|p3|favorite|collect|interested)=1\\b",
+    "(?:^|[_\\W])(add|favorite|collect|interest(?:ed)?)(?:$|[_\\W])"
+  ]
+);
+const FAVORITE_REMOVE_PATTERNS = getHealingValue(
+  HEALING_RULES,
+  ["network", "favorite", "remove_patterns"],
+  [
+    "\\/del(?:\\/|$)|[?&](?:action|op|operation|type)=del\\b|[?&](?:status|p3|favorite|collect|interested)=0\\b",
+    "(?:^|[_\\W])(del|delete|remove|cancel|unfavorite|uncollect|uninterest)(?:$|[_\\W])"
+  ]
+);
+const FAVORITE_ACTIONLOG_NAME = getHealingValue(
+  HEALING_RULES,
+  ["network", "favorite", "actionlog_action_name"],
+  "star-interest-click"
+);
+
 function classifyFinishedWrapState(finishedWrapText, refreshButtonVisible = false) {
   const normalizedText = normalizeText(finishedWrapText);
   const matchedBottomKeyword = BOTTOM_HINT_KEYWORDS.find((keyword) => normalizedText.includes(keyword)) || null;
@@ -292,10 +490,10 @@ function parseFavoriteActionFromRequest(url, postData = "") {
   const normalizedUrl = normalizeText(url).toLowerCase();
   if (!normalizedUrl) return null;
 
-  if (/\/add(?:\/|$)|[?&](?:action|op|operation|type)=add\b|[?&](?:status|p3|favorite|collect|interested)=1\b/i.test(normalizedUrl)) {
+  if (firstMatchingPattern(normalizedUrl, FAVORITE_ADD_PATTERNS)) {
     return "add";
   }
-  if (/\/del(?:\/|$)|[?&](?:action|op|operation|type)=del\b|[?&](?:status|p3|favorite|collect|interested)=0\b/i.test(normalizedUrl)) {
+  if (firstMatchingPattern(normalizedUrl, FAVORITE_REMOVE_PATTERNS)) {
     return "del";
   }
 
@@ -307,14 +505,14 @@ function parseFavoriteActionFromActionLog(postData = "") {
   if (!raw) return null;
   try {
     const payload = JSON.parse(raw);
-    if (normalizeText(payload?.action).toLowerCase() !== "star-interest-click") return null;
+    if (normalizeText(payload?.action).toLowerCase() !== normalizeText(FAVORITE_ACTIONLOG_NAME).toLowerCase()) return null;
     return parseFavoriteActionValue(payload?.p3);
   } catch {}
 
   try {
     const params = new URLSearchParams(raw);
     const actionName = normalizeText(params.get("action")).toLowerCase();
-    if (actionName !== "star-interest-click") return null;
+    if (actionName !== normalizeText(FAVORITE_ACTIONLOG_NAME).toLowerCase()) return null;
     return parseFavoriteActionValue(params.get("p3"));
   } catch {}
   return null;
@@ -345,7 +543,7 @@ function parseFavoriteActionFromWsPayload(payload, depth = 0) {
   if (depth > 3 || payload === null || payload === undefined) return null;
 
   if (typeof payload === "object") {
-    if (normalizeText(payload?.action).toLowerCase() === "star-interest-click") {
+    if (normalizeText(payload?.action).toLowerCase() === normalizeText(FAVORITE_ACTIONLOG_NAME).toLowerCase()) {
       const strictAction = parseFavoriteActionValue(payload?.p3);
       if (strictAction) return strictAction;
     }
@@ -830,23 +1028,13 @@ function extractResumePayloadFromResponseBody(parsedBody) {
 function isResumeInfoRequestUrl(url) {
   const normalizedUrl = normalizeText(url).toLowerCase();
   if (!normalizedUrl || !normalizedUrl.includes("/wapi/")) return false;
-  if (!normalizedUrl.includes("geek") || !normalizedUrl.includes("info")) return false;
-  if (/\/wapi\/zpjob\/view\/geek\/info\b/.test(normalizedUrl)) return true;
-  if (/\/wapi\/zpitem\/web\/boss\/[^?#]*\/geek\/info\b/.test(normalizedUrl)) return true;
-  if (/\/boss\/[^?#]*\/geek\/info\b/.test(normalizedUrl)) return true;
-  if (/\/geek\/info\b/.test(normalizedUrl)) return true;
-  return /[?&](?:geekid|geek_id|encryptgeekid|encryptjid|jid|securityid)=/.test(normalizedUrl);
+  return Boolean(firstMatchingPattern(normalizedUrl, RESUME_INFO_URL_PATTERNS));
 }
 
 function isResumeRelatedWapiUrl(url) {
   const normalizedUrl = normalizeText(url).toLowerCase();
   if (!normalizedUrl || !normalizedUrl.includes("/wapi/")) return false;
-  return (
-    normalizedUrl.includes("geek")
-    || normalizedUrl.includes("resume")
-    || normalizedUrl.includes("candidate")
-    || normalizedUrl.includes("friend")
-  );
+  return RESUME_RELATED_KEYWORDS.some((keyword) => normalizedUrl.includes(String(keyword).toLowerCase()));
 }
 
 function formatResumeApiData(data) {
@@ -994,20 +1182,18 @@ async function promptMaxGreetCount() {
 
 function buildListCandidatesExpr(processedKeys) {
   return `((processedKeys) => {
-    const frame = document.querySelector('iframe[name="recommendFrame"]')
-      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-      || document.querySelector('iframe');
+    const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
     if (!frame || !frame.contentDocument) {
       return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
     }
     const doc = frame.contentDocument;
     const frameRect = frame.getBoundingClientRect();
     const processed = new Set(processedKeys || []);
-    const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
-    const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
-    const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap'));
+    const cards = ${buildSelectorCollectionExpression(RECOMMEND_CARD_SELECTORS, "doc")};
+    const featuredCards = ${buildSelectorCollectionExpression(FEATURED_CARD_SELECTORS, "doc")};
+    const latestCards = ${buildSelectorCollectionExpression(LATEST_CARD_SELECTORS, "doc")};
     const textOf = (el) => String(el ? el.textContent : '').replace(/\s+/g, ' ').trim();
-    const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+    const tabs = ${buildSelectorCollectionExpression(RECOMMEND_TAB_SELECTORS, "doc")};
     const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
     const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
     const recommendCandidates = cards.map((card, index) => {
@@ -1142,22 +1328,20 @@ function buildListCandidatesExpr(processedKeys) {
 }
 
 const jsGetListState = `(() => {
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
   const doc = frame.contentDocument;
   const body = doc.body;
   const frameRect = frame.getBoundingClientRect();
-  const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
+  const cards = ${buildSelectorCollectionExpression(RECOMMEND_CARD_SELECTORS, "doc")};
   const candidateCards = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
-  const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
+  const featuredCards = ${buildSelectorCollectionExpression(FEATURED_CARD_SELECTORS, "doc")};
   const featuredCandidates = featuredCards.filter((card) => card.querySelector('a[data-geekid]'));
-  const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap'));
+  const latestCards = ${buildSelectorCollectionExpression(LATEST_CARD_SELECTORS, "doc")};
   const latestCandidates = latestCards.filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
-  const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+  const tabs = ${buildSelectorCollectionExpression(RECOMMEND_TAB_SELECTORS, "doc")};
   const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
   const activeTabStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
   const inferredStatus = activeTabStatus
@@ -1201,18 +1385,16 @@ const jsGetListState = `(() => {
 })()`;
 
 const jsScrollList = `(() => {
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
   const doc = frame.contentDocument;
   const body = doc.body;
-  const recommendCards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item')).filter((card) => card.querySelector('.card-inner[data-geekid]'));
-  const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card')).filter((card) => card.querySelector('a[data-geekid]'));
-  const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap')).filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
-  const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+  const recommendCards = ${buildSelectorCollectionExpression(RECOMMEND_CARD_SELECTORS, "doc")}.filter((card) => card.querySelector('.card-inner[data-geekid]'));
+  const featuredCards = ${buildSelectorCollectionExpression(FEATURED_CARD_SELECTORS, "doc")}.filter((card) => card.querySelector('a[data-geekid]'));
+  const latestCards = ${buildSelectorCollectionExpression(LATEST_CARD_SELECTORS, "doc")}.filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
+  const tabs = ${buildSelectorCollectionExpression(RECOMMEND_TAB_SELECTORS, "doc")};
   const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
   const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
   const inferredStatus = activeStatus
@@ -1249,9 +1431,7 @@ const jsScrollList = `(() => {
 })()`;
 
 const jsDetectBottom = `(() => {
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { isBottom: false, error: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1267,8 +1447,9 @@ const jsDetectBottom = `(() => {
     const rect = el.getBoundingClientRect();
     return rect.width > 2 && rect.height > 2 && el.offsetParent !== null;
   };
-  const finishedWrap = Array.from(doc.querySelectorAll('.finished-wrap')).find((el) => isVisible(el)) || null;
-  const refreshButton = Array.from(doc.querySelectorAll('.finished-wrap .btn.btn-refresh, .finished-wrap .btn-refresh, .no-data-refresh .btn-refresh'))
+  const finishedWrap = ${buildSelectorCollectionExpression(REFRESH_FINISHED_WRAP_SELECTORS, "doc")}
+    .find((el) => isVisible(el)) || null;
+  const refreshButton = ${buildSelectorCollectionExpression(REFRESH_BUTTON_SELECTORS, "doc")}
     .find((el) => isVisible(el)) || null;
   const keywords = ${JSON.stringify(BOTTOM_HINT_KEYWORDS)};
   const loadMoreKeywords = ${JSON.stringify(LOAD_MORE_HINT_KEYWORDS)};
@@ -1316,13 +1497,7 @@ const jsWaitForDetail = `(() => {
     const rect = el.getBoundingClientRect();
     return rect.width > 2 && rect.height > 2;
   };
-  const topSignals = [
-    '.dialog-wrap.active',
-    '.boss-popup__wrapper',
-    '.boss-popup_wrapper',
-    'iframe[src*="/web/frame/c-resume/"]',
-    'iframe[name*="resume"]'
-  ];
+  const topSignals = ${JSON.stringify([...DETAIL_POPUP_SELECTORS, ...DETAIL_RESUME_IFRAME_SELECTORS])};
   for (const sel of topSignals) {
     const nodes = Array.from(document.querySelectorAll(sel));
     for (const node of nodes) {
@@ -1331,9 +1506,7 @@ const jsWaitForDetail = `(() => {
       }
     }
   }
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { open: false, error: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1356,10 +1529,10 @@ const jsWaitForDetail = `(() => {
     if (viewportWidth <= 0 || viewportHeight <= 0) return el.offsetParent !== null;
     return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
   };
-  const close = doc.querySelector('.boss-popup__close');
-  const favorite = doc.querySelector('.like-icon-and-text');
-  const greet = doc.querySelector('button.btn-v2.btn-sure-v2.btn-greet');
-  const resumeFrame = doc.querySelector('iframe[src*="/web/frame/c-resume/"], iframe[name*="resume"]');
+  const close = ${buildFirstSelectorLookupExpression(DETAIL_CLOSE_SELECTORS, "doc")};
+  const favorite = ${buildFirstSelectorLookupExpression(FAVORITE_BUTTON_SELECTORS, "doc")};
+  const greet = ${buildFirstSelectorLookupExpression(GREET_BUTTON_RECOMMEND_SELECTORS, "doc")};
+  const resumeFrame = ${buildFirstSelectorLookupExpression(DETAIL_RESUME_IFRAME_SELECTORS, "doc")};
   const open = Boolean(
     isVisibleInViewport(close)
     || isVisibleInViewport(favorite)
@@ -1392,16 +1565,7 @@ const jsCloseDetail = `(() => {
     const rect = el.getBoundingClientRect();
     return rect.width > 2 && rect.height > 2;
   };
-  const topCloseSelectors = [
-    '.boss-popup__close',
-    '.popup-close',
-    '.modal-close',
-    '.dialog-close',
-    '.close-btn',
-    'button[aria-label*="关闭"]',
-    'button[title*="关闭"]',
-    '.icon-close'
-  ];
+  const topCloseSelectors = ${JSON.stringify(DETAIL_CLOSE_SELECTORS)};
   for (const sel of topCloseSelectors) {
     const nodes = Array.from(document.querySelectorAll(sel));
     for (const node of nodes) {
@@ -1413,9 +1577,7 @@ const jsCloseDetail = `(() => {
     }
   }
 
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1445,16 +1607,7 @@ const jsCloseDetail = `(() => {
     return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
   };
 
-  const directCloseSelectors = [
-    '.boss-popup__close',
-    '.popup-close',
-    '.modal-close',
-    '.dialog-close',
-    '.close-btn',
-    'button[aria-label*="关闭"]',
-    'button[title*="关闭"]',
-    '.icon-close'
-  ];
+  const directCloseSelectors = ${JSON.stringify(DETAIL_CLOSE_SELECTORS)};
   for (const sel of directCloseSelectors) {
     const nodes = Array.from(doc.querySelectorAll(sel));
     for (const node of nodes) {
@@ -1532,15 +1685,7 @@ const jsIsDetailClosed = `(() => {
     return { closed: false, reason: 'top know button visible' };
   }
 
-  const topPopupSelectors = [
-    '.boss-popup__wrapper',
-    '.boss-popup_wrapper',
-    '.boss-dialog_wrapper',
-    '.dialog-wrap.active',
-    '.boss-dialog',
-    '[class*="popup"][class*="wrapper"]',
-    '[class*="dialog"][class*="wrapper"]'
-  ];
+  const topPopupSelectors = ${JSON.stringify(DETAIL_POPUP_SELECTORS)};
   for (const sel of topPopupSelectors) {
     const nodes = Array.from(document.querySelectorAll(sel));
     for (const node of nodes) {
@@ -1552,9 +1697,7 @@ const jsIsDetailClosed = `(() => {
     }
   }
 
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { closed: true, reason: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1579,17 +1722,7 @@ const jsIsDetailClosed = `(() => {
     return rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
   };
 
-  const popupSelectors = [
-    '.boss-popup__wrapper',
-    '.boss-popup_wrapper',
-    '.boss-dialog_wrapper',
-    '.dialog-wrap.active',
-    '.boss-dialog',
-    '[class*="popup"][class*="wrapper"]',
-    '[class*="dialog"][class*="wrapper"]',
-    '.geek-detail-modal',
-    '.resume-item-detail'
-  ];
+  const popupSelectors = ${JSON.stringify(DETAIL_POPUP_SELECTORS)};
   for (const sel of popupSelectors) {
     const nodes = Array.from(doc.querySelectorAll(sel));
     for (const node of nodes) {
@@ -1599,12 +1732,7 @@ const jsIsDetailClosed = `(() => {
     }
   }
 
-  const detailSignals = [
-    '.like-icon-and-text',
-    'button.btn-v2.btn-sure-v2.btn-greet',
-    'iframe[src*="/web/frame/c-resume/"]',
-    'iframe[name*="resume"]'
-  ];
+  const detailSignals = ${JSON.stringify([...FAVORITE_BUTTON_SELECTORS, ...GREET_BUTTON_RECOMMEND_SELECTORS, ...DETAIL_RESUME_IFRAME_SELECTORS])};
   for (const sel of detailSignals) {
     const node = doc.querySelector(sel);
     if (isVisible(node)) {
@@ -1629,7 +1757,8 @@ const jsGetFavoriteState = `(() => {
   };
   const resolveFavorite = (doc, offsetX, offsetY, scope) => {
     if (!doc) return null;
-    const direct = Array.from(doc.querySelectorAll('.like-icon-and-text')).find((node) => isVisible(doc, node)) || null;
+    const direct = ${buildSelectorCollectionExpression(FAVORITE_BUTTON_SELECTORS, "doc")}
+      .find((node) => isVisible(doc, node)) || null;
     const footer = doc.querySelector('.resume-footer.item-operate, .resume-footer-wrap, .resume-footer');
     const fromFooter = footer
       ? Array.from(footer.querySelectorAll('[class*="collect"], [class*="favorite"], button, .btn, span'))
@@ -1661,9 +1790,7 @@ const jsGetFavoriteState = `(() => {
   const topResult = resolveFavorite(document, 0, 0, 'top');
   if (topResult) return topResult;
 
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1674,12 +1801,10 @@ const jsGetFavoriteState = `(() => {
 })()`;
 
 const jsClickFavoriteFallback = `(() => {
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   const doc = frame.contentDocument;
-  const root = doc.querySelector('.like-icon-and-text');
+  const root = ${buildFirstSelectorLookupExpression(FAVORITE_BUTTON_SELECTORS, "doc")};
   if (!root || root.offsetParent === null) return { ok: false, error: 'FAVORITE_BUTTON_NOT_FOUND' };
   root.click();
   return { ok: true };
@@ -1697,14 +1822,10 @@ const jsGetGreetStateRecommend = `(() => {
     const rect = el.getBoundingClientRect();
     return rect.width > 2 && rect.height > 2;
   };
-  const resolveGreet = (doc, offsetX, offsetY, scope) => {
-    if (!doc) return null;
-    const candidates = [
-      ...Array.from(doc.querySelectorAll('button.btn-v2.btn-sure-v2.btn-greet')),
-      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button.btn-v2, .resume-footer-wrap button.btn-v2')),
-      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button'))
-    ];
-    const button = candidates.find((item) => isVisible(doc, item) && /沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
+    const resolveGreet = (doc, offsetX, offsetY, scope) => {
+      if (!doc) return null;
+      const candidates = ${buildSelectorCollectionExpression(GREET_BUTTON_RECOMMEND_SELECTORS, "doc")};
+      const button = candidates.find((item) => isVisible(doc, item) && /沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
     if (!button) return null;
     const rect = button.getBoundingClientRect();
     return {
@@ -1718,9 +1839,7 @@ const jsGetGreetStateRecommend = `(() => {
   const topResult = resolveGreet(document, 0, 0, 'top');
   if (topResult) return topResult;
 
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1737,12 +1856,10 @@ const jsClickGreetFallbackRecommend = `(() => {
     topButton.click();
     return { ok: true, scope: 'top' };
   }
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   const doc = frame.contentDocument;
-  const button = doc.querySelector('button.btn-v2.btn-sure-v2.btn-greet');
+  const button = ${buildFirstSelectorLookupExpression(GREET_BUTTON_RECOMMEND_SELECTORS, "doc")};
   if (!button || button.offsetParent === null) return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
   button.click();
   return { ok: true };
@@ -1760,15 +1877,10 @@ const jsGetGreetStateFeatured = `(() => {
     const rect = el.getBoundingClientRect();
     return rect.width > 2 && rect.height > 2;
   };
-  const resolveGreet = (doc, offsetX, offsetY, scope) => {
-    if (!doc) return null;
-    const candidates = [
-      ...Array.from(doc.querySelectorAll('button.btn-v2.position-rights.btn-sure-v2')),
-      ...Array.from(doc.querySelectorAll('button.btn-v2.btn-sure-v2.position-rights')),
-      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button.btn-v2, .resume-footer-wrap button.btn-v2')),
-      ...Array.from(doc.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button'))
-    ];
-    const button = candidates.find((item) => isVisible(doc, item) && /立即沟通|沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
+    const resolveGreet = (doc, offsetX, offsetY, scope) => {
+      if (!doc) return null;
+      const candidates = ${buildSelectorCollectionExpression(GREET_BUTTON_FEATURED_SELECTORS, "doc")};
+      const button = candidates.find((item) => isVisible(doc, item) && /立即沟通|沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
     if (!button) return null;
     const rect = button.getBoundingClientRect();
     return {
@@ -1782,9 +1894,7 @@ const jsGetGreetStateFeatured = `(() => {
   const topResult = resolveGreet(document, 0, 0, 'top');
   if (topResult) return topResult;
 
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) {
     return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   }
@@ -1801,12 +1911,10 @@ const jsClickGreetFallbackFeatured = `(() => {
     topButton.click();
     return { ok: true, scope: 'top' };
   }
-  const frame = document.querySelector('iframe[name="recommendFrame"]')
-    || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-    || document.querySelector('iframe');
+  const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   const doc = frame.contentDocument;
-  const button = doc.querySelector('button.btn-v2.position-rights.btn-sure-v2, button.btn-v2.btn-sure-v2.position-rights');
+  const button = ${buildFirstSelectorLookupExpression(GREET_BUTTON_FEATURED_SELECTORS, "doc")};
   if (!button || button.offsetParent === null) return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
   button.click();
   return { ok: true };
@@ -3016,9 +3124,7 @@ class RecommendScreenCli {
       return { ok: false, error: "CANDIDATE_KEY_MISSING" };
     }
     return this.evaluate(`((candidateKey) => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
@@ -3027,11 +3133,11 @@ class RecommendScreenCli {
         .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey)) || null;
       const latestInner = recommendInner
         ? null
-        : Array.from(doc.querySelectorAll('.candidate-card-wrap .card-inner[data-geek], .candidate-card-wrap [data-geek]'))
+        : ${buildSelectorCollectionExpression([".candidate-card-wrap .card-inner[data-geek]", ".candidate-card-wrap [data-geek]"], "doc")}
           .find((item) => (item.getAttribute('data-geek') || '') === String(candidateKey)) || null;
       const featuredAnchor = (recommendInner || latestInner)
         ? null
-        : Array.from(doc.querySelectorAll('li.geek-info-card a[data-geekid], a[data-geekid]'))
+        : ${buildSelectorCollectionExpression(["li.geek-info-card a[data-geekid]", "a[data-geekid]"], "doc")}
           .find((item) => (item.getAttribute('data-geekid') || '') === String(candidateKey)) || null;
       const card = recommendInner
         ? (recommendInner.closest('li.card-item') || recommendInner.closest('.card-item'))

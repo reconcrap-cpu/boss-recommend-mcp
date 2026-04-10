@@ -1,0 +1,261 @@
+{
+  "version": 1,
+  "selectors": {
+    "top": {
+      "recommend_iframe": [
+        "iframe[name=\"recommendFrame\"]",
+        "iframe[src*=\"/web/frame/recommend/\"]",
+        "iframe"
+      ]
+    },
+    "frame": {
+      "tab_items": [
+        "li.tab-item[data-status]",
+        "li[data-status][class*=\"tab\"]"
+      ],
+      "filter_trigger": [
+        ".filter-label-wrap",
+        ".recommend-filter.op-filter"
+      ],
+      "filter_panel": [
+        ".recommend-filter.op-filter .filter-panel",
+        ".recommend-filter .filter-panel",
+        ".filter-panel"
+      ],
+      "filter_confirm_button": [
+        ".recommend-filter.op-filter .filter-panel .btn",
+        ".recommend-filter.op-filter .filter-panel button",
+        ".filter-panel .btn",
+        ".filter-panel button"
+      ],
+      "filter_group_container": [
+        ".check-box"
+      ],
+      "filter_group_school": [
+        ".check-box.school"
+      ],
+      "filter_group_degree": [
+        ".check-box.degree"
+      ],
+      "filter_group_gender": [
+        ".check-box.gender"
+      ],
+      "filter_group_recent_not_view": [
+        ".check-box.recentNotView"
+      ],
+      "filter_option": [
+        ".check-box .default.option",
+        ".check-box .options .option",
+        ".check-box .option"
+      ],
+      "filter_option_all": [
+        ".default.option, .options .option, .option"
+      ],
+      "filter_option_active": [
+        ".default.option.active, .options .option.active, .option.active"
+      ],
+      "filter_scroll_container": [
+        ".recommend-filter.op-filter .filter-panel .top",
+        ".recommend-filter.op-filter .top",
+        ".recommend-filter.op-filter .filter-panel"
+      ],
+      "filter_confirm_candidates": [
+        ".btn, button"
+      ],
+      "job_dropdown_trigger": [
+        ".top-chat-search",
+        ".chat-job-select",
+        ".chat-job-selector",
+        ".job-selecter",
+        ".job-selector",
+        ".job-select-wrap",
+        ".job-select",
+        ".job-select-box",
+        ".job-wrap",
+        ".chat-job-name"
+      ],
+      "job_list_items": [
+        ".ui-dropmenu-list .job-list .job-item",
+        ".job-selecter-options .job-list .job-item",
+        ".job-selector-options .job-list .job-item",
+        ".dropmenu-list .job-list .job-item",
+        ".job-list .job-item"
+      ],
+      "job_item_label": [
+        ".ui-dropmenu-list .job-list .job-item .label",
+        ".job-list .job-item .label",
+        ".label"
+      ],
+      "job_search_input": [
+        ".top-chat-search"
+      ],
+      "job_selected_label": [
+        ".job-selecter-wrap .ui-dropmenu-label",
+        ".ui-dropmenu-label",
+        ".chat-job-name",
+        ".job-selecter .label",
+        ".job-selecter .job-name",
+        ".job-select .label"
+      ],
+      "recommend_cards": [
+        "ul.card-list > li.card-item"
+      ],
+      "recommend_card_inner": [
+        ".card-inner[data-geekid]"
+      ],
+      "featured_cards": [
+        "li.geek-info-card"
+      ],
+      "featured_card_anchor": [
+        "a[data-geekid]"
+      ],
+      "latest_cards": [
+        ".candidate-card-wrap"
+      ],
+      "latest_card_inner": [
+        ".candidate-card-wrap .card-inner[data-geek]",
+        ".candidate-card-wrap [data-geek]"
+      ],
+      "refresh_finished_wrap": [
+        ".finished-wrap"
+      ],
+      "refresh_button": [
+        ".finished-wrap .btn.btn-refresh",
+        ".finished-wrap .btn-refresh",
+        ".no-data-refresh .btn-refresh"
+      ]
+    },
+    "detail": {
+      "popup": [
+        ".dialog-wrap.active",
+        ".boss-popup__wrapper",
+        ".boss-popup_wrapper",
+        ".boss-dialog_wrapper",
+        ".boss-dialog",
+        ".resume-item-detail",
+        ".geek-detail-modal",
+        "[class*=\"popup\"][class*=\"wrapper\"]",
+        "[class*=\"dialog\"][class*=\"wrapper\"]"
+      ],
+      "resume_iframe": [
+        "iframe[src*=\"/web/frame/c-resume/\"]",
+        "iframe[name*=\"resume\"]"
+      ],
+      "close_button": [
+        ".boss-popup__close",
+        ".popup-close",
+        ".modal-close",
+        ".dialog-close",
+        ".close-btn",
+        "button[aria-label*=\"关闭\"]",
+        "button[title*=\"关闭\"]",
+        ".icon-close"
+      ],
+      "close_fallback_candidates": [
+        "[aria-label*=\"关闭\"]",
+        "[aria-label*=\"返回\"]",
+        "[title*=\"关闭\"]",
+        "[title*=\"返回\"]",
+        "[class*=\"close\"]",
+        "[class*=\"Close\"]",
+        "[class*=\"back\"]",
+        "[class*=\"Back\"]",
+        "button",
+        "a",
+        "i",
+        "span"
+      ],
+      "ack_button": [
+        "button.btn-v2.btn-sure-v2",
+        "button.btn",
+        ".boss-dialog button",
+        ".boss-popup__wrapper button"
+      ],
+      "favorite_button": [
+        ".like-icon-and-text",
+        ".resume-footer.item-operate [class*=\"collect\"]",
+        ".resume-footer.item-operate [class*=\"favorite\"]",
+        ".resume-footer-wrap [class*=\"collect\"]",
+        ".resume-footer-wrap [class*=\"favorite\"]"
+      ],
+      "greet_button_recommend": [
+        "button.btn-v2.btn-sure-v2.btn-greet",
+        ".resume-footer.item-operate button.btn-v2",
+        ".resume-footer-wrap button.btn-v2",
+        ".resume-footer.item-operate button",
+        ".resume-footer-wrap button"
+      ],
+      "greet_button_featured": [
+        "button.btn-v2.position-rights.btn-sure-v2",
+        "button.btn-v2.btn-sure-v2.position-rights",
+        ".resume-footer.item-operate button.btn-v2",
+        ".resume-footer-wrap button.btn-v2",
+        ".resume-footer.item-operate button",
+        ".resume-footer-wrap button"
+      ]
+    }
+  },
+  "network": {
+    "resume": {
+      "info_url_patterns": [
+        "\\/wapi\\/zpjob\\/view\\/geek\\/info\\b",
+        "\\/wapi\\/zpitem\\/web\\/boss\\/[^?#]*\\/geek\\/info\\b",
+        "\\/boss\\/[^?#]*\\/geek\\/info\\b",
+        "\\/geek\\/info\\b",
+        "[?&](?:geekid|geek_id|encryptgeekid|encryptjid|jid|securityid)="
+      ],
+      "related_keywords": [
+        "geek",
+        "resume",
+        "candidate",
+        "friend"
+      ]
+    },
+    "favorite": {
+      "request_source_keywords": [
+        "usermark",
+        "actionlog/common.json"
+      ],
+      "add_patterns": [
+        "(?:^|[_\\W])(add|favorite|collect|interest(?:ed)?)(?:$|[_\\W])",
+        "\\/add(?:\\/|$)|[?&](?:action|op|operation|type)=add\\b|[?&](?:status|p3|favorite|collect|interested)=1\\b"
+      ],
+      "remove_patterns": [
+        "(?:^|[_\\W])(del|delete|remove|cancel|unfavorite|uncollect|uninterest)(?:$|[_\\W])",
+        "\\/del(?:\\/|$)|[?&](?:action|op|operation|type)=del\\b|[?&](?:status|p3|favorite|collect|interested)=0\\b"
+      ],
+      "actionlog_action_name": "star-interest-click",
+      "status_keys": [
+        "p3",
+        "status",
+        "state",
+        "favorite",
+        "collect",
+        "interested",
+        "markstatus",
+        "isfavorite",
+        "iscollect"
+      ],
+      "operation_keys": [
+        "action",
+        "op",
+        "operation",
+        "type",
+        "mode",
+        "mark",
+        "interest"
+      ]
+    },
+    "greet": {
+      "url_patterns": [
+        "greet",
+        "sayhi",
+        "hello",
+        "friend/add",
+        "chat/start",
+        "boss\\/friend",
+        "boss\\/dialog"
+      ]
+    }
+  }
+}

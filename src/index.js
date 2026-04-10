@@ -9,6 +9,7 @@ import {
   runRecommendCalibration
 } from "./adapters.js";
 import { runRecommendPipeline } from "./pipeline.js";
+import { runRecommendSelfHeal } from "./self-heal.js";
 import {
   RUN_MODE_ASYNC,
   RUN_STAGE_PREFLIGHT,
@@ -39,6 +40,7 @@ const TOOL_PAUSE_RUN = "pause_recommend_pipeline_run";
 const TOOL_RESUME_RUN = "resume_recommend_pipeline_run";
 const TOOL_RUN_FEATURED_CALIBRATION = "run_featured_calibration";
 const TOOL_GET_FEATURED_CALIBRATION_STATUS = "get_featured_calibration_status";
+const TOOL_RUN_RECOMMEND_SELF_HEAL = "run_recommend_self_heal";
 
 const SERVER_NAME = "boss-recommend-mcp";
 const FRAMING_UNKNOWN = "unknown";
@@ -49,6 +51,7 @@ const DETACHED_WORKER_RUN_ID_FLAG = "--run-id";
 const DETACHED_WORKER_RESUME_FLAG = "--resume";
 
 let runPipelineImpl = runRecommendPipeline;
+let runSelfHealImpl = runRecommendSelfHeal;
 let spawnProcessImpl = spawn;
 const TERMINAL_RUN_STATES = new Set([RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_STATE_CANCELED]);
 
@@ -321,6 +324,43 @@ function createRunFeaturedCalibrationInputSchema() {
   };
 }
 
+function createRunRecommendSelfHealInputSchema() {
+  return {
+    type: "object",
+    properties: {
+      mode: {
+        type: "string",
+        enum: ["scan", "apply"],
+        description: "scan=扫描漂移；apply=按 repair_session_id 应用高置信度修复"
+      },
+      scope: {
+        type: "string",
+        enum: ["full", "search_screen", "selectors_only"],
+        description: "扫描范围，默认 full"
+      },
+      validation_profile: {
+        type: "string",
+        enum: ["safe", "full"],
+        description: "校验强度，默认 full"
+      },
+      port: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，Boss Chrome 远程调试端口"
+      },
+      repair_session_id: {
+        type: "string",
+        description: "apply 模式必填，来自 scan 返回值"
+      },
+      confirm_apply: {
+        type: "boolean",
+        description: "apply 模式必填，必须显式传 true"
+      }
+    },
+    additionalProperties: false
+  };
+}
+
 function createToolsSchema() {
   return [
     {
@@ -389,6 +429,11 @@ function createToolsSchema() {
         properties: {},
         additionalProperties: false
       }
+    },
+    {
+      name: TOOL_RUN_RECOMMEND_SELF_HEAL,
+      description: "手动运维自愈工具：扫描 Boss recommend 相关 selector / network 规则漂移，并在确认后应用高置信度修复。",
+      inputSchema: createRunRecommendSelfHealInputSchema()
     }
   ];
 }
@@ -442,6 +487,42 @@ function validateRunFeaturedCalibrationArgs(args) {
   if (Object.prototype.hasOwnProperty.call(args, "output")) {
     if (typeof args.output !== "string" || !normalizeText(args.output)) {
       return "output must be a non-empty string when provided";
+    }
+  }
+
+  return null;
+}
+
+function validateRunRecommendSelfHealArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return "arguments must be an object";
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "mode")) {
+    const mode = normalizeText(args.mode).toLowerCase();
+    if (!["scan", "apply"].includes(mode)) {
+      return "mode must be one of: scan, apply";
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "scope")) {
+    const scope = normalizeText(args.scope).toLowerCase();
+    if (!["full", "search_screen", "selectors_only"].includes(scope)) {
+      return "scope must be one of: full, search_screen, selectors_only";
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "validation_profile")) {
+    const profile = normalizeText(args.validation_profile).toLowerCase();
+    if (!["safe", "full"].includes(profile)) {
+      return "validation_profile must be one of: safe, full";
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(args, "port")) {
+    const port = Number.parseInt(String(args.port), 10);
+    if (!Number.isFinite(port) || port <= 0) {
+      return "port must be a positive integer";
     }
   }
 
@@ -1340,6 +1421,10 @@ async function handleRunFeaturedCalibrationTool({ workspaceRoot, args }) {
   };
 }
 
+async function handleRunRecommendSelfHealTool({ workspaceRoot, args }) {
+  return runSelfHealImpl({ workspaceRoot, args });
+}
+
 async function handleRequest(message, workspaceRoot) {
   if (!message || message.jsonrpc !== "2.0") {
     return createJsonRpcError(null, -32600, "Invalid JSON-RPC request");
@@ -1396,6 +1481,13 @@ async function handleRequest(message, workspaceRoot) {
       }
     }
 
+    if (toolName === TOOL_RUN_RECOMMEND_SELF_HEAL) {
+      const inputError = validateRunRecommendSelfHealArgs(args);
+      if (inputError) {
+        return createJsonRpcError(id, -32602, inputError);
+      }
+    }
+
     if ([TOOL_GET_RUN, TOOL_CANCEL_RUN, TOOL_PAUSE_RUN, TOOL_RESUME_RUN].includes(toolName)) {
       if (!args || typeof args.run_id !== "string" || !normalizeText(args.run_id)) {
         return createJsonRpcError(id, -32602, "run_id is required and must be a string");
@@ -1418,6 +1510,8 @@ async function handleRequest(message, workspaceRoot) {
         payload = handleGetFeaturedCalibrationStatusTool(workspaceRoot);
       } else if (toolName === TOOL_RUN_FEATURED_CALIBRATION) {
         payload = await handleRunFeaturedCalibrationTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_RUN_RECOMMEND_SELF_HEAL) {
+        payload = await handleRunRecommendSelfHealTool({ workspaceRoot, args });
       } else {
         return createJsonRpcError(id, -32602, `Unknown tool: ${toolName || ""}`);
       }
@@ -1553,6 +1647,9 @@ export const __testables = {
   },
   setRunPipelineImplForTests(nextImpl) {
     runPipelineImpl = typeof nextImpl === "function" ? nextImpl : runRecommendPipeline;
+  },
+  setRunSelfHealImplForTests(nextImpl) {
+    runSelfHealImpl = typeof nextImpl === "function" ? nextImpl : runRecommendSelfHeal;
   }
 };
 

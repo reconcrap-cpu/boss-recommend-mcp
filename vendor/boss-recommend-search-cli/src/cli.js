@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 import process from "node:process";
 import readline from "node:readline";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import CDP from "chrome-remote-interface";
+import {
+  buildFirstSelectorLookupExpression,
+  getRecommendSelectorRule
+} from "../../../src/recommend-healing-config.js";
 
 const DEFAULT_PORT = 9222;
 const RECOMMEND_URL_FRAGMENT = "/web/chat/recommend";
@@ -14,6 +19,56 @@ const DEGREE_OPTIONS = ["不限", "初中及以下", "中专/中技", "高中", 
 const DEGREE_ORDER = ["初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"];
 const GENDER_OPTIONS = ["不限", "男", "女"];
 const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
+const require = createRequire(import.meta.url);
+require("../../../src/recommend-healing-rules.json");
+const RECOMMEND_IFRAME_SELECTORS = getRecommendSelectorRule(
+  ["top", "recommend_iframe"],
+  ['iframe[name="recommendFrame"]', 'iframe[src*="/web/frame/recommend/"]', "iframe"]
+);
+const FILTER_TRIGGER_SELECTORS = getRecommendSelectorRule(
+  ["frame", "filter_trigger"],
+  [".filter-label-wrap", ".recommend-filter.op-filter"]
+);
+const JOB_DROPDOWN_TRIGGER_SELECTORS = getRecommendSelectorRule(
+  ["frame", "job_dropdown_trigger"],
+  [
+    ".chat-job-select",
+    ".chat-job-selector",
+    ".job-selecter",
+    ".job-selector",
+    ".job-select-wrap",
+    ".job-select",
+    ".job-select-box",
+    ".job-wrap",
+    ".chat-job-name",
+    ".top-chat-search"
+  ]
+);
+const JOB_LIST_ITEM_SELECTORS = getRecommendSelectorRule(
+  ["frame", "job_list_items"],
+  [
+    ".ui-dropmenu-list .job-list .job-item",
+    ".job-selecter-options .job-list .job-item",
+    ".job-selector-options .job-list .job-item",
+    ".dropmenu-list .job-list .job-item",
+    ".job-list .job-item"
+  ]
+);
+const JOB_SELECTED_LABEL_SELECTORS = getRecommendSelectorRule(
+  ["frame", "job_selected_label"],
+  [".chat-job-name", ".job-selecter .label", ".job-selecter .job-name", ".job-select .label"]
+);
+const RECOMMEND_CARD_SELECTORS = getRecommendSelectorRule(["frame", "recommend_cards"], ["ul.card-list > li.card-item"]);
+const FEATURED_CARD_SELECTORS = getRecommendSelectorRule(["frame", "featured_cards"], ["li.geek-info-card"]);
+const LATEST_CARD_SELECTORS = getRecommendSelectorRule(["frame", "latest_cards"], [".candidate-card-wrap"]);
+const RECOMMEND_TAB_SELECTORS = getRecommendSelectorRule(
+  ["frame", "tab_items"],
+  ["li.tab-item[data-status]", 'li[data-status][class*="tab"]']
+);
+
+function buildRecommendFrameExpression() {
+  return buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS);
+}
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -419,9 +474,7 @@ class RecommendSearchCli {
           title
         };
       }
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildRecommendFrameExpression()};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME', currentUrl, title };
       }
@@ -438,14 +491,16 @@ class RecommendSearchCli {
 
   async getFilterEntryPoint() {
     return this.evaluate(`(() => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildRecommendFrameExpression()};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
       const doc = frame.contentDocument;
-      const el = doc.querySelector('.filter-label-wrap') || doc.querySelector('.recommend-filter.op-filter');
+      const el = ${JSON.stringify(FILTER_TRIGGER_SELECTORS)}
+        .map((selector) => {
+          try { return doc.querySelector(selector); } catch { return null; }
+        })
+        .find((node) => node) || null;
       if (!el) {
         return { ok: false, error: 'FILTER_TRIGGER_NOT_FOUND' };
       }
@@ -461,9 +516,7 @@ class RecommendSearchCli {
 
   async getJobListState() {
     return this.evaluate(`(() => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildRecommendFrameExpression()};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
@@ -491,13 +544,10 @@ class RecommendSearchCli {
         return rect.width > 2 && rect.height > 2;
       };
 
-      const items = Array.from(doc.querySelectorAll([
-        '.ui-dropmenu-list .job-list .job-item',
-        '.job-selecter-options .job-list .job-item',
-        '.job-selector-options .job-list .job-item',
-        '.dropmenu-list .job-list .job-item',
-        '.job-list .job-item'
-      ].join(',')));
+      const items = ${JSON.stringify(JOB_LIST_ITEM_SELECTORS)}
+        .flatMap((selector) => {
+          try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+        });
       const jobs = [];
       const seen = new Set();
       for (const item of items) {
@@ -516,7 +566,11 @@ class RecommendSearchCli {
         });
       }
 
-      const selectedLabelNode = doc.querySelector('.chat-job-name, .job-selecter .label, .job-selecter .job-name, .job-select .label');
+      const selectedLabelNode = ${JSON.stringify(JOB_SELECTED_LABEL_SELECTORS)}
+        .map((selector) => {
+          try { return doc.querySelector(selector); } catch { return null; }
+        })
+        .find((node) => node) || null;
       return {
         ok: true,
         jobs,
@@ -530,25 +584,12 @@ class RecommendSearchCli {
 
   async clickJobDropdownTriggerBySelector() {
     return this.evaluate(`(() => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildRecommendFrameExpression()};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
       const doc = frame.contentDocument;
-      const selectors = [
-        '.chat-job-select',
-        '.chat-job-selector',
-        '.job-selecter',
-        '.job-selector',
-        '.job-select-wrap',
-        '.job-select',
-        '.job-select-box',
-        '.job-wrap',
-        '.chat-job-name',
-        '.top-chat-search'
-      ];
+      const selectors = ${JSON.stringify(JOB_DROPDOWN_TRIGGER_SELECTORS)};
       const isVisible = (el) => {
         if (!el) return false;
         const style = getComputedStyle(el);
@@ -615,9 +656,7 @@ class RecommendSearchCli {
 
   async clickJobBySelector(job) {
     return this.evaluate(`((job) => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildRecommendFrameExpression()};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
@@ -635,13 +674,10 @@ class RecommendSearchCli {
           .trim();
         return strippedSingle || byGap;
       };
-      const items = Array.from(doc.querySelectorAll([
-        '.ui-dropmenu-list .job-list .job-item',
-        '.job-selecter-options .job-list .job-item',
-        '.job-selector-options .job-list .job-item',
-        '.dropmenu-list .job-list .job-item',
-        '.job-list .job-item'
-      ].join(',')));
+      const items = ${JSON.stringify(JOB_LIST_ITEM_SELECTORS)}
+        .flatMap((selector) => {
+          try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+        });
       const target = items.find((item) => {
         const value = normalize(item.getAttribute('value') || item.dataset?.value || '');
         const label = normalize(item.querySelector('.label')?.textContent || item.textContent || '');
@@ -1439,20 +1475,30 @@ class RecommendSearchCli {
 
   async countCandidates() {
     return this.evaluate(`(() => {
-      const frame = document.querySelector('iframe[name="recommendFrame"]')
-        || document.querySelector('iframe[src*="/web/frame/recommend/"]')
-        || document.querySelector('iframe');
+      const frame = ${buildRecommendFrameExpression()};
       if (!frame || !frame.contentDocument) {
         return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
       }
       const doc = frame.contentDocument;
-      const cards = Array.from(doc.querySelectorAll('ul.card-list > li.card-item'));
+      const cards = ${JSON.stringify(RECOMMEND_CARD_SELECTORS)}
+        .flatMap((selector) => {
+          try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+        });
       const recommendCandidates = cards.filter((card) => card.querySelector('.card-inner[data-geekid]'));
-      const featuredCards = Array.from(doc.querySelectorAll('li.geek-info-card'));
+      const featuredCards = ${JSON.stringify(FEATURED_CARD_SELECTORS)}
+        .flatMap((selector) => {
+          try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+        });
       const featuredCandidates = featuredCards.filter((card) => card.querySelector('a[data-geekid]'));
-      const latestCards = Array.from(doc.querySelectorAll('.candidate-card-wrap'));
+      const latestCards = ${JSON.stringify(LATEST_CARD_SELECTORS)}
+        .flatMap((selector) => {
+          try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+        });
       const latestCandidates = latestCards.filter((card) => card.querySelector('.card-inner[data-geek], [data-geek]'));
-      const tabs = Array.from(doc.querySelectorAll('li.tab-item[data-status], li[data-status][class*="tab"]'));
+      const tabs = ${JSON.stringify(RECOMMEND_TAB_SELECTORS)}
+        .flatMap((selector) => {
+          try { return Array.from(doc.querySelectorAll(selector)); } catch { return []; }
+        });
       const activeTab = tabs.find((node) => {
         const className = String(node.className || '');
         const selected = String(node.getAttribute('aria-selected') || '').toLowerCase() === 'true';
@@ -1648,3 +1694,5 @@ export {
   normalizeJobTitle,
   parseArgs
 };
+
+
