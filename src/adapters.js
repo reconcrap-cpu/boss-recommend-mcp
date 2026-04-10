@@ -1353,6 +1353,12 @@ function isBossLoginTab(tab) {
   );
 }
 
+function findRecommendTab(tabs = []) {
+  return tabs.find(
+    (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/recommend")
+  ) || null;
+}
+
 export async function inspectBossRecommendPageState(port, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 6000;
   const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
@@ -1365,9 +1371,7 @@ export async function inspectBossRecommendPageState(port, options = {}) {
     try {
       const tabs = await listChromeTabs(port);
       lastTabs = tabs;
-      const exactTab = tabs.find(
-        (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/recommend")
-      );
+      const exactTab = findRecommendTab(tabs);
       if (exactTab) {
         if (isBossLoginTab(exactTab)) {
           return buildBossPageState({
@@ -1509,7 +1513,39 @@ async function verifyRecommendPageStable(port, options = {}) {
     pollMs
   });
   if (recheck.state === "RECOMMEND_READY") {
-    return recheck;
+    const iframeState = await waitForRecommendIframeReady(port, {
+      timeoutMs: recheckTimeoutMs,
+      pollMs
+    });
+    if (iframeState.state === "RECOMMEND_IFRAME_READY") {
+      return buildBossPageState({
+        ...recheck,
+        ok: true,
+        state: "RECOMMEND_READY",
+        frame_url: iframeState.frame_url || null,
+        iframe_state: iframeState
+      });
+    }
+    if (iframeState.state === "LOGIN_REQUIRED") {
+      return buildBossPageState({
+        ...iframeState,
+        state: "LOGIN_REQUIRED_AFTER_REDIRECT",
+        message: "Boss 页面曾进入 recommend 但 iframe 不可用且出现登录态特征，通常表示登录态失效。"
+      });
+    }
+    if (iframeState.state === "NO_RECOMMEND_IFRAME") {
+      return buildBossPageState({
+        ...recheck,
+        ok: false,
+        state: "NO_RECOMMEND_IFRAME",
+        current_url: iframeState.current_url || recheck.current_url || null,
+        title: iframeState.title || recheck.title || null,
+        frame_url: iframeState.frame_url || null,
+        iframe_state: iframeState,
+        message: "Boss recommend 页面已打开，但 recommend iframe 尚未就绪。"
+      });
+    }
+    return iframeState;
   }
   if (recheck.state === "LOGIN_REQUIRED") {
     return buildBossPageState({
@@ -1521,10 +1557,229 @@ async function verifyRecommendPageStable(port, options = {}) {
   return recheck;
 }
 
+function buildRecommendIframeProbeExpression() {
+  return `(() => {
+    const currentUrl = (() => {
+      try { return String(window.location.href || ""); } catch { return ""; }
+    })();
+    const title = (() => {
+      try { return String(document.title || ""); } catch { return ""; }
+    })();
+    const isLogin = ${bossLoginUrlPattern}.test(currentUrl)
+      || ${bossLoginTitlePattern}.test(title);
+    if (isLogin) {
+      return {
+        ok: false,
+        error: "LOGIN_REQUIRED",
+        current_url: currentUrl || ${JSON.stringify(bossLoginUrl)},
+        title
+      };
+    }
+    const frame = document.querySelector('iframe[name="recommendFrame"]')
+      || document.querySelector('iframe[src*="/web/frame/recommend/"]')
+      || document.querySelector('iframe');
+    const frameUrl = (() => {
+      try {
+        return String(frame?.contentWindow?.location?.href || frame?.src || "");
+      } catch {
+        return String(frame?.src || "");
+      }
+    })();
+    const iframeCount = document.querySelectorAll("iframe").length;
+    if (!frame || !frame.contentDocument) {
+      return {
+        ok: false,
+        error: "NO_RECOMMEND_IFRAME",
+        current_url: currentUrl,
+        title,
+        frame_url: frameUrl,
+        frame_present: Boolean(frame),
+        iframe_count: iframeCount
+      };
+    }
+    return {
+      ok: true,
+      current_url: currentUrl,
+      title,
+      frame_url: frameUrl,
+      frame_present: true,
+      iframe_count: iframeCount
+    };
+  })()`;
+}
+
+async function probeRecommendIframeState(port, options = {}) {
+  const expectedUrl = options.expectedUrl || bossRecommendUrl;
+  let client = null;
+  try {
+    const tabs = await listChromeTabs(port);
+    const exactTab = findRecommendTab(tabs);
+    if (!exactTab) {
+      const loginTab = tabs.find((tab) => isBossLoginTab(tab));
+      if (loginTab) {
+        return buildBossPageState({
+          ok: false,
+          state: "LOGIN_REQUIRED",
+          path: loginTab.url || bossLoginUrl,
+          current_url: loginTab.url || bossLoginUrl,
+          title: loginTab.title || null,
+          requires_login: true,
+          expected_url: expectedUrl,
+          login_url: bossLoginUrl,
+          message: "Boss 页面未登录，需先完成登录后再进入 recommend 页面。"
+        });
+      }
+      const bossTab = tabs.find(
+        (tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")
+      );
+      if (bossTab) {
+        return buildBossPageState({
+          ok: false,
+          state: "BOSS_NOT_ON_RECOMMEND",
+          path: bossTab.url,
+          current_url: bossTab.url,
+          title: bossTab.title || null,
+          requires_login: false,
+          expected_url: expectedUrl,
+          message: "Boss 已登录但当前不在 recommend 页面。"
+        });
+      }
+      return buildBossPageState({
+        ok: false,
+        state: "BOSS_TAB_NOT_FOUND",
+        path: expectedUrl,
+        current_url: null,
+        title: null,
+        requires_login: false,
+        expected_url: expectedUrl,
+        message: "未检测到 Boss 推荐页标签页。",
+        sample_urls: extractSampleUrls(tabs)
+      });
+    }
+    if (isBossLoginTab(exactTab)) {
+      return buildBossPageState({
+        ok: false,
+        state: "LOGIN_REQUIRED",
+        path: exactTab.url || bossLoginUrl,
+        current_url: exactTab.url || bossLoginUrl,
+        title: exactTab.title || null,
+        requires_login: true,
+        expected_url: expectedUrl,
+        login_url: bossLoginUrl,
+        message: "当前标签页虽在 recommend 路径，但检测到登录态页面特征，请先完成 Boss 登录。"
+      });
+    }
+
+    client = await CDP({ port, target: exactTab });
+    const { Runtime, Page } = client;
+    if (Runtime && typeof Runtime.enable === "function") {
+      await Runtime.enable();
+    }
+    if (Page && typeof Page.enable === "function") {
+      await Page.enable();
+    }
+    const frameProbe = await evaluateCdpExpression(client, buildRecommendIframeProbeExpression());
+    if (frameProbe?.ok) {
+      return buildBossPageState({
+        ok: true,
+        state: "RECOMMEND_IFRAME_READY",
+        path: frameProbe.current_url || exactTab.url || expectedUrl,
+        current_url: frameProbe.current_url || exactTab.url || null,
+        title: frameProbe.title || exactTab.title || null,
+        expected_url: expectedUrl,
+        frame_url: frameProbe.frame_url || null,
+        frame_present: frameProbe.frame_present === true,
+        iframe_count: Number.isFinite(Number(frameProbe.iframe_count))
+          ? Number(frameProbe.iframe_count)
+          : null,
+        message: "Boss 推荐页 iframe 已就绪。"
+      });
+    }
+    if (frameProbe?.error === "LOGIN_REQUIRED") {
+      return buildBossPageState({
+        ok: false,
+        state: "LOGIN_REQUIRED",
+        path: frameProbe.current_url || exactTab.url || bossLoginUrl,
+        current_url: frameProbe.current_url || exactTab.url || bossLoginUrl,
+        title: frameProbe.title || exactTab.title || null,
+        requires_login: true,
+        expected_url: expectedUrl,
+        login_url: bossLoginUrl,
+        message: "页面检测到登录态特征，请先完成 Boss 登录。"
+      });
+    }
+    return buildBossPageState({
+      ok: false,
+      state: frameProbe?.error || "NO_RECOMMEND_IFRAME",
+      path: frameProbe?.current_url || exactTab.url || expectedUrl,
+      current_url: frameProbe?.current_url || exactTab.url || null,
+      title: frameProbe?.title || exactTab.title || null,
+      expected_url: expectedUrl,
+      frame_url: frameProbe?.frame_url || null,
+      frame_present: frameProbe?.frame_present === true,
+      iframe_count: Number.isFinite(Number(frameProbe?.iframe_count))
+        ? Number(frameProbe.iframe_count)
+        : null,
+      message: "recommend iframe 暂不可用。"
+    });
+  } catch (error) {
+    return buildBossPageState({
+      ok: false,
+      state: "DEBUG_PORT_UNREACHABLE",
+      path: `http://127.0.0.1:${port}`,
+      current_url: null,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: `无法连接到 Chrome DevTools 端口 ${port}。请确认 Chrome 已以远程调试模式启动。`,
+      error: error?.message || String(error)
+    });
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {}
+    }
+  }
+}
+
+async function waitForRecommendIframeReady(port, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 3000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 600;
+  const expectedUrl = options.expectedUrl || bossRecommendUrl;
+  const deadline = Date.now() + timeoutMs;
+  let lastState = null;
+
+  while (Date.now() < deadline) {
+    lastState = await probeRecommendIframeState(port, { expectedUrl });
+    if (lastState?.state === "RECOMMEND_IFRAME_READY") {
+      return lastState;
+    }
+    if (
+      lastState?.state === "LOGIN_REQUIRED"
+      || lastState?.state === "LOGIN_REQUIRED_AFTER_REDIRECT"
+      || lastState?.state === "DEBUG_PORT_UNREACHABLE"
+      || lastState?.state === "BOSS_TAB_NOT_FOUND"
+      || lastState?.state === "BOSS_NOT_ON_RECOMMEND"
+    ) {
+      return lastState;
+    }
+    await sleep(pollMs);
+  }
+
+  return lastState || buildBossPageState({
+    ok: false,
+    state: "NO_RECOMMEND_IFRAME",
+    path: expectedUrl,
+    current_url: null,
+    title: null,
+    expected_url: expectedUrl,
+    message: "recommend iframe 尚未就绪。"
+  });
+}
+
 function pickBossRecommendReloadTarget(tabs = []) {
-  return tabs.find(
-    (tab) => typeof tab?.url === "string" && tab.url.includes("/web/chat/recommend")
-  ) || tabs.find(
+  return findRecommendTab(tabs) || tabs.find(
     (tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")
   ) || null;
 }

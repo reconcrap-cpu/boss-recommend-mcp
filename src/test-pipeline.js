@@ -1505,6 +1505,72 @@ async function testSearchNoIframeWithLoginShouldReturnLoginRequired() {
   assert.equal(result.guidance.agent_prompt.includes("https://www.zhipin.com/web/user/?ka=bticket"), true);
 }
 
+async function testSearchNoIframeShouldRetryOnceWhenPageRecheckReady() {
+  let searchCallCount = 0;
+  let recheckCount = 0;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => createParsed(),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => {
+        recheckCount += 1;
+        return {
+          ok: true,
+          debug_port: 9222,
+          state: "RECOMMEND_READY",
+          page_state: {
+            state: "RECOMMEND_READY",
+            expected_url: "https://www.zhipin.com/web/chat/recommend",
+            current_url: "https://www.zhipin.com/web/chat/recommend"
+          }
+        };
+      },
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => {
+        searchCallCount += 1;
+        if (searchCallCount === 1) {
+          return {
+            ok: false,
+            stdout: "",
+            stderr: "NO_RECOMMEND_IFRAME",
+            structured: null,
+            error: {
+              code: "NO_RECOMMEND_IFRAME",
+              message: "NO_RECOMMEND_IFRAME"
+            }
+          };
+        }
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 5,
+            applied_filters: {}
+          }
+        };
+      },
+      runRecommendScreenCli: async () => ({
+        ok: true,
+        summary: {
+          processed_count: 2,
+          passed_count: 1,
+          skipped_count: 1,
+          output_csv: "C:/temp/retry.csv"
+        }
+      })
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(searchCallCount, 2);
+  assert.equal(recheckCount >= 2, true);
+}
+
 async function testJobTriggerNotFoundShouldMapToLoginRequiredWhenRecheckShowsLogin() {
   const result = await runRecommendPipeline(
     {
@@ -1940,6 +2006,7 @@ async function main() {
   await testCompletedPipeline();
   await testSearchFailure();
   await testSearchNoIframeWithLoginShouldReturnLoginRequired();
+  await testSearchNoIframeShouldRetryOnceWhenPageRecheckReady();
   await testJobTriggerNotFoundShouldMapToLoginRequiredWhenRecheckShowsLogin();
   await testLoginRequiredShouldReturnGuidance();
   await testDebugPortUnreachableShouldReturnConnectionCode();

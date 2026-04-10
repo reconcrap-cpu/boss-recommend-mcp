@@ -16,6 +16,8 @@ import {
 
 const FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY = "近14天没有";
 const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 5;
+const MAX_SEARCH_NO_IFRAME_RETRY_ATTEMPTS = 1;
+const SEARCH_NO_IFRAME_RETRY_DELAY_MS = 1200;
 const PAGE_SCOPE_TO_TAB_STATUS = {
   recommend: "0",
   latest: "1",
@@ -38,6 +40,10 @@ function dedupe(values = []) {
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizePageScope(value) {
@@ -886,6 +892,7 @@ export async function runRecommendPipeline(
   let shouldRunSearch = !skipSearchOnResume;
   let screenAutoRecoveryCount = 0;
   let lastAutoRecovery = null;
+  let searchNoIframeRetryCount = 0;
   let activeTabStatus = null;
   let currentResumeConfig = {
     checkpoint_path: resume?.checkpoint_path || null,
@@ -971,11 +978,14 @@ export async function runRecommendPipeline(
       if (!searchResult.ok) {
         const searchErrorCode = String(searchResult.error?.code || "");
         const searchErrorMessage = String(searchResult.error?.message || "");
+        const isNoIframeSearchFailure = (
+          searchErrorCode === "NO_RECOMMEND_IFRAME"
+          || searchErrorMessage.includes("NO_RECOMMEND_IFRAME")
+        );
         const loginRelatedSearchFailure = (
           searchErrorCode === "LOGIN_REQUIRED"
-          || searchErrorCode === "NO_RECOMMEND_IFRAME"
+          || isNoIframeSearchFailure
           || searchErrorMessage.includes("LOGIN_REQUIRED")
-          || searchErrorMessage.includes("NO_RECOMMEND_IFRAME")
         );
         if (loginRelatedSearchFailure) {
           const recheck = await ensureRecommendPageReady(workspaceRoot, {
@@ -1005,6 +1015,28 @@ export async function runRecommendPipeline(
                 }
               }
             );
+          }
+          if (
+            isNoIframeSearchFailure
+            && recheck.state === "RECOMMEND_READY"
+            && searchNoIframeRetryCount < MAX_SEARCH_NO_IFRAME_RETRY_ATTEMPTS
+          ) {
+            searchNoIframeRetryCount += 1;
+            const retryDelayMs = SEARCH_NO_IFRAME_RETRY_DELAY_MS;
+            const retryDiagnostics = {
+              trigger: "NO_RECOMMEND_IFRAME",
+              attempt: searchNoIframeRetryCount,
+              max_attempts: MAX_SEARCH_NO_IFRAME_RETRY_ATTEMPTS,
+              delay_ms: retryDelayMs,
+              page_state: recheck.page_state || null
+            };
+            runtimeHooks.setStage(
+              "search_recovery",
+              `检测到 recommend iframe 暂未就绪，等待 ${Math.round(retryDelayMs / 1000)} 秒后重试 search（第 ${searchNoIframeRetryCount}/${MAX_SEARCH_NO_IFRAME_RETRY_ATTEMPTS} 次）。`
+            );
+            runtimeHooks.heartbeat("search_recovery", retryDiagnostics);
+            await sleep(retryDelayMs);
+            continue;
           }
         }
         return buildFailedResponse(
