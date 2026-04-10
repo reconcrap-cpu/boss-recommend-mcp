@@ -385,7 +385,34 @@ function testGreetMaxGreetCountCanComeFromOverrides() {
   assert.equal(result.needs_max_greet_count_confirmation, true);
 }
 
-function testGreetAutoFilledMaxGreetCountShouldRequireReconfirmation() {
+function testGreetAutoFilledMaxGreetCountShouldRequireReconfirmationWhenNotExplicitlyConfirmed() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选985男生，有大模型工程经验，目标3人，符合标准直接沟通",
+    confirmation: {
+      filters_confirmed: true,
+      school_tag_confirmed: true,
+      degree_confirmed: true,
+      gender_confirmed: true,
+      recent_not_view_confirmed: true,
+      criteria_confirmed: true,
+      target_count_confirmed: true,
+      target_count_value: 3,
+      post_action_confirmed: true,
+      post_action_value: "greet"
+    },
+    overrides: {
+      max_greet_count: 3
+    }
+  });
+
+  assert.equal(result.screenParams.post_action, "greet");
+  assert.equal(result.screenParams.max_greet_count, null);
+  assert.equal(result.needs_max_greet_count_confirmation, true);
+  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), true);
+  assert.equal(result.suspicious_fields.some((item) => item.field === "max_greet_count"), true);
+}
+
+function testGreetMaxGreetCountEqualTargetShouldPassAfterExplicitConfirmation() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选985男生，有大模型工程经验，目标3人，符合标准直接沟通",
     confirmation: {
@@ -406,10 +433,9 @@ function testGreetAutoFilledMaxGreetCountShouldRequireReconfirmation() {
   });
 
   assert.equal(result.screenParams.post_action, "greet");
-  assert.equal(result.screenParams.max_greet_count, null);
-  assert.equal(result.needs_max_greet_count_confirmation, true);
-  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), true);
-  assert.equal(result.suspicious_fields.some((item) => item.field === "max_greet_count"), true);
+  assert.equal(result.screenParams.max_greet_count, 3);
+  assert.equal(result.needs_max_greet_count_confirmation, false);
+  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
 }
 
 function testTargetCountNeedsConfirmationEvenWhenOptional() {
@@ -602,7 +628,8 @@ function main() {
   testMcpMentionShouldStayInCriteria();
   testGreetNeedsMaxGreetCountConfirmation();
   testGreetMaxGreetCountCanComeFromOverrides();
-  testGreetAutoFilledMaxGreetCountShouldRequireReconfirmation();
+  testGreetAutoFilledMaxGreetCountShouldRequireReconfirmationWhenNotExplicitlyConfirmed();
+  testGreetMaxGreetCountEqualTargetShouldPassAfterExplicitConfirmation();
   testTargetCountNeedsConfirmationEvenWhenOptional();
   testTargetCountCanBeSkippedAfterConfirmation();
   testPostActionNoneCanBeConfirmed();

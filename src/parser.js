@@ -497,17 +497,16 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
   const proposed = confirmationValue || overrideValue || instructionValue || null;
   const resolved = confirmed ? (confirmationValue || overrideValue || null) : null;
   const suspiciousAutoFill = Boolean(
-    confirmed
-    && Number.isInteger(confirmationValue)
-    && confirmationValue > 0
+    !confirmed
+    && Number.isInteger(proposed)
+    && proposed > 0
     && !Number.isInteger(instructionValue)
     && Number.isInteger(targetCountHint)
     && targetCountHint > 0
-    && confirmationValue === targetCountHint
+    && proposed === targetCountHint
   );
   const needsConfirmation = (
     !(Number.isInteger(resolved) && resolved > 0)
-    || suspiciousAutoFill
   );
 
   return {
