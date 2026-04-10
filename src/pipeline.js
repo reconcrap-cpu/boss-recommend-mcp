@@ -367,7 +367,11 @@ function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob, sel
       page_scope: selectedPage || "recommend",
       search_params: searchParams,
       screen_params: screenParams
-    }
+    },
+    options: [
+      { label: "参数无误，开始执行", value: "confirm" },
+      { label: "参数需要调整", value: "revise" }
+    ]
   };
 }
 

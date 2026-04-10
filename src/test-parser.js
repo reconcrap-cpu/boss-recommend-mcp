@@ -250,7 +250,7 @@ function testSchoolTagOverrideMixedValidAndInvalidShouldKeepValidOnes() {
     instruction: "推荐页筛选候选人，有算法经验",
     confirmation: null,
     overrides: {
-      school_tag: ["985", "211", "qs100"]
+      school_tag: ["985", "211", "foo_tag"]
     }
   });
 
@@ -263,11 +263,35 @@ function testSchoolTagOverrideAllInvalidShouldFallbackToUnlimited() {
     instruction: "推荐页筛选候选人，有算法经验",
     confirmation: null,
     overrides: {
-      school_tag: ["qs100", "abc"]
+      school_tag: ["abc", "foo"]
     }
   });
 
   assert.deepEqual(result.searchParams.school_tag, ["不限"]);
+}
+
+function testSchoolTagQsAliasShouldNormalizeToDomesticAndOverseasTop() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选候选人，有算法经验",
+    confirmation: null,
+    overrides: {
+      school_tag: ["985", "QS前200"]
+    }
+  });
+
+  assert.deepEqual(result.searchParams.school_tag, ["985", "国内外名校"]);
+}
+
+function testRecentNotViewSpacedOverrideShouldNormalize() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选985男生，有算法经验",
+    confirmation: null,
+    overrides: {
+      recent_not_view: "近 14 天没有"
+    }
+  });
+
+  assert.equal(result.searchParams.recent_not_view, "近14天没有");
 }
 
 function testCriteriaCanBeProvidedViaOverrides() {
@@ -488,6 +512,30 @@ function testFeaturedKeywordShouldProposeFeaturedPageScope() {
   assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
 }
 
+function testClosedQuestionsShouldExposeStructuredOptions() {
+  const result = parseRecommendInstruction({
+    instruction: "推荐页筛选候选人，有 Agent 经验，符合标准收藏",
+    confirmation: null,
+    overrides: null
+  });
+  const schoolTagQuestion = result.pending_questions.find((item) => item.field === "school_tag");
+  const recentNotViewQuestion = result.pending_questions.find((item) => item.field === "recent_not_view");
+  const filtersQuestion = result.pending_questions.find((item) => item.field === "filters");
+
+  assert.equal(Boolean(schoolTagQuestion), true);
+  assert.equal(Array.isArray(schoolTagQuestion.options), true);
+  assert.equal(schoolTagQuestion.options.some((item) => item.value === "国内外名校"), true);
+  assert.equal(schoolTagQuestion.options.every((item) => typeof item.label === "string" && typeof item.value === "string"), true);
+
+  assert.equal(Boolean(recentNotViewQuestion), true);
+  assert.equal(Array.isArray(recentNotViewQuestion.options), true);
+  assert.equal(recentNotViewQuestion.options.some((item) => item.value === "近14天没有"), true);
+
+  assert.equal(Boolean(filtersQuestion), true);
+  assert.equal(Array.isArray(filtersQuestion.options), true);
+  assert.equal(filtersQuestion.options.some((item) => item.value === "confirm"), true);
+}
+
 function testLatestKeywordShouldProposeLatestPageScope() {
   const result = parseRecommendInstruction({
     instruction: "在推荐页最新里筛选候选人，有 Agent 经验，符合标准收藏",
@@ -547,6 +595,8 @@ function main() {
   testSchoolTagOverrideCanBeArray();
   testSchoolTagOverrideMixedValidAndInvalidShouldKeepValidOnes();
   testSchoolTagOverrideAllInvalidShouldFallbackToUnlimited();
+  testSchoolTagQsAliasShouldNormalizeToDomesticAndOverseasTop();
+  testRecentNotViewSpacedOverrideShouldNormalize();
   testCriteriaCanBeProvidedViaOverrides();
   testMissingCriteriaTriggersNeedInput();
   testMcpMentionShouldStayInCriteria();
@@ -558,6 +608,7 @@ function main() {
   testPostActionNoneCanBeConfirmed();
   testJobSelectionHintCanComeFromOverrides();
   testFeaturedKeywordShouldProposeFeaturedPageScope();
+  testClosedQuestionsShouldExposeStructuredOptions();
   testLatestKeywordShouldProposeLatestPageScope();
   testConfirmedPageScopeShouldBeResolved();
   testPageScopeOverrideShouldNotBypassConfirmation();

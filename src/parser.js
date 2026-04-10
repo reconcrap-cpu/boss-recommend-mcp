@@ -28,6 +28,10 @@ const DEGREE_ORDER = [
 ];
 const GENDER_OPTIONS = ["不限", "男", "女"];
 const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
+const FILTER_CONFIRM_OPTIONS = [
+  { label: "筛选项无误，继续", value: "confirm" },
+  { label: "筛选项需要调整", value: "revise" }
+];
 const POST_ACTION_OPTIONS = ["favorite", "greet", "none"];
 const POST_ACTION_LABELS = {
   favorite: "收藏",
@@ -52,8 +56,8 @@ const SCHOOL_TAG_PATTERNS = [
   { label: "985", pattern: /(?:学校|院校|学历|标签|筛选|要求)?[^。；;\n]{0,12}(?:985)(?!\d)/i },
   { label: "211", pattern: /(?:学校|院校|学历|标签|筛选|要求)?[^。；;\n]{0,12}(?:211)(?!\d)/i },
   { label: "双一流院校", pattern: /双一流(?:院校|学校)?/i },
-  { label: "留学", pattern: /留学|留学生/i },
-  { label: "国内外名校", pattern: /国内外名校|名校/i },
+  { label: "留学", pattern: /留学|留学生|海归/i },
+  { label: "国内外名校", pattern: /国内外名校|海内外名校|海外名校|qs\s*(?:top|前)?\s*\d+|名校/i },
   { label: "公办本科", pattern: /公办本科/i }
 ];
 const DEGREE_PATTERNS = [
@@ -111,6 +115,10 @@ function normalizeText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
 }
 
+function normalizeCompactText(input) {
+  return normalizeText(input).replace(/\s+/g, "").toLowerCase();
+}
+
 function parsePositiveIntegerValue(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
@@ -120,10 +128,25 @@ function uniqueList(items) {
   return Array.from(new Set(items.filter(Boolean)));
 }
 
+function buildTextOptions(values = []) {
+  return values.map((value) => ({
+    label: value,
+    value
+  }));
+}
+
 function normalizeSchoolTag(value) {
   const normalized = normalizeText(value);
   if (!normalized) return null;
-  if (normalized === "双一流") return "双一流院校";
+  const compact = normalizeCompactText(normalized);
+  if (normalized === "双一流" || compact === "双一流") return "双一流院校";
+  if (["留学", "留学生", "海归", "海外留学"].includes(compact)) return "留学";
+  if (
+    ["国内外名校", "海内外名校", "国内外高校", "海内外高校", "海外名校"].includes(compact)
+    || /^qs(?:前|top)?\d+$/.test(compact)
+  ) {
+    return "国内外名校";
+  }
   if (SCHOOL_TAG_OPTIONS.includes(normalized)) return normalized;
   return null;
 }
@@ -257,10 +280,19 @@ function normalizeGender(value) {
 function normalizeRecentNotView(value) {
   const normalized = normalizeText(value);
   if (!normalized) return null;
-  if (normalized === "近14天未看" || normalized === "近14天没有" || normalized === "近14天没看过") {
+  const compact = normalizeCompactText(normalized).replace(/天内/g, "天");
+  if (
+    /^(?:近)?14天(?:没有|未看|没看过|没看|未查看|未查看过)$/.test(compact)
+    || /^(?:过滤|排除)(?:近)?14天(?:已看|看过)?$/.test(compact)
+  ) {
     return "近14天没有";
   }
-  if (normalized === "不限") return "不限";
+  if (
+    /^(?:不限|不限制|无要求|无|全部|都可以)$/.test(compact)
+    || /^(?:不过滤|保留)(?:近)?14天(?:已看|看过)?$/.test(compact)
+  ) {
+    return "不限";
+  }
   return RECENT_NOT_VIEW_OPTIONS.includes(normalized) ? normalized : null;
 }
 
@@ -634,7 +666,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       field: "school_tag",
       question: schoolTagQuestion,
       value: searchParams.school_tag,
-      options: SCHOOL_TAG_OPTIONS
+      options: buildTextOptions(SCHOOL_TAG_OPTIONS)
     });
   }
 
@@ -643,7 +675,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       field: "degree",
       question: "请确认学历筛选（可多选）。",
       value: searchParams.degree,
-      options: DEGREE_OPTIONS
+      options: buildTextOptions(DEGREE_OPTIONS)
     });
   }
 
@@ -652,7 +684,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       field: "gender",
       question: "请确认性别筛选。",
       value: searchParams.gender,
-      options: GENDER_OPTIONS
+      options: buildTextOptions(GENDER_OPTIONS)
     });
   }
 
@@ -661,7 +693,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       field: "recent_not_view",
       question: "请确认是否过滤近14天内已看过的人选。",
       value: searchParams.recent_not_view,
-      options: RECENT_NOT_VIEW_OPTIONS
+      options: buildTextOptions(RECENT_NOT_VIEW_OPTIONS)
     });
   }
 
@@ -669,7 +701,8 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     pending_questions.push({
       field: "filters",
       question: "请确认以上推荐页筛选项整体无误。",
-      value: searchParams
+      value: searchParams,
+      options: FILTER_CONFIRM_OPTIONS
     });
   }
 
