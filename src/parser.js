@@ -82,9 +82,9 @@ const RECENT_NOT_VIEW_NEGATIVE_PATTERNS = [
   /保留[^。；;\n]{0,12}14天/i
 ];
 const TARGET_COUNT_PATTERNS = [
-  /目标(?:处理|筛选)?(?:人数|数量)?(?:为|是|:|：)?\s*(\d+)/i,
-  /至少(?:处理|筛选)\s*(\d+)\s*(?:位|人)/i,
-  /(?:处理|筛选)\s*(\d+)\s*(?:位|人)/i
+  /目标(?:处理|筛选|通过)?(?:人数|数量)?(?:为|是|:|：)?\s*(\d+)/i,
+  /至少(?:处理|筛选|通过)\s*(\d+)\s*(?:位|人)/i,
+  /(?:处理|筛选|通过)\s*(\d+)\s*(?:位|人)/i
 ];
 const MAX_GREET_COUNT_PATTERNS = [
   /最多(?:打招呼|沟通|联系)\s*(\d+)\s*(?:位|人|个)?/i,
@@ -95,7 +95,7 @@ const FILTER_CLAUSE_PATTERNS = [
   /学历|学位|教育|初中及以下|中专|中技|高中|大专|专科|本科|硕士|研究生|博士/i,
   /性别|男生|女生|男性|女性|男\b|女\b/i,
   /近?14天(?:内)?没有|近?14天(?:内)?没看过|近?14天(?:内)?未查看|过滤[^。；;\n]{0,12}14天|排除[^。；;\n]{0,12}14天/i,
-  /目标(?:处理|筛选)?(?:人数|数量)?|至少(?:处理|筛选)|(?:处理|筛选)\s*\d+\s*(?:位|人)/i,
+  /目标(?:处理|筛选|通过)?(?:人数|数量)?|至少(?:处理|筛选|通过)|(?:处理|筛选|通过)\s*\d+\s*(?:位|人)/i,
   /最多(?:打招呼|沟通|联系)|(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多)/i,
   /收藏|打招呼|直接沟通|什么也不做|不做任何操作|不操作|仅筛选|只筛选/i
 ];
@@ -690,7 +690,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   if (needs_target_count_confirmation) {
     pending_questions.push({
       field: "target_count",
-      question: "本次目标筛选人数是多少？可留空表示不设上限。",
+      question: "本次目标通过人数是多少？可留空表示不设上限。",
       value: targetCountResolution.proposed_target_count
     });
   }

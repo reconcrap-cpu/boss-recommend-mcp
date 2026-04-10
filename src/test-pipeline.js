@@ -1432,6 +1432,7 @@ async function testCompletedPipeline() {
 }
 
 async function testSearchFailure() {
+  let searchCallCount = 0;
   const result = await runRecommendPipeline(
     {
       workspaceRoot: process.cwd(),
@@ -1444,22 +1445,80 @@ async function testSearchFailure() {
       runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
       ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
       listRecommendJobs: async () => createJobListResult(),
-      runRecommendSearchCli: async () => ({
-        ok: false,
-        stdout: "",
-        stderr: "boom",
-        structured: null,
-        error: {
-          code: "RECOMMEND_FILTER_PANEL_UNAVAILABLE",
-          message: "筛选面板不可用。"
-        }
-      }),
+      runRecommendSearchCli: async () => {
+        searchCallCount += 1;
+        return {
+          ok: false,
+          stdout: "",
+          stderr: "boom",
+          structured: null,
+          error: {
+            code: "RECOMMEND_FILTER_PANEL_UNAVAILABLE",
+            message: "筛选面板不可用。"
+          }
+        };
+      },
       runRecommendScreenCli: async () => ({ ok: true, summary: {} })
     }
   );
 
   assert.equal(result.status, "FAILED");
   assert.equal(result.error.code, "RECOMMEND_FILTER_PANEL_UNAVAILABLE");
+  assert.equal(searchCallCount, 3);
+}
+
+async function testSearchFilterFailureShouldRetryAndRecover() {
+  let searchCallCount = 0;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {}
+    },
+    {
+      parseRecommendInstruction: () => createParsed(),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9222 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => {
+        searchCallCount += 1;
+        if (searchCallCount === 1) {
+          return {
+            ok: false,
+            stdout: "",
+            stderr: "FILTER_CONFIRM_FAILED",
+            structured: null,
+            error: {
+              code: "FILTER_CONFIRM_FAILED",
+              message: "FILTER_CONFIRM_FAILED"
+            }
+          };
+        }
+        return {
+          ok: true,
+          summary: {
+            candidate_count: 6,
+            applied_filters: {}
+          }
+        };
+      },
+      runRecommendScreenCli: async () => ({
+        ok: true,
+        summary: {
+          processed_count: 3,
+          passed_count: 2,
+          skipped_count: 1,
+          output_csv: "C:/temp/search-filter-retry.csv"
+        }
+      })
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(searchCallCount, 2);
+  assert.equal(result.result.auto_recovery.trigger, "SEARCH_FILTER_RETRY");
+  assert.equal(result.result.auto_recovery.attempt, 1);
 }
 
 async function testSearchNoIframeWithLoginShouldReturnLoginRequired() {
@@ -2005,6 +2064,7 @@ async function main() {
   await testNeedFinalReviewConfirmationGate();
   await testCompletedPipeline();
   await testSearchFailure();
+  await testSearchFilterFailureShouldRetryAndRecover();
   await testSearchNoIframeWithLoginShouldReturnLoginRequired();
   await testSearchNoIframeShouldRetryOnceWhenPageRecheckReady();
   await testJobTriggerNotFoundShouldMapToLoginRequiredWhenRecheckShowsLogin();

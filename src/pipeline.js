@@ -18,6 +18,17 @@ const FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY = "近14天没有";
 const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 5;
 const MAX_SEARCH_NO_IFRAME_RETRY_ATTEMPTS = 1;
 const SEARCH_NO_IFRAME_RETRY_DELAY_MS = 1200;
+const MAX_SEARCH_FILTER_AUTO_RETRY_ATTEMPTS = 2;
+const SEARCH_FILTER_AUTO_RETRY_DELAY_MS = 1200;
+const SEARCH_FILTER_RETRY_TOKENS = [
+  "FILTER_CONFIRM_FAILED",
+  "FILTER_DOM_CLASS_VERIFY_FAILED",
+  "RECOMMEND_FILTER_PANEL_UNAVAILABLE",
+  "RECOMMEND_FILTER_PANEL_NOT_READY",
+  "FILTER_PANEL_NOT_FOUND",
+  "FILTER_TRIGGER_NOT_FOUND",
+  "FILTER_PANEL_OPEN_FAILED"
+];
 const PAGE_SCOPE_TO_TAB_STATUS = {
   recommend: "0",
   latest: "1",
@@ -44,6 +55,20 @@ function normalizeText(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldAutoRetrySearchFilterFailure(errorCode, errorMessage) {
+  const normalizedCode = normalizeText(errorCode).toUpperCase();
+  const normalizedMessage = normalizeText(errorMessage).toUpperCase();
+  const combined = `${normalizedCode} ${normalizedMessage}`.trim();
+  if (!combined) return false;
+  if (combined.includes("LOGIN_REQUIRED") || combined.includes("NO_RECOMMEND_IFRAME")) {
+    return false;
+  }
+  if (SEARCH_FILTER_RETRY_TOKENS.some((token) => combined.includes(token))) {
+    return true;
+  }
+  return /^(RECOMMEND_)?FILTER_/.test(normalizedCode);
 }
 
 function normalizePageScope(value) {
@@ -336,7 +361,7 @@ function buildNeedConfirmationResponse(parsedResult) {
 function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob, selectedPage }) {
   return {
     field: "final_review",
-    question: "开始执行搜索和筛选前，请最后确认全部参数（岗位/页面/筛选条件/筛选 criteria/目标人数/post_action/max_greet_count）无误。",
+    question: "开始执行搜索和筛选前，请最后确认全部参数（岗位/页面/筛选条件/筛选 criteria/目标通过人数/post_action/max_greet_count）无误。",
     value: {
       job: selectedJob?.title || selectedJob?.label || selectedJob?.value || null,
       page_scope: selectedPage || "recommend",
@@ -893,6 +918,7 @@ export async function runRecommendPipeline(
   let screenAutoRecoveryCount = 0;
   let lastAutoRecovery = null;
   let searchNoIframeRetryCount = 0;
+  let searchFilterRetryCount = 0;
   let activeTabStatus = null;
   let currentResumeConfig = {
     checkpoint_path: resume?.checkpoint_path || null,
@@ -1039,6 +1065,29 @@ export async function runRecommendPipeline(
             continue;
           }
         }
+        if (
+          shouldAutoRetrySearchFilterFailure(searchErrorCode, searchErrorMessage)
+          && searchFilterRetryCount < MAX_SEARCH_FILTER_AUTO_RETRY_ATTEMPTS
+        ) {
+          searchFilterRetryCount += 1;
+          const retryDelayMs = SEARCH_FILTER_AUTO_RETRY_DELAY_MS;
+          lastAutoRecovery = {
+            trigger: "SEARCH_FILTER_RETRY",
+            attempt: searchFilterRetryCount,
+            max_attempts: MAX_SEARCH_FILTER_AUTO_RETRY_ATTEMPTS,
+            delay_ms: retryDelayMs,
+            error_code: searchErrorCode || null,
+            error_message: searchErrorMessage || null,
+            action: "retry_search"
+          };
+          runtimeHooks.setStage(
+            "search_recovery",
+            `检测到筛选控件状态异常（${searchErrorCode || "UNKNOWN"}），等待 ${Math.round(retryDelayMs / 1000)} 秒后重试 search（第 ${searchFilterRetryCount}/${MAX_SEARCH_FILTER_AUTO_RETRY_ATTEMPTS} 次）。`
+          );
+          runtimeHooks.heartbeat("search_recovery", lastAutoRecovery);
+          await sleep(retryDelayMs);
+          continue;
+        }
         return buildFailedResponse(
           searchResult.error?.code || "RECOMMEND_SEARCH_FAILED",
           searchResult.error?.message || "推荐页筛选执行失败。",
@@ -1057,6 +1106,7 @@ export async function runRecommendPipeline(
         );
       }
 
+      searchFilterRetryCount = 0;
       searchSummary = searchResult.summary || {};
       if (isPauseRequested(runtimeHooks)) {
         return buildPausedResponse("已在 screen 阶段开始前暂停 Recommend 流水线。", {

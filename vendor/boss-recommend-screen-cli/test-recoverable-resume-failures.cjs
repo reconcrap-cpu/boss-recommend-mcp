@@ -124,6 +124,30 @@ class FakeRecommendScreenCli extends RecommendScreenCli {
   saveCheckpoint() {}
 }
 
+class FakeDetailCloseProbeCli extends RecommendScreenCli {
+  constructor(args, options = {}) {
+    super(args);
+    this.listReady = options.listReady === true;
+    this.evaluateCallCount = 0;
+  }
+
+  async getDetailClosedState() {
+    return { closed: false, reason: "popup visible: .boss-popup__wrapper" };
+  }
+
+  async evaluate() {
+    this.evaluateCallCount += 1;
+    if (this.evaluateCallCount >= 2) {
+      return this.listReady
+        ? { ok: true, candidate_count: 1 }
+        : { ok: false, error: "LIST_NOT_READY" };
+    }
+    return { ok: false, error: "CLOSE_ACTION_NOOP" };
+  }
+
+  async pressEsc() {}
+}
+
 function createResumeCaptureError(message = "Resume canvas not found") {
   const error = new Error(message);
   error.code = "RESUME_CAPTURE_FAILED";
@@ -304,6 +328,55 @@ async function testPageExhaustedWithoutTargetShouldStillComplete() {
   assert.equal(result.result.output_csv, cli.args.output);
   assert.equal(result.result.checkpoint_path, cli.args.checkpointPath);
   assert.equal(result.result.completion_reason, "page_exhausted");
+}
+
+async function testTargetCountShouldStopWhenPassedCountReached() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-target-pass-stop-"));
+  const args = createArgs(tempDir);
+  args.targetCount = 1;
+  const first = { key: "pass-1", geek_id: "pass-1", name: "pass-1" };
+  const second = { key: "skip-2", geek_id: "skip-2", name: "skip-2" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [first, second],
+    screeningByKey: new Map([
+      ["pass-1", { passed: true, reason: "matched", summary: "matched" }],
+      ["skip-2", { passed: false, reason: "not matched", summary: "not matched" }]
+    ])
+  });
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 1);
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.skipped_count, 0);
+  assert.equal(result.result.completion_reason, "target_count_reached");
+}
+
+async function testTargetCountShouldNotTreatProcessedCountAsReached() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-target-pass-only-"));
+  const args = createArgs(tempDir);
+  args.targetCount = 1;
+  const first = { key: "skip-a", geek_id: "skip-a", name: "skip-a" };
+  const second = { key: "skip-b", geek_id: "skip-b", name: "skip-b" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [first, second],
+    screeningByKey: new Map([
+      ["skip-a", { passed: false, reason: "not matched", summary: "not matched" }],
+      ["skip-b", { passed: false, reason: "not matched", summary: "not matched" }]
+    ])
+  });
+
+  await assert.rejects(
+    () => cli.run(),
+    (error) => {
+      assert.equal(error.code, "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED");
+      assert.equal(error.retryable, true);
+      assert.equal(error.partial_result?.processed_count, 2);
+      assert.equal(error.partial_result?.passed_count, 0);
+      assert.equal(error.partial_result?.completion_reason, "page_exhausted_before_target_count");
+      return true;
+    }
+  );
 }
 
 async function testFeaturedShouldUseNetworkResumeOnly() {
@@ -842,12 +915,152 @@ function testParseArgsShouldSupportLatestPageScope() {
   assert.equal(parsed.port, 9222);
 }
 
+async function testCallTextModelShouldNotTruncateLongResume() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-full-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const marker = "__END_OF_RESUME_MARKER__";
+  const resumeText = `${"A".repeat(32000)}${marker}`;
+  const originalFetch = global.fetch;
+  let capturedUserContent = "";
+  global.fetch = async (_url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    capturedUserContent = String(payload?.messages?.[1]?.content || "");
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": false, \"reason\": \"not matched\", \"summary\": \"not matched\", \"evidence\": [\"A\"]}"
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    const result = await cli.callTextModel(resumeText);
+    assert.equal(result.passed, false);
+    assert.equal(capturedUserContent.includes(marker), true);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-chunk-fallback-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const originalFetch = global.fetch;
+  const prevChunkSize = process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS;
+  const prevChunkOverlap = process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS;
+  const prevMaxChunks = process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS;
+  process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS = "80";
+  process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS = "0";
+  process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS = "6";
+
+  const passMarker = "PASS_MARKER_ABC";
+  const resumeText = `${"x".repeat(120)}${passMarker}${"y".repeat(120)}`;
+  let callCount = 0;
+  global.fetch = async (_url, options = {}) => {
+    callCount += 1;
+    if (callCount === 1) {
+      return {
+        ok: false,
+        status: 400,
+        async text() {
+          return "maximum context length exceeded";
+        }
+      };
+    }
+
+    const payload = JSON.parse(String(options.body || "{}"));
+    const userContent = String(payload?.messages?.[1]?.content || "");
+    const passed = userContent.includes(passMarker);
+    const response = passed
+      ? "{\"passed\": true, \"reason\": \"命中证据\", \"summary\": \"命中\", \"evidence\": [\"PASS_MARKER_ABC\"]}"
+      : "{\"passed\": false, \"reason\": \"本段证据不足\", \"summary\": \"不足\", \"evidence\": []}";
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: response
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    const result = await cli.callTextModel(resumeText);
+    assert.equal(result.passed, true);
+    assert.equal(callCount >= 2, true);
+    assert.equal(Array.isArray(result.evidence), true);
+  } finally {
+    global.fetch = originalFetch;
+    if (prevChunkSize === undefined) {
+      delete process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS;
+    } else {
+      process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS = prevChunkSize;
+    }
+    if (prevChunkOverlap === undefined) {
+      delete process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS;
+    } else {
+      process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS = prevChunkOverlap;
+    }
+    if (prevMaxChunks === undefined) {
+      delete process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS;
+    } else {
+      process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS = prevMaxChunks;
+    }
+  }
+}
+
+async function testPrepareVisionImageSegmentsShouldSplitLongImage() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-segments-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const imagePath = path.join(tempDir, "long.png");
+  await sharp({
+    create: { width: 400, height: 1200, channels: 3, background: { r: 240, g: 240, b: 240 } }
+  }).png().toFile(imagePath);
+
+  const prepared = await cli.prepareVisionImageSegmentsForModel(imagePath, 120000, "test");
+  assert.equal(Array.isArray(prepared.imagePaths), true);
+  assert.equal(prepared.imagePaths.length > 1, true);
+  for (const segmentPath of prepared.imagePaths) {
+    assert.equal(fs.existsSync(segmentPath), true);
+  }
+}
+
+async function testCloseDetailPageShouldFailWhenDetailStillOpenAndListNotReady() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-close-detail-fail-"));
+  const cli = new FakeDetailCloseProbeCli(createArgs(tempDir), { listReady: false });
+  const closed = await cli.closeDetailPage(1);
+  assert.equal(closed, false);
+}
+
+async function testCloseDetailPageShouldContinueWhenListReady() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-close-detail-list-ready-"));
+  const cli = new FakeDetailCloseProbeCli(createArgs(tempDir), { listReady: true });
+  const closed = await cli.closeDetailPage(1);
+  assert.equal(closed, true);
+}
+
 async function main() {
   testShouldAbortResumeProbeEarly();
   await testSingleResumeCaptureFailureIsSkipped();
   await testConsecutiveResumeCaptureFailuresStillAbort();
   await testPageExhaustedBeforeTargetShouldRaiseRecoverableError();
   await testPageExhaustedWithoutTargetShouldStillComplete();
+  await testTargetCountShouldStopWhenPassedCountReached();
+  await testTargetCountShouldNotTreatProcessedCountAsReached();
   await testFeaturedShouldUseNetworkResumeOnly();
   await testRecommendShouldPreferNetworkResumeWhenAvailable();
   await testNetworkMissShouldFallbackToImageCapture();
@@ -871,6 +1084,11 @@ async function main() {
   testStitchWithAvailablePythonShouldFailWhenScriptMissing();
   testParseArgsShouldSupportFeaturedAliasesAndInlinePort();
   testParseArgsShouldSupportLatestPageScope();
+  await testCallTextModelShouldNotTruncateLongResume();
+  await testCallTextModelShouldFallbackToChunkModeOnContextLimit();
+  await testPrepareVisionImageSegmentsShouldSplitLongImage();
+  await testCloseDetailPageShouldFailWhenDetailStillOpenAndListNotReady();
+  await testCloseDetailPageShouldContinueWhenListReady();
   console.log("recoverable resume failure tests passed");
 }
 

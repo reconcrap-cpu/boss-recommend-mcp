@@ -15,6 +15,9 @@ const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
 const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
 const DEFAULT_VISION_MAX_IMAGE_PIXELS = 36000000;
 const DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS = 30000000;
+const DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS = 24000;
+const DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS = 1200;
+const DEFAULT_TEXT_MODEL_MAX_CHUNKS = 12;
 let visionSharpFactory = null;
 const PAGE_SCOPE_TAB_STATUS = {
   recommend: "0",
@@ -331,6 +334,60 @@ function isVisionImageSizeLimitMessage(message) {
     /(像素|pixel|pixels|too large|image size|image dimension|too many pixels|max(?:imum)?[^a-z0-9]{0,8}(?:pixel|image)|超过|超出|上限)/i.test(text)
     || (text.includes("image") && text.includes("limit"))
   );
+}
+
+function isTextContextLimitMessage(message) {
+  const text = normalizeText(message).toLowerCase();
+  if (!text) return false;
+  return (
+    /context length|maximum context|too many tokens|max(?:imum)? token|prompt is too long|input is too long|token limit|上下文|超出.*token|超过.*token|输入过长/i.test(text)
+  );
+}
+
+function toStringArray(value, maxItems = 8) {
+  if (!Array.isArray(value)) return [];
+  const normalized = [];
+  for (const item of value) {
+    const text = normalizeText(item);
+    if (!text) continue;
+    normalized.push(text);
+    if (normalized.length >= maxItems) break;
+  }
+  return normalized;
+}
+
+function splitTextByChunks(text, chunkSize, overlap, maxChunks) {
+  const source = String(text || "");
+  if (!source) return [];
+
+  const safeChunkSize = Math.max(1000, parsePositiveInteger(chunkSize) || DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS);
+  const safeOverlap = Math.max(0, Math.min(safeChunkSize - 1, parsePositiveInteger(overlap) || DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS));
+  const safeMaxChunks = Math.max(1, parsePositiveInteger(maxChunks) || DEFAULT_TEXT_MODEL_MAX_CHUNKS);
+
+  const chunks = [];
+  let start = 0;
+  while (start < source.length && chunks.length < safeMaxChunks) {
+    const end = Math.min(source.length, start + safeChunkSize);
+    chunks.push({
+      text: source.slice(start, end),
+      start,
+      end
+    });
+    if (end >= source.length) break;
+    start = Math.max(0, end - safeOverlap);
+  }
+
+  if (chunks.length > 0) {
+    const last = chunks[chunks.length - 1];
+    if (last.end < source.length) {
+      chunks[chunks.length - 1] = {
+        text: source.slice(last.start),
+        start: last.start,
+        end: source.length
+      };
+    }
+  }
+  return chunks;
 }
 
 function normalizePostAction(value) {
@@ -795,7 +852,7 @@ async function promptMissingInputs(args) {
     if (args.targetCount === null) {
       const targetCount = await askWithValidation(
         ask,
-        "请输入目标筛选人数（--targetCount，可留空表示不设上限）: ",
+        "请输入目标通过人数（--targetCount，可留空表示不设上限）: ",
         (value) => parsePositiveInteger(value),
         { allowEmpty: true }
       );
@@ -3241,9 +3298,9 @@ class RecommendScreenCli {
       DEFAULT_VISION_MAX_IMAGE_PIXELS
     );
     const retryLimit = resolveVisionRetryPixelLimit(primaryLimit);
-    const preparedPrimary = await this.prepareVisionImageForModel(imagePath, primaryLimit, "primary");
+    const preparedPrimary = await this.prepareVisionImageSegmentsForModel(imagePath, primaryLimit, "primary");
     try {
-      return await this.requestVisionModel(preparedPrimary.imagePath);
+      return await this.requestVisionModel(preparedPrimary.imagePaths);
     } catch (error) {
       if (!isVisionImageSizeLimitMessage(error?.message || "")) {
         throw error;
@@ -3251,12 +3308,13 @@ class RecommendScreenCli {
       log(
         `[VISION] 检测到图片尺寸超限，准备降采样重试: ` +
         `primary_limit=${primaryLimit} source=${preparedPrimary.source} ` +
-        `source_pixels=${preparedPrimary.sourcePixels ?? "unknown"}`
+        `source_pixels=${preparedPrimary.sourcePixels ?? "unknown"} ` +
+        `segments=${preparedPrimary.imagePaths?.length || 1}`
       );
     }
-    const preparedRetry = await this.prepareVisionImageForModel(imagePath, retryLimit, "retry");
+    const preparedRetry = await this.prepareVisionImageSegmentsForModel(imagePath, retryLimit, "retry");
     try {
-      return await this.requestVisionModel(preparedRetry.imagePath);
+      return await this.requestVisionModel(preparedRetry.imagePaths);
     } catch (retryError) {
       if (!isVisionImageSizeLimitMessage(retryError?.message || "")) {
         throw retryError;
@@ -3267,9 +3325,104 @@ class RecommendScreenCli {
           `primary_limit=${primaryLimit}; retry_limit=${retryLimit}; ` +
           `source_pixels=${preparedRetry.sourcePixels ?? "unknown"}; ` +
           `retry_pixels=${preparedRetry.currentPixels ?? "unknown"}; ` +
+          `segments=${preparedRetry.imagePaths?.length || 1}; ` +
           `last_error=${normalizeText(retryError?.message || retryError)}`
       );
     }
+  }
+
+  async prepareVisionImageSegmentsForModel(imagePath, maxPixels, attemptTag = "primary") {
+    const resolvedMaxPixels = parsePositiveInteger(maxPixels);
+    if (!resolvedMaxPixels) {
+      return {
+        imagePaths: [imagePath],
+        source: "no_limit",
+        sourcePixels: null,
+        currentPixels: null
+      };
+    }
+
+    let sharp;
+    try {
+      sharp = loadVisionSharp();
+    } catch (error) {
+      log(`[VISION] 加载 sharp 失败，回退到单图模式: ${error?.message || error}`);
+      const single = await this.prepareVisionImageForModel(imagePath, resolvedMaxPixels, attemptTag);
+      return {
+        imagePaths: [single.imagePath],
+        source: `single_${single.source}`,
+        sourcePixels: single.sourcePixels ?? null,
+        currentPixels: single.currentPixels ?? null
+      };
+    }
+
+    let metadata;
+    try {
+      metadata = await sharp(imagePath).metadata();
+    } catch (error) {
+      log(`[VISION] 读取图片尺寸失败，回退到单图模式: ${error?.message || error}`);
+      const single = await this.prepareVisionImageForModel(imagePath, resolvedMaxPixels, attemptTag);
+      return {
+        imagePaths: [single.imagePath],
+        source: `single_${single.source}`,
+        sourcePixels: single.sourcePixels ?? null,
+        currentPixels: single.currentPixels ?? null
+      };
+    }
+
+    const width = Number(metadata?.width || 0);
+    const height = Number(metadata?.height || 0);
+    const sourcePixels = width > 0 && height > 0 ? width * height : null;
+    if (!sourcePixels || sourcePixels <= resolvedMaxPixels) {
+      return {
+        imagePaths: [imagePath],
+        source: "within_limit",
+        sourcePixels,
+        currentPixels: sourcePixels
+      };
+    }
+
+    const maxTileHeight = Math.floor(resolvedMaxPixels / Math.max(1, width));
+    if (!Number.isFinite(maxTileHeight) || maxTileHeight < 64) {
+      const single = await this.prepareVisionImageForModel(imagePath, resolvedMaxPixels, attemptTag);
+      return {
+        imagePaths: [single.imagePath],
+        source: `single_${single.source}`,
+        sourcePixels: single.sourcePixels ?? sourcePixels,
+        currentPixels: single.currentPixels ?? sourcePixels
+      };
+    }
+
+    const parsedPath = path.parse(imagePath);
+    const imagePaths = [];
+    for (let top = 0, index = 0; top < height; top += maxTileHeight, index += 1) {
+      const segmentHeight = Math.min(maxTileHeight, height - top);
+      const segmentPath = path.join(
+        parsedPath.dir,
+        `${parsedPath.name}.${attemptTag}.seg${String(index + 1).padStart(3, "0")}.png`
+      );
+      await sharp(imagePath)
+        .extract({
+          left: 0,
+          top,
+          width,
+          height: segmentHeight
+        })
+        .png()
+        .toFile(segmentPath);
+      imagePaths.push(segmentPath);
+    }
+
+    log(
+      `[VISION] 长简历按分段输入模型: ${width}x${height}(${sourcePixels}) ` +
+      `-> segments=${imagePaths.length}, max_pixels_per_segment=${resolvedMaxPixels}, attempt=${attemptTag}`
+    );
+    return {
+      imagePaths,
+      source: "segmented",
+      sourcePixels,
+      currentPixels: resolvedMaxPixels
+    };
   }
 
   async prepareVisionImageForModel(imagePath, maxPixels, attemptTag = "primary") {
@@ -3360,7 +3513,38 @@ class RecommendScreenCli {
   }
 
   async requestVisionModel(imagePath) {
-    const imageBase64 = fs.readFileSync(imagePath, "base64");
+    const imagePaths = Array.isArray(imagePath) ? imagePath.filter(Boolean) : [imagePath].filter(Boolean);
+    if (imagePaths.length <= 0) {
+      throw this.buildError("VISION_MODEL_FAILED", "No vision image input provided.");
+    }
+    const userContent = [
+      {
+        type: "text",
+        text:
+          "请根据以下标准判断候选人是否通过筛选。\n\n" +
+          `筛选标准:\n${this.args.criteria}\n\n` +
+          "你将收到候选人完整简历的一个或多个顺序分段图片。必须完整阅读全部分段后再判断，" +
+          "严禁编造任何不存在的经历、项目、学校、公司或时间线；证据不足时必须判定为不通过。\n\n" +
+          "请返回严格 JSON: " +
+          "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
+      }
+    ];
+    for (let index = 0; index < imagePaths.length; index += 1) {
+      const segmentPath = imagePaths[index];
+      const imageBase64 = fs.readFileSync(segmentPath, "base64");
+      if (imagePaths.length > 1) {
+        userContent.push({
+          type: "text",
+          text: `简历分段 ${index + 1}/${imagePaths.length}`
+        });
+      }
+      userContent.push({
+        type: "image_url",
+        image_url: {
+          url: `data:image/png;base64,${imageBase64}`
+        }
+      });
+    }
     const rawBaseUrl = this.args.baseUrl;
     log(`[callVisionModel] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
     const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
@@ -3370,22 +3554,13 @@ class RecommendScreenCli {
       messages: [
         {
           role: "system",
-          content: "你是一位严谨的招聘筛选助手。你只能返回 JSON，不要输出任何额外文字。"
+          content:
+            "你是一位严谨的招聘筛选助手。必须完整阅读所有输入材料，严禁臆造不存在的简历经历。" +
+            "只能返回 JSON，不要输出任何额外文字。"
         },
         {
           role: "user",
-          content: [
-            {
-              type: "text",
-              text: `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${this.args.criteria}\n\n你看到的是整份候选人简历长图。请返回严格 JSON: {\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\"}`
-            },
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/png;base64,${imageBase64}`
-              }
-            }
-          ]
+          content: userContent
         }
       ]
     };
@@ -3410,15 +3585,79 @@ class RecommendScreenCli {
       ? json.choices[0].message.content.map((item) => item?.text || "").join("\n")
       : json?.choices?.[0]?.message?.content || "";
     const parsed = extractJsonObject(content);
+    const reason = normalizeText(parsed.reason);
+    const summary = normalizeText(parsed.summary || reason);
+    const evidence = toStringArray(parsed.evidence);
     return {
       passed: parsed.passed === true,
-      reason: normalizeText(parsed.reason),
-      summary: normalizeText(parsed.summary)
+      reason: reason || "未满足筛选标准。",
+      summary: summary || reason || "未满足筛选标准。",
+      evidence
     };
   }
 
   async callTextModel(resumeText) {
-    const safeResumeText = String(resumeText || "").slice(0, 28000);
+    const fullResumeText = String(resumeText || "");
+    if (!normalizeText(fullResumeText)) {
+      throw this.buildError("TEXT_MODEL_FAILED", "Resume text is empty.");
+    }
+    try {
+      return await this.requestTextModel(fullResumeText, {
+        chunkIndex: 1,
+        chunkTotal: 1
+      });
+    } catch (error) {
+      if (!isTextContextLimitMessage(error?.message || "")) {
+        throw error;
+      }
+      log("[TEXT_MODEL] 检测到上下文长度限制，启用分段筛选模式。");
+    }
+
+    const chunkSize = parsePositiveInteger(process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS) || DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS;
+    const overlap = parsePositiveInteger(process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS) || DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS;
+    const maxChunks = parsePositiveInteger(process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS) || DEFAULT_TEXT_MODEL_MAX_CHUNKS;
+    const chunks = splitTextByChunks(fullResumeText, chunkSize, overlap, maxChunks);
+    if (!chunks.length) {
+      throw this.buildError("TEXT_MODEL_FAILED", "Resume text is empty after chunk split.");
+    }
+
+    const chunkResults = [];
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      const result = await this.requestTextModel(chunk.text, {
+        chunkIndex: index + 1,
+        chunkTotal: chunks.length
+      });
+      chunkResults.push(result);
+    }
+
+    const passedChunks = chunkResults.filter((item) => item?.passed === true);
+    if (passedChunks.length > 0) {
+      const best = passedChunks[0];
+      return {
+        passed: true,
+        reason: best.reason || `分段筛选命中（${best.chunkIndex}/${chunks.length}）。`,
+        summary: best.summary || best.reason || "分段筛选命中",
+        evidence: Array.isArray(best.evidence) ? best.evidence : []
+      };
+    }
+
+    const firstReason = chunkResults.map((item) => normalizeText(item?.reason)).find(Boolean);
+    return {
+      passed: false,
+      reason: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
+      summary: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
+      evidence: []
+    };
+  }
+
+  async requestTextModel(resumeText, options = {}) {
+    const safeResumeText = String(resumeText || "");
+    const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
+    const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
+    const chunkHint = chunkTotal > 1
+      ? `\n\n当前输入是简历分段 ${chunkIndex}/${chunkTotal}。请严格基于本分段文本判断；如果本分段证据不足，必须返回 passed=false。`
+      : "";
     const rawBaseUrl = this.args.baseUrl;
     log(`[callTextModel] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
     const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
@@ -3428,11 +3667,21 @@ class RecommendScreenCli {
       messages: [
         {
           role: "system",
-          content: "你是一位严谨的招聘筛选助手。你只能返回 JSON，不要输出任何额外文字。"
+          content:
+            "你是一位严谨的招聘筛选助手。必须完整阅读输入内容，严禁编造不存在的简历经历。" +
+            "只能返回 JSON，不要输出任何额外文字。"
         },
         {
           role: "user",
-          content: `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${this.args.criteria}\n\n简历内容:\n${safeResumeText}\n\n请返回严格 JSON: {"passed": true/false, "reason": "...", "summary": "..."}`
+          content:
+            `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${this.args.criteria}\n\n` +
+            `简历内容:\n${safeResumeText}${chunkHint}\n\n` +
+            "要求：\n" +
+            "1) 必须完整阅读上面的全部简历文本。\n" +
+            "2) 只能依据简历中真实出现的信息判断，严禁编造不存在的经历/项目/学历/公司。\n" +
+            "3) 若证据不足，必须返回 passed=false。\n\n" +
+            "请返回严格 JSON: " +
+            "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
         }
       ]
     };
@@ -3457,10 +3706,28 @@ class RecommendScreenCli {
       ? json.choices[0].message.content.map((item) => item?.text || "").join("\n")
       : json?.choices?.[0]?.message?.content || "";
     const parsed = extractJsonObject(content);
+    const reason = normalizeText(parsed.reason);
+    const summary = normalizeText(parsed.summary || reason);
+    const normalizedResume = normalizeText(safeResumeText);
+    const parsedEvidence = toStringArray(parsed.evidence);
+    const evidence = parsedEvidence.filter((item) => {
+      const normalizedEvidence = normalizeText(item);
+      if (!normalizedEvidence) return false;
+      return safeResumeText.includes(item) || normalizedResume.includes(normalizedEvidence);
+    });
+    let passed = parsed.passed === true;
+    let finalReason = reason || (passed ? "满足筛选标准。" : "不满足筛选标准。");
+    if (passed && evidence.length <= 0) {
+      passed = false;
+      finalReason = `模型未给出可在简历原文中校验的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`;
+    }
     return {
-      passed: parsed.passed === true,
-      reason: normalizeText(parsed.reason),
-      summary: normalizeText(parsed.summary)
+      passed,
+      reason: finalReason,
+      summary: summary || finalReason,
+      evidence,
+      chunkIndex,
+      chunkTotal
     };
   }
 
@@ -3686,8 +3953,13 @@ class RecommendScreenCli {
     }
 
     state = await this.getDetailClosedState();
-    log(`[关闭详情] 连续 ESC 后仍未确认关闭（${state?.reason || "unknown"}），按策略视为检测误差并继续下一位。`);
-    return true;
+    const listState = await this.evaluate(jsGetListState);
+    if (listState?.ok) {
+      log(`[关闭详情] 连续 ESC 后仍未确认关闭（${state?.reason || "unknown"}），但候选人列表已可用，按就绪状态继续。`);
+      return true;
+    }
+    log(`[关闭详情] 连续 ESC 后仍未确认关闭（${state?.reason || "unknown"}），且候选人列表未恢复，判定关闭失败。`);
+    return false;
   }
 
   async waitForListReady(maxRounds = 30) {
@@ -3756,7 +4028,10 @@ class RecommendScreenCli {
 
     const restoredFromCheckpoint = this.loadCheckpointIfNeeded();
     if (restoredFromCheckpoint) {
-      log(`[恢复] 已从 checkpoint 恢复，已处理 ${this.processedCount} 位候选人。`);
+      log(
+        `[恢复] 已从 checkpoint 恢复，已处理 ${this.processedCount} 位候选人，` +
+        `其中通过 ${this.passedCandidates.length} 位。`
+      );
     }
 
     await this.connect();
@@ -3790,7 +4065,7 @@ class RecommendScreenCli {
       }
 
       let pageExhaustion = null;
-      while (!this.args.targetCount || this.processedCount < this.args.targetCount) {
+      while (!this.args.targetCount || this.passedCandidates.length < this.args.targetCount) {
         if (this.shouldPauseAtBoundary()) {
           this.saveCsv();
           this.saveCheckpoint();
@@ -4048,10 +4323,10 @@ class RecommendScreenCli {
         }
       }
 
-      if (this.args.targetCount && this.processedCount < this.args.targetCount) {
+      if (this.args.targetCount && this.passedCandidates.length < this.args.targetCount) {
         throw this.buildError(
           "TARGET_COUNT_NOT_REACHED_PAGE_EXHAUSTED",
-          `推荐列表已到底，但当前仅处理 ${this.processedCount} 位，尚未达到目标 ${this.args.targetCount} 位。`,
+          `推荐列表已到底，但当前仅通过 ${this.passedCandidates.length} 位，尚未达到目标 ${this.args.targetCount} 位。`,
           true,
           {
             partial_result: this.buildProgressSnapshot("page_exhausted_before_target_count"),
@@ -4070,11 +4345,11 @@ class RecommendScreenCli {
         status: "COMPLETED",
         result: {
           ...this.buildProgressSnapshot(
-            this.args.targetCount && this.processedCount >= this.args.targetCount
+            this.args.targetCount && this.passedCandidates.length >= this.args.targetCount
               ? "target_count_reached"
               : "page_exhausted"
           ),
-          completion_reason: this.args.targetCount && this.processedCount >= this.args.targetCount
+          completion_reason: this.args.targetCount && this.passedCandidates.length >= this.args.targetCount
             ? "target_count_reached"
             : "page_exhausted",
         }
