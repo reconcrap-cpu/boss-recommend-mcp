@@ -491,8 +491,22 @@ export class BossChatApp {
       await this.checkpoint();
       const readyState = await this.page.waitForConversationReady();
       this.logger.log(
-        `会话面板就绪。onlineResume=${Boolean(readyState?.hasOnlineResume)} | askResume=${Boolean(readyState?.hasAskResume)}`,
+        `会话面板就绪。onlineResume=${Boolean(readyState?.hasOnlineResume)} | askResume=${Boolean(readyState?.hasAskResume)} | attachmentResume=${Boolean(readyState?.hasAttachmentResume)} | attachmentResumeEnabled=${Boolean(readyState?.attachmentResumeEnabled)}`,
       );
+      if (readyState?.attachmentResumeEnabled) {
+        baseResult.decision = 'skipped';
+        baseResult.reason = '检测到附件简历按钮可用，按策略跳过，不进入在线简历截图与LLM评估。';
+        baseResult.artifacts.attachmentResume = {
+          present: Boolean(readyState?.hasAttachmentResume),
+          enabled: Boolean(readyState?.attachmentResumeEnabled),
+          className: String(readyState?.attachmentResumeClass || ''),
+        };
+        this.logger.log(
+          `候选人跳过：name=${customer.name || '未知'} | key=${customer.customerKey} | reason=${baseResult.reason}`,
+        );
+        await this.stateStore.record(baseResult.customerKey, baseResult, baseAliases);
+        return baseResult;
+      }
       if (!readyState?.hasOnlineResume) {
         throw new Error('ONLINE_RESUME_UNAVAILABLE');
       }

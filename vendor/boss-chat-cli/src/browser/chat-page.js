@@ -718,6 +718,12 @@ function browserConversationReadyState() {
     const rect = el.getBoundingClientRect();
     return rect.width > 2 && rect.height > 2;
   };
+  const isDisabled = (el) => {
+    const classText = String(el?.className || '').toLowerCase();
+    const ariaDisabled = String(el?.getAttribute?.('aria-disabled') || '').toLowerCase() === 'true';
+    const disabledAttr = Boolean(el?.hasAttribute?.('disabled'));
+    return classText.includes('disabled') || ariaDisabled || disabledAttr;
+  };
   const onlineResume = Array.from(
     document.querySelectorAll(
       'a.btn.resume-btn-online, a.resume-btn-online, .resume-btn-online, .btn.resume-btn-online',
@@ -725,18 +731,29 @@ function browserConversationReadyState() {
   ).find((el) => {
     if (!isVisible(el)) return false;
     if (!normalize(el.textContent || '').includes('在线简历')) return false;
+    return !isDisabled(el);
+  });
+  const attachmentResume = Array.from(
+    document.querySelectorAll(
+      '.btn.resume-btn-file, .resume-btn-file, [class*="resume-btn-file"], button, a, div, span',
+    ),
+  ).find((el) => {
+    if (!isVisible(el)) return false;
+    if (!normalize(el.textContent || '').includes('附件简历')) return false;
     const classText = String(el.className || '').toLowerCase();
-    const ariaDisabled = String(el.getAttribute('aria-disabled') || '').toLowerCase() === 'true';
-    const disabledAttr = el.hasAttribute('disabled');
-    return !classText.includes('disabled') && !ariaDisabled && !disabledAttr;
+    return classText.includes('resume-btn-file') || classText.includes('resume') || classText.includes('btn');
   });
   const askResume = Array.from(document.querySelectorAll('span.operate-btn, button, a, span')).find(
     (el) => isVisible(el) && isAskResumeText(el.textContent || ''),
   );
+  const attachmentResumeEnabled = Boolean(attachmentResume) && !isDisabled(attachmentResume);
   return {
     hasOnlineResume: Boolean(onlineResume),
     hasAskResume: Boolean(askResume),
     onlineResumeClass: String(onlineResume?.className || ''),
+    hasAttachmentResume: Boolean(attachmentResume),
+    attachmentResumeEnabled,
+    attachmentResumeClass: String(attachmentResume?.className || ''),
   };
 }
 
@@ -2180,7 +2197,7 @@ export class BossChatPage {
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const state = await this.chromeClient.callFunction(browserConversationReadyState);
-      if (state?.hasOnlineResume || state?.hasAskResume) {
+      if (state?.hasOnlineResume || state?.hasAskResume || state?.hasAttachmentResume) {
         return state;
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
