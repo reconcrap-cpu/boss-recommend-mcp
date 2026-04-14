@@ -13,6 +13,7 @@ class FakeRecommendScreenCli extends RecommendScreenCli {
     this.testCandidates = options.candidates || [];
     this.captureOutcomes = options.captureOutcomes || new Map();
     this.screeningByKey = options.screeningByKey || new Map();
+    this.domResumeByKey = options.domResumeByKey || new Map();
     this.discoveryCalls = 0;
     this.lastCapturedCandidateKey = null;
   }
@@ -90,6 +91,10 @@ class FakeRecommendScreenCli extends RecommendScreenCli {
     return true;
   }
 
+  async extractResumeTextFromDom(candidate) {
+    return this.domResumeByKey.get(candidate.key) || null;
+  }
+
   async captureResumeImage(candidate) {
     const outcome = this.captureOutcomes.get(candidate.key);
     if (outcome instanceof Error) {
@@ -148,6 +153,31 @@ class FakeDetailCloseProbeCli extends RecommendScreenCli {
   async pressEsc() {}
 }
 
+class FakeRecoverableGreetFailureCli extends FakeRecommendScreenCli {
+  constructor(args, options = {}) {
+    super(args, options);
+    this.greetErrors = options.greetErrors || new Map();
+    this.closeFailureKeys = options.closeFailureKeys || new Set();
+  }
+
+  async greetCandidate() {
+    const key = this.currentCandidateKey || "";
+    const code = this.greetErrors.get(key);
+    if (!code) return { actionTaken: "greet" };
+    const error = new Error(code);
+    error.code = code;
+    throw error;
+  }
+
+  async closeDetailPage() {
+    const key = this.currentCandidateKey || "";
+    if (this.closeFailureKeys.has(key)) {
+      return false;
+    }
+    return true;
+  }
+}
+
 function createResumeCaptureError(message = "Resume canvas not found") {
   const error = new Error(message);
   error.code = "RESUME_CAPTURE_FAILED";
@@ -166,6 +196,7 @@ function createArgs(tempDir) {
     pageScope: "recommend",
     port: 9222,
     output: path.join(tempDir, "result.csv"),
+    inputSummary: null,
     checkpointPath: path.join(tempDir, "checkpoint.json"),
     pauseControlPath: path.join(tempDir, "pause.json"),
     resume: false,
@@ -181,6 +212,7 @@ function createArgs(tempDir) {
       maxGreetCount: false,
       pageScope: true,
       port: true,
+      inputSummary: false,
       postAction: true,
       postActionConfirmed: true
     }
@@ -249,7 +281,7 @@ async function testConsecutiveResumeCaptureFailuresStillAbort() {
     () => cli.run(),
     (error) => {
       assert.equal(error.code, "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT");
-      assert.match(error.message, /连续 .* 位候选人简历(?:捕获失败|获取失败（network \+ 截图）)/);
+      assert.match(error.message, /连续 .* 位候选人简历(?:捕获失败|获取失败（network \+ (?:DOM \+ )?截图）)/);
       assert.equal(error.rollback?.rollback_count, maxFailures);
       assert.equal(error.partial_result?.processed_count, 0);
       assert.equal(error.partial_result?.skipped_count, 0);
@@ -435,6 +467,42 @@ async function testRecommendShouldPreferNetworkResumeWhenAvailable() {
   assert.equal(result.result.resume_source, "network");
 }
 
+async function testNetworkMissShouldFallbackToDomBeforeImageCapture() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-network-dom-fallback-"));
+  const candidate = { key: "dom-1", geek_id: "dom-1", name: "dom candidate" };
+  const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
+    candidates: [candidate],
+    domResumeByKey: new Map([
+      ["dom-1", {
+        name: "dom candidate",
+        school: "华中科技大学",
+        major: "智能科学与技术",
+        company: "小米科技（武汉）",
+        position: "算法工程师",
+        resumeText: "教育经历：华中科技大学（本硕），专业智能科学与技术。工作与项目经历包含多模态、大模型微调、Agent 架构设计与落地。"
+      }]
+    ])
+  });
+
+  cli.waitForNetworkResumeCandidateInfo = async () => null;
+  cli.callTextModel = async (resumeText) => ({
+    passed: true,
+    reason: resumeText.includes("华中科技大学") ? "dom fallback used" : "unexpected",
+    summary: "dom fallback used"
+  });
+  cli.captureResumeImage = async () => {
+    throw new Error("capture should not be called when dom fallback resume exists");
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.resume_source, "dom_fallback");
+  assert.equal(cli.passedCandidates.length, 1);
+  assert.equal(cli.passedCandidates[0].school, "华中科技大学");
+  assert.equal(cli.passedCandidates[0].resumeSource, "dom_fallback");
+}
+
 async function testNetworkMissShouldFallbackToImageCapture() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-network-fallback-"));
   const candidate = { key: "img-1", geek_id: "img-1", name: "image candidate" };
@@ -499,6 +567,40 @@ async function testLatestNetworkMissShouldFallbackToImageCapture() {
   const result = await cli.run();
   assert.equal(result.status, "COMPLETED");
   assert.equal(result.result.resume_source, "image_fallback");
+}
+
+function testLatestPayloadShouldNotLeakAcrossCandidates() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-latest-payload-leak-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.latestResumeNetworkPayload = {
+    ts: Date.now(),
+    geekIds: ["candidate-a"],
+    candidateInfo: {
+      resumeText: "candidate-a resume"
+    }
+  };
+  const extracted = cli.tryExtractNetworkResumeForCandidate({
+    key: "candidate-b",
+    geek_id: "candidate-b"
+  });
+  assert.equal(extracted, null);
+}
+
+function testLatestPayloadShouldRemainAvailableWhenCandidateKeyMissing() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-latest-payload-no-key-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.latestResumeNetworkPayload = {
+    ts: Date.now(),
+    geekIds: ["candidate-a"],
+    candidateInfo: {
+      resumeText: "recent resume payload"
+    }
+  };
+  const extracted = cli.tryExtractNetworkResumeForCandidate({
+    key: "",
+    geek_id: ""
+  });
+  assert.equal(extracted?.resumeText, "recent resume payload");
 }
 
 async function testVisionModelFailureShouldSkipCandidateAndContinue() {
@@ -721,6 +823,193 @@ function testFinishedWrapClassifierShouldNotTreatLoadMoreAsBottom() {
   assert.equal(refreshOnly.reason, "refresh_button_visible");
 }
 
+function testFormatResumeApiDataShouldPreserveEducationTagsAndProjectDescription() {
+  const source = {
+    geekDetailInfo: {
+      geekBaseInfo: {
+        name: "测试候选人",
+        degreeCategory: "硕士"
+      },
+      geekEduExpList: [
+        {
+          school: "南京大学",
+          major: "数学",
+          degree: 203,
+          degreeName: "本科",
+          schoolTags: [{ name: "985院校" }, { name: "QS世界大学排名TOP200" }]
+        }
+      ],
+      geekProjExpList: [
+        {
+          name: "Prompt-to-Prompt 3DEditing via NeRF",
+          projectDescription: "采用stable diffusion进行编辑实验"
+        }
+      ]
+    }
+  };
+  const formatted = __testables.formatResumeApiData(source);
+  assert.equal(formatted.includes("学历: 本科"), true);
+  assert.equal(formatted.includes("学历: 203"), false);
+  assert.equal(formatted.includes("学校标签: 985院校、QS世界大学排名TOP200"), true);
+  assert.equal(formatted.includes("描述: 采用stable diffusion进行编辑实验"), true);
+}
+
+function testEvidenceTokenMatcherShouldSupportParaphrasedEvidence() {
+  const resume = [
+    "南京大学 专业: 数学",
+    "Prompt-to-Prompt 3DEditing via NeRF",
+    "采用 stable diffusion 进行编辑实验"
+  ].join(" | ");
+  const normalizedResume = resume.replace(/\s+/g, " ").trim();
+  const matched = __testables.matchEvidenceAgainstResume(
+    "项目经历包含Prompt-to-Prompt 3DEditing via NeRF（stable diffusion）",
+    resume,
+    normalizedResume,
+    normalizedResume.toLowerCase()
+  );
+  assert.equal(matched.matched, true);
+  const unmatched = __testables.matchEvidenceAgainstResume(
+    "有十年金融风控投研经历",
+    resume,
+    normalizedResume,
+    normalizedResume.toLowerCase()
+  );
+  assert.equal(unmatched.matched, false);
+}
+
+function testCheckpointPayloadShouldIncludeCandidateAudits() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-audit-checkpoint-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.recordCandidateAudit({
+    candidate_key: "candidate-a",
+    geek_id: "candidate-a",
+    candidate_name: "候选人A",
+    outcome: "skipped",
+    resume_source: "network",
+    raw_passed: true,
+    final_passed: false,
+    evidence_gate_demoted: true,
+    screening_reason: "模型未给出可校验证据"
+  });
+  const checkpoint = cli.buildCheckpointPayload();
+  assert.equal(Array.isArray(checkpoint.candidate_audits), true);
+  assert.equal(checkpoint.candidate_audits.length, 1);
+  assert.equal(checkpoint.candidate_audits[0].candidate_key, "candidate-a");
+  assert.equal(checkpoint.candidate_audits[0].evidence_gate_demoted, true);
+}
+
+function testCheckpointShouldPersistAndRestoreInputSummary() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-input-summary-checkpoint-"));
+  const args = createArgs(tempDir);
+  args.inputSummary = {
+    instruction: "筛选 AI 人选",
+    search_params: {
+      school_tag: ["985"],
+      degree: ["本科"]
+    },
+    screen_params: {
+      criteria: "有 LLM 项目经验"
+    },
+    baseUrl: "https://should-not-be-stored",
+    apiKey: "sk-should-not-be-stored",
+    model: "should-not-be-stored"
+  };
+  const cli = new RecommendScreenCli(args);
+  const checkpoint = cli.buildCheckpointPayload();
+  assert.equal(checkpoint.input_summary?.instruction, "筛选 AI 人选");
+  assert.equal(checkpoint.input_summary?.screen_params?.criteria, "有 LLM 项目经验");
+  assert.equal(Object.prototype.hasOwnProperty.call(checkpoint.input_summary || {}, "baseUrl"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(checkpoint.input_summary || {}, "apiKey"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(checkpoint.input_summary || {}, "model"), false);
+
+  fs.writeFileSync(args.checkpointPath, JSON.stringify(checkpoint, null, 2), "utf8");
+  const resumeArgs = createArgs(tempDir);
+  resumeArgs.resume = true;
+  resumeArgs.inputSummary = null;
+  const resumeCli = new RecommendScreenCli(resumeArgs);
+  const restored = resumeCli.loadCheckpointIfNeeded();
+  assert.equal(restored, true);
+  assert.equal(resumeCli.inputSummary?.instruction, "筛选 AI 人选");
+  assert.equal(resumeCli.inputSummary?.screen_params?.criteria, "有 LLM 项目经验");
+}
+
+function testSaveCsvShouldIncludeAllCandidateOutcomes() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-csv-audit-"));
+  const args = createArgs(tempDir);
+  args.output = path.join(tempDir, "result.csv");
+  const cli = new RecommendScreenCli(args);
+  cli.inputSummary = {
+    instruction: "找算法候选人",
+    search_params: {
+      school_tag: ["985", "211"],
+      degree: ["本科"],
+      gender: "不限"
+    },
+    screen_params: {
+      criteria: "有 LLM 研究或工程经验",
+      post_action: "greet"
+    },
+    baseUrl: "https://should-not-appear",
+    apiKey: "sk-should-not-appear",
+    model: "gpt-should-not-appear"
+  };
+  cli.candidateAudits = [
+    {
+      candidate_key: "cand-pass",
+      geek_id: "cand-pass",
+      candidate_name: "通过候选人",
+      school: "南京大学",
+      major: "数学",
+      company: "",
+      position: "",
+      outcome: "passed",
+      screening_reason: "满足全部条件",
+      action_taken: "greet",
+      resume_source: "network",
+      raw_passed: true,
+      final_passed: true,
+      evidence_raw_count: 4,
+      evidence_matched_count: 3,
+      evidence_gate_demoted: false,
+      error_code: "",
+      error_message: ""
+    },
+    {
+      candidate_key: "cand-skip",
+      geek_id: "cand-skip",
+      candidate_name: "跳过候选人",
+      school: "某大学",
+      major: "工科",
+      company: "",
+      position: "",
+      outcome: "skipped",
+      screening_reason: "证据不足",
+      action_taken: "none",
+      resume_source: "network",
+      raw_passed: false,
+      final_passed: false,
+      evidence_raw_count: 2,
+      evidence_matched_count: 0,
+      evidence_gate_demoted: false,
+      error_code: "",
+      error_message: ""
+    }
+  ];
+  cli.saveCsv();
+  const content = fs.readFileSync(args.output, "utf8");
+  assert.equal(content.includes("处理结果"), true);
+  assert.equal(content.includes("运行输入字段"), true);
+  assert.equal(content.includes("instruction"), true);
+  assert.equal(content.includes("screen_params.criteria"), true);
+  assert.equal(content.includes("baseUrl"), false);
+  assert.equal(content.includes("apiKey"), false);
+  assert.equal(content.includes("model"), false);
+  assert.equal((content.match(/运行输入字段/g) || []).length, 1);
+  assert.equal(content.includes("通过候选人"), true);
+  assert.equal(content.includes("跳过候选人"), true);
+  assert.equal(content.includes("cand-skip"), true);
+}
+
 async function testGetCenteredCandidateClickPointShouldSupportLatestSelector() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-latest-click-locator-"));
   const args = createArgs(tempDir);
@@ -915,6 +1204,20 @@ function testParseArgsShouldSupportLatestPageScope() {
   assert.equal(parsed.port, 9222);
 }
 
+function testParseArgsShouldSupportInputSummaryJson() {
+  const parsed = parseArgs([
+    "--criteria", "test criteria",
+    "--baseurl", "https://example.com/v1",
+    "--apikey", "key",
+    "--model", "test-model",
+    "--post-action", "none",
+    "--post-action-confirmed", "true",
+    "--input-summary-json", "{\"instruction\":\"筛选测试\",\"search_params\":{\"school_tag\":[\"985\"]}}"
+  ]);
+  assert.equal(parsed.inputSummary?.instruction, "筛选测试");
+  assert.equal(parsed.inputSummary?.search_params?.school_tag?.[0], "985");
+}
+
 async function testCallTextModelShouldNotTruncateLongResume() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-full-"));
   const cli = new RecommendScreenCli(createArgs(tempDir));
@@ -1039,6 +1342,77 @@ async function testPrepareVisionImageSegmentsShouldSplitLongImage() {
   }
 }
 
+function testRecoverablePostActionErrorShouldTreatGreetContinueAndNoButtonAsRecoverable() {
+  assert.equal(
+    __testables.isRecoverablePostActionError({ code: "GREET_CONTINUE_BUTTON_FOUND" }, "greet"),
+    true
+  );
+  assert.equal(
+    __testables.isRecoverablePostActionError({ code: "GREET_BUTTON_NOT_FOUND" }, "greet"),
+    true
+  );
+}
+
+async function testRecoverableGreetContinueButtonShouldNotAbortWhenDetailCloseFails() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-greet-continue-"));
+  const args = createArgs(tempDir);
+  args.postAction = "greet";
+  args.maxGreetCount = 5;
+  args.__provided.maxGreetCount = true;
+
+  const first = { key: "candidate-1", geek_id: "candidate-1", name: "candidate-1" };
+  const second = { key: "candidate-2", geek_id: "candidate-2", name: "candidate-2" };
+  const cli = new FakeRecoverableGreetFailureCli(args, {
+    candidates: [first, second],
+    captureOutcomes: new Map([
+      [first.key, { stitchedImage: path.join(tempDir, "candidate-1.png") }],
+      [second.key, { stitchedImage: path.join(tempDir, "candidate-2.png") }]
+    ]),
+    screeningByKey: new Map([
+      [first.key, { passed: true, reason: "matched", summary: "matched" }],
+      [second.key, { passed: true, reason: "matched", summary: "matched" }]
+    ]),
+    greetErrors: new Map([[first.key, "GREET_CONTINUE_BUTTON_FOUND"]]),
+    closeFailureKeys: new Set([first.key])
+  });
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 2);
+  assert.equal(result.result.passed_count, 2);
+  assert.equal(result.result.greet_count, 1);
+}
+
+async function testRecoverableGreetButtonNotFoundShouldNotAbortWhenDetailCloseFails() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-greet-not-found-"));
+  const args = createArgs(tempDir);
+  args.postAction = "greet";
+  args.maxGreetCount = 5;
+  args.__provided.maxGreetCount = true;
+
+  const first = { key: "candidate-a", geek_id: "candidate-a", name: "candidate-a" };
+  const second = { key: "candidate-b", geek_id: "candidate-b", name: "candidate-b" };
+  const cli = new FakeRecoverableGreetFailureCli(args, {
+    candidates: [first, second],
+    captureOutcomes: new Map([
+      [first.key, { stitchedImage: path.join(tempDir, "candidate-a.png") }],
+      [second.key, { stitchedImage: path.join(tempDir, "candidate-b.png") }]
+    ]),
+    screeningByKey: new Map([
+      [first.key, { passed: true, reason: "matched", summary: "matched" }],
+      [second.key, { passed: true, reason: "matched", summary: "matched" }]
+    ]),
+    greetErrors: new Map([[first.key, "GREET_BUTTON_NOT_FOUND"]]),
+    closeFailureKeys: new Set([first.key])
+  });
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.processed_count, 2);
+  assert.equal(result.result.passed_count, 2);
+  assert.equal(result.result.greet_count, 1);
+}
+
 async function testCloseDetailPageShouldFailWhenDetailStillOpenAndListNotReady() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-close-detail-fail-"));
   const cli = new FakeDetailCloseProbeCli(createArgs(tempDir), { listReady: false });
@@ -1063,9 +1437,12 @@ async function main() {
   await testTargetCountShouldNotTreatProcessedCountAsReached();
   await testFeaturedShouldUseNetworkResumeOnly();
   await testRecommendShouldPreferNetworkResumeWhenAvailable();
+  await testNetworkMissShouldFallbackToDomBeforeImageCapture();
   await testNetworkMissShouldFallbackToImageCapture();
   await testLatestShouldPreferNetworkResumeWhenAvailable();
   await testLatestNetworkMissShouldFallbackToImageCapture();
+  testLatestPayloadShouldNotLeakAcrossCandidates();
+  testLatestPayloadShouldRemainAvailableWhenCandidateKeyMissing();
   await testVisionModelFailureShouldSkipCandidateAndContinue();
   await testFeaturedNetworkMissShouldSkipWithoutImageCapture();
   await testFeaturedFavoriteShouldNotUseDomFallback();
@@ -1077,6 +1454,11 @@ async function main() {
   testFavoriteActionParserShouldSupportWebSocketPayload();
   testFavoriteActionParserShouldOnlyTrustKnownRequestShapes();
   testFinishedWrapClassifierShouldNotTreatLoadMoreAsBottom();
+  testFormatResumeApiDataShouldPreserveEducationTagsAndProjectDescription();
+  testEvidenceTokenMatcherShouldSupportParaphrasedEvidence();
+  testCheckpointPayloadShouldIncludeCandidateAudits();
+  testCheckpointShouldPersistAndRestoreInputSummary();
+  testSaveCsvShouldIncludeAllCandidateOutcomes();
   await testGetCenteredCandidateClickPointShouldSupportLatestSelector();
   await testFeaturedPostActionFailureShouldStillRecordPassedCandidate();
   await testStitchWithSharpShouldComposeExpectedImage();
@@ -1084,9 +1466,13 @@ async function main() {
   testStitchWithAvailablePythonShouldFailWhenScriptMissing();
   testParseArgsShouldSupportFeaturedAliasesAndInlinePort();
   testParseArgsShouldSupportLatestPageScope();
+  testParseArgsShouldSupportInputSummaryJson();
   await testCallTextModelShouldNotTruncateLongResume();
   await testCallTextModelShouldFallbackToChunkModeOnContextLimit();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();
+  testRecoverablePostActionErrorShouldTreatGreetContinueAndNoButtonAsRecoverable();
+  await testRecoverableGreetContinueButtonShouldNotAbortWhenDetailCloseFails();
+  await testRecoverableGreetButtonNotFoundShouldNotAbortWhenDetailCloseFails();
   await testCloseDetailPageShouldFailWhenDetailStillOpenAndListNotReady();
   await testCloseDetailPageShouldContinueWhenListReady();
   console.log("recoverable resume failure tests passed");

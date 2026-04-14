@@ -1,0 +1,53 @@
+{
+  "name": "@reconcrap/boss-chat-cli",
+  "version": "1.1.0",
+  "description": "Boss chat education screening and outreach CLI with MCP agent bridge",
+  "type": "module",
+  "bin": {
+    "boss-chat": "src/cli.js",
+    "boss-chat-mcp": "src/mcp/server.js",
+    "openclaw-boss-chat-mcp": "src/mcp/server.js",
+    "codex-boss-chat-mcp": "src/mcp/server.js",
+    "trae-cn-boss-chat-mcp": "src/mcp/server.js"
+  },
+  "main": "./src/cli.js",
+  "files": [
+    "src/",
+    "configs/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node ./src/cli.js run",
+    "start:mcp": "node ./src/mcp/server.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "boss",
+    "zhipin",
+    "chrome-devtools",
+    "cli",
+    "automation",
+    "mcp",
+    "openclaw",
+    "codex",
+    "trae-cn"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.1",
+    "chrome-remote-interface": "^0.33.3",
+    "sharp": "^0.34.5",
+    "zod": "^4.1.12"
+  }
+}

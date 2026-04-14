@@ -115,6 +115,15 @@ function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function serializeInputSummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+}
+
 function normalizePageScope(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
@@ -2794,6 +2803,7 @@ export async function runRecommendScreenCli({
   workspaceRoot,
   screenParams,
   pageScope = "recommend",
+  inputSummary = null,
   resume = null,
   runtime = null
 }) {
@@ -2924,6 +2934,10 @@ export async function runRecommendScreenCli({
   }
   if (resumeRequested) {
     args.push("--resume");
+  }
+  const serializedInputSummary = serializeInputSummary(inputSummary);
+  if (serializedInputSummary) {
+    args.push("--input-summary-json", serializedInputSummary);
   }
 
   let inferredProgress = {

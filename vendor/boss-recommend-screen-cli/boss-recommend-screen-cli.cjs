@@ -8,7 +8,27 @@ const { captureFullResumeCanvas } = require("./scripts/capture-full-resume-canva
 
 const DEFAULT_PORT = 9222;
 const RECOMMEND_URL_FRAGMENT = "/web/chat/recommend";
-const CSV_HEADER = ["姓名", "最高学历学校", "最高学历专业", "最近工作公司", "最近工作职位", "评估通过详细原因"].join(",");
+const CSV_HEADER = [
+  "姓名",
+  "最高学历学校",
+  "最高学历专业",
+  "最近工作公司",
+  "最近工作职位",
+  "评估通过详细原因",
+  "处理结果",
+  "筛选原因",
+  "动作执行结果",
+  "简历来源",
+  "原始判定通过",
+  "最终判定通过",
+  "证据总数",
+  "证据命中数",
+  "证据门控降级",
+  "错误码",
+  "错误信息",
+  "候选人ID"
+].join(",");
+const INPUT_SUMMARY_HEADER = ["运行输入字段", "运行输入值"].join(",");
 const RESUME_CAPTURE_WAIT_MS = 60000;
 const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
 const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
@@ -18,6 +38,7 @@ const DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS = 30000000;
 const DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS = 24000;
 const DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS = 1200;
 const DEFAULT_TEXT_MODEL_MAX_CHUNKS = 12;
+const MAX_EVIDENCE_TOKENS = 12;
 let visionSharpFactory = null;
 const PAGE_SCOPE_TAB_STATUS = {
   recommend: "0",
@@ -139,6 +160,51 @@ const DETAIL_RESUME_IFRAME_SELECTORS = getHealingValue(
   ["selectors", "detail", "resume_iframe"],
   ['iframe[src*="/web/frame/c-resume/"]', 'iframe[name*="resume"]']
 );
+const RESUME_DOM_ROOT_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "resume_dom_root"],
+  [
+    ".resume-center-side",
+    ".resume-detail-wrap",
+    ".resume-item-detail",
+    ".resume-section"
+  ]
+);
+const RESUME_DOM_BLOCK_SELECTORS = getHealingValue(
+  HEALING_RULES,
+  ["selectors", "detail", "resume_dom_blocks"],
+  [
+    ".resume-section .section-title",
+    ".resume-section .section-content",
+    ".resume-section .item-content",
+    ".resume-section .geek-desc",
+    ".resume-section .text-item",
+    ".resume-warning"
+  ]
+);
+const RESUME_DOM_PROFILE_SELECTORS = {
+  name: [
+    ".resume-section.geek-base-info-wrap .name",
+    ".geek-name .name",
+    ".name-wrap .name"
+  ],
+  school: [
+    ".geek-education-experience-wrap .school-name",
+    ".edu-wrap .school-name"
+  ],
+  major: [
+    ".geek-education-experience-wrap .major",
+    ".edu-wrap .major"
+  ],
+  company: [
+    ".geek-work-experience-wrap .company-name-wrap .name",
+    ".geek-work-experience-wrap .company-name"
+  ],
+  position: [
+    ".geek-work-experience-wrap .position span",
+    ".geek-work-experience-wrap .position"
+  ]
+};
 const DETAIL_CLOSE_SELECTORS = getHealingValue(
   HEALING_RULES,
   ["selectors", "detail", "close_button"],
@@ -307,6 +373,41 @@ function parsePositiveInteger(raw) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+function parseInputSummary(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isSensitiveInputSummaryKey(key) {
+  const normalized = String(key || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return normalized === "baseurl" || normalized === "apikey" || normalized === "model";
+}
+
+function sanitizeInputSummary(value) {
+  if (value === null || value === undefined) return null;
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeInputSummary(item));
+  }
+  if (typeof value === "object") {
+    const sanitized = {};
+    for (const [key, raw] of Object.entries(value)) {
+      if (isSensitiveInputSummaryKey(key)) continue;
+      const next = sanitizeInputSummary(raw);
+      if (next !== undefined) {
+        sanitized[key] = next;
+      }
+    }
+    return sanitized;
+  }
+  return value;
+}
+
 function resolveVisionPixelLimitFromEnv(envName, fallback) {
   const parsed = parsePositiveInteger(process.env[envName]);
   return parsed || fallback;
@@ -354,6 +455,85 @@ function toStringArray(value, maxItems = 8) {
     if (normalized.length >= maxItems) break;
   }
   return normalized;
+}
+
+function toLowerSafe(text) {
+  return String(text || "").toLowerCase();
+}
+
+function extractEvidenceTokens(text, maxItems = MAX_EVIDENCE_TOKENS) {
+  const normalized = normalizeText(text);
+  if (!normalized) return [];
+  const matched = normalized.match(/[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9.+#_-]{2,}|\d{3,}/g) || [];
+  const seen = new Set();
+  const picked = [];
+  const sorted = matched
+    .map((item) => normalizeText(item))
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+  for (const token of sorted) {
+    const key = toLowerSafe(token);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    picked.push(token);
+    if (picked.length >= maxItems) break;
+  }
+  return picked;
+}
+
+function matchEvidenceAgainstResume(evidenceText, rawResumeText, normalizedResumeText, normalizedResumeLowerText) {
+  const normalizedEvidence = normalizeText(evidenceText);
+  if (!normalizedEvidence) {
+    return {
+      matched: false,
+      mode: "empty",
+      matchedTokens: []
+    };
+  }
+  if (rawResumeText.includes(evidenceText) || normalizedResumeText.includes(normalizedEvidence)) {
+    return {
+      matched: true,
+      mode: "exact",
+      matchedTokens: [normalizedEvidence]
+    };
+  }
+  const evidenceTokens = extractEvidenceTokens(normalizedEvidence, MAX_EVIDENCE_TOKENS);
+  if (evidenceTokens.length <= 0) {
+    return {
+      matched: false,
+      mode: "token_empty",
+      matchedTokens: []
+    };
+  }
+  const matchedTokens = [];
+  for (const token of evidenceTokens) {
+    if (normalizedResumeLowerText.includes(toLowerSafe(token))) {
+      matchedTokens.push(token);
+    }
+  }
+  const requiredHits = evidenceTokens.length >= 4 ? 2 : 1;
+  return {
+    matched: matchedTokens.length >= requiredHits,
+    mode: "token_fuzzy",
+    matchedTokens
+  };
+}
+
+function formatEducationDegree(edu) {
+  const degreeName = normalizeText(edu?.degreeName || edu?.degreeCategory || "");
+  if (degreeName) return degreeName;
+  if (typeof edu?.degree === "string") {
+    return normalizeText(edu.degree);
+  }
+  return "";
+}
+
+function formatEducationSchoolTags(edu) {
+  if (!Array.isArray(edu?.schoolTags) || edu.schoolTags.length <= 0) return "";
+  const tags = edu.schoolTags
+    .map((item) => normalizeText(item?.name || item?.tagName || item))
+    .filter(Boolean);
+  return tags.join("、");
 }
 
 function splitTextByChunks(text, chunkSize, overlap, maxChunks) {
@@ -642,7 +822,9 @@ function isRecoverablePostActionError(error, action) {
   const normalizedCode = normalizeText(error?.code).toUpperCase();
   if (!normalizedAction || !normalizedCode) return false;
   if (normalizedAction === "favorite" && normalizedCode === "FAVORITE_BUTTON_FAILED") return true;
-  if (normalizedAction === "greet" && normalizedCode === "GREET_BUTTON_FAILED") return true;
+  if (normalizedAction === "greet" && ["GREET_BUTTON_FAILED", "GREET_BUTTON_NOT_FOUND", "GREET_CONTINUE_BUTTON_FOUND"].includes(normalizedCode)) {
+    return true;
+  }
   return false;
 }
 
@@ -695,6 +877,7 @@ function parseArgs(argv) {
     calibrationPath: getDefaultCalibrationPath(),
     port: DEFAULT_PORT,
     output: path.resolve(process.cwd(), `筛选结果_${Date.now()}.csv`),
+    inputSummary: null,
     checkpointPath: null,
     pauseControlPath: null,
     resume: false,
@@ -765,6 +948,9 @@ function parseArgs(argv) {
       if (!inlineValue) index += 1;
     } else if (token === "--output" && (inlineValue || next)) {
       parsed.output = path.resolve(inlineValue || next);
+      if (!inlineValue) index += 1;
+    } else if ((token === "--input-summary-json" || token === "--inputSummaryJson") && (inlineValue || next)) {
+      parsed.inputSummary = parseInputSummary(inlineValue || next);
       if (!inlineValue) index += 1;
     } else if (token === "--checkpoint-path" && (inlineValue || next)) {
       parsed.checkpointPath = path.resolve(inlineValue || next);
@@ -920,6 +1106,56 @@ function generateBezierPath(start, end, steps = 18) {
 
 function csvEscape(value) {
   return `"${String(value || "").replace(/"/g, '""')}"`;
+}
+
+function stringifyInputSummaryValue(value) {
+  if (value === null) return "null";
+  if (value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function appendInputSummaryRows(rows, value, prefix = "") {
+  if (value === null || value === undefined) {
+    if (prefix) rows.push([prefix, stringifyInputSummaryValue(value)]);
+    return;
+  }
+  if (Array.isArray(value)) {
+    rows.push([prefix, stringifyInputSummaryValue(value)]);
+    return;
+  }
+  if (typeof value !== "object") {
+    rows.push([prefix, stringifyInputSummaryValue(value)]);
+    return;
+  }
+  const entries = Object.entries(value);
+  if (entries.length === 0) {
+    if (prefix) rows.push([prefix, "{}"]);
+    return;
+  }
+  for (const [key, item] of entries) {
+    const nextPrefix = prefix ? `${prefix}.${key}` : key;
+    if (!nextPrefix) continue;
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      appendInputSummaryRows(rows, item, nextPrefix);
+    } else {
+      rows.push([nextPrefix, stringifyInputSummaryValue(item)]);
+    }
+  }
+}
+
+function buildInputSummaryRows(inputSummary) {
+  if (!inputSummary || typeof inputSummary !== "object" || Array.isArray(inputSummary)) {
+    return [];
+  }
+  const rows = [];
+  appendInputSummaryRows(rows, inputSummary);
+  return rows;
 }
 
 function stripHtml(value) {
@@ -1096,7 +1332,7 @@ function isResumeRelatedWapiUrl(url) {
 
 function formatResumeApiData(data) {
   const parts = [];
-  const geekDetail = data?.geekDetail || data || {};
+  const geekDetail = data?.geekDetail || data?.geekDetailInfo || data || {};
   const baseInfo = geekDetail.geekBaseInfo || {};
   const expectList = geekDetail.geekExpectList || [];
   const workExpList = geekDetail.geekWorkExpList || [];
@@ -1138,8 +1374,9 @@ function formatResumeApiData(data) {
       if (exp.startYearMonStr) {
         parts.push(`   时间: ${exp.startYearMonStr} ~ ${exp.endYearMonStr || "至今"}`);
       }
-      if (exp.responsibility) {
-        parts.push(`   职责: ${stripHtml(exp.responsibility)}`);
+      const workContent = exp.responsibility || exp.workContent || "";
+      if (workContent) {
+        parts.push(`   职责: ${stripHtml(workContent)}`);
       }
     });
   }
@@ -1147,13 +1384,15 @@ function formatResumeApiData(data) {
   if (projExpList.length > 0) {
     parts.push("\n=== 项目经历 ===");
     projExpList.forEach((proj, index) => {
-      parts.push(`${index + 1}. ${proj.name || "未知项目"}`);
+      parts.push(`${index + 1}. ${proj.name || proj.projectName || "未知项目"}`);
       if (proj.roleName) parts.push(`   角色: ${proj.roleName}`);
       if (proj.startYearMonStr) {
         parts.push(`   时间: ${proj.startYearMonStr} ~ ${proj.endYearMonStr || "至今"}`);
       }
-      if (proj.description) parts.push(`   描述: ${stripHtml(proj.description)}`);
-      if (proj.performance) parts.push(`   成果: ${stripHtml(proj.performance)}`);
+      const projectDescription = proj.description || proj.projectDescription || "";
+      if (projectDescription) parts.push(`   描述: ${stripHtml(projectDescription)}`);
+      const projectPerformance = proj.performance || proj.projectPerformance || "";
+      if (projectPerformance) parts.push(`   成果: ${stripHtml(projectPerformance)}`);
     });
   }
 
@@ -1162,12 +1401,16 @@ function formatResumeApiData(data) {
     eduExpList.forEach((edu, index) => {
       parts.push(`${index + 1}. ${edu.school || edu.schoolName || "未知学校"}`);
       if (edu.major || edu.majorName) parts.push(`   专业: ${edu.major || edu.majorName}`);
-      const eduDegree = edu.degree || edu.degreeCategory || edu.degreeName;
+      const eduDegree = formatEducationDegree(edu);
       if (eduDegree) parts.push(`   学历: ${eduDegree}`);
       const eduStart = edu.startYearMonStr || edu.startYearStr;
       if (eduStart) {
         const eduEnd = edu.endYearMonStr || edu.endYearStr || "";
         parts.push(`   时间: ${eduStart} ~ ${eduEnd}`);
+      }
+      const schoolTags = formatEducationSchoolTags(edu);
+      if (schoolTags) {
+        parts.push(`   学校标签: ${schoolTags}`);
       }
     });
   }
@@ -1599,6 +1842,182 @@ const jsWaitForDetail = `(() => {
   return { open, scope: 'frame' };
 })()`;
 
+const jsExtractResumeTextFromDom = `(() => {
+  const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+  const rootSelectors = ${JSON.stringify(RESUME_DOM_ROOT_SELECTORS)};
+  const blockSelectors = ${JSON.stringify(RESUME_DOM_BLOCK_SELECTORS)};
+  const profileSelectors = ${JSON.stringify(RESUME_DOM_PROFILE_SELECTORS)};
+
+  const isVisible = (doc, el) => {
+    if (!el) return false;
+    const win = (doc && doc.defaultView) || window;
+    const style = win.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.02) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
+
+  const pickFirstText = (doc, scopeRoot, selectors) => {
+    const scopeNode = scopeRoot && typeof scopeRoot.querySelectorAll === 'function' ? scopeRoot : doc;
+    for (const selector of selectors || []) {
+      let nodes = [];
+      try {
+        nodes = Array.from(scopeNode.querySelectorAll(selector)).slice(0, 12);
+      } catch {
+        nodes = [];
+      }
+      for (const node of nodes) {
+        if (!isVisible(doc, node)) continue;
+        const text = normalize(node.textContent || '');
+        if (text) return text;
+      }
+    }
+    return '';
+  };
+
+  const extractProfileFromRoot = (doc, root) => ({
+    name: pickFirstText(doc, root, profileSelectors.name),
+    school: pickFirstText(doc, root, profileSelectors.school),
+    major: pickFirstText(doc, root, profileSelectors.major),
+    company: pickFirstText(doc, root, profileSelectors.company),
+    position: pickFirstText(doc, root, profileSelectors.position)
+  });
+
+  const extractRootText = (doc, root) => {
+    const sectionSelector = '.resume-section';
+    const titleSelector = '.section-title';
+    const contentSelector = '.section-content';
+    const dedup = new Set();
+    const lines = [];
+    const pushLine = (raw) => {
+      const text = normalize(raw);
+      if (!text) return;
+      const key = text.toLowerCase();
+      if (dedup.has(key)) return;
+      dedup.add(key);
+      lines.push(text);
+    };
+
+    let sections = [];
+    try {
+      sections = Array.from(root.querySelectorAll(sectionSelector)).slice(0, 120);
+    } catch {
+      sections = [];
+    }
+    if (sections.length > 0) {
+      for (const section of sections) {
+        if (!isVisible(doc, section)) continue;
+        const title = normalize((section.querySelector(titleSelector)?.textContent) || '');
+        const contentNode = section.querySelector(contentSelector);
+        const content = normalize((contentNode && contentNode.textContent) || section.textContent || '');
+        if (title && content) {
+          pushLine('[' + title + '] ' + content);
+        } else if (content) {
+          pushLine(content);
+        } else if (title) {
+          pushLine('[' + title + ']');
+        }
+      }
+    }
+
+    if (lines.length === 0) {
+      let blocks = [];
+      try {
+        blocks = Array.from(root.querySelectorAll(blockSelectors.join(','))).slice(0, 260);
+      } catch {
+        blocks = [];
+      }
+      if (blocks.length > 0) {
+        for (const node of blocks) {
+          if (!isVisible(doc, node)) continue;
+          pushLine(node.textContent || '');
+        }
+      }
+    }
+
+    if (lines.length === 0) {
+      pushLine(root.textContent || '');
+    }
+    return normalize(lines.join('\\n'));
+  };
+
+  const collectFromDocument = (doc, scope) => {
+    if (!doc) return [];
+    const rows = [];
+    const seen = new Set();
+
+    const pushCandidate = (root, selectorLabel) => {
+      if (!root || seen.has(root)) return;
+      seen.add(root);
+      if (!isVisible(doc, root)) return;
+      const text = extractRootText(doc, root);
+      if (text.length < 120) return;
+      const profile = extractProfileFromRoot(doc, root);
+      rows.push({
+        scope,
+        selector: selectorLabel,
+        text,
+        text_length: text.length,
+        name: profile.name || '',
+        school: profile.school || '',
+        major: profile.major || '',
+        company: profile.company || '',
+        position: profile.position || ''
+      });
+    };
+
+    for (const selector of rootSelectors) {
+      let nodes = [];
+      try {
+        nodes = Array.from(doc.querySelectorAll(selector)).slice(0, 20);
+      } catch {
+        nodes = [];
+      }
+      for (const node of nodes) {
+        pushCandidate(node, selector);
+      }
+    }
+
+    if (rows.length === 0) {
+      const fallbackRoot = doc.querySelector('.resume-center-side')
+        || doc.querySelector('.resume-detail-wrap')
+        || doc.querySelector('.resume-section');
+      if (fallbackRoot) {
+        pushCandidate(fallbackRoot, 'fallback_any_resume_root');
+      }
+    }
+    return rows;
+  };
+
+  const topRows = collectFromDocument(document, 'top');
+  let frameRows = [];
+  try {
+    const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
+    if (frame && frame.contentDocument) {
+      frameRows = collectFromDocument(frame.contentDocument, 'frame');
+    }
+  } catch {}
+
+  const candidates = [...topRows, ...frameRows]
+    .filter((item) => normalize(item?.text || '').length > 0)
+    .sort((a, b) => Number(b?.text_length || 0) - Number(a?.text_length || 0));
+  const best = candidates[0] || null;
+  if (!best) {
+    return {
+      ok: false,
+      reason: 'resume_dom_not_found',
+      candidate_count: 0
+    };
+  }
+  return {
+    ok: true,
+    ...best,
+    candidate_count: candidates.length
+  };
+})()`;
+
 const jsCloseDetail = `(() => {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const pickVisibleKnowButton = (rootDoc) => {
@@ -1882,7 +2301,18 @@ const jsGetGreetStateRecommend = `(() => {
     const resolveGreet = (doc, offsetX, offsetY, scope) => {
       if (!doc) return null;
       const candidates = ${buildSelectorCollectionExpression(GREET_BUTTON_RECOMMEND_SELECTORS, "doc")};
-      const button = candidates.find((item) => isVisible(doc, item) && /沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
+      const visibleButtons = candidates.filter((item) => isVisible(doc, item));
+      const normalizeLabel = (item) => normalize(item?.textContent || '');
+      const isContinue = (item) => /继续沟通/.test(normalizeLabel(item));
+      const isGreetEntry = (item) => (
+        /打招呼|聊一聊|立即沟通/.test(normalizeLabel(item))
+        || (/沟通/.test(normalizeLabel(item)) && !isContinue(item))
+      );
+      const button = visibleButtons.find((item) => isGreetEntry(item)) || null;
+      const continueButton = visibleButtons.find((item) => isContinue(item)) || null;
+      if (!button && continueButton) {
+        return { ok: false, error: 'GREET_CONTINUE_BUTTON_FOUND', scope };
+      }
     if (!button) return null;
     const rect = button.getBoundingClientRect();
     return {
@@ -1908,7 +2338,12 @@ const jsGetGreetStateRecommend = `(() => {
 
 const jsClickGreetFallbackRecommend = `(() => {
   const topButton = Array.from(document.querySelectorAll('.resume-footer.item-operate button, .resume-footer-wrap button, button.btn-v2.btn-sure-v2'))
-    .find((item) => item && item.offsetParent !== null && /沟通|打招呼|聊一聊/.test(String(item.textContent || '').replace(/\\s+/g, ' ')));
+    .find((item) => {
+      if (!item || item.offsetParent === null) return false;
+      const text = String(item.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (/继续沟通/.test(text)) return false;
+      return /打招呼|聊一聊|立即沟通/.test(text) || /沟通/.test(text);
+    });
   if (topButton) {
     topButton.click();
     return { ok: true, scope: 'top' };
@@ -1916,7 +2351,13 @@ const jsClickGreetFallbackRecommend = `(() => {
   const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   const doc = frame.contentDocument;
-  const button = ${buildFirstSelectorLookupExpression(GREET_BUTTON_RECOMMEND_SELECTORS, "doc")};
+  const button = ${buildSelectorCollectionExpression(GREET_BUTTON_RECOMMEND_SELECTORS, "doc")}
+    .find((item) => {
+      if (!item || item.offsetParent === null) return false;
+      const text = String(item.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (/继续沟通/.test(text)) return false;
+      return /打招呼|聊一聊|立即沟通/.test(text) || /沟通/.test(text);
+    }) || null;
   if (!button || button.offsetParent === null) return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
   button.click();
   return { ok: true };
@@ -1937,7 +2378,18 @@ const jsGetGreetStateFeatured = `(() => {
     const resolveGreet = (doc, offsetX, offsetY, scope) => {
       if (!doc) return null;
       const candidates = ${buildSelectorCollectionExpression(GREET_BUTTON_FEATURED_SELECTORS, "doc")};
-      const button = candidates.find((item) => isVisible(doc, item) && /立即沟通|沟通|打招呼|聊一聊/.test(normalize(item.textContent))) || null;
+      const visibleButtons = candidates.filter((item) => isVisible(doc, item));
+      const normalizeLabel = (item) => normalize(item?.textContent || '');
+      const isContinue = (item) => /继续沟通/.test(normalizeLabel(item));
+      const isGreetEntry = (item) => (
+        /打招呼|聊一聊|立即沟通/.test(normalizeLabel(item))
+        || (/沟通/.test(normalizeLabel(item)) && !isContinue(item))
+      );
+      const button = visibleButtons.find((item) => isGreetEntry(item)) || null;
+      const continueButton = visibleButtons.find((item) => isContinue(item)) || null;
+      if (!button && continueButton) {
+        return { ok: false, error: 'GREET_CONTINUE_BUTTON_FOUND', scope };
+      }
     if (!button) return null;
     const rect = button.getBoundingClientRect();
     return {
@@ -1963,7 +2415,12 @@ const jsGetGreetStateFeatured = `(() => {
 
 const jsClickGreetFallbackFeatured = `(() => {
   const topButton = Array.from(document.querySelectorAll('button.btn-v2.position-rights.btn-sure-v2, button.btn-v2.btn-sure-v2.position-rights, .resume-footer.item-operate button, .resume-footer-wrap button'))
-    .find((item) => item && item.offsetParent !== null && /立即沟通|沟通|打招呼|聊一聊/.test(String(item.textContent || '').replace(/\\s+/g, ' ')));
+    .find((item) => {
+      if (!item || item.offsetParent === null) return false;
+      const text = String(item.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (/继续沟通/.test(text)) return false;
+      return /打招呼|聊一聊|立即沟通/.test(text) || /沟通/.test(text);
+    });
   if (topButton) {
     topButton.click();
     return { ok: true, scope: 'top' };
@@ -1971,7 +2428,13 @@ const jsClickGreetFallbackFeatured = `(() => {
   const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
   if (!frame || !frame.contentDocument) return { ok: false, error: 'NO_RECOMMEND_IFRAME' };
   const doc = frame.contentDocument;
-  const button = ${buildFirstSelectorLookupExpression(GREET_BUTTON_FEATURED_SELECTORS, "doc")};
+  const button = ${buildSelectorCollectionExpression(GREET_BUTTON_FEATURED_SELECTORS, "doc")}
+    .find((item) => {
+      if (!item || item.offsetParent === null) return false;
+      const text = String(item.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (/继续沟通/.test(text)) return false;
+      return /打招呼|聊一聊|立即沟通/.test(text) || /沟通/.test(text);
+    }) || null;
   if (!button || button.offsetParent === null) return { ok: false, error: 'GREET_BUTTON_NOT_FOUND' };
   button.click();
   return { ok: true };
@@ -2261,8 +2724,10 @@ class RecommendScreenCli {
     this.favoriteClickPendingSince = 0;
     this.favoriteNetworkTraces = [];
     this.webSocketByRequestId = new Map();
+    this.candidateAudits = [];
     this.resumeSourceStats = {
       network: 0,
+      dom_fallback: 0,
       image_fallback: 0
     };
     this.lastActiveTabStatus = PAGE_SCOPE_TAB_STATUS[this.args.pageScope] || null;
@@ -2273,6 +2738,7 @@ class RecommendScreenCli {
     this.restThreshold = 25 + Math.floor(Math.random() * 8);
     this.checkpointPath = this.args.checkpointPath ? path.resolve(this.args.checkpointPath) : null;
     this.pauseControlPath = this.args.pauseControlPath ? path.resolve(this.args.pauseControlPath) : null;
+    this.inputSummary = sanitizeInputSummary(this.args.inputSummary);
     this.debugDir = path.join(os.tmpdir(), "boss-recommend-screen", String(Date.now()));
     fs.mkdirSync(this.debugDir, { recursive: true });
   }
@@ -2323,7 +2789,32 @@ class RecommendScreenCli {
         summary: item?.summary || "",
         imagePath: item?.imagePath || "",
         resumeSource: item?.resumeSource || ""
-      }))
+      })),
+      candidate_audits: this.candidateAudits.map((item) => ({
+        ts: item?.ts || null,
+        candidate_key: item?.candidate_key || "",
+        geek_id: item?.geek_id || "",
+        candidate_name: item?.candidate_name || "",
+        school: item?.school || "",
+        major: item?.major || "",
+        company: item?.company || "",
+        position: item?.position || "",
+        outcome: item?.outcome || "",
+        resume_source: item?.resume_source || "",
+        resume_text_len: Number.isFinite(Number(item?.resume_text_len)) ? Number(item.resume_text_len) : null,
+        raw_passed: item?.raw_passed === true,
+        final_passed: item?.final_passed === true,
+        evidence_raw_count: Number.isFinite(Number(item?.evidence_raw_count)) ? Number(item.evidence_raw_count) : null,
+        evidence_matched_count: Number.isFinite(Number(item?.evidence_matched_count)) ? Number(item.evidence_matched_count) : null,
+        evidence_gate_demoted: item?.evidence_gate_demoted === true,
+        screening_reason: item?.screening_reason || "",
+        action_taken: item?.action_taken || "",
+        error_code: item?.error_code || "",
+        error_message: item?.error_message || "",
+        chunk_index: Number.isFinite(Number(item?.chunk_index)) ? Number(item.chunk_index) : null,
+        chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null
+      })),
+      input_summary: sanitizeInputSummary(this.inputSummary)
     };
   }
 
@@ -2339,6 +2830,8 @@ class RecommendScreenCli {
       active_tab_status: this.lastActiveTabStatus || PAGE_SCOPE_TAB_STATUS[this.args.pageScope] || null,
       resume_source: this.resumeSourceStats.image_fallback > 0
         ? "image_fallback"
+        : this.resumeSourceStats.dom_fallback > 0
+          ? "dom_fallback"
         : this.resumeSourceStats.network > 0
           ? "network"
           : defaultResumeSource,
@@ -2443,8 +2936,49 @@ class RecommendScreenCli {
         if (item.kind === "wait_timeout") {
           return `${prefix} candidate=${item.candidate_key || "-"} waited_ms=${item.waited_ms ?? "?"} reason=${item.reason || "timeout"}`;
         }
+        if (item.kind === "dom_fallback_hit") {
+          return `${prefix} candidate=${item.candidate_key || "-"} scope=${item.source || "-"} selector=${item.reason || "-"} resume_len=${item.resume_text_len ?? "?"}`;
+        }
+        if (item.kind === "dom_fallback_miss") {
+          return `${prefix} candidate=${item.candidate_key || "-"} reason=${item.reason || "dom_not_found"}`;
+        }
+        if (item.kind === "dom_fallback_error") {
+          return `${prefix} candidate=${item.candidate_key || "-"} error=${item.error || "unknown"}`;
+        }
         return `${prefix} ${item.url || item.reason || "n/a"}`;
       });
+  }
+
+  recordCandidateAudit(entry = {}) {
+    const normalized = {
+      ts: new Date().toISOString(),
+      candidate_key: normalizeText(entry?.candidate_key || entry?.geek_id || "") || "",
+      geek_id: normalizeText(entry?.geek_id || entry?.candidate_key || "") || "",
+      candidate_name: normalizeText(entry?.candidate_name || "") || "",
+      school: normalizeText(entry?.school || "") || "",
+      major: normalizeText(entry?.major || "") || "",
+      company: normalizeText(entry?.company || "") || "",
+      position: normalizeText(entry?.position || "") || "",
+      outcome: normalizeText(entry?.outcome || "unknown") || "unknown",
+      resume_source: normalizeText(entry?.resume_source || "") || "",
+      resume_text_len: Number.isFinite(Number(entry?.resume_text_len)) ? Number(entry.resume_text_len) : null,
+      raw_passed: entry?.raw_passed === true,
+      final_passed: entry?.final_passed === true,
+      evidence_raw_count: Number.isFinite(Number(entry?.evidence_raw_count)) ? Number(entry.evidence_raw_count) : null,
+      evidence_matched_count: Number.isFinite(Number(entry?.evidence_matched_count)) ? Number(entry.evidence_matched_count) : null,
+      evidence_gate_demoted: entry?.evidence_gate_demoted === true,
+      screening_reason: normalizeText(entry?.screening_reason || "") || "",
+      action_taken: normalizeText(entry?.action_taken || "") || "",
+      error_code: normalizeText(entry?.error_code || "") || "",
+      error_message: normalizeText(entry?.error_message || "") || "",
+      chunk_index: Number.isFinite(Number(entry?.chunk_index)) ? Number(entry.chunk_index) : null,
+      chunk_total: Number.isFinite(Number(entry?.chunk_total)) ? Number(entry.chunk_total) : null
+    };
+    this.candidateAudits.push(normalized);
+    const maxItems = parsePositiveInteger(process.env.BOSS_RECOMMEND_MAX_CANDIDATE_AUDITS);
+    if (maxItems && this.candidateAudits.length > maxItems) {
+      this.candidateAudits = this.candidateAudits.slice(-maxItems);
+    }
   }
 
   logResumeNetworkMissDiagnostics(candidate, options = {}) {
@@ -2507,7 +3041,9 @@ class RecommendScreenCli {
     };
     this.latestResumeNetworkPayload = wrapped;
     for (const id of geekIds) {
-      this.resumeNetworkByGeekId.set(id, wrapped);
+      const normalizedId = normalizeText(id);
+      if (!normalizedId) continue;
+      this.resumeNetworkByGeekId.set(normalizedId, wrapped);
     }
   }
 
@@ -2518,7 +3054,13 @@ class RecommendScreenCli {
     }
     if (this.latestResumeNetworkPayload) {
       const ageMs = Date.now() - Number(this.latestResumeNetworkPayload.ts || 0);
-      if (ageMs <= 12000) {
+      const latestGeekIds = Array.isArray(this.latestResumeNetworkPayload.geekIds)
+        ? this.latestResumeNetworkPayload.geekIds.map((id) => normalizeText(id)).filter(Boolean)
+        : [];
+      if (!candidateKey && ageMs <= 12000) {
+        return this.latestResumeNetworkPayload.candidateInfo || null;
+      }
+      if (candidateKey && ageMs <= 12000 && latestGeekIds.includes(candidateKey)) {
         return this.latestResumeNetworkPayload.candidateInfo || null;
       }
     }
@@ -2532,9 +3074,12 @@ class RecommendScreenCli {
     while (Date.now() < deadline) {
       const info = this.tryExtractNetworkResumeForCandidate(candidate);
       if (info && normalizeText(info.resumeText)) {
+        const latestGeekIds = Array.isArray(this.latestResumeNetworkPayload?.geekIds)
+          ? this.latestResumeNetworkPayload.geekIds.map((id) => normalizeText(id)).filter(Boolean)
+          : [];
         const source = candidateKey && this.resumeNetworkByGeekId.has(candidateKey)
           ? "geek_id_map"
-          : "latest_payload";
+          : (candidateKey && latestGeekIds.includes(candidateKey) ? "latest_payload_key_match" : "latest_payload");
         this.recordResumeNetworkDiagnostic({
           kind: "wait_hit",
           candidate_key: candidateKey,
@@ -2553,6 +3098,71 @@ class RecommendScreenCli {
       reason: "resume_text_not_ready"
     });
     return null;
+  }
+
+  async extractResumeTextFromDom(candidate) {
+    const candidateKey = normalizeText(candidate?.key || candidate?.geek_id || "");
+    const candidateLabel = normalizeText(candidate?.name || candidateKey || "unknown");
+    if (!this.Runtime || typeof this.Runtime.evaluate !== "function") {
+      return null;
+    }
+    let extracted = null;
+    try {
+      extracted = await this.evaluate(jsExtractResumeTextFromDom);
+    } catch (error) {
+      this.recordResumeNetworkDiagnostic({
+        kind: "dom_fallback_error",
+        candidate_key: candidateKey,
+        error: normalizeText(error?.message || error)
+      });
+      log(`[DOM简历提取失败] candidate=${candidateLabel} error=${normalizeText(error?.message || error)}`);
+      return null;
+    }
+    if (!extracted || extracted.ok !== true) {
+      this.recordResumeNetworkDiagnostic({
+        kind: "dom_fallback_miss",
+        candidate_key: candidateKey,
+        reason: normalizeText(extracted?.reason || "resume_dom_not_found")
+      });
+      log(
+        `[DOM简历未命中] candidate=${candidateLabel} reason=${normalizeText(extracted?.reason || "resume_dom_not_found")}`
+      );
+      return null;
+    }
+
+    const resumeText = normalizeText(extracted.text || "");
+    if (!resumeText) {
+      this.recordResumeNetworkDiagnostic({
+        kind: "dom_fallback_miss",
+        candidate_key: candidateKey,
+        reason: "resume_dom_text_empty"
+      });
+      log(`[DOM简历未命中] candidate=${candidateLabel} reason=resume_dom_text_empty`);
+      return null;
+    }
+
+    const info = {
+      name: normalizeText(extracted.name || candidate?.name || ""),
+      school: normalizeText(extracted.school || candidate?.school || ""),
+      major: normalizeText(extracted.major || candidate?.major || ""),
+      company: normalizeText(extracted.company || candidate?.last_company || ""),
+      position: normalizeText(extracted.position || candidate?.last_position || ""),
+      resumeText,
+      alreadyInterested: false
+    };
+
+    this.recordResumeNetworkDiagnostic({
+      kind: "dom_fallback_hit",
+      candidate_key: candidateKey,
+      source: normalizeText(extracted.scope || "unknown"),
+      reason: normalizeText(extracted.selector || "unknown"),
+      resume_text_len: resumeText.length
+    });
+    log(
+      `[DOM简历命中] candidate=${candidateLabel} scope=${normalizeText(extracted.scope || "unknown")} `
+      + `selector=${normalizeText(extracted.selector || "unknown")} resume_len=${resumeText.length}`
+    );
+    return info;
   }
 
   handleNetworkRequestWillBeSent(params) {
@@ -2740,6 +3350,8 @@ class RecommendScreenCli {
       this.processedKeys.delete(key);
       this.discoveredKeys.delete(key);
     }
+    const rollbackSet = new Set(streakKeys);
+    this.candidateAudits = this.candidateAudits.filter((item) => !rollbackSet.has(item?.candidate_key));
     this.resetResumeCaptureFailureStreak();
     return {
       rollback_count: rollbackCount,
@@ -2808,16 +3420,53 @@ class RecommendScreenCli {
           resumeSource: item?.resumeSource || ""
         }))
       : [];
+    this.candidateAudits = Array.isArray(parsed.candidate_audits)
+      ? parsed.candidate_audits.map((item) => ({
+          ts: normalizeText(item?.ts || "") || null,
+          candidate_key: normalizeText(item?.candidate_key || "") || "",
+          geek_id: normalizeText(item?.geek_id || "") || "",
+          candidate_name: normalizeText(item?.candidate_name || "") || "",
+          school: normalizeText(item?.school || "") || "",
+          major: normalizeText(item?.major || "") || "",
+          company: normalizeText(item?.company || "") || "",
+          position: normalizeText(item?.position || "") || "",
+          outcome: normalizeText(item?.outcome || "unknown") || "unknown",
+          resume_source: normalizeText(item?.resume_source || "") || "",
+          resume_text_len: Number.isFinite(Number(item?.resume_text_len)) ? Number(item.resume_text_len) : null,
+          raw_passed: item?.raw_passed === true,
+          final_passed: item?.final_passed === true,
+          evidence_raw_count: Number.isFinite(Number(item?.evidence_raw_count)) ? Number(item.evidence_raw_count) : null,
+          evidence_matched_count: Number.isFinite(Number(item?.evidence_matched_count)) ? Number(item.evidence_matched_count) : null,
+          evidence_gate_demoted: item?.evidence_gate_demoted === true,
+          screening_reason: normalizeText(item?.screening_reason || "") || "",
+          action_taken: normalizeText(item?.action_taken || "") || "",
+          error_code: normalizeText(item?.error_code || "") || "",
+          error_message: normalizeText(item?.error_message || "") || "",
+          chunk_index: Number.isFinite(Number(item?.chunk_index)) ? Number(item.chunk_index) : null,
+          chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null
+        }))
+      : [];
+    if (!this.inputSummary) {
+      this.inputSummary = sanitizeInputSummary(parsed.input_summary);
+    }
     const networkCount = this.passedCandidates.filter((item) => item?.resumeSource === "network").length;
+    const domFallbackCount = this.passedCandidates.filter((item) => item?.resumeSource === "dom_fallback").length;
     const imageFallbackCount = this.passedCandidates.filter((item) => item?.resumeSource === "image_fallback").length;
     this.resumeSourceStats = {
       network: networkCount,
+      dom_fallback: domFallbackCount,
       image_fallback: imageFallbackCount
     };
-    if (this.resumeSourceStats.network <= 0 && this.resumeSourceStats.image_fallback <= 0) {
+    if (
+      this.resumeSourceStats.network <= 0
+      && this.resumeSourceStats.dom_fallback <= 0
+      && this.resumeSourceStats.image_fallback <= 0
+    ) {
       const snapshotSource = normalizeText(parsed.resume_source || "").toLowerCase();
       if (snapshotSource === "network") {
         this.resumeSourceStats.network = 1;
+      } else if (snapshotSource === "dom_fallback") {
+        this.resumeSourceStats.dom_fallback = 1;
       } else if (snapshotSource === "image_fallback") {
         this.resumeSourceStats.image_fallback = 1;
       }
@@ -3636,18 +4285,30 @@ class RecommendScreenCli {
       const best = passedChunks[0];
       return {
         passed: true,
+        rawPassed: best?.rawPassed === true || best?.passed === true,
         reason: best.reason || `分段筛选命中（${best.chunkIndex}/${chunks.length}）。`,
         summary: best.summary || best.reason || "分段筛选命中",
-        evidence: Array.isArray(best.evidence) ? best.evidence : []
+        evidence: Array.isArray(best.evidence) ? best.evidence : [],
+        evidenceRawCount: Number.isFinite(Number(best?.evidenceRawCount)) ? Number(best.evidenceRawCount) : null,
+        evidenceMatchedCount: Number.isFinite(Number(best?.evidenceMatchedCount)) ? Number(best.evidenceMatchedCount) : null,
+        evidenceGateDemoted: best?.evidenceGateDemoted === true,
+        chunkIndex: best?.chunkIndex || null,
+        chunkTotal: best?.chunkTotal || chunks.length
       };
     }
 
     const firstReason = chunkResults.map((item) => normalizeText(item?.reason)).find(Boolean);
     return {
       passed: false,
+      rawPassed: chunkResults.some((item) => item?.rawPassed === true),
       reason: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
       summary: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
-      evidence: []
+      evidence: [],
+      evidenceRawCount: chunkResults.reduce((acc, item) => acc + (Number.isFinite(Number(item?.evidenceRawCount)) ? Number(item.evidenceRawCount) : 0), 0),
+      evidenceMatchedCount: chunkResults.reduce((acc, item) => acc + (Number.isFinite(Number(item?.evidenceMatchedCount)) ? Number(item.evidenceMatchedCount) : 0), 0),
+      evidenceGateDemoted: chunkResults.some((item) => item?.evidenceGateDemoted === true),
+      chunkIndex: null,
+      chunkTotal: chunks.length
     };
   }
 
@@ -3709,23 +4370,41 @@ class RecommendScreenCli {
     const reason = normalizeText(parsed.reason);
     const summary = normalizeText(parsed.summary || reason);
     const normalizedResume = normalizeText(safeResumeText);
+    const normalizedResumeLower = toLowerSafe(normalizedResume);
     const parsedEvidence = toStringArray(parsed.evidence);
-    const evidence = parsedEvidence.filter((item) => {
-      const normalizedEvidence = normalizeText(item);
-      if (!normalizedEvidence) return false;
-      return safeResumeText.includes(item) || normalizedResume.includes(normalizedEvidence);
-    });
-    let passed = parsed.passed === true;
+    const evidence = [];
+    const unmatchedEvidence = [];
+    for (const item of parsedEvidence) {
+      const matched = matchEvidenceAgainstResume(item, safeResumeText, normalizedResume, normalizedResumeLower);
+      if (matched.matched) {
+        evidence.push(item);
+      } else {
+        unmatchedEvidence.push(item);
+      }
+    }
+    const rawPassed = parsed.passed === true;
+    let passed = rawPassed;
     let finalReason = reason || (passed ? "满足筛选标准。" : "不满足筛选标准。");
-    if (passed && evidence.length <= 0) {
+    const evidenceGateDemoted = rawPassed && evidence.length <= 0;
+    if (evidenceGateDemoted) {
       passed = false;
       finalReason = `模型未给出可在简历原文中校验的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`;
+      if (unmatchedEvidence.length > 0) {
+        log(
+          `[EVIDENCE_GATE] passed=true 但证据未命中简历原文，已降级为不通过；` +
+          `chunk=${chunkIndex}/${chunkTotal}; unmatched=${unmatchedEvidence.slice(0, 3).join(" | ")}`
+        );
+      }
     }
     return {
       passed,
+      rawPassed,
       reason: finalReason,
       summary: summary || finalReason,
       evidence,
+      evidenceRawCount: parsedEvidence.length,
+      evidenceMatchedCount: evidence.length,
+      evidenceGateDemoted,
       chunkIndex,
       chunkTotal
     };
@@ -3844,8 +4523,17 @@ class RecommendScreenCli {
       ? jsClickGreetFallbackFeatured
       : jsClickGreetFallbackRecommend;
     const greet = await this.evaluate(greetStateScript);
-    if (!greet?.ok || greet.disabled) {
+    if (!greet?.ok) {
+      if (greet?.error === "GREET_CONTINUE_BUTTON_FOUND") {
+        throw this.buildError("GREET_CONTINUE_BUTTON_FOUND", "检测到“继续沟通”按钮，判定为已沟通过，跳过本次打招呼。");
+      }
+      if (greet?.error === "GREET_BUTTON_NOT_FOUND") {
+        throw this.buildError("GREET_BUTTON_NOT_FOUND", "未找到可用的打招呼按钮，跳过本次打招呼。");
+      }
       throw this.buildError("GREET_BUTTON_FAILED", greet?.error || "打招呼按钮不可用");
+    }
+    if (greet.disabled) {
+      throw this.buildError("GREET_BUTTON_FAILED", "打招呼按钮不可用");
     }
 
     try {
@@ -3991,15 +4679,70 @@ class RecommendScreenCli {
   }
 
   saveCsv() {
-    const lines = [CSV_HEADER];
+    const lines = [];
+    const sanitizedInputSummary = sanitizeInputSummary(this.inputSummary);
+    const inputSummaryRows = buildInputSummaryRows(sanitizedInputSummary);
+    if (inputSummaryRows.length > 0) {
+      lines.push(INPUT_SUMMARY_HEADER);
+      for (const [key, value] of inputSummaryRows) {
+        lines.push([csvEscape(key), csvEscape(value)].join(","));
+      }
+      lines.push("");
+    }
+    lines.push(CSV_HEADER);
+    const passedByGeekId = new Map();
     for (const item of this.passedCandidates) {
+      const key = normalizeText(item?.geekId || "");
+      if (!key) continue;
+      passedByGeekId.set(key, item);
+    }
+    const auditRows = Array.isArray(this.candidateAudits) && this.candidateAudits.length > 0
+      ? this.candidateAudits
+      : this.passedCandidates.map((item) => ({
+          candidate_key: item?.geekId || "",
+          geek_id: item?.geekId || "",
+          candidate_name: item?.name || "",
+          school: item?.school || "",
+          major: item?.major || "",
+          company: item?.company || "",
+          position: item?.position || "",
+          outcome: "passed",
+          screening_reason: item?.reason || "",
+          action_taken: item?.action || "none",
+          resume_source: item?.resumeSource || "",
+          raw_passed: true,
+          final_passed: true,
+          evidence_raw_count: null,
+          evidence_matched_count: null,
+          evidence_gate_demoted: false,
+          error_code: "",
+          error_message: ""
+        }));
+    for (const audit of auditRows) {
+      const auditGeekId = normalizeText(audit?.geek_id || audit?.candidate_key || "");
+      const passedItem = auditGeekId ? passedByGeekId.get(auditGeekId) : null;
+      const finalPassed = audit?.final_passed === true || normalizeText(audit?.outcome || "") === "passed";
+      const screeningReason = normalizeText(audit?.screening_reason || passedItem?.reason || "");
+      const passReason = finalPassed ? screeningReason : "";
       lines.push([
-        csvEscape(item.name),
-        csvEscape(item.school),
-        csvEscape(item.major),
-        csvEscape(item.company),
-        csvEscape(item.position),
-        csvEscape(item.reason)
+        csvEscape(audit?.candidate_name || passedItem?.name || ""),
+        csvEscape(audit?.school || passedItem?.school || ""),
+        csvEscape(audit?.major || passedItem?.major || ""),
+        csvEscape(audit?.company || passedItem?.company || ""),
+        csvEscape(audit?.position || passedItem?.position || ""),
+        csvEscape(passReason),
+        csvEscape(audit?.outcome || (finalPassed ? "passed" : "unknown")),
+        csvEscape(screeningReason),
+        csvEscape(audit?.action_taken || passedItem?.action || "none"),
+        csvEscape(audit?.resume_source || passedItem?.resumeSource || ""),
+        csvEscape(audit?.raw_passed === true ? "true" : audit?.raw_passed === false ? "false" : ""),
+        csvEscape(finalPassed ? "true" : "false"),
+        csvEscape(Number.isFinite(Number(audit?.evidence_raw_count)) ? Number(audit.evidence_raw_count) : ""),
+        csvEscape(Number.isFinite(Number(audit?.evidence_matched_count)) ? Number(audit.evidence_matched_count) : ""),
+        csvEscape(audit?.evidence_gate_demoted === true ? "true" : "false"),
+        csvEscape(audit?.error_code || ""),
+        csvEscape(audit?.error_message || ""),
+        csvEscape(auditGeekId || passedItem?.geekId || "")
       ].join(","));
     }
     fs.mkdirSync(path.dirname(this.args.output), { recursive: true });
@@ -4156,6 +4899,17 @@ class RecommendScreenCli {
         this.processedCount += 1;
         log(`处理第 ${this.processedCount} 位候选人: ${nextCandidate.name || nextCandidate.geek_id}`);
         let shouldMarkProcessed = true;
+        let resumeSource = "";
+        let resumeTextLength = null;
+        let screening = null;
+        let candidateProfile = {
+          name: nextCandidate.name || "",
+          school: nextCandidate.school || "",
+          major: nextCandidate.major || "",
+          company: nextCandidate.last_company || "",
+          position: nextCandidate.last_position || ""
+        };
+        let allowDetailCloseFailure = false;
 
         try {
           this.currentCandidateKey = nextCandidate.key || nextCandidate.geek_id || null;
@@ -4166,33 +4920,42 @@ class RecommendScreenCli {
           }
 
           let capture = null;
-          let screening = null;
-          let resumeSource = "image_fallback";
           const networkWaitMs = 4200;
           const networkWaitStartedAt = Date.now();
           const networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, networkWaitMs);
-          if (!normalizeText(networkCandidateInfo?.resumeText) && typeof this.logResumeNetworkMissDiagnostics === "function") {
-            this.logResumeNetworkMissDiagnostics(nextCandidate, {
-              timeoutMs: networkWaitMs,
-              waitStartedAt: networkWaitStartedAt
-            });
+          let domCandidateInfo = null;
+          if (!normalizeText(networkCandidateInfo?.resumeText)) {
+            if (typeof this.logResumeNetworkMissDiagnostics === "function") {
+              this.logResumeNetworkMissDiagnostics(nextCandidate, {
+                timeoutMs: networkWaitMs,
+                waitStartedAt: networkWaitStartedAt
+              });
+            }
+            domCandidateInfo = await this.extractResumeTextFromDom(nextCandidate);
           }
-          const candidateProfile = {
-            name: networkCandidateInfo?.name || nextCandidate.name || "",
-            school: networkCandidateInfo?.school || nextCandidate.school || "",
-            major: networkCandidateInfo?.major || nextCandidate.major || "",
-            company: networkCandidateInfo?.company || nextCandidate.last_company || "",
-            position: networkCandidateInfo?.position || nextCandidate.last_position || ""
+          const resumeCandidateInfo = networkCandidateInfo?.resumeText ? networkCandidateInfo : domCandidateInfo;
+          candidateProfile = {
+            name: resumeCandidateInfo?.name || nextCandidate.name || "",
+            school: resumeCandidateInfo?.school || nextCandidate.school || "",
+            major: resumeCandidateInfo?.major || nextCandidate.major || "",
+            company: resumeCandidateInfo?.company || nextCandidate.last_company || "",
+            position: resumeCandidateInfo?.position || nextCandidate.last_position || ""
           };
 
           if (networkCandidateInfo?.resumeText) {
             screening = await this.callTextModel(networkCandidateInfo.resumeText);
             resumeSource = "network";
+            resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
             this.resumeSourceStats.network += 1;
+          } else if (domCandidateInfo?.resumeText) {
+            screening = await this.callTextModel(domCandidateInfo.resumeText);
+            resumeSource = "dom_fallback";
+            resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
+            this.resumeSourceStats.dom_fallback += 1;
           } else {
+            resumeSource = "image_fallback";
             capture = await this.captureResumeImage(nextCandidate);
             screening = await this.callVisionModel(capture.stitchedImage);
-            resumeSource = "image_fallback";
             this.resumeSourceStats.image_fallback += 1;
           }
           this.resetResumeCaptureFailureStreak();
@@ -4223,6 +4986,9 @@ class RecommendScreenCli {
                 throw postActionError;
               }
               log(`[POST_ACTION_WARN] ${effectiveAction} 失败，继续写入通过候选人: ${postActionError.message || postActionError}`);
+              if (effectiveAction === "greet") {
+                allowDetailCloseFailure = true;
+              }
               actionResult = {
                 actionTaken: `${effectiveAction}_failed`,
                 errorCode: postActionError.code || "POST_ACTION_FAILED",
@@ -4250,16 +5016,89 @@ class RecommendScreenCli {
               imagePath: capture?.stitchedImage || "",
               resumeSource
             });
+            this.recordCandidateAudit({
+              candidate_key: nextCandidate.key || nextCandidate.geek_id || "",
+              geek_id: nextCandidate.geek_id || nextCandidate.key || "",
+              candidate_name: candidateProfile.name || nextCandidate.name || "",
+              school: candidateProfile.school || "",
+              major: candidateProfile.major || "",
+              company: candidateProfile.company || "",
+              position: candidateProfile.position || "",
+              outcome: "passed",
+              resume_source: resumeSource,
+              resume_text_len: resumeTextLength,
+              raw_passed: screening?.rawPassed === true || screening?.passed === true,
+              final_passed: true,
+              evidence_raw_count: Number.isFinite(Number(screening?.evidenceRawCount))
+                ? Number(screening.evidenceRawCount)
+                : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
+              evidence_matched_count: Number.isFinite(Number(screening?.evidenceMatchedCount))
+                ? Number(screening.evidenceMatchedCount)
+                : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
+              evidence_gate_demoted: screening?.evidenceGateDemoted === true,
+              screening_reason: screeningReason,
+              action_taken: actionResult.actionTaken || "none",
+              chunk_index: Number.isFinite(Number(screening?.chunkIndex)) ? Number(screening.chunkIndex) : null,
+              chunk_total: Number.isFinite(Number(screening?.chunkTotal)) ? Number(screening.chunkTotal) : null
+            });
           } else {
             this.skippedCount += 1;
+            this.recordCandidateAudit({
+              candidate_key: nextCandidate.key || nextCandidate.geek_id || "",
+              geek_id: nextCandidate.geek_id || nextCandidate.key || "",
+              candidate_name: candidateProfile.name || nextCandidate.name || "",
+              school: candidateProfile.school || "",
+              major: candidateProfile.major || "",
+              company: candidateProfile.company || "",
+              position: candidateProfile.position || "",
+              outcome: "skipped",
+              resume_source: resumeSource,
+              resume_text_len: resumeTextLength,
+              raw_passed: screening?.rawPassed === true,
+              final_passed: false,
+              evidence_raw_count: Number.isFinite(Number(screening?.evidenceRawCount))
+                ? Number(screening.evidenceRawCount)
+                : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
+              evidence_matched_count: Number.isFinite(Number(screening?.evidenceMatchedCount))
+                ? Number(screening.evidenceMatchedCount)
+                : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
+              evidence_gate_demoted: screening?.evidenceGateDemoted === true,
+              screening_reason: normalizeText(screening?.reason || screening?.summary || "模型判定不通过"),
+              chunk_index: Number.isFinite(Number(screening?.chunkIndex)) ? Number(screening.chunkIndex) : null,
+              chunk_total: Number.isFinite(Number(screening?.chunkTotal)) ? Number(screening.chunkTotal) : null
+            });
           }
         } catch (error) {
           this.skippedCount += 1;
+          this.recordCandidateAudit({
+            candidate_key: nextCandidate.key || nextCandidate.geek_id || "",
+            geek_id: nextCandidate.geek_id || nextCandidate.key || "",
+            candidate_name: nextCandidate.name || candidateProfile.name || "",
+            school: candidateProfile.school || nextCandidate.school || "",
+            major: candidateProfile.major || nextCandidate.major || "",
+            company: candidateProfile.company || nextCandidate.last_company || "",
+            position: candidateProfile.position || nextCandidate.last_position || "",
+            outcome: "skipped_error",
+            resume_source: resumeSource,
+            resume_text_len: resumeTextLength,
+            raw_passed: screening?.rawPassed === true,
+            final_passed: false,
+            evidence_raw_count: Number.isFinite(Number(screening?.evidenceRawCount))
+              ? Number(screening.evidenceRawCount)
+              : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
+            evidence_matched_count: Number.isFinite(Number(screening?.evidenceMatchedCount))
+              ? Number(screening.evidenceMatchedCount)
+              : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
+            evidence_gate_demoted: screening?.evidenceGateDemoted === true,
+            screening_reason: normalizeText(screening?.reason || screening?.summary || ""),
+            error_code: error?.code || "CANDIDATE_PROCESS_FAILED",
+            error_message: normalizeText(error?.message || error)
+          });
           log(`候选人处理失败: ${error.code || error.message}`);
           if (["RESUME_CAPTURE_FAILED", "RESUME_NETWORK_UNAVAILABLE"].includes(error.code)) {
             this.recordResumeCaptureFailure(nextCandidate.key);
             const failureLabel = error.code === "RESUME_NETWORK_UNAVAILABLE"
-              ? "简历 network 获取失败且截图回退未完成"
+              ? "简历 network/DOM 获取失败且截图回退未完成"
               : "简历截图失败";
             log(
               `[候选人跳过] ${nextCandidate.name || nextCandidate.geek_id || "unknown"} ${failureLabel}，` +
@@ -4268,7 +5107,7 @@ class RecommendScreenCli {
             if (this.consecutiveResumeCaptureFailures >= MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES) {
               shouldMarkProcessed = false;
               const rollback = this.rollbackResumeCaptureFailureStreak(nextCandidate.key);
-              const failureTypeText = "简历获取失败（network + 截图）";
+              const failureTypeText = "简历获取失败（network + DOM + 截图）";
               throw this.buildError(
                 "RESUME_CAPTURE_FAILED_CONSECUTIVE_LIMIT",
                 `连续 ${MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES} 位候选人${failureTypeText}，已停止运行以避免错误跳过。` +
@@ -4308,7 +5147,11 @@ class RecommendScreenCli {
         } finally {
           const closed = await this.closeDetailPage();
           if (!closed) {
-            throw this.buildError("DETAIL_CLOSE_FAILED", "详情页未能正确关闭");
+            if (allowDetailCloseFailure) {
+              log("[详情关闭兜底] 本候选人 post_action 失败后详情页关闭未确认，已记录错误并继续下一位候选人。");
+            } else {
+              throw this.buildError("DETAIL_CLOSE_FAILED", "详情页未能正确关闭");
+            }
           }
           if (shouldMarkProcessed) {
             this.processedKeys.add(nextCandidate.key);
@@ -4381,7 +5224,7 @@ async function main() {
     console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
+          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> [--input-summary-json <json>] --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
         }
       }));
     return;
@@ -4427,7 +5270,10 @@ if (require.main === module) {
       parseFavoriteActionFromActionLog,
       parseFavoriteActionFromWsPayload,
       isRecoverablePostActionError,
-      classifyFinishedWrapState
+      classifyFinishedWrapState,
+      formatResumeApiData,
+      extractEvidenceTokens,
+      matchEvidenceAgainstResume
     }
   };
 }

@@ -16,6 +16,14 @@ import {
   switchRecommendTab,
   waitRecommendFeaturedDetailReady
 } from "./adapters.js";
+import {
+  cancelBossChatRun,
+  getBossChatHealthCheck,
+  getBossChatRun,
+  pauseBossChatRun,
+  resumeBossChatRun,
+  startBossChatRun
+} from "./boss-chat.js";
 import { runRecommendPipeline } from "./pipeline.js";
 
 const require = createRequire(import.meta.url);
@@ -23,7 +31,7 @@ const currentFilePath = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(currentFilePath), "..");
 const packageJsonPath = path.join(packageRoot, "package.json");
 const skillName = "boss-recommend-pipeline";
-const skillSourceDir = path.join(packageRoot, "skills", skillName);
+const bundledSkillNames = [skillName, "boss-chat"];
 const exampleConfigPath = path.join(packageRoot, "config", "screening-config.example.json");
 const bossUrl = "https://www.zhipin.com/web/chat/recommend";
 const chromeOnboardingUrlPattern = /^chrome:\/\/(welcome|intro|newtab|signin|history-sync|settings\/syncSetup)/i;
@@ -36,6 +44,10 @@ const recommendMcpBinaryName = "boss-recommend-mcp";
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h"]);
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
+
+function getSkillSourceDir(name = skillName) {
+  return path.join(packageRoot, "skills", name);
+}
 
 function getPackageVersion() {
   try {
@@ -137,16 +149,16 @@ function getLegacyUserConfigPath() {
   return path.join(getCodexHome(), "boss-recommend-mcp", "screening-config.json");
 }
 
-function getSkillTargetDir() {
-  return path.join(getCodexHome(), "skills", skillName);
+function getSkillTargetDir(name = skillName) {
+  return path.join(getCodexHome(), "skills", name);
 }
 
-function getSkillVersionMarkerPath() {
-  return path.join(getSkillTargetDir(), ".installed-version");
+function getSkillVersionMarkerPath(name = skillName) {
+  return path.join(getSkillTargetDir(name), ".installed-version");
 }
 
-function readInstalledSkillVersion() {
-  const markerPath = getSkillVersionMarkerPath();
+function readInstalledSkillVersion(name = skillName) {
+  const markerPath = getSkillVersionMarkerPath(name);
   if (!fs.existsSync(markerPath)) return null;
   try {
     return fs.readFileSync(markerPath, "utf8").trim() || null;
@@ -155,8 +167,8 @@ function readInstalledSkillVersion() {
   }
 }
 
-function writeInstalledSkillVersion(version) {
-  const markerPath = getSkillVersionMarkerPath();
+function writeInstalledSkillVersion(name, version) {
+  const markerPath = getSkillVersionMarkerPath(name);
   ensureDir(path.dirname(markerPath));
   fs.writeFileSync(markerPath, `${version}\n`, "utf8");
 }
@@ -181,6 +193,15 @@ function parseOptions(args) {
 function parsePositivePort(raw) {
   const port = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(port) && port > 0 ? port : null;
+}
+
+function parseBooleanOption(raw, fallback = undefined) {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (raw === true) return true;
+  const normalized = String(raw).trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 function normalizePageScope(value) {
@@ -257,6 +278,13 @@ function getRunOverrides(options) {
     return parseJsonOption(readTextFile(options["overrides-file"], "overrides"), "overrides");
   }
   return parseJsonOption(options["overrides-json"], "overrides");
+}
+
+function getRunFollowUp(options) {
+  if (typeof options["follow-up-file"] === "string" && options["follow-up-file"].trim()) {
+    return parseJsonOption(readTextFile(options["follow-up-file"], "follow_up"), "follow_up");
+  }
+  return parseJsonOption(options["follow-up-json"], "follow_up");
 }
 
 function normalizeMcpClientName(value) {
@@ -542,13 +570,15 @@ function mirrorSkillToExternalDirs(options = {}) {
   const mirrored = [];
   const skipped = [];
   for (const baseDir of baseDirs) {
-    try {
-      const targetDir = path.join(baseDir, skillName);
-      ensureDir(path.dirname(targetDir));
-      fs.cpSync(skillSourceDir, targetDir, { recursive: true, force: true });
-      mirrored.push({ base_dir: baseDir, target_dir: targetDir });
-    } catch (error) {
-      skipped.push({ base_dir: baseDir, reason: error.message });
+    for (const bundledSkillName of bundledSkillNames) {
+      try {
+        const targetDir = path.join(baseDir, bundledSkillName);
+        ensureDir(path.dirname(targetDir));
+        fs.cpSync(getSkillSourceDir(bundledSkillName), targetDir, { recursive: true, force: true });
+        mirrored.push({ base_dir: baseDir, target_dir: targetDir, skill: bundledSkillName });
+      } catch (error) {
+        skipped.push({ base_dir: baseDir, skill: bundledSkillName, reason: error.message });
+      }
     }
   }
   return { baseDirs, mirrored, skipped };
@@ -556,17 +586,29 @@ function mirrorSkillToExternalDirs(options = {}) {
 
 function syncSkillAssets(options = {}) {
   const force = options.force === true;
-  const targetDir = getSkillTargetDir();
-  const skillEntry = path.join(targetDir, "SKILL.md");
-  const installedVersion = readInstalledSkillVersion();
-  const needsSync = force || !fs.existsSync(skillEntry) || installedVersion !== packageVersion;
-  if (!needsSync) {
-    return { targetDir, updated: false, installedVersion, packageVersion };
+  const results = [];
+  for (const bundledSkillName of bundledSkillNames) {
+    const targetDir = getSkillTargetDir(bundledSkillName);
+    const skillEntry = path.join(targetDir, "SKILL.md");
+    const installedVersion = readInstalledSkillVersion(bundledSkillName);
+    const needsSync = force || !fs.existsSync(skillEntry) || installedVersion !== packageVersion;
+    if (needsSync) {
+      ensureDir(path.dirname(targetDir));
+      fs.cpSync(getSkillSourceDir(bundledSkillName), targetDir, { recursive: true, force: true });
+      writeInstalledSkillVersion(bundledSkillName, packageVersion);
+    }
+    results.push({
+      skill: bundledSkillName,
+      targetDir,
+      updated: needsSync,
+      installedVersion,
+      packageVersion
+    });
   }
-  ensureDir(path.dirname(targetDir));
-  fs.cpSync(skillSourceDir, targetDir, { recursive: true, force: true });
-  writeInstalledSkillVersion(packageVersion);
-  return { targetDir, updated: true, installedVersion, packageVersion };
+  return {
+    primaryTargetDir: results[0]?.targetDir || null,
+    results
+  };
 }
 
 function ensureAssetsUpToDate(command) {
@@ -579,7 +621,7 @@ function ensureAssetsUpToDate(command) {
 }
 
 function installSkill() {
-  return syncSkillAssets({ force: true }).targetDir;
+  return syncSkillAssets({ force: true }).results;
 }
 
 function pathStartsWith(filePath, rootPath) {
@@ -1163,10 +1205,10 @@ function printPaths() {
   const stateHome = getStateHome();
   const calibrationResolution = getFeaturedCalibrationResolution(process.cwd());
   console.log(`package_root=${packageRoot}`);
-  console.log(`skill_source=${skillSourceDir}`);
+  console.log(`skill_sources=${bundledSkillNames.map((name) => getSkillSourceDir(name)).join(" | ")}`);
   console.log(`codex_home=${codexHome}`);
   console.log(`state_home=${stateHome}`);
-  console.log(`skill_target=${path.join(codexHome, "skills", skillName)}`);
+  console.log(`skill_targets=${bundledSkillNames.map((name) => path.join(codexHome, "skills", name)).join(" | ")}`);
   console.log(`config_target=${getUserConfigPath()}`);
   console.log(`legacy_config_target=${getLegacyUserConfigPath()}`);
   console.log(`calibration_target=${calibrationResolution.calibration_path}`);
@@ -1181,8 +1223,9 @@ function printHelp() {
   console.log("  boss-recommend-mcp              Start the MCP server");
   console.log("  boss-recommend-mcp start        Start the MCP server");
   console.log("  boss-recommend-mcp run          Run the recommend pipeline once via CLI and print JSON");
+  console.log("  boss-recommend-mcp chat <subcommand>  Run bundled boss-chat commands via the recommend package");
   console.log("  boss-recommend-mcp install      Install skill/MCP templates and auto-init screening-config.json (supports --agent trae-cn/cursor/...)");
-  console.log("  boss-recommend-mcp install-skill Install only the Codex skill");
+  console.log("  boss-recommend-mcp install-skill Install bundled Codex skills");
   console.log("  boss-recommend-mcp init-config  Create screening-config.json if missing (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp config set   Write baseUrl/apiKey/model (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
@@ -1193,7 +1236,8 @@ function printHelp() {
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("");
   console.log("Run command:");
-  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}']");
+  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}'] [--follow-up-json '{...}']");
+  console.log("  boss-recommend-mcp chat run --job \"算法工程师\" --start-from unread --criteria \"有 AI Agent 经验\" --targetCount 20    # 后台启动，不自动轮询");
   console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
   console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");
@@ -1214,12 +1258,15 @@ function printMcpConfig(options = {}) {
 }
 
 function installAll(options = {}) {
-  const skillTarget = installSkill();
+  const skillResults = installSkill();
   const configResult = ensureUserConfig(options);
   const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
   const externalMcpResult = installExternalMcpConfigs(options);
   const externalSkillResult = mirrorSkillToExternalDirs(options);
-  console.log(`Skill installed to: ${skillTarget}`);
+  console.log(`Bundled skills installed: ${skillResults.length}`);
+  for (const item of skillResults) {
+    console.log(`- ${item.skill}: ${item.targetDir}`);
+  }
   console.log(
     configResult.created
       ? `screening-config.json created: ${configResult.path}`
@@ -1256,6 +1303,7 @@ async function runPipelineOnce(options) {
   const instruction = getRunInstruction(options);
   const confirmation = getRunConfirmation(options);
   const overrides = getRunOverrides(options);
+  const followUp = getRunFollowUp(options);
   const workspaceRoot = getWorkspaceRoot(options);
   const explicitPort = parsePositivePort(options.port);
   if (explicitPort) {
@@ -1267,78 +1315,168 @@ async function runPipelineOnce(options) {
     workspaceRoot,
     instruction,
     confirmation,
-    overrides
+    overrides,
+    followUp
   });
   printJson(result);
 }
 
-const command = process.argv[2] || "start";
-const options = parseOptions(process.argv.slice(3));
-ensureAssetsUpToDate(command);
+function buildBossChatCliInput(options = {}) {
+  return {
+    profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+    job: typeof options.job === "string" ? options.job.trim() : undefined,
+    start_from: String(options["start-from"] || options.start_from || "").trim().toLowerCase() || undefined,
+    criteria: typeof options.criteria === "string" ? options.criteria.trim() : undefined,
+    target_count: parsePositivePort(options.targetCount || options["target-count"] || options.target_count),
+    port: parsePositivePort(options.port),
+    dry_run: options["dry-run"] === true || options.dryRun === true,
+    no_state: options["no-state"] === true || options.noState === true,
+    safe_pacing: parseBooleanOption(options["safe-pacing"] ?? options.safe_pacing),
+    batch_rest_enabled: parseBooleanOption(options["batch-rest"] ?? options.batch_rest_enabled)
+  };
+}
 
-switch (command) {
-  case "start":
-    startServer();
-    break;
-  case "run":
-    try {
-      await runPipelineOnce(options);
-    } catch (error) {
-      printJson({
-        status: "FAILED",
-        error: {
-          code: "INVALID_CLI_INPUT",
-          message: error.message || "Invalid CLI input",
-          retryable: false
-        }
-      });
-      process.exitCode = 1;
-    }
-    break;
-  case "install":
-    try {
-      installAll(options);
-    } catch (error) {
-      console.error(error.message || "Install failed.");
-      process.exitCode = 1;
-    }
-    break;
-  case "install-skill":
-    console.log(`Skill installed to: ${installSkill()}`);
-    break;
-  case "init-config": {
-    const result = ensureUserConfig(options);
-    console.log(result.created ? `Config template created at: ${result.path}` : `Config already exists at: ${result.path}`);
-    break;
+function getBossChatCliRunTarget(options = {}) {
+  return {
+    profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+    run_id: String(options["run-id"] || options.runId || options.run_id || "").trim()
+  };
+}
+
+async function runBossChatCliCommand(subcommand, options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  if (subcommand === "health-check") {
+    printJson(getBossChatHealthCheck(workspaceRoot, {
+      port: parsePositivePort(options.port)
+    }));
+    return;
   }
-  case "set-port": {
-    try {
-      const result = setDebugPort(options);
-      console.log(`Preferred debug port saved: ${result.port}`);
-      console.log(`Updated config: ${result.configPath}`);
-      console.log("Port priority for runtime commands: --port > BOSS_RECOMMEND_CHROME_PORT > screening-config.json.debugPort > 9222");
-    } catch (error) {
-      console.error(error.message || "Failed to persist debug port.");
-      process.exitCode = 1;
-    }
-    break;
+
+  if (subcommand === "run") {
+    printJson(await startBossChatRun({
+      workspaceRoot,
+      input: buildBossChatCliInput(options)
+    }));
+    return;
   }
-  case "set-config": {
-    try {
-      const result = setScreeningConfig(options);
-      console.log(`screening-config.json updated: ${result.path}`);
-    } catch (error) {
-      console.error(error.message || "Failed to write screening-config.json.");
-      process.exitCode = 1;
-    }
-    break;
+
+  if (subcommand === "start-run") {
+    printJson(await startBossChatRun({
+      workspaceRoot,
+      input: buildBossChatCliInput(options)
+    }));
+    return;
   }
-  case "config": {
-    const sub = String(process.argv[3] || "").trim().toLowerCase();
-    if (!sub || sub.startsWith("--") || sub === "set") {
-      const configOptions = sub === "set" ? parseOptions(process.argv.slice(4)) : options;
+
+  if (subcommand === "get-run") {
+    printJson(await getBossChatRun({
+      workspaceRoot,
+      input: getBossChatCliRunTarget(options)
+    }));
+    return;
+  }
+
+  if (subcommand === "pause-run") {
+    printJson(await pauseBossChatRun({
+      workspaceRoot,
+      input: getBossChatCliRunTarget(options)
+    }));
+    return;
+  }
+
+  if (subcommand === "resume-run") {
+    printJson(await resumeBossChatRun({
+      workspaceRoot,
+      input: getBossChatCliRunTarget(options)
+    }));
+    return;
+  }
+
+  if (subcommand === "cancel-run") {
+    printJson(await cancelBossChatRun({
+      workspaceRoot,
+      input: getBossChatCliRunTarget(options)
+    }));
+    return;
+  }
+
+  throw new Error(`Unknown chat subcommand: ${subcommand || ""}`);
+}
+
+export async function runCli(argv = process.argv) {
+  const command = argv[2] || "start";
+  const options = parseOptions(argv.slice(3));
+  ensureAssetsUpToDate(command);
+
+  switch (command) {
+    case "start":
+      startServer();
+      break;
+    case "run":
       try {
-        const result = setScreeningConfig(configOptions);
+        await runPipelineOnce(options);
+      } catch (error) {
+        printJson({
+          status: "FAILED",
+          error: {
+            code: "INVALID_CLI_INPUT",
+            message: error.message || "Invalid CLI input",
+            retryable: false
+          }
+        });
+        process.exitCode = 1;
+      }
+      break;
+    case "chat":
+      try {
+        const chatSubcommand = String(argv[3] || "").trim().toLowerCase();
+        const chatOptions = parseOptions(argv.slice(4));
+        await runBossChatCliCommand(chatSubcommand, chatOptions);
+      } catch (error) {
+        printJson({
+          status: "FAILED",
+          error: {
+            code: "INVALID_CHAT_CLI_INPUT",
+            message: error.message || "Invalid chat CLI input",
+            retryable: false
+          }
+        });
+        process.exitCode = 1;
+      }
+      break;
+    case "install":
+      try {
+        installAll(options);
+      } catch (error) {
+        console.error(error.message || "Install failed.");
+        process.exitCode = 1;
+      }
+      break;
+    case "install-skill":
+      for (const item of installSkill()) {
+        console.log(`Skill installed: ${item.skill} -> ${item.targetDir}`);
+      }
+      break;
+    case "init-config": {
+      const result = ensureUserConfig(options);
+      console.log(result.created ? `Config template created at: ${result.path}` : `Config already exists at: ${result.path}`);
+      break;
+    }
+    case "set-port": {
+      try {
+        const result = setDebugPort(options);
+        console.log(`Preferred debug port saved: ${result.port}`);
+        console.log(`Updated config: ${result.configPath}`);
+        console.log("Port priority for runtime commands: --port > BOSS_RECOMMEND_CHROME_PORT > screening-config.json.debugPort > 9222");
+      } catch (error) {
+        console.error(error.message || "Failed to persist debug port.");
+        process.exitCode = 1;
+      }
+      break;
+    }
+    case "set-config": {
+      try {
+        const result = setScreeningConfig(options);
         console.log(`screening-config.json updated: ${result.path}`);
       } catch (error) {
         console.error(error.message || "Failed to write screening-config.json.");
@@ -1346,37 +1484,64 @@ switch (command) {
       }
       break;
     }
-    console.error(`Unknown config subcommand: ${sub}`);
-    process.exitCode = 1;
-    break;
-  }
-  case "mcp-config":
-    try {
-      printMcpConfig(options);
-    } catch (error) {
-      console.error(error.message || "Failed to generate MCP config template.");
+    case "config": {
+      const sub = String(argv[3] || "").trim().toLowerCase();
+      if (!sub || sub.startsWith("--") || sub === "set") {
+        const configOptions = sub === "set" ? parseOptions(argv.slice(4)) : options;
+        try {
+          const result = setScreeningConfig(configOptions);
+          console.log(`screening-config.json updated: ${result.path}`);
+        } catch (error) {
+          console.error(error.message || "Failed to write screening-config.json.");
+          process.exitCode = 1;
+        }
+        break;
+      }
+      console.error(`Unknown config subcommand: ${sub}`);
       process.exitCode = 1;
+      break;
     }
-    break;
-  case "doctor":
-    await printDoctor(options);
-    break;
-  case "calibrate":
-    await calibrate(options);
-    break;
-  case "launch-chrome":
-    await launchChrome(options);
-    break;
-  case "where":
-    printPaths();
-    break;
-  case "help":
-  case "--help":
-  case "-h":
-    printHelp();
-    break;
-  default:
-    console.error(`Unknown command: ${command}`);
-    console.error("Run `boss-recommend-mcp --help` for usage.");
-    process.exitCode = 1;
+    case "mcp-config":
+      try {
+        printMcpConfig(options);
+      } catch (error) {
+        console.error(error.message || "Failed to generate MCP config template.");
+        process.exitCode = 1;
+      }
+      break;
+    case "doctor":
+      await printDoctor(options);
+      break;
+    case "calibrate":
+      await calibrate(options);
+      break;
+    case "launch-chrome":
+      await launchChrome(options);
+      break;
+    case "where":
+      printPaths();
+      break;
+    case "help":
+    case "--help":
+    case "-h":
+      printHelp();
+      break;
+    default:
+      console.error(`Unknown command: ${command}`);
+      console.error("Run `boss-recommend-mcp --help` for usage.");
+      process.exitCode = 1;
+  }
+}
+
+export const __testables = {
+  buildBossChatCliInput,
+  getBossChatCliRunTarget,
+  getRunFollowUp,
+  installSkill,
+  runBossChatCliCommand,
+  runPipelineOnce
+};
+
+if (process.argv[1] && path.resolve(process.argv[1]) === currentFilePath) {
+  await runCli(process.argv);
 }

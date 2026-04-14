@@ -7,6 +7,12 @@ Boss 推荐页自动化流水线 MCP（stdio）服务。
 - `boss-recommend-search-cli`: 只负责推荐页筛选项
 - `boss-recommend-screen-cli`: 只负责滚动列表、打开详情、提取完整简历图、多模态判断，并对通过人选统一执行 `favorite` 或 `greet`
 
+现在包内还内置了 `boss-chat` runtime，因此安装 `boss-recommend-mcp` 后可以直接：
+
+- 单独运行 chat-only 任务，不需要再单独安装 `boss-chat`
+- 在 recommend screen 完成后，通过同一个父 run 自动进入 `chat_followup`
+- 继续把聊天页状态保存在工作区下的 `.boss-chat/`
+
 MCP 工具：
 
 - `start_recommend_pipeline_run`（异步启动；同样先经过前置门禁，通过后返回 run_id）
@@ -15,6 +21,12 @@ MCP 工具：
 - `pause_recommend_pipeline_run`（请求暂停 run；会在当前候选人处理完成后进入 paused）
 - `resume_recommend_pipeline_run`（继续 paused run；沿用同 run_id 与同 CSV）
 - `run_recommend_self_heal`（手动运维工具；扫描 Boss recommend 的 selector / network 规则漂移，并在确认后应用高置信度修复）
+- `boss_chat_health_check`
+- `start_boss_chat_run`
+- `get_boss_chat_run`
+- `pause_boss_chat_run`
+- `resume_boss_chat_run`
+- `cancel_boss_chat_run`
   - `validation_profile=safe`：只做非破坏性扫描与被动 network 观察
   - `validation_profile=full`：会主动打开候选人详情，并执行收藏往返校验与一次打招呼校验；若完整交互没跑通，会明确返回验证异常而不是静默跳过
   - 扫描会主动覆盖 recommend/latest/featured 三个 tab 的详情链路（详情打开、详情内关键 selector、popup 关闭）
@@ -36,6 +48,8 @@ MCP 工具：
 - `completed`
 - `failed`
 - `canceled`
+
+当 recommend run 传入 `follow_up.chat` 且 screen 成功后，父 run 会进入 `chat_followup` 阶段并保持 `running`，直到内置 boss-chat 子任务结束。此时对父 run 的 `pause/resume/cancel` 会代理到子 chat run。
 
 ## 设计特点
 
@@ -146,7 +160,61 @@ node src/cli.js set-port --port 9222
 node src/cli.js doctor --agent trae-cn
 node src/cli.js launch-chrome --port 9222
 node src/cli.js run --instruction-file request.txt --confirmation-file confirmation.json --overrides-file overrides.json
+node src/cli.js run --instruction-file request.txt --confirmation-file confirmation.json --overrides-file overrides.json --follow-up-file follow-up.json
+node src/cli.js chat health-check
+node src/cli.js chat run --job "算法工程师" --start-from unread --criteria "有 AI Agent 经验" --targetCount 20
 ```
+
+## Recommend + Chat Follow-up
+
+若要让 recommend screen 完成后自动开始 boss-chat，把 chat 配置放到同一个 recommend run 的顶层 `follow_up.chat`：
+
+```json
+{
+  "follow_up": {
+    "chat": {
+      "criteria": "候选人需要继续在聊天页过滤有 AI Agent 经验的人选",
+      "start_from": "unread",
+      "target_count": 20,
+      "profile": "default",
+      "dry_run": false,
+      "no_state": false,
+      "safe_pacing": true,
+      "batch_rest_enabled": true
+    }
+  }
+}
+```
+
+说明：
+
+- `criteria` / `start_from` / `target_count` 为必填
+- `profile` 可选，默认 `default`
+- `job` 与 `port` 继承 recommend run 已选岗位和调试端口
+- `baseUrl` / `apiKey` / `model` 不再单独传入，固定复用 recommend 的 `screening-config.json`
+- 若缺少 `follow_up.chat` 必填项，pipeline 会返回 `NEED_INPUT`
+- recommend 成功后，父 run 继续存活并进入 `chat_followup`；chat 结束后父 run 才会进入最终终态
+
+## Chat-only
+
+安装 `boss-recommend-mcp` 后，无需额外安装 `boss-chat`：
+
+- CLI：
+  - `boss-recommend-mcp chat health-check`
+  - `boss-recommend-mcp chat run --job "算法工程师" --start-from unread --targetCount 20 --criteria "有 AI Agent 经验"`（后台启动，不自动轮询）
+  - `boss-recommend-mcp chat start-run|get-run|pause-run|resume-run|cancel-run`
+- MCP：
+  - `boss_chat_health_check`
+  - `start_boss_chat_run`
+  - `get_boss_chat_run`
+  - `pause_boss_chat_run`
+  - `resume_boss_chat_run`
+  - `cancel_boss_chat_run`
+
+chat-only 交互建议：
+
+- 先调用一次 `start_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
+- 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count`、`criteria` 后再次调用 `start_boss_chat_run` 启动任务。
 
 ## 长流程 Agent 兼容模式
 
@@ -154,10 +222,11 @@ node src/cli.js run --instruction-file request.txt --confirmation-file confirmat
 
 1. 调用 `start_recommend_pipeline_run`。
 2. 若返回 `NEED_INPUT/NEED_CONFIRMATION/FAILED`，按同步流程先补齐前置条件（登录、页面就绪、岗位确认、最终确认）。
-3. 仅当门禁通过时，接口才会返回 `ACCEPTED + run_id`；随后每 5~15 秒调用一次 `get_recommend_pipeline_run` 轮询。
+3. 仅当门禁通过时，接口才会返回 `ACCEPTED + run_id`；默认不自动轮询，建议按需调用 `get_recommend_pipeline_run`（长任务至少每 30 分钟一次，除非用户明确要求更频繁）。
 4. 若需临时中断，调用 `pause_recommend_pipeline_run`；接口会先返回 `PAUSE_REQUESTED`，随后在安全边界进入 `paused`。
 5. `paused` 后调用 `resume_recommend_pipeline_run` 继续执行；同一 `run_id` 会复用同一 CSV，并从 checkpoint 无缝续跑。
 6. 若需终止，调用 `cancel_recommend_pipeline_run`。
+7. 若该 run 配置了 `follow_up.chat`，screen 完成后父 run 会进入 `chat_followup`；继续轮询同一个 `run_id` 即可，不需要再新建 chat run。
 
 说明：
 
@@ -167,6 +236,7 @@ node src/cli.js run --instruction-file request.txt --confirmation-file confirmat
 - screen 阶段会持久化 checkpoint：`~/.boss-recommend-mcp/runs/<run_id>.checkpoint.json`。
 - 暂停采用“当前候选人处理完成后暂停”语义，避免停在详情页中间态。
 - 轮询期间不要重复 `start`，优先复用已有 `run_id`，避免重复筛选。
+- 处于 `chat_followup` 时，对父 run 的 `pause/resume/cancel` 会自动代理到内置 boss-chat 子 run。
 
 ## MCP Tool Input
 
@@ -204,6 +274,15 @@ node src/cli.js run --instruction-file request.txt --confirmation-file confirmat
     "target_count": 20,
     "post_action": "greet",
     "max_greet_count": 10
+  },
+  "follow_up": {
+    "chat": {
+      "criteria": "继续在聊天页处理有 AI Agent 或 MCP 项目经验的人选",
+      "start_from": "unread",
+      "target_count": 20,
+      "profile": "default",
+      "safe_pacing": true
+    }
   }
 }
 ```
@@ -213,6 +292,8 @@ node src/cli.js run --instruction-file request.txt --confirmation-file confirmat
 ```bash
 npm run test:parser
 npm run test:pipeline
+npm run test:async
+npm run test:boss-chat
 ```
 
 ## 当前实现边界

@@ -1,0 +1,436 @@
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+import { getScreenConfigResolution } from "./adapters.js";
+
+const currentFilePath = fileURLToPath(import.meta.url);
+const packageRoot = path.resolve(path.dirname(currentFilePath), "..");
+const VENDORED_BOSS_CHAT_DIR = path.join(packageRoot, "vendor", "boss-chat-cli");
+const DEFAULT_BOSS_CHAT_POLL_MS = 1500;
+const BOSS_CHAT_TERMINAL_STATES = new Set(["completed", "failed", "canceled"]);
+const CHAT_REQUIRED_FIELDS = ["job", "start_from", "target_count", "criteria"];
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function pathExists(targetPath) {
+  try {
+    return fs.existsSync(targetPath);
+  } catch {
+    return false;
+  }
+}
+
+function parsePositiveInteger(value, fallback = null) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseJsonOutput(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    try {
+      return JSON.parse(lines[index]);
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resolveBossChatCliDir(workspaceRoot) {
+  const localDir = path.join(path.resolve(String(workspaceRoot || process.cwd())), "boss-chat-cli");
+  if (pathExists(localDir)) return localDir;
+  return pathExists(VENDORED_BOSS_CHAT_DIR) ? VENDORED_BOSS_CHAT_DIR : null;
+}
+
+function resolveBossChatCliPath(workspaceRoot) {
+  const cliDir = resolveBossChatCliDir(workspaceRoot);
+  if (!cliDir) return null;
+  const cliPath = path.join(cliDir, "src", "cli.js");
+  return pathExists(cliPath) ? cliPath : null;
+}
+
+function validateRecommendScreenConfig(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return {
+      ok: false,
+      message: "screening-config.json 缺失或格式无效。请填写 baseUrl、apiKey、model。"
+    };
+  }
+  const baseUrl = normalizeText(config.baseUrl).replace(/\/+$/, "");
+  const apiKey = normalizeText(config.apiKey);
+  const model = normalizeText(config.model);
+  const missing = [];
+  if (!baseUrl) missing.push("baseUrl");
+  if (!apiKey) missing.push("apiKey");
+  if (!model) missing.push("model");
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      message: `screening-config.json 缺少必填字段：${missing.join(", ")}。`
+    };
+  }
+  if (/^replace-with/i.test(apiKey)) {
+    return {
+      ok: false,
+      message: "screening-config.json 的 apiKey 仍是模板占位符，请填写真实 API Key。"
+    };
+  }
+  return { ok: true };
+}
+
+function resolveBossChatScreenConfig(workspaceRoot) {
+  const resolution = getScreenConfigResolution(workspaceRoot);
+  const configPath = resolution.resolved_path || resolution.writable_path || resolution.legacy_path || null;
+  if (!configPath || !pathExists(configPath)) {
+    return {
+      ok: false,
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: `screening-config.json 不存在。请先完成 recommend 配置。${configPath ? ` (path: ${configPath})` : ""}`
+      },
+      config_path: configPath,
+      config_dir: configPath ? path.dirname(configPath) : null
+    };
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  } catch (error) {
+    return {
+      ok: false,
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: `screening-config.json 解析失败：${error.message || "unknown error"} (path: ${configPath})`
+      },
+      config_path: configPath,
+      config_dir: path.dirname(configPath)
+    };
+  }
+  const validation = validateRecommendScreenConfig(parsed);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: `${validation.message} (path: ${configPath})`
+      },
+      config_path: configPath,
+      config_dir: path.dirname(configPath)
+    };
+  }
+  return {
+    ok: true,
+    config: {
+      baseUrl: normalizeText(parsed.baseUrl).replace(/\/+$/, ""),
+      apiKey: normalizeText(parsed.apiKey),
+      model: normalizeText(parsed.model),
+      debugPort: parsePositiveInteger(parsed.debugPort, 9222)
+    },
+    config_path: configPath,
+    config_dir: path.dirname(configPath)
+  };
+}
+
+function normalizeBossChatStartInput(input = {}) {
+  const profile = normalizeText(input.profile) || "default";
+  const job = normalizeText(input.job);
+  const startFromRaw = normalizeText(input.startFrom || input.start_from).toLowerCase();
+  const startFrom = startFromRaw === "all" ? "all" : startFromRaw === "unread" ? "unread" : "";
+  const criteria = normalizeText(input.criteria);
+  const targetCount = parsePositiveInteger(input.targetCount ?? input.target_count);
+  const port = parsePositiveInteger(input.port);
+  return {
+    profile,
+    job,
+    startFrom,
+    criteria,
+    targetCount,
+    port,
+    dryRun: input.dryRun === true || input.dry_run === true,
+    noState: input.noState === true || input.no_state === true,
+    safePacing: typeof input.safePacing === "boolean" ? input.safePacing : (
+      typeof input.safe_pacing === "boolean" ? input.safe_pacing : undefined
+    ),
+    batchRestEnabled: typeof input.batchRestEnabled === "boolean" ? input.batchRestEnabled : (
+      typeof input.batch_rest_enabled === "boolean" ? input.batch_rest_enabled : undefined
+    )
+  };
+}
+
+function normalizeBossChatRunId(input = {}) {
+  return normalizeText(input.runId || input.run_id);
+}
+
+function getMissingBossChatStartFields(input = {}) {
+  const normalized = normalizeBossChatStartInput(input);
+  const missing = [];
+  if (!normalized.job) missing.push("job");
+  if (!normalized.startFrom) missing.push("start_from");
+  if (!normalized.targetCount) missing.push("target_count");
+  if (!normalized.criteria) missing.push("criteria");
+  return missing;
+}
+
+function buildBossChatCliArgs(command, input, resolvedConfig) {
+  const args = [command, "--json"];
+  if (command === "prepare-run") {
+    const normalized = normalizeBossChatStartInput(input);
+    args.push("--profile", normalized.profile);
+    if (normalized.job) args.push("--job", normalized.job);
+    if (normalized.startFrom) args.push("--start-from", normalized.startFrom);
+    if (normalized.criteria) args.push("--criteria", normalized.criteria);
+    if (normalized.targetCount) args.push("--targetCount", String(normalized.targetCount));
+    args.push("--port", String(normalized.port || resolvedConfig.debugPort || 9222));
+    args.push("--baseurl", resolvedConfig.baseUrl);
+    args.push("--apikey", resolvedConfig.apiKey);
+    args.push("--model", resolvedConfig.model);
+    return args;
+  }
+
+  if (command === "start-run") {
+    const normalized = normalizeBossChatStartInput(input);
+    args.push("--profile", normalized.profile);
+    if (normalized.dryRun) args.push("--dry-run");
+    if (normalized.noState) args.push("--no-state");
+    args.push("--job", normalized.job);
+    args.push("--start-from", normalized.startFrom);
+    args.push("--criteria", normalized.criteria);
+    if (normalized.targetCount) {
+      args.push("--targetCount", String(normalized.targetCount));
+    }
+    args.push("--baseurl", resolvedConfig.baseUrl);
+    args.push("--apikey", resolvedConfig.apiKey);
+    args.push("--model", resolvedConfig.model);
+    args.push("--port", String(normalized.port || resolvedConfig.debugPort || 9222));
+    if (typeof normalized.safePacing === "boolean") {
+      args.push("--safe-pacing", String(normalized.safePacing));
+    }
+    if (typeof normalized.batchRestEnabled === "boolean") {
+      args.push("--batch-rest", String(normalized.batchRestEnabled));
+    }
+    return args;
+  }
+
+  const runId = normalizeBossChatRunId(input);
+  args.push("--profile", normalizeText(input.profile) || "default");
+  args.push("--run-id", runId);
+  return args;
+}
+
+async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
+  const cliPath = resolveBossChatCliPath(workspaceRoot);
+  if (!cliPath) {
+    return {
+      ok: false,
+      exitCode: -1,
+      stdout: "",
+      stderr: "",
+      payload: {
+        status: "FAILED",
+        error: {
+          code: "BOSS_CHAT_CLI_MISSING",
+          message: "未找到 vendored boss-chat CLI。"
+        }
+      }
+    };
+  }
+
+  let configResolution = null;
+  if (command === "start-run" || command === "prepare-run") {
+    configResolution = resolveBossChatScreenConfig(workspaceRoot);
+    if (!configResolution.ok) {
+      return {
+        ok: false,
+        exitCode: 1,
+        stdout: "",
+        stderr: "",
+        payload: {
+          status: "FAILED",
+          error: configResolution.error,
+          config_path: configResolution.config_path,
+          config_dir: configResolution.config_dir
+        }
+      };
+    }
+  }
+
+  const args = [cliPath, ...buildBossChatCliArgs(command, input, configResolution?.config || {})];
+  const cwd = path.resolve(String(workspaceRoot || process.cwd()));
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, args, {
+      cwd,
+      env: process.env,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", (error) => {
+      resolve({
+        ok: false,
+        exitCode: -1,
+        stdout,
+        stderr,
+        payload: {
+          status: "FAILED",
+          error: {
+            code: "BOSS_CHAT_CLI_SPAWN_FAILED",
+            message: error?.message || "无法启动 vendored boss-chat CLI。"
+          }
+        }
+      });
+    });
+    child.on("close", (code) => {
+      const parsed = parseJsonOutput(stdout) || parseJsonOutput(stderr);
+      if (parsed && typeof parsed === "object") {
+        resolve({
+          ok: Number(code) === 0 && String(parsed.status || "").toUpperCase() !== "FAILED",
+          exitCode: Number.isInteger(code) ? code : 1,
+          stdout,
+          stderr,
+          payload: parsed
+        });
+        return;
+      }
+      resolve({
+        ok: Number(code) === 0,
+        exitCode: Number.isInteger(code) ? code : 1,
+        stdout,
+        stderr,
+        payload: Number(code) === 0
+          ? {
+              status: "OK",
+              message: normalizeText(stdout) || `${command} 执行成功。`
+            }
+          : {
+              status: "FAILED",
+              error: {
+                code: "BOSS_CHAT_CLI_EXECUTION_FAILED",
+                message: normalizeText(stderr || stdout) || `${command} 执行失败。`
+              }
+            }
+      });
+    });
+  });
+}
+
+export function getBossChatHealthCheck(workspaceRoot, input = {}) {
+  const cliDir = resolveBossChatCliDir(workspaceRoot);
+  const cliPath = resolveBossChatCliPath(workspaceRoot);
+  const configResolution = resolveBossChatScreenConfig(workspaceRoot);
+  const resolvedPort = parsePositiveInteger(input.port)
+    || (configResolution.ok ? configResolution.config.debugPort : 9222);
+  if (!cliDir || !cliPath) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "BOSS_CHAT_CLI_MISSING",
+        message: "未找到 vendored boss-chat CLI。"
+      }
+    };
+  }
+  if (!configResolution.ok) {
+    return {
+      status: "FAILED",
+      error: configResolution.error,
+      config_path: configResolution.config_path,
+      config_dir: configResolution.config_dir,
+      cli_dir: cliDir,
+      cli_path: cliPath
+    };
+  }
+  return {
+    status: "OK",
+    server: "boss-chat",
+    cli_dir: cliDir,
+    cli_path: cliPath,
+    config_path: configResolution.config_path,
+    debug_port: resolvedPort,
+    shared_llm_config: true
+  };
+}
+
+export async function startBossChatRun({ workspaceRoot, input = {} }) {
+  const missingFields = getMissingBossChatStartFields(input);
+  if (missingFields.length > 0) {
+    const prepared = await prepareBossChatRun({ workspaceRoot, input });
+    if (prepared?.status === "FAILED") return prepared;
+    const pendingQuestions = Array.isArray(prepared?.pending_questions)
+      ? prepared.pending_questions.filter((item) => missingFields.includes(String(item?.field || "")))
+      : [];
+    return {
+      ...prepared,
+      status: "NEED_INPUT",
+      required_fields: CHAT_REQUIRED_FIELDS.slice(),
+      missing_fields: missingFields,
+      pending_questions: pendingQuestions,
+      message: prepared?.message
+        || "已获取 Boss 聊天页岗位列表，请先补齐 job / start_from / target_count / criteria。"
+    };
+  }
+  return (await spawnBossChatCli({ workspaceRoot, command: "start-run", input })).payload;
+}
+
+export async function prepareBossChatRun({ workspaceRoot, input = {} }) {
+  return (await spawnBossChatCli({ workspaceRoot, command: "prepare-run", input })).payload;
+}
+
+export async function getBossChatRun({ workspaceRoot, input = {} }) {
+  return (await spawnBossChatCli({ workspaceRoot, command: "get-run", input })).payload;
+}
+
+export async function pauseBossChatRun({ workspaceRoot, input = {} }) {
+  return (await spawnBossChatCli({ workspaceRoot, command: "pause-run", input })).payload;
+}
+
+export async function resumeBossChatRun({ workspaceRoot, input = {} }) {
+  return (await spawnBossChatCli({ workspaceRoot, command: "resume-run", input })).payload;
+}
+
+export async function cancelBossChatRun({ workspaceRoot, input = {} }) {
+  return (await spawnBossChatCli({ workspaceRoot, command: "cancel-run", input })).payload;
+}
+
+export async function runBossChatSync({ workspaceRoot, input = {}, pollMs = DEFAULT_BOSS_CHAT_POLL_MS }) {
+  const accepted = await startBossChatRun({ workspaceRoot, input });
+  if (accepted?.status !== "ACCEPTED" || !normalizeText(accepted.run_id)) {
+    return accepted;
+  }
+  const runId = normalizeText(accepted.run_id);
+  while (true) {
+    await sleep(pollMs);
+    const statusPayload = await getBossChatRun({
+      workspaceRoot,
+      input: {
+        profile: input.profile,
+        runId
+      }
+    });
+    const runState = normalizeText(statusPayload?.run?.state).toLowerCase();
+    if (BOSS_CHAT_TERMINAL_STATES.has(runState)) {
+      return statusPayload;
+    }
+  }
+}

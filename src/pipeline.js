@@ -13,6 +13,13 @@ import {
   runRecommendScreenCli,
   switchRecommendTab
 } from "./adapters.js";
+import {
+  cancelBossChatRun,
+  getBossChatRun,
+  pauseBossChatRun,
+  resumeBossChatRun,
+  startBossChatRun
+} from "./boss-chat.js";
 
 const FORCED_RECENT_NOT_VIEW_ON_SCREEN_RECOVERY = "近14天没有";
 const MAX_SCREEN_AUTO_RECOVERY_ATTEMPTS = 5;
@@ -20,6 +27,7 @@ const MAX_SEARCH_NO_IFRAME_RETRY_ATTEMPTS = 1;
 const SEARCH_NO_IFRAME_RETRY_DELAY_MS = 1200;
 const MAX_SEARCH_FILTER_AUTO_RETRY_ATTEMPTS = 2;
 const SEARCH_FILTER_AUTO_RETRY_DELAY_MS = 1200;
+const BOSS_CHAT_FOLLOW_UP_POLL_MS = 1500;
 const SEARCH_FILTER_RETRY_TOKENS = [
   "FILTER_CONFIRM_FAILED",
   "FILTER_DOM_CLASS_VERIFY_FAILED",
@@ -51,6 +59,11 @@ function dedupe(values = []) {
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function parsePositiveIntegerValue(value) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function sleep(ms) {
@@ -331,11 +344,12 @@ function buildNeedInputResponse(parsedResult) {
     selected_page: parsedResult.proposed_page_scope || parsedResult.page_scope || "recommend",
     search_params: parsedResult.searchParams,
     screen_params: parsedResult.screenParams,
+    follow_up: parsedResult.follow_up || null,
     pending_questions: parsedResult.pending_questions,
     review: parsedResult.review,
     error: {
       code: "MISSING_REQUIRED_FIELDS",
-      message: "缺少必要的筛选 criteria，请先补充或通过 overrides.criteria 明确传入。",
+      message: buildNeedInputMessage(parsedResult.missing_fields),
       retryable: true
     }
   };
@@ -353,25 +367,243 @@ function buildNeedConfirmationResponse(parsedResult) {
       post_action: parsedResult.proposed_post_action || parsedResult.screenParams.post_action,
       max_greet_count: parsedResult.proposed_max_greet_count || parsedResult.screenParams.max_greet_count
     },
+    follow_up: parsedResult.follow_up || null,
     pending_questions: parsedResult.pending_questions,
     review: parsedResult.review
   };
 }
 
-function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob, selectedPage }) {
+function normalizeFollowUpChatInput(followUp = null, defaults = null) {
+  const raw = followUp?.chat;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {
+      requested: false,
+      missing_fields: [],
+      pending_questions: [],
+      summary: null,
+      input: null
+    };
+  }
+
+  const defaultCriteria = normalizeText(defaults?.criteria || "");
+  const defaultStartFromRaw = normalizeText(defaults?.start_from || "").toLowerCase();
+  const defaultStartFrom = defaultStartFromRaw === "all" ? "all" : "unread";
+  const defaultTargetCount = parsePositiveIntegerValue(defaults?.target_count);
+
+  const explicitCriteria = normalizeText(raw.criteria);
+  const explicitStartFromRaw = normalizeText(raw.start_from).toLowerCase();
+  const explicitStartFrom = explicitStartFromRaw === "all" ? "all" : explicitStartFromRaw === "unread" ? "unread" : "";
+  const explicitTargetCount = parsePositiveIntegerValue(raw.target_count);
+
+  const hasExplicitCriteria = Boolean(explicitCriteria);
+  const hasExplicitStartFrom = Boolean(explicitStartFrom);
+  const hasExplicitTargetCount = Number.isInteger(explicitTargetCount) && explicitTargetCount > 0;
+
+  const criteria = explicitCriteria || defaultCriteria;
+  const startFrom = explicitStartFrom || defaultStartFrom;
+  const targetCount = explicitTargetCount || defaultTargetCount;
+
+  const profile = normalizeText(raw.profile) || "default";
+  const summary = {
+    profile,
+    criteria: criteria || null,
+    start_from: startFrom || null,
+    target_count: targetCount,
+    dry_run: raw.dry_run === true,
+    no_state: raw.no_state === true,
+    safe_pacing: typeof raw.safe_pacing === "boolean" ? raw.safe_pacing : null,
+    batch_rest_enabled: typeof raw.batch_rest_enabled === "boolean" ? raw.batch_rest_enabled : null
+  };
+
+  const missing_fields = [];
+  const pending_questions = [];
+
+  if (!hasExplicitCriteria) {
+    missing_fields.push("follow_up.chat.criteria");
+    pending_questions.push({
+      field: "follow_up.chat.criteria",
+      question: "请填写 boss-chat follow-up 的筛选 criteria（自然语言，必填）。",
+      value: criteria || null
+    });
+  }
+  if (!hasExplicitStartFrom) {
+    missing_fields.push("follow_up.chat.start_from");
+    pending_questions.push({
+      field: "follow_up.chat.start_from",
+      question: "请确认 boss-chat follow-up 从未读还是全部聊天列表开始。",
+      value: summary.start_from,
+      options: [
+        { label: "未读", value: "unread" },
+        { label: "全部", value: "all" }
+      ]
+    });
+  }
+  if (!hasExplicitTargetCount) {
+    missing_fields.push("follow_up.chat.target_count");
+    pending_questions.push({
+      field: "follow_up.chat.target_count",
+      question: "请填写 boss-chat follow-up 本次处理人数上限（正整数，必填）。",
+      value: summary.target_count
+    });
+  }
+
+  return {
+    requested: true,
+    missing_fields,
+    pending_questions,
+    summary,
+    input: {
+      profile,
+      criteria: criteria || null,
+      start_from: startFrom || null,
+      target_count: targetCount,
+      dry_run: raw.dry_run === true,
+      no_state: raw.no_state === true,
+      safe_pacing: typeof raw.safe_pacing === "boolean" ? raw.safe_pacing : undefined,
+      batch_rest_enabled: typeof raw.batch_rest_enabled === "boolean" ? raw.batch_rest_enabled : undefined
+    }
+  };
+}
+
+function mergeParsedFollowUp(parsedResult, followUpChat) {
+  if (!followUpChat?.requested) {
+    return {
+      ...parsedResult,
+      follow_up: null,
+      follow_up_chat: followUpChat || null
+    };
+  }
+  const pending_questions = [
+    ...(Array.isArray(parsedResult?.pending_questions) ? parsedResult.pending_questions : []),
+    ...followUpChat.pending_questions
+  ];
+  return {
+    ...parsedResult,
+    missing_fields: dedupe([
+      ...(Array.isArray(parsedResult?.missing_fields) ? parsedResult.missing_fields : []),
+      ...followUpChat.missing_fields
+    ]),
+    pending_questions,
+    review: {
+      ...(parsedResult?.review || {}),
+      follow_up: {
+        chat: followUpChat.summary
+      }
+    },
+    follow_up: {
+      chat: followUpChat.summary
+    },
+    follow_up_chat: followUpChat
+  };
+}
+
+function buildResolvedFollowUpChatInput(followUpChat, { selectedJob, debugPort }) {
+  return {
+    profile: followUpChat?.input?.profile || "default",
+    job: selectedJob?.title || selectedJob?.label || selectedJob?.value || null,
+    start_from: followUpChat?.input?.start_from || null,
+    criteria: followUpChat?.input?.criteria || null,
+    target_count: followUpChat?.input?.target_count || null,
+    port: Number.isFinite(debugPort) ? debugPort : null,
+    dry_run: followUpChat?.input?.dry_run === true,
+    no_state: followUpChat?.input?.no_state === true,
+    safe_pacing: followUpChat?.input?.safe_pacing,
+    batch_rest_enabled: followUpChat?.input?.batch_rest_enabled
+  };
+}
+
+function buildBossChatFollowUpStatus({ payload, runId, fallbackInput = null, startMessage = null }) {
+  const run = payload?.run || null;
+  const progress = run?.progress && typeof run.progress === "object" ? run.progress : {};
+  return {
+    enabled: true,
+    run_id: normalizeText(payload?.run_id || run?.runId || runId) || null,
+    state: normalizeText(run?.state || payload?.state || payload?.status).toLowerCase() || null,
+    profile: normalizeText(fallbackInput?.profile) || "default",
+    job: normalizeText(fallbackInput?.job) || null,
+    start_from: normalizeText(fallbackInput?.start_from) || null,
+    criteria: normalizeText(fallbackInput?.criteria) || null,
+    target_count: parsePositiveIntegerValue(fallbackInput?.target_count),
+    port: parsePositiveIntegerValue(fallbackInput?.port),
+    progress: {
+      inspected: Number.isInteger(progress.inspected) ? progress.inspected : 0,
+      passed: Number.isInteger(progress.passed) ? progress.passed : 0,
+      requested: Number.isInteger(progress.requested) ? progress.requested : 0,
+      skipped: Number.isInteger(progress.skipped) ? progress.skipped : 0,
+      errors: Number.isInteger(progress.errors) ? progress.errors : 0
+    },
+    last_message: normalizeText(run?.lastMessage || payload?.message || startMessage) || null,
+    error: run?.error || payload?.error || null,
+    result: run?.result || null
+  };
+}
+
+function buildNeedInputMessage(missingFields = []) {
+  if (!Array.isArray(missingFields) || missingFields.length === 0) {
+    return "缺少必要字段，请先补充后再继续。";
+  }
+  if (missingFields.length === 1 && missingFields[0] === "criteria") {
+    return "缺少必要的筛选 criteria，请先补充或通过 overrides.criteria 明确传入。";
+  }
+  return `缺少必要字段：${missingFields.join(", ")}。请先补充后再继续。`;
+}
+
+function buildFinalReviewQuestion({ searchParams, screenParams, selectedJob, selectedPage, followUpChat }) {
   return {
     field: "final_review",
-    question: "开始执行搜索和筛选前，请最后确认全部参数（岗位/页面/筛选条件/筛选 criteria/目标通过人数/post_action/max_greet_count）无误。",
+    question: followUpChat
+      ? "开始执行前，请最后确认全部参数（岗位/页面/筛选条件/筛选 criteria/目标通过人数/post_action/max_greet_count/boss-chat follow-up）无误。"
+      : "开始执行搜索和筛选前，请最后确认全部参数（岗位/页面/筛选条件/筛选 criteria/目标通过人数/post_action/max_greet_count）无误。",
     value: {
       job: selectedJob?.title || selectedJob?.label || selectedJob?.value || null,
       page_scope: selectedPage || "recommend",
       search_params: searchParams,
-      screen_params: screenParams
+      screen_params: screenParams,
+      follow_up: followUpChat
+        ? {
+            chat: followUpChat
+          }
+        : null
     },
     options: [
       { label: "参数无误，开始执行", value: "confirm" },
       { label: "参数需要调整", value: "revise" }
     ]
+  };
+}
+
+function cloneJsonSafe(value) {
+  if (value === null || value === undefined) return null;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
+  }
+}
+
+function buildScreenInputSummary({
+  instruction,
+  selectedPage,
+  selectedJob,
+  userSearchParams,
+  effectiveSearchParams,
+  screenParams,
+  followUp
+}) {
+  return {
+    instruction: normalizeText(instruction || "") || null,
+    selected_page: selectedPage || "recommend",
+    selected_job: selectedJob
+      ? {
+          value: normalizeText(selectedJob.value || "") || null,
+          title: normalizeText(selectedJob.title || "") || null,
+          label: normalizeText(selectedJob.label || "") || null
+        }
+      : null,
+    user_search_params: cloneJsonSafe(userSearchParams),
+    effective_search_params: cloneJsonSafe(effectiveSearchParams),
+    screen_params: cloneJsonSafe(screenParams),
+    follow_up: cloneJsonSafe(followUp)
   };
 }
 
@@ -392,6 +624,40 @@ function buildPausedResponse(message, extra = {}) {
     status: "PAUSED",
     message: normalizeText(message || "") || "Recommend 流水线已暂停。",
     ...extra
+  };
+}
+
+function buildRecommendFollowUpEnvelope(recommendResult, chatPayload = null) {
+  return {
+    search_params: recommendResult?.search_params || null,
+    screen_params: recommendResult?.screen_params || null,
+    result: recommendResult?.result || null,
+    partial_result: recommendResult?.result || null,
+    follow_up: chatPayload
+      ? {
+          chat: chatPayload
+        }
+      : null
+  };
+}
+
+function buildFollowUpFailedResponse(code, message, recommendResult, chatPayload) {
+  return {
+    status: "FAILED",
+    error: {
+      code,
+      message,
+      retryable: true
+    },
+    ...buildRecommendFollowUpEnvelope(recommendResult, chatPayload)
+  };
+}
+
+function buildFollowUpPausedResponse(message, recommendResult, chatPayload) {
+  return {
+    status: "PAUSED",
+    message: normalizeText(message || "") || "Recommend 流水线已暂停。",
+    ...buildRecommendFollowUpEnvelope(recommendResult, chatPayload)
   };
 }
 
@@ -430,6 +696,9 @@ function createPipelineRuntime(runtime = null) {
   const isPauseRequested = typeof runtime?.isPauseRequested === "function"
     ? runtime.isPauseRequested
     : () => false;
+  const isCancelRequested = typeof runtime?.isCancelRequested === "function"
+    ? runtime.isCancelRequested
+    : () => false;
 
   function setStage(stage, message = null) {
     safeInvokeRuntimeCallback(runtime?.onStage, {
@@ -463,6 +732,13 @@ function createPipelineRuntime(runtime = null) {
     });
   }
 
+  function followUp(payload) {
+    safeInvokeRuntimeCallback(runtime?.onFollowUp, {
+      ...(payload || {}),
+      at: new Date().toISOString()
+    });
+  }
+
   function adapterRuntime(stage) {
     return {
       signal,
@@ -477,10 +753,12 @@ function createPipelineRuntime(runtime = null) {
     signal,
     heartbeatIntervalMs,
     isPauseRequested,
+    isCancelRequested,
     setStage,
     heartbeat,
     output,
     progress,
+    followUp,
     adapterRuntime
   };
 }
@@ -493,6 +771,14 @@ function isProcessAbortError(errorLike) {
 function isPauseRequested(runtimeHooks) {
   try {
     return runtimeHooks?.isPauseRequested?.() === true;
+  } catch {
+    return false;
+  }
+}
+
+function isCancelRequested(runtimeHooks) {
+  try {
+    return runtimeHooks?.isCancelRequested?.() === true;
   } catch {
     return false;
   }
@@ -536,6 +822,233 @@ function buildChromeSetupGuidance({ debugPort, pageState }) {
   };
 }
 
+async function runBossChatFollowUpPhase({
+  workspaceRoot,
+  followUpChat,
+  selectedJob,
+  debugPort,
+  recommendResult,
+  resume,
+  runtimeHooks,
+  startChatRun,
+  getChatRun,
+  pauseChatRun,
+  resumeChatRun,
+  cancelChatRun
+}) {
+  const recommendSummary = recommendResult?.result || null;
+  const resolvedChatInput = buildResolvedFollowUpChatInput(followUpChat, {
+    selectedJob,
+    debugPort
+  });
+  let chatRunId = normalizeText(resume?.chat_run_id || "");
+  const resumeFromChatPhase = resume?.resume === true && normalizeText(resume?.follow_up_phase) === "chat_followup";
+  let pauseRequested = false;
+  let cancelRequested = false;
+  let resumeIssued = false;
+
+  runtimeHooks.setStage(
+    "chat_followup",
+    chatRunId
+      ? "Recommend 流水线已完成，准备恢复 boss-chat follow-up。"
+      : "Recommend 流水线已完成，开始执行 boss-chat follow-up。"
+  );
+  runtimeHooks.heartbeat("chat_followup", {
+    profile: resolvedChatInput.profile,
+    job: resolvedChatInput.job,
+    start_from: resolvedChatInput.start_from,
+    target_count: resolvedChatInput.target_count
+  });
+
+  if (!chatRunId) {
+    const startResult = await startChatRun({
+      workspaceRoot,
+      input: {
+        profile: resolvedChatInput.profile,
+        job: resolvedChatInput.job,
+        start_from: resolvedChatInput.start_from,
+        criteria: resolvedChatInput.criteria,
+        target_count: resolvedChatInput.target_count,
+        port: resolvedChatInput.port,
+        dry_run: resolvedChatInput.dry_run,
+        no_state: resolvedChatInput.no_state,
+        safe_pacing: resolvedChatInput.safe_pacing,
+        batch_rest_enabled: resolvedChatInput.batch_rest_enabled
+      }
+    });
+    if (startResult?.status !== "ACCEPTED" || !normalizeText(startResult?.run_id)) {
+      return buildFollowUpFailedResponse(
+        startResult?.error?.code || "BOSS_CHAT_FOLLOW_UP_LAUNCH_FAILED",
+        startResult?.error?.message || "boss-chat follow-up 启动失败。",
+        recommendResult,
+        {
+          enabled: true,
+          input: resolvedChatInput,
+          launch_result: startResult || null
+        }
+      );
+    }
+    chatRunId = normalizeText(startResult.run_id);
+    runtimeHooks.followUp({
+      stage: "chat_followup",
+      last_message: startResult.message || "boss-chat follow-up 已启动。",
+      recommend_payload: recommendResult,
+      recommend_result: recommendSummary,
+      follow_up: {
+        chat: {
+          ...buildBossChatFollowUpStatus({
+            payload: startResult,
+            runId: chatRunId,
+            fallbackInput: resolvedChatInput,
+            startMessage: startResult.message || "boss-chat follow-up 已启动。"
+          }),
+          input: resolvedChatInput
+        }
+      }
+    });
+  }
+
+  while (true) {
+    ensurePipelineNotAborted(runtimeHooks.signal);
+
+    const chatStatusPayload = await getChatRun({
+      workspaceRoot,
+      input: {
+        profile: resolvedChatInput.profile,
+        runId: chatRunId
+      }
+    });
+    const chatStatus = buildBossChatFollowUpStatus({
+      payload: chatStatusPayload,
+      runId: chatRunId,
+      fallbackInput: resolvedChatInput
+    });
+    const chatState = normalizeText(chatStatus.state).toLowerCase();
+
+    runtimeHooks.followUp({
+      stage: "chat_followup",
+      last_message: chatStatus.last_message || "boss-chat follow-up 进行中。",
+      recommend_payload: recommendResult,
+      recommend_result: recommendSummary,
+      follow_up: {
+        chat: {
+          ...chatStatus,
+          input: resolvedChatInput
+        }
+      }
+    });
+
+    if (isCancelRequested(runtimeHooks) && !cancelRequested && !["completed", "failed", "canceled"].includes(chatState)) {
+      cancelRequested = true;
+      await cancelChatRun({
+        workspaceRoot,
+        input: {
+          profile: resolvedChatInput.profile,
+          runId: chatRunId
+        }
+      });
+      await sleep(500);
+      continue;
+    }
+
+    if (
+      isPauseRequested(runtimeHooks)
+      && !pauseRequested
+      && !cancelRequested
+      && !["paused", "completed", "failed", "canceled"].includes(chatState)
+    ) {
+      pauseRequested = true;
+      await pauseChatRun({
+        workspaceRoot,
+        input: {
+          profile: resolvedChatInput.profile,
+          runId: chatRunId
+        }
+      });
+      await sleep(500);
+      continue;
+    }
+
+    if (resumeFromChatPhase && !isPauseRequested(runtimeHooks) && !isCancelRequested(runtimeHooks) && !resumeIssued) {
+      if (chatState === "paused") {
+        resumeIssued = true;
+        await resumeChatRun({
+          workspaceRoot,
+          input: {
+            profile: resolvedChatInput.profile,
+            runId: chatRunId
+          }
+        });
+        await sleep(500);
+        continue;
+      }
+      if (chatState === "running" || chatState === "queued") {
+        resumeIssued = true;
+      }
+    }
+
+    if (chatState === "completed") {
+      return {
+        ...recommendResult,
+        follow_up: {
+          chat: {
+            ...chatStatus,
+            input: resolvedChatInput
+          }
+        },
+        message: "Recommend 流水线已完成，boss-chat follow-up 也已执行完成。"
+      };
+    }
+
+    if (chatState === "failed") {
+      return buildFollowUpFailedResponse(
+        chatStatus.error?.code || "BOSS_CHAT_FOLLOW_UP_FAILED",
+        chatStatus.error?.message || "boss-chat follow-up 执行失败。",
+        recommendResult,
+        {
+          ...chatStatus,
+          input: resolvedChatInput
+        }
+      );
+    }
+
+    if (chatState === "canceled") {
+      if (isCancelRequested(runtimeHooks)) {
+        return buildFollowUpPausedResponse(
+          "Recommend 流水线已取消，boss-chat follow-up 已停止。",
+          recommendResult,
+          {
+            ...chatStatus,
+            input: resolvedChatInput
+          }
+        );
+      }
+      return buildFollowUpFailedResponse(
+        "BOSS_CHAT_FOLLOW_UP_CANCELED",
+        "boss-chat follow-up 已取消。",
+        recommendResult,
+        {
+          ...chatStatus,
+          input: resolvedChatInput
+        }
+      );
+    }
+
+    if (chatState === "paused" && isPauseRequested(runtimeHooks)) {
+      return buildFollowUpPausedResponse(
+        "Recommend 流水线已暂停，可使用 resume 继续 boss-chat follow-up。",
+        recommendResult,
+        {
+          ...chatStatus,
+          input: resolvedChatInput
+        }
+      );
+    }
+
+    await sleep(BOSS_CHAT_FOLLOW_UP_POLL_MS);
+  }
+}
+
 const defaultDependencies = {
   attemptPipelineAutoRepair,
   parseRecommendInstruction,
@@ -548,11 +1061,16 @@ const defaultDependencies = {
   runPipelinePreflight,
   runRecommendSearchCli,
   runRecommendScreenCli,
+  startBossChatRun,
+  getBossChatRun,
+  pauseBossChatRun,
+  resumeBossChatRun,
+  cancelBossChatRun,
   switchRecommendTab
 };
 
 export async function runRecommendPipeline(
-  { workspaceRoot, instruction, confirmation, overrides, resume = null },
+  { workspaceRoot, instruction, confirmation, overrides, followUp = null, resume = null },
   dependencies = defaultDependencies,
   runtime = null
 ) {
@@ -570,13 +1088,26 @@ export async function runRecommendPipeline(
     runPipelinePreflight: runPreflight,
     runRecommendSearchCli: searchCli,
     runRecommendScreenCli: screenCli,
+    startBossChatRun: startChatRun,
+    getBossChatRun: getChatRun,
+    pauseBossChatRun: pauseChatRun,
+    resumeBossChatRun: resumeChatRun,
+    cancelBossChatRun: cancelChatRun,
     switchRecommendTab: switchTab
   } = resolvedDependencies;
   const runtimeHooks = createPipelineRuntime(runtime);
   ensurePipelineNotAborted(runtimeHooks.signal);
 
   const startedAt = Date.now();
-  const parsed = parseInstruction({ instruction, confirmation, overrides });
+  const instructionParsed = parseInstruction({ instruction, confirmation, overrides });
+  const parsed = mergeParsedFollowUp(
+    instructionParsed,
+    normalizeFollowUpChatInput(followUp, {
+      criteria: instructionParsed?.screenParams?.criteria || null,
+      target_count: instructionParsed?.screenParams?.target_count || null,
+      start_from: "unread"
+    })
+  );
   const selectedPage = resolvePipelinePageScope(parsed, confirmation, overrides);
 
   if (parsed.missing_fields.length > 0) {
@@ -596,6 +1127,41 @@ export async function runRecommendPipeline(
     || parsed.needs_max_greet_count_confirmation
   ) {
     return buildNeedConfirmationResponse(parsed);
+  }
+
+  const resumeFromChatPhase = (
+    resume?.resume === true
+    && normalizeText(resume?.follow_up_phase) === "chat_followup"
+    && normalizeText(resume?.chat_run_id)
+  );
+  if (resumeFromChatPhase) {
+    if (!parsed.follow_up_chat?.requested || !resume?.recommend_result) {
+      return buildFailedResponse(
+        "BOSS_CHAT_FOLLOW_UP_RESUME_CONTEXT_MISSING",
+        "缺少 boss-chat follow-up 恢复上下文，无法继续。"
+      );
+    }
+    const preflight = runPreflight(workspaceRoot, { pageScope: selectedPage });
+    return runBossChatFollowUpPhase({
+      workspaceRoot,
+      followUpChat: parsed.follow_up_chat,
+      selectedJob: resume.recommend_result?.selected_job || null,
+      debugPort: preflight.debug_port,
+      recommendResult: {
+        status: "COMPLETED",
+        search_params: resume.recommend_search_params || parsed.searchParams,
+        screen_params: resume.recommend_screen_params || parsed.screenParams,
+        result: resume.recommend_result,
+        message: "Recommend 流水线已完成，正在恢复 boss-chat follow-up。"
+      },
+      resume,
+      runtimeHooks,
+      startChatRun,
+      getChatRun,
+      pauseChatRun,
+      resumeChatRun,
+      cancelChatRun
+    });
   }
 
   ensurePipelineNotAborted(runtimeHooks.signal);
@@ -874,6 +1440,7 @@ export async function runRecommendPipeline(
         post_action: parsed.proposed_post_action || parsed.screenParams.post_action,
         max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
       },
+      follow_up: parsed.follow_up || null,
       pending_questions: pendingQuestions,
       review: parsed.review,
       job_options: jobOptions
@@ -892,7 +1459,8 @@ export async function runRecommendPipeline(
         max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
       },
       selectedJob,
-      selectedPage
+      selectedPage,
+      followUpChat: parsed.follow_up?.chat || null
     }));
     return {
       status: "NEED_CONFIRMATION",
@@ -905,6 +1473,7 @@ export async function runRecommendPipeline(
         post_action: parsed.proposed_post_action || parsed.screenParams.post_action,
         max_greet_count: parsed.proposed_max_greet_count || parsed.screenParams.max_greet_count
       },
+      follow_up: parsed.follow_up || null,
       selected_job: selectedJob,
       pending_questions: pendingQuestions,
       review: parsed.review,
@@ -1192,6 +1761,15 @@ export async function runRecommendPipeline(
       workspaceRoot,
       screenParams: parsed.screenParams,
       pageScope: selectedPage,
+      inputSummary: buildScreenInputSummary({
+        instruction,
+        selectedPage,
+        selectedJob,
+        userSearchParams: parsed.searchParams,
+        effectiveSearchParams,
+        screenParams: parsed.screenParams,
+        followUp: parsed.follow_up || null
+      }),
       resume: currentResumeConfig,
       runtime: runtimeHooks.adapterRuntime("screen")
     });
@@ -1475,7 +2053,7 @@ export async function runRecommendPipeline(
       greet_count: screenSummary.greet_count ?? 0
     });
 
-    return {
+    const recommendResult = {
       status: "COMPLETED",
       search_params: effectiveSearchParams,
       screen_params: parsed.screenParams,
@@ -1503,5 +2081,24 @@ export async function runRecommendPipeline(
         ? "Recommend 流水线已完成。本次 post_action=none：符合条件的人选仅记录到 CSV，不执行收藏或打招呼。"
         : "Recommend 流水线已完成。post_action 在运行开始时已一次性确认；若选择打招呼并设置上限，超出上限后会自动改为收藏。"
     };
+
+    if (!parsed.follow_up_chat?.requested) {
+      return recommendResult;
+    }
+
+    return runBossChatFollowUpPhase({
+      workspaceRoot,
+      followUpChat: parsed.follow_up_chat,
+      selectedJob,
+      debugPort: preflight.debug_port,
+      recommendResult,
+      resume,
+      runtimeHooks,
+      startChatRun,
+      getChatRun,
+      pauseChatRun,
+      resumeChatRun,
+      cancelChatRun
+    });
   }
 }

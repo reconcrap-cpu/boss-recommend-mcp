@@ -18,6 +18,7 @@ export const RUN_STAGE_PAGE_READY = "page_ready";
 export const RUN_STAGE_JOB_LIST = "job_list";
 export const RUN_STAGE_SEARCH = "search";
 export const RUN_STAGE_SCREEN = "screen";
+export const RUN_STAGE_CHAT_FOLLOWUP = "chat_followup";
 export const RUN_STAGE_FINALIZE = "finalize";
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 120_000;
@@ -38,6 +39,7 @@ const VALID_RUN_STAGES = new Set([
   RUN_STAGE_JOB_LIST,
   RUN_STAGE_SEARCH,
   RUN_STAGE_SCREEN,
+  RUN_STAGE_CHAT_FOLLOWUP,
   RUN_STAGE_FINALIZE
 ]);
 
@@ -158,6 +160,9 @@ function defaultResume(resume = {}) {
     checkpoint_path: normalizeMessage(resume?.checkpoint_path || ""),
     pause_control_path: normalizeMessage(resume?.pause_control_path || ""),
     output_csv: normalizeMessage(resume?.output_csv || ""),
+    follow_up_phase: normalizeMessage(resume?.follow_up_phase || ""),
+    chat_run_id: normalizeMessage(resume?.chat_run_id || ""),
+    chat_state: normalizeMessage(resume?.chat_state || ""),
     resume_count: Number.isInteger(resume?.resume_count) && resume.resume_count >= 0 ? resume.resume_count : 0,
     last_resumed_at: normalizeMessage(resume?.last_resumed_at || ""),
     last_paused_at: normalizeMessage(resume?.last_paused_at || "")

@@ -8,10 +8,19 @@ import {
   getFeaturedCalibrationResolution,
   runRecommendCalibration
 } from "./adapters.js";
+import {
+  cancelBossChatRun,
+  getBossChatHealthCheck,
+  getBossChatRun,
+  pauseBossChatRun,
+  resumeBossChatRun,
+  startBossChatRun
+} from "./boss-chat.js";
 import { runRecommendPipeline } from "./pipeline.js";
 import { runRecommendSelfHeal } from "./self-heal.js";
 import {
   RUN_MODE_ASYNC,
+  RUN_STAGE_CHAT_FOLLOWUP,
   RUN_STAGE_PREFLIGHT,
   RUN_STATE_CANCELED,
   RUN_STATE_COMPLETED,
@@ -41,6 +50,12 @@ const TOOL_RESUME_RUN = "resume_recommend_pipeline_run";
 const TOOL_RUN_FEATURED_CALIBRATION = "run_featured_calibration";
 const TOOL_GET_FEATURED_CALIBRATION_STATUS = "get_featured_calibration_status";
 const TOOL_RUN_RECOMMEND_SELF_HEAL = "run_recommend_self_heal";
+const TOOL_BOSS_CHAT_HEALTH_CHECK = "boss_chat_health_check";
+const TOOL_BOSS_CHAT_START_RUN = "start_boss_chat_run";
+const TOOL_BOSS_CHAT_GET_RUN = "get_boss_chat_run";
+const TOOL_BOSS_CHAT_PAUSE_RUN = "pause_boss_chat_run";
+const TOOL_BOSS_CHAT_RESUME_RUN = "resume_boss_chat_run";
+const TOOL_BOSS_CHAT_CANCEL_RUN = "cancel_boss_chat_run";
 
 const SERVER_NAME = "boss-recommend-mcp";
 const FRAMING_UNKNOWN = "unknown";
@@ -65,8 +80,39 @@ function parsePositiveInteger(raw, fallback) {
 }
 
 function getDefaultPollAfterSec() {
-  const fromEnv = parsePositiveInteger(process.env.BOSS_RECOMMEND_POLL_AFTER_SEC, 10);
-  return Math.max(5, Math.min(15, fromEnv));
+  const fromEnv = parsePositiveInteger(process.env.BOSS_RECOMMEND_POLL_AFTER_SEC, 1800);
+  return Math.max(60, fromEnv);
+}
+
+function getLongRunPollAfterSec() {
+  const fromEnv = parsePositiveInteger(process.env.BOSS_RECOMMEND_LONG_POLL_AFTER_SEC, 1800);
+  return Math.max(60, fromEnv);
+}
+
+function getRecommendedPollAfterSec(args = {}) {
+  return hasFollowUpChatRequest(args)
+    ? getLongRunPollAfterSec()
+    : getDefaultPollAfterSec();
+}
+
+function hasFollowUpChatRequest(args = {}) {
+  const directChat = args?.follow_up?.chat && typeof args.follow_up.chat === "object"
+    ? args.follow_up.chat
+    : null;
+  const overrideChat = args?.overrides?.follow_up?.chat && typeof args.overrides.follow_up.chat === "object"
+    ? args.overrides.follow_up.chat
+    : null;
+  return Boolean(directChat || overrideChat);
+}
+
+function getDefaultAcceptedMessage(args = {}) {
+  if (hasFollowUpChatRequest(args)) {
+    return "异步流水线已启动（detached）。recommend+chat 联动任务可能耗时较长，默认建议至少每 30 分钟查询一次 get_recommend_pipeline_run；若手动查询时已完成，将立即进入聊天衔接。";
+  }
+  const fromEnv = parsePositiveInteger(process.env.BOSS_RECOMMEND_POLL_AFTER_SEC, 1800);
+  const recommendedSeconds = Math.max(60, fromEnv);
+  const recommendedMinutes = Math.max(1, Math.round(recommendedSeconds / 60));
+  return `异步流水线已启动（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run（建议至少每 ${recommendedMinutes} 分钟查询一次）。`;
 }
 
 function getRunArtifacts(runId) {
@@ -82,7 +128,8 @@ function buildRunContext(workspaceRoot, args = {}) {
     workspace_root: path.resolve(workspaceRoot),
     instruction: String(args?.instruction || ""),
     confirmation: args?.confirmation && typeof args.confirmation === "object" ? args.confirmation : {},
-    overrides: args?.overrides && typeof args.overrides === "object" ? args.overrides : {}
+    overrides: args?.overrides && typeof args.overrides === "object" ? args.overrides : {},
+    follow_up: args?.follow_up && typeof args.follow_up === "object" ? args.follow_up : null
   };
 }
 
@@ -101,7 +148,10 @@ function resolveRunContext(snapshot) {
         : {},
       overrides: snapshot?.context?.overrides && typeof snapshot.context.overrides === "object"
         ? snapshot.context.overrides
-        : {}
+        : {},
+      follow_up: snapshot?.context?.follow_up && typeof snapshot.context.follow_up === "object"
+        ? snapshot.context.follow_up
+        : null
     }
   };
 }
@@ -294,9 +344,75 @@ function createRunInputSchema() {
           }
         },
         additionalProperties: false
+      },
+      follow_up: {
+        type: "object",
+        properties: {
+          chat: {
+            type: "object",
+            properties: {
+              profile: { type: "string" },
+              criteria: { type: "string" },
+              start_from: {
+                type: "string",
+                enum: ["unread", "all"]
+              },
+              target_count: {
+                type: "integer",
+                minimum: 1
+              },
+              dry_run: { type: "boolean" },
+              no_state: { type: "boolean" },
+              safe_pacing: { type: "boolean" },
+              batch_rest_enabled: { type: "boolean" }
+            },
+            additionalProperties: false
+          }
+        },
+        additionalProperties: false
       }
     },
     required: ["instruction"],
+    additionalProperties: false
+  };
+}
+
+function createBossChatStartInputSchema() {
+  return {
+    type: "object",
+    properties: {
+      profile: {
+        type: "string",
+        description: "可选，boss-chat profile 名称，默认 default"
+      },
+      job: {
+        type: "string",
+        description: "岗位，支持岗位名/编号/value"
+      },
+      start_from: {
+        type: "string",
+        enum: ["unread", "all"],
+        description: "从未读或全部聊天列表开始"
+      },
+      criteria: {
+        type: "string",
+        description: "boss-chat 的筛选 criteria"
+      },
+      target_count: {
+        type: "integer",
+        minimum: 1,
+        description: "本次处理人数上限；chat-only 模式必填（可先不传，服务会返回 NEED_INPUT 引导补齐）"
+      },
+      port: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，覆盖 Chrome 调试端口；未传时读取 screening-config.json.debugPort"
+      },
+      dry_run: { type: "boolean" },
+      no_state: { type: "boolean" },
+      safe_pacing: { type: "boolean" },
+      batch_rest_enabled: { type: "boolean" }
+    },
     additionalProperties: false
   };
 }
@@ -434,6 +550,77 @@ function createToolsSchema() {
       name: TOOL_RUN_RECOMMEND_SELF_HEAL,
       description: "手动运维自愈工具：扫描 Boss recommend 相关 selector / network 规则漂移，并在确认后应用高置信度修复。",
       inputSchema: createRunRecommendSelfHealInputSchema()
+    },
+    {
+      name: TOOL_BOSS_CHAT_HEALTH_CHECK,
+      description: "检查内置 boss-chat 运行时与共享 screening-config.json 是否可用。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          port: {
+            type: "integer",
+            minimum: 1
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_START_RUN,
+      description: "异步启动一次 boss-chat 任务。若缺少必填参数会先返回 NEED_INPUT（含岗位列表与待确认字段）。",
+      inputSchema: createBossChatStartInputSchema()
+    },
+    {
+      name: TOOL_BOSS_CHAT_GET_RUN,
+      description: "查询 boss-chat run_id 的当前状态。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_PAUSE_RUN,
+      description: "暂停运行中的 boss-chat 任务。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_RESUME_RUN,
+      description: "继续已暂停的 boss-chat 任务。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_CANCEL_RUN,
+      description: "取消运行中的 boss-chat 任务。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
     }
   ];
 }
@@ -461,6 +648,41 @@ function validateRunArgs(args) {
   }
   if (!args.instruction || typeof args.instruction !== "string") {
     return "instruction is required and must be a string";
+  }
+  return null;
+}
+
+function validateBossChatStartArgs(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    return "arguments must be an object";
+  }
+  if (Object.prototype.hasOwnProperty.call(args, "job")) {
+    if (typeof args.job !== "string" || !normalizeText(args.job)) {
+      return "job must be a non-empty string when provided";
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(args, "start_from")) {
+    const startFrom = normalizeText(args.start_from).toLowerCase();
+    if (!["unread", "all"].includes(startFrom)) {
+      return "start_from must be one of: unread, all";
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(args, "criteria")) {
+    if (typeof args.criteria !== "string" || !normalizeText(args.criteria)) {
+      return "criteria must be a non-empty string when provided";
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(args, "target_count")) {
+    const targetCount = Number.parseInt(String(args.target_count), 10);
+    if (!Number.isFinite(targetCount) || targetCount <= 0) {
+      return "target_count must be a positive integer";
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(args, "port")) {
+    const port = Number.parseInt(String(args.port), 10);
+    if (!Number.isFinite(port) || port <= 0) {
+      return "port must be a positive integer";
+    }
   }
   return null;
 }
@@ -564,7 +786,8 @@ function buildAsyncPrecheckArgs(args) {
   return {
     instruction: args.instruction,
     confirmation: buildAsyncPrecheckConfirmation(args.confirmation),
-    overrides: args.overrides
+    overrides: args.overrides,
+    follow_up: args.follow_up
   };
 }
 
@@ -617,6 +840,46 @@ function readCheckpointProgress(checkpointPath) {
   } catch {
     return null;
   }
+}
+
+function getBossChatRunIdFromSnapshot(snapshot) {
+  return normalizeText(
+    snapshot?.resume?.chat_run_id
+    || snapshot?.result?.follow_up?.chat?.run_id
+    || ""
+  );
+}
+
+function mergeFollowUpResult(currentResult, event = {}) {
+  const currentBase = currentResult && typeof currentResult === "object" ? currentResult : {};
+  const recommendPayload = event?.recommend_payload && typeof event.recommend_payload === "object"
+    ? event.recommend_payload
+    : null;
+  const baseResult = recommendPayload
+    ? {
+        ...currentBase,
+        ...recommendPayload
+      }
+    : { ...currentBase };
+  const followUp = event?.follow_up && typeof event.follow_up === "object" ? event.follow_up : {};
+  const currentFollowUp = baseResult.follow_up && typeof baseResult.follow_up === "object"
+    ? baseResult.follow_up
+    : {};
+  const nextChat = followUp.chat && typeof followUp.chat === "object"
+    ? {
+        ...(currentFollowUp.chat && typeof currentFollowUp.chat === "object" ? currentFollowUp.chat : {}),
+        ...followUp.chat
+      }
+    : currentFollowUp.chat;
+  return {
+    ...baseResult,
+    ...(event?.recommend_result ? { result: event.recommend_result } : {}),
+    follow_up: {
+      ...currentFollowUp,
+      ...followUp,
+      ...(nextChat ? { chat: nextChat } : {})
+    }
+  };
 }
 
 function reconcileOrphanRunIfNeeded(runId, snapshot) {
@@ -787,6 +1050,26 @@ function createRuntimeCallbacks(runId, heartbeatIntervalMs) {
         normalizeText(event?.line || "")
       );
     },
+    onFollowUp(event) {
+      const stage = normalizeText(event?.stage) || RUN_STAGE_CHAT_FOLLOWUP;
+      lastStage = stage || lastStage;
+      safeUpdateRunState(runId, (current) => ({
+        state: RUN_STATE_RUNNING,
+        stage: lastStage,
+        last_message: normalizeText(event?.last_message || current?.last_message || ""),
+        resume: {
+          ...current?.resume,
+          follow_up_phase: RUN_STAGE_CHAT_FOLLOWUP,
+          chat_run_id: normalizeText(
+            event?.follow_up?.chat?.run_id
+            || getBossChatRunIdFromSnapshot(current)
+            || ""
+          ) || null,
+          chat_state: normalizeText(event?.follow_up?.chat?.state || current?.resume?.chat_state || "") || null
+        },
+        result: mergeFollowUpResult(current?.result, event)
+      }));
+    },
     getLastStage() {
       return lastStage;
     }
@@ -811,13 +1094,23 @@ async function executeTrackedPipeline({
     checkpoint_path: normalizeText(existingSnapshot?.resume?.checkpoint_path || artifacts.checkpoint_path),
     pause_control_path: normalizeText(existingSnapshot?.resume?.pause_control_path || artifacts.run_state_path),
     output_csv: normalizeText(existingSnapshot?.resume?.output_csv || "") || null,
+    follow_up_phase: normalizeText(existingSnapshot?.resume?.follow_up_phase || "") || null,
+    chat_run_id: normalizeText(existingSnapshot?.resume?.chat_run_id || "") || null,
+    chat_state: normalizeText(existingSnapshot?.resume?.chat_state || "") || null,
+    recommend_result: existingSnapshot?.result?.result || null,
+    recommend_search_params: existingSnapshot?.result?.search_params || null,
+    recommend_screen_params: existingSnapshot?.result?.screen_params || null,
     previous_completion_reason: getCompletionReasonFromResult(existingSnapshot?.result || null)
   };
   safeUpdateRunState(runId, {
     state: RUN_STATE_RUNNING,
-    stage: RUN_STAGE_PREFLIGHT,
+    stage: resumeConfig.follow_up_phase === RUN_STAGE_CHAT_FOLLOWUP ? RUN_STAGE_CHAT_FOLLOWUP : RUN_STAGE_PREFLIGHT,
     last_message: resumeRun
-      ? "流水线继续执行中，等待 preflight。"
+      ? (
+        resumeConfig.follow_up_phase === RUN_STAGE_CHAT_FOLLOWUP
+          ? "流水线继续执行中，准备恢复 boss-chat follow-up。"
+          : "流水线继续执行中，等待 preflight。"
+      )
       : "流水线已启动，等待 preflight。",
     resume: resumeConfig
   });
@@ -830,6 +1123,7 @@ async function executeTrackedPipeline({
         instruction: args.instruction,
         confirmation: args.confirmation,
         overrides: args.overrides,
+        followUp: args.follow_up,
         resume: resumeConfig
       },
       undefined,
@@ -837,10 +1131,12 @@ async function executeTrackedPipeline({
         signal,
         heartbeatIntervalMs,
         isPauseRequested: () => isRunPauseRequested(runId),
+        isCancelRequested: () => isRunCancelRequested(runId),
         onStage: runtimeCallbacks.onStage,
         onHeartbeat: runtimeCallbacks.onHeartbeat,
         onOutput: runtimeCallbacks.onOutput,
-        onProgress: runtimeCallbacks.onProgress
+        onProgress: runtimeCallbacks.onProgress,
+        onFollowUp: runtimeCallbacks.onFollowUp
       }
     );
   } catch (error) {
@@ -1040,7 +1336,8 @@ async function handleStartRunTool({ workspaceRoot, args }) {
         workspaceRoot,
         instruction: precheckArgs.instruction,
         confirmation: precheckArgs.confirmation,
-        overrides: precheckArgs.overrides
+        overrides: precheckArgs.overrides,
+        followUp: precheckArgs.follow_up
       },
       undefined,
       null
@@ -1110,8 +1407,8 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     status: "ACCEPTED",
     run_id: runId,
     state: "queued",
-    poll_after_sec: getDefaultPollAfterSec(),
-    message: "异步流水线已启动（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
+    poll_after_sec: getRecommendedPollAfterSec(args),
+    message: getDefaultAcceptedMessage(args)
   };
 }
 
@@ -1367,8 +1664,10 @@ function handleResumeRunTool(args) {
   return {
     status: "RESUME_REQUESTED",
     run: started,
-    poll_after_sec: getDefaultPollAfterSec(),
-    message: "已恢复 Recommend 流水线（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
+    poll_after_sec: getRecommendedPollAfterSec(executionContext?.args || {}),
+    message: hasFollowUpChatRequest(executionContext?.args || {})
+      ? "已恢复 Recommend 流水线（detached）。recommend+chat 联动任务建议按 30 分钟间隔查询状态；手动查询到完成时会立即衔接聊天流程。"
+      : "已恢复 Recommend 流水线（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
   };
 }
 
@@ -1423,6 +1722,30 @@ async function handleRunFeaturedCalibrationTool({ workspaceRoot, args }) {
 
 async function handleRunRecommendSelfHealTool({ workspaceRoot, args }) {
   return runSelfHealImpl({ workspaceRoot, args });
+}
+
+function handleBossChatHealthCheckTool(workspaceRoot, args) {
+  return getBossChatHealthCheck(workspaceRoot, args);
+}
+
+async function handleBossChatStartRunTool({ workspaceRoot, args }) {
+  return startBossChatRun({ workspaceRoot, input: args });
+}
+
+async function handleBossChatGetRunTool({ workspaceRoot, args }) {
+  return getBossChatRun({ workspaceRoot, input: args });
+}
+
+async function handleBossChatPauseRunTool({ workspaceRoot, args }) {
+  return pauseBossChatRun({ workspaceRoot, input: args });
+}
+
+async function handleBossChatResumeRunTool({ workspaceRoot, args }) {
+  return resumeBossChatRun({ workspaceRoot, input: args });
+}
+
+async function handleBossChatCancelRunTool({ workspaceRoot, args }) {
+  return cancelBossChatRun({ workspaceRoot, input: args });
 }
 
 async function handleRequest(message, workspaceRoot) {
@@ -1488,7 +1811,23 @@ async function handleRequest(message, workspaceRoot) {
       }
     }
 
-    if ([TOOL_GET_RUN, TOOL_CANCEL_RUN, TOOL_PAUSE_RUN, TOOL_RESUME_RUN].includes(toolName)) {
+    if (toolName === TOOL_BOSS_CHAT_START_RUN) {
+      const inputError = validateBossChatStartArgs(args);
+      if (inputError) {
+        return createJsonRpcError(id, -32602, inputError);
+      }
+    }
+
+    if ([
+      TOOL_GET_RUN,
+      TOOL_CANCEL_RUN,
+      TOOL_PAUSE_RUN,
+      TOOL_RESUME_RUN,
+      TOOL_BOSS_CHAT_GET_RUN,
+      TOOL_BOSS_CHAT_CANCEL_RUN,
+      TOOL_BOSS_CHAT_PAUSE_RUN,
+      TOOL_BOSS_CHAT_RESUME_RUN
+    ].includes(toolName)) {
       if (!args || typeof args.run_id !== "string" || !normalizeText(args.run_id)) {
         return createJsonRpcError(id, -32602, "run_id is required and must be a string");
       }
@@ -1512,6 +1851,18 @@ async function handleRequest(message, workspaceRoot) {
         payload = await handleRunFeaturedCalibrationTool({ workspaceRoot, args });
       } else if (toolName === TOOL_RUN_RECOMMEND_SELF_HEAL) {
         payload = await handleRunRecommendSelfHealTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_BOSS_CHAT_HEALTH_CHECK) {
+        payload = handleBossChatHealthCheckTool(workspaceRoot, args);
+      } else if (toolName === TOOL_BOSS_CHAT_START_RUN) {
+        payload = await handleBossChatStartRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_BOSS_CHAT_GET_RUN) {
+        payload = await handleBossChatGetRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_BOSS_CHAT_PAUSE_RUN) {
+        payload = await handleBossChatPauseRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_BOSS_CHAT_RESUME_RUN) {
+        payload = await handleBossChatResumeRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_BOSS_CHAT_CANCEL_RUN) {
+        payload = await handleBossChatCancelRunTool({ workspaceRoot, args });
       } else {
         return createJsonRpcError(id, -32602, `Unknown tool: ${toolName || ""}`);
       }

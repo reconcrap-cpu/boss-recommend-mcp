@@ -446,6 +446,74 @@ async function testScreenCliShouldPassLatestPageScopeArgument() {
   }
 }
 
+async function testScreenCliShouldPassInputSummaryArgument() {
+  const previousHome = process.env.BOSS_RECOMMEND_HOME;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-input-summary-home-"));
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-input-summary-workspace-"));
+  const cliDir = path.join(workspaceRoot, "boss-recommend-screen-cli");
+  fs.mkdirSync(cliDir, { recursive: true });
+  const cliPath = path.join(cliDir, "boss-recommend-screen-cli.cjs");
+  fs.writeFileSync(
+    cliPath,
+    [
+      "#!/usr/bin/env node",
+      "console.log(JSON.stringify({",
+      "  status: 'COMPLETED',",
+      "  result: {",
+      "    processed_count: 0,",
+      "    passed_count: 0,",
+      "    skipped_count: 0,",
+      "    argv: process.argv.slice(2),",
+      "    resume_source: 'network',",
+      "    active_tab_status: '0'",
+      "  }",
+      "}));"
+    ].join("\n"),
+    "utf8"
+  );
+
+  process.env.BOSS_RECOMMEND_HOME = tempHome;
+  fs.writeFileSync(path.join(tempHome, "screening-config.json"), JSON.stringify({
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-valid-test",
+    model: "gpt-4.1-mini"
+  }, null, 2));
+
+  try {
+    const inputSummary = {
+      instruction: "测试输入摘要",
+      search_params: { school_tag: ["985"], gender: "男" },
+      screen_params: { criteria: "有 MCP 经验" }
+    };
+    const result = await runRecommendScreenCli({
+      workspaceRoot,
+      screenParams: {
+        criteria: "有 MCP 经验",
+        target_count: null,
+        post_action: "none",
+        max_greet_count: null
+      },
+      inputSummary
+    });
+    assert.equal(result.ok, true);
+    const argv = result.summary?.argv || [];
+    const summaryIndex = argv.indexOf("--input-summary-json");
+    assert.equal(summaryIndex >= 0, true);
+    const parsedSummary = JSON.parse(String(argv[summaryIndex + 1] || "{}"));
+    assert.equal(parsedSummary.instruction, "测试输入摘要");
+    assert.equal(parsedSummary.search_params?.gender, "男");
+    assert.equal(parsedSummary.screen_params?.criteria, "有 MCP 经验");
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.BOSS_RECOMMEND_HOME;
+    } else {
+      process.env.BOSS_RECOMMEND_HOME = previousHome;
+    }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
 async function main() {
   await testRunProcessHeartbeatAndOutput();
   await testRunProcessAbortSignal();
@@ -463,6 +531,7 @@ async function main() {
   await testSearchCliShouldPassLatestPageScopeWithoutCalibration();
   await testScreenCliShouldPassPageScopeArgument();
   await testScreenCliShouldPassLatestPageScopeArgument();
+  await testScreenCliShouldPassInputSummaryArgument();
   console.log("adapters runtime tests passed");
 }
 
