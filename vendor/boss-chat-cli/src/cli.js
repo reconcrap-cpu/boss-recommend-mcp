@@ -131,11 +131,35 @@ function parseStartFrom(value, fallback = 'unread') {
   return fallback;
 }
 
+function isUnlimitedTargetCountToken(value) {
+  const token = String(value || '').trim().toLowerCase();
+  if (!token) return false;
+  return [
+    'all',
+    'unlimited',
+    'infinity',
+    'inf',
+    'max',
+    'full',
+    '全部',
+    '全量',
+    '不限',
+    '扫到底',
+    '直到完成所有人选',
+  ].includes(token);
+}
+
 function parseTargetCount(value) {
   if (value === undefined || value === null || String(value).trim() === '') {
     return null;
   }
+  if (isUnlimitedTargetCountToken(value)) {
+    return -1;
+  }
   const parsed = Number.parseInt(String(value), 10);
+  if (Number.isFinite(parsed) && parsed === -1) {
+    return -1;
+  }
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
@@ -266,7 +290,7 @@ function printUsage() {
   console.log('  --job <text|value|index>        Select job by label/value/index');
   console.log('  --criteria <text>               Screening criteria for resume evaluation');
   console.log('  --start-from <unread|all>       Start from unread or all list');
-  console.log('  --targetCount <n>               Maximum candidates to process; empty means unlimited');
+  console.log('  --targetCount <n|all>           Maximum candidates to process; all means unlimited');
   console.log('  --baseurl <url>                 Override LLM base URL');
   console.log('  --apikey <key>                  Override LLM API key');
   console.log('  --model <name>                  Override LLM model');
@@ -540,7 +564,9 @@ function validateStartRunArgs(args) {
   const missing = [];
   if (!args?.overrides?.jobSelection) missing.push('--job');
   if (!args?.overrides?.startFrom) missing.push('--start-from');
-  if (!args?.overrides?.targetCount) missing.push('--targetCount');
+  if (args?.overrides?.targetCount === undefined || args?.overrides?.targetCount === null) {
+    missing.push('--targetCount');
+  }
   if (!args?.overrides?.screeningCriteria) missing.push('--criteria');
 
   if (missing.length === 0) return null;
@@ -557,7 +583,12 @@ function validateStartRunArgs(args) {
 function buildPreparePendingQuestions(args, jobs = []) {
   const pendingQuestions = [];
   const startFromValue = String(args?.overrides?.startFrom || '').trim().toLowerCase();
-  const targetCountValue = Number.parseInt(String(args?.overrides?.targetCount || ''), 10);
+  const targetCountValue = Number.parseInt(String(args?.overrides?.targetCount ?? ''), 10);
+  const hasTargetCount =
+    args?.overrides?.targetCount !== undefined &&
+    args?.overrides?.targetCount !== null &&
+    Number.isFinite(targetCountValue) &&
+    (targetCountValue > 0 || targetCountValue === -1);
   const criteriaValue = String(args?.overrides?.screeningCriteria || '').trim();
   const jobValue = String(args?.overrides?.jobSelection || '').trim();
   const jobOptions = jobs.map((job, index) => ({
@@ -586,10 +617,10 @@ function buildPreparePendingQuestions(args, jobs = []) {
       ],
     });
   }
-  if (!Number.isFinite(targetCountValue) || targetCountValue <= 0) {
+  if (!hasTargetCount) {
     pendingQuestions.push({
       field: 'target_count',
-      question: '请输入目标数量（正整数）',
+      question: '请输入目标数量（正整数）或 all（扫到底）',
       required: true,
     });
   }
@@ -1198,8 +1229,12 @@ async function executeRunCommand(args, dataDir) {
     cleanupRuntimeControls = setupRuntimeControls(runControl);
 
     logger.log('开始处理 Boss 聊天候选人列表...');
+    const targetCountLabel =
+      Number.isFinite(Number(runProfile.targetCount)) && Number(runProfile.targetCount) > 0
+        ? String(runProfile.targetCount)
+        : '扫到底';
     logger.log(
-      `本次设置: 岗位=${runProfile.jobSelection.label}, 范围=${runProfile.startFrom === 'all' ? '全部' : '未读'}, 上限=${runProfile.targetCount || '扫到底'}`,
+      `本次设置: 岗位=${runProfile.jobSelection.label}, 范围=${runProfile.startFrom === 'all' ? '全部' : '未读'}, 上限=${targetCountLabel}`,
     );
     logger.log('运行中快捷键: p=暂停/继续, r=继续, q=停止, Ctrl+C=停止');
 

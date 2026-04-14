@@ -630,6 +630,40 @@ function browserActivateCandidate(options = {}) {
 function browserScrollCustomerList(options = {}) {
   const ratio = Number(options.ratio || 0.72);
   const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+  const isOverflowScrollable = (el) => {
+    if (!(el instanceof HTMLElement)) return false;
+    const style = getComputedStyle(el);
+    return /(auto|scroll|overlay)/i.test(String(style.overflowY || ''));
+  };
+  const findBestScrollableContainer = (seedCard) => {
+    const candidates = [];
+    const pushCandidate = (node) => {
+      if (node instanceof HTMLElement) candidates.push(node);
+    };
+    if (seedCard instanceof HTMLElement) {
+      let current = seedCard.parentElement;
+      let depth = 0;
+      while (current && depth < 30) {
+        pushCandidate(current);
+        current = current.parentElement;
+        depth += 1;
+      }
+    }
+    const unique = Array.from(new Set(candidates));
+    let best = null;
+    let bestScore = -Infinity;
+    for (const node of unique) {
+      const scrollRange = Number(node.scrollHeight || 0) - Number(node.clientHeight || 0);
+      const styleBonus = isOverflowScrollable(node) ? 80 : 0;
+      const classBonus = /user|list|chat/i.test(String(node.className || '')) ? 24 : 0;
+      const score = scrollRange + styleBonus + classBonus;
+      if (score > bestScore) {
+        best = node;
+        bestScore = score;
+      }
+    }
+    return best;
+  };
   const isScrollable = (el) =>
     el instanceof HTMLElement &&
     Number(el.scrollHeight || 0) > Number(el.clientHeight || 0) + 16 &&
@@ -672,27 +706,59 @@ function browserScrollCustomerList(options = {}) {
     return { ok: false, error: 'CHAT_LIST_CONTAINER_NOT_FOUND' };
   }
 
+  const firstCard = listContainer.querySelector('div[role="listitem"]') || document.querySelector('div[role="listitem"]');
+  if (firstCard instanceof HTMLElement) {
+    const best = findBestScrollableContainer(firstCard);
+    if (best instanceof HTMLElement) {
+      listContainer = best;
+    }
+  }
+
   const before = {
     top: Number(listContainer.scrollTop || 0),
     height: Number(listContainer.scrollHeight || 0),
     clientHeight: Number(listContainer.clientHeight || 0),
+    cardCount: Number(listContainer.querySelectorAll('div[role="listitem"]').length || 0),
   };
   const amount = Math.max(120, Math.round(before.clientHeight * Math.max(0.35, Math.min(0.95, ratio))));
   const maxScroll = Math.max(0, before.height - before.clientHeight);
-  listContainer.scrollTop = clamp(before.top + amount, 0, maxScroll);
+  if (maxScroll > 0) {
+    listContainer.scrollTop = clamp(before.top + amount, 0, maxScroll);
+  } else {
+    const cards = Array.from(listContainer.querySelectorAll('div[role="listitem"]')).filter(
+      (node) => node instanceof HTMLElement,
+    );
+    const tail = cards[cards.length - 1];
+    if (tail instanceof HTMLElement) {
+      tail.scrollIntoView({ block: 'end', inline: 'nearest' });
+      try {
+        listContainer.dispatchEvent(
+          new WheelEvent('wheel', {
+            deltaY: amount,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      } catch {}
+    }
+  }
   listContainer.dispatchEvent(new Event('scroll', { bubbles: true }));
 
   const after = {
     top: Number(listContainer.scrollTop || 0),
     height: Number(listContainer.scrollHeight || 0),
     clientHeight: Number(listContainer.clientHeight || 0),
+    cardCount: Number(listContainer.querySelectorAll('div[role="listitem"]').length || 0),
   };
 
   return {
     ok: true,
     before,
     after,
-    didScroll: before.top !== after.top || before.height !== after.height,
+    didScroll:
+      before.top !== after.top ||
+      before.height !== after.height ||
+      before.cardCount !== after.cardCount,
   };
 }
 
@@ -725,29 +791,46 @@ function browserConversationReadyState() {
     const disabledAttr = Boolean(el?.hasAttribute?.('disabled'));
     return classText.includes('disabled') || ariaDisabled || disabledAttr;
   };
+  const isDisabledDeep = (el) => {
+    if (!(el instanceof HTMLElement)) return true;
+    let current = el;
+    let depth = 0;
+    while (current && depth < 5) {
+      if (isDisabled(current)) return true;
+      current = current.parentElement;
+      depth += 1;
+    }
+    return false;
+  };
+  const resolveAttachmentButton = () => {
+    const candidates = Array.from(
+      document.querySelectorAll(
+        '.resume-btn-file, .btn.resume-btn-file, [class*="resume-btn-file"]',
+      ),
+    ).filter((el) => isVisible(el));
+    const match = candidates.find((el) => {
+      const text = normalize(el.textContent || '');
+      if (!text) return false;
+      if (!text.includes('附件简历')) return false;
+      if (text.includes('求附件简历')) return false;
+      return true;
+    });
+    return match || null;
+  };
   const onlineResume = Array.from(
     document.querySelectorAll(
       'a.btn.resume-btn-online, a.resume-btn-online, .resume-btn-online, .btn.resume-btn-online',
     ),
   ).find((el) => {
     if (!isVisible(el)) return false;
-    if (!normalize(el.textContent || '').includes('在线简历')) return false;
-    return !isDisabled(el);
+      if (!normalize(el.textContent || '').includes('在线简历')) return false;
+      return !isDisabled(el);
   });
-  const attachmentResume = Array.from(
-    document.querySelectorAll(
-      '.btn.resume-btn-file, .resume-btn-file, [class*="resume-btn-file"], button, a, div, span',
-    ),
-  ).find((el) => {
-    if (!isVisible(el)) return false;
-    if (!normalize(el.textContent || '').includes('附件简历')) return false;
-    const classText = String(el.className || '').toLowerCase();
-    return classText.includes('resume-btn-file') || classText.includes('resume') || classText.includes('btn');
-  });
+  const attachmentResume = resolveAttachmentButton();
   const askResume = Array.from(document.querySelectorAll('span.operate-btn, button, a, span')).find(
     (el) => isVisible(el) && isAskResumeText(el.textContent || ''),
   );
-  const attachmentResumeEnabled = Boolean(attachmentResume) && !isDisabled(attachmentResume);
+  const attachmentResumeEnabled = Boolean(attachmentResume) && !isDisabledDeep(attachmentResume);
   return {
     hasOnlineResume: Boolean(onlineResume),
     hasAskResume: Boolean(askResume),

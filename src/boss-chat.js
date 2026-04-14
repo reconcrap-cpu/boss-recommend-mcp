@@ -30,6 +30,69 @@ function parsePositiveInteger(value, fallback = null) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function isUnlimitedTargetCountToken(value) {
+  const token = normalizeText(value).toLowerCase();
+  if (!token) return false;
+  return [
+    "all",
+    "unlimited",
+    "infinity",
+    "inf",
+    "max",
+    "full",
+    "全部",
+    "全量",
+    "不限",
+    "扫到底",
+    "直到完成所有人选"
+  ].includes(token);
+}
+
+function parseBossChatTargetCount(value) {
+  if (value === undefined || value === null) {
+    return {
+      provided: false,
+      targetCount: null,
+      cliArg: null
+    };
+  }
+  const raw = normalizeText(value);
+  if (!raw) {
+    return {
+      provided: false,
+      targetCount: null,
+      cliArg: null
+    };
+  }
+  if (isUnlimitedTargetCountToken(raw)) {
+    return {
+      provided: true,
+      targetCount: null,
+      cliArg: "-1"
+    };
+  }
+  const parsed = Number.parseInt(String(raw), 10);
+  if (Number.isFinite(parsed) && parsed === -1) {
+    return {
+      provided: true,
+      targetCount: null,
+      cliArg: "-1"
+    };
+  }
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return {
+      provided: true,
+      targetCount: parsed,
+      cliArg: String(parsed)
+    };
+  }
+  return {
+    provided: false,
+    targetCount: null,
+    cliArg: null
+  };
+}
+
 function parseJsonOutput(text) {
   const trimmed = String(text || "").trim();
   if (!trimmed) return null;
@@ -152,14 +215,16 @@ function normalizeBossChatStartInput(input = {}) {
   const startFromRaw = normalizeText(input.startFrom || input.start_from).toLowerCase();
   const startFrom = startFromRaw === "all" ? "all" : startFromRaw === "unread" ? "unread" : "";
   const criteria = normalizeText(input.criteria);
-  const targetCount = parsePositiveInteger(input.targetCount ?? input.target_count);
+  const parsedTarget = parseBossChatTargetCount(input.targetCount ?? input.target_count);
   const port = parsePositiveInteger(input.port);
   return {
     profile,
     job,
     startFrom,
     criteria,
-    targetCount,
+    targetCount: parsedTarget.targetCount,
+    targetCountArg: parsedTarget.cliArg,
+    targetCountProvided: parsedTarget.provided,
     port,
     dryRun: input.dryRun === true || input.dry_run === true,
     noState: input.noState === true || input.no_state === true,
@@ -181,7 +246,7 @@ function getMissingBossChatStartFields(input = {}) {
   const missing = [];
   if (!normalized.job) missing.push("job");
   if (!normalized.startFrom) missing.push("start_from");
-  if (!normalized.targetCount) missing.push("target_count");
+  if (!normalized.targetCountProvided) missing.push("target_count");
   if (!normalized.criteria) missing.push("criteria");
   return missing;
 }
@@ -194,7 +259,7 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     if (normalized.job) args.push("--job", normalized.job);
     if (normalized.startFrom) args.push("--start-from", normalized.startFrom);
     if (normalized.criteria) args.push("--criteria", normalized.criteria);
-    if (normalized.targetCount) args.push("--targetCount", String(normalized.targetCount));
+    if (normalized.targetCountArg) args.push("--targetCount", normalized.targetCountArg);
     args.push("--port", String(normalized.port || resolvedConfig.debugPort || 9222));
     args.push("--baseurl", resolvedConfig.baseUrl);
     args.push("--apikey", resolvedConfig.apiKey);
@@ -210,8 +275,8 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     args.push("--job", normalized.job);
     args.push("--start-from", normalized.startFrom);
     args.push("--criteria", normalized.criteria);
-    if (normalized.targetCount) {
-      args.push("--targetCount", String(normalized.targetCount));
+    if (normalized.targetCountArg) {
+      args.push("--targetCount", normalized.targetCountArg);
     }
     args.push("--baseurl", resolvedConfig.baseUrl);
     args.push("--apikey", resolvedConfig.apiKey);

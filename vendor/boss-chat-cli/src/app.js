@@ -226,6 +226,7 @@ export class BossChatApp {
 
     let consecutiveErrors = 0;
     let exhaustedScrolls = 0;
+    const exhaustedScrollLimit = targetCount ? 3 : 8;
 
     try {
       while (shouldContinue(summary, targetCount)) {
@@ -336,7 +337,7 @@ export class BossChatApp {
             `列表滚动：ratio=${ratio.toFixed(2)} | didScroll=${Boolean(scrollResult.didScroll)} | top=${scrollResult.after?.top ?? 'n/a'} | scrollRetry=${exhaustedScrolls + 1}`,
           );
           exhaustedScrolls = scrollResult.didScroll ? exhaustedScrolls + 1 : exhaustedScrolls + 2;
-          if (exhaustedScrolls >= 3) {
+          if (exhaustedScrolls >= exhaustedScrollLimit) {
             summary.exhausted = true;
             this.logger.log('列表滚动终止：连续无可处理候选人，判定为 exhausted。');
             break;

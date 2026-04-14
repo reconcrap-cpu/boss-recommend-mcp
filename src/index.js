@@ -74,6 +74,24 @@ function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function isUnlimitedTargetCountToken(value) {
+  const token = normalizeText(value).toLowerCase();
+  if (!token) return false;
+  return [
+    "all",
+    "unlimited",
+    "infinity",
+    "inf",
+    "max",
+    "full",
+    "全部",
+    "全量",
+    "不限",
+    "扫到底",
+    "直到完成所有人选"
+  ].includes(token);
+}
+
 function parsePositiveInteger(raw, fallback) {
   const value = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(value) && value > 0 ? value : fallback;
@@ -358,8 +376,16 @@ function createRunInputSchema() {
                 enum: ["unread", "all"]
               },
               target_count: {
-                type: "integer",
-                minimum: 1
+                oneOf: [
+                  {
+                    type: "integer",
+                    minimum: 1
+                  },
+                  {
+                    type: "string",
+                    enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量"]
+                  }
+                ]
               },
               dry_run: { type: "boolean" },
               no_state: { type: "boolean" },
@@ -399,9 +425,17 @@ function createBossChatStartInputSchema() {
         description: "boss-chat 的筛选 criteria"
       },
       target_count: {
-        type: "integer",
-        minimum: 1,
-        description: "本次处理人数上限；chat-only 模式必填（可先不传，服务会返回 NEED_INPUT 引导补齐）"
+        oneOf: [
+          {
+            type: "integer",
+            minimum: 1
+          },
+          {
+            type: "string",
+            enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量"]
+          }
+        ],
+        description: "本次处理人数上限；支持正整数或 all/不限（扫到底）"
       },
       port: {
         type: "integer",
@@ -673,9 +707,13 @@ function validateBossChatStartArgs(args) {
     }
   }
   if (Object.prototype.hasOwnProperty.call(args, "target_count")) {
-    const targetCount = Number.parseInt(String(args.target_count), 10);
-    if (!Number.isFinite(targetCount) || targetCount <= 0) {
-      return "target_count must be a positive integer";
+    const rawTargetCount = args.target_count;
+    const targetCount = Number.parseInt(String(rawTargetCount), 10);
+    const tokenAllowed =
+      typeof rawTargetCount === "string" && isUnlimitedTargetCountToken(rawTargetCount);
+    const numericUnlimited = Number.isFinite(targetCount) && targetCount === -1;
+    if ((!Number.isFinite(targetCount) || targetCount <= 0) && !tokenAllowed && !numericUnlimited) {
+      return "target_count must be a positive integer or one of: all, unlimited, 全部, 不限, 扫到底, 全量";
     }
   }
   if (Object.prototype.hasOwnProperty.call(args, "port")) {
