@@ -2756,10 +2756,16 @@ export class BossChatPage {
   async waitForResumeRequestMessage({ baselineCount = 0, timeoutMs = 6500, pollMs = 260 } = {}) {
     const start = Date.now();
     let latest = null;
+    const hasSentMessage = (state = {}) => {
+      const lastText = String(state?.lastText || '');
+      const recent = Array.isArray(state?.recent) ? state.recent : [];
+      if (lastText.includes('简历请求已发送')) return true;
+      return recent.some((item) => String(item || '').includes('简历请求已发送'));
+    };
     while (Date.now() - start < timeoutMs) {
       const state = await this.getResumeRequestMessageState();
       latest = state;
-      if (state.count > baselineCount) {
+      if (state.count > baselineCount || hasSentMessage(state)) {
         return {
           observed: true,
           state,

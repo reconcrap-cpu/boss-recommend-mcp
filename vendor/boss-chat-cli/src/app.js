@@ -57,6 +57,13 @@ function shouldContinue(summary, targetCount) {
   return summary.inspected < targetCount;
 }
 
+function hasResumeRequestSentMessage(state = {}) {
+  const lastText = normalizeText(state?.lastText || '');
+  const recent = Array.isArray(state?.recent) ? state.recent : [];
+  if (lastText.includes('简历请求已发送')) return true;
+  return recent.some((item) => normalizeText(item).includes('简历请求已发送'));
+}
+
 export class BossChatApp {
   constructor({
     page,
@@ -691,19 +698,30 @@ export class BossChatApp {
         await this.interaction.sleepRange(360, 120);
 
         this.logger.log('候选人通过，执行求简历动作。');
-        await this.checkpoint();
-        const messageBefore =
-          typeof this.page.getResumeRequestMessageState === 'function'
-            ? await this.page.getResumeRequestMessageState()
-            : { ok: false, count: 0, lastText: '', recent: [] };
-        const askResult = await this.page.clickAskResume();
-        await this.interaction.sleepRange(460, 150);
-        if (askResult?.alreadyRequested) {
-          baseResult.requested = true;
-          this.logger.log('求简历动作完成：alreadyRequested=true');
-        } else {
+        const maxRequestAttempts = 3;
+        let requestSucceeded = false;
+        let lastAttempt = null;
+
+        for (let requestAttempt = 0; requestAttempt < maxRequestAttempts; requestAttempt += 1) {
           await this.checkpoint();
-          const confirmResult = await this.page.clickConfirmRequestResume();
+          const messageBefore =
+            typeof this.page.getResumeRequestMessageState === 'function'
+              ? await this.page.getResumeRequestMessageState()
+              : { ok: false, count: 0, lastText: '', recent: [] };
+          const askResult = await this.page.clickAskResume();
+          await this.interaction.sleepRange(460, 150);
+
+          let confirmResult = {
+            confirmed: false,
+            requestedVerified: false,
+            assumedRequested: false,
+            uiState: null,
+          };
+          if (!askResult?.alreadyRequested) {
+            await this.checkpoint();
+            confirmResult = await this.page.clickConfirmRequestResume();
+          }
+
           let messageObserved = false;
           let messageAfter = null;
           if (typeof this.page.waitForResumeRequestMessage === 'function') {
@@ -712,28 +730,49 @@ export class BossChatApp {
               timeoutMs: 7000,
               pollMs: 260,
             });
-            messageObserved = Boolean(messageCheck?.observed);
             messageAfter = messageCheck?.state || null;
+            messageObserved = Boolean(messageCheck?.observed) || hasResumeRequestSentMessage(messageAfter || {});
           }
 
-          const requestedVerified =
-            Boolean(confirmResult?.requestedVerified) ||
-            Boolean(messageObserved);
-          baseResult.requested = requestedVerified;
+          const requestedVerified = Boolean(messageObserved);
+          lastAttempt = {
+            attempt: requestAttempt + 1,
+            askResult,
+            confirmResult,
+            messageBefore,
+            messageAfter,
+            messageObserved,
+            requestedVerified,
+          };
+
           if (messageAfter) {
             baseResult.artifacts.resumeRequestMessageBefore = Number(messageBefore?.count || 0);
             baseResult.artifacts.resumeRequestMessageAfter = Number(messageAfter?.count || 0);
             baseResult.artifacts.resumeRequestMessageObserved = messageObserved;
             baseResult.artifacts.resumeRequestMessageLastText = String(messageAfter?.lastText || '');
           }
+
           this.logger.log(
-            `求简历动作完成：confirmed=${Boolean(confirmResult?.confirmed)} | disabledOperateAsk=${Boolean(confirmResult?.uiState?.hasDisabledOperateAsk)} | verified=${requestedVerified} | messageObserved=${messageObserved} | assumed=${Boolean(confirmResult?.assumedRequested)}`,
+            `求简历动作检查：attempt=${requestAttempt + 1}/${maxRequestAttempts} | alreadyRequested=${Boolean(askResult?.alreadyRequested)} | confirmed=${Boolean(confirmResult?.confirmed)} | disabledOperateAsk=${Boolean(confirmResult?.uiState?.hasDisabledOperateAsk)} | messageObserved=${messageObserved} | verified=${requestedVerified} | assumed=${Boolean(confirmResult?.assumedRequested)}`,
           );
-          if (!requestedVerified) {
-            throw new Error(
-              `REQUEST_RESUME_NOT_CONFIRMED(state=${JSON.stringify(confirmResult?.uiState || {})},messageBefore=${Number(messageBefore?.count || 0)},messageAfter=${Number(messageAfter?.count || 0)})`,
-            );
+
+          if (requestedVerified) {
+            requestSucceeded = true;
+            break;
           }
+
+          if (requestAttempt < maxRequestAttempts - 1) {
+            this.logger.log('未检测到“简历请求已发送”提示，重新发起求简历。');
+            await this.interaction.sleepRange(640, 180);
+          }
+        }
+
+        baseResult.requested = requestSucceeded;
+        if (!requestSucceeded) {
+          const confirmStateText = JSON.stringify(lastAttempt?.confirmResult?.uiState || {});
+          throw new Error(
+            `REQUEST_RESUME_MESSAGE_NOT_OBSERVED(state=${confirmStateText},messageBefore=${Number(lastAttempt?.messageBefore?.count || 0)},messageAfter=${Number(lastAttempt?.messageAfter?.count || 0)},attempts=${maxRequestAttempts})`,
+          );
         }
       }
 
