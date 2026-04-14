@@ -16,6 +16,7 @@ import {
 import {
   cancelBossChatRun,
   getBossChatRun,
+  normalizeTargetCountInput,
   pauseBossChatRun,
   resumeBossChatRun,
   startBossChatRun
@@ -64,6 +65,10 @@ function normalizeText(value) {
 function parsePositiveIntegerValue(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizePipelineTargetCountValue(value) {
+  return normalizeTargetCountInput(value).publicValue;
 }
 
 function sleep(ms) {
@@ -388,16 +393,17 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
   const defaultCriteria = normalizeText(defaults?.criteria || "");
   const defaultStartFromRaw = normalizeText(defaults?.start_from || "").toLowerCase();
   const defaultStartFrom = defaultStartFromRaw === "all" ? "all" : "unread";
-  const defaultTargetCount = parsePositiveIntegerValue(defaults?.target_count);
+  const defaultTargetCount = normalizePipelineTargetCountValue(defaults?.target_count);
 
   const explicitCriteria = normalizeText(raw.criteria);
   const explicitStartFromRaw = normalizeText(raw.start_from).toLowerCase();
   const explicitStartFrom = explicitStartFromRaw === "all" ? "all" : explicitStartFromRaw === "unread" ? "unread" : "";
-  const explicitTargetCount = parsePositiveIntegerValue(raw.target_count);
+  const explicitTarget = normalizeTargetCountInput(raw.target_count);
+  const explicitTargetCount = explicitTarget.publicValue;
 
   const hasExplicitCriteria = Boolean(explicitCriteria);
   const hasExplicitStartFrom = Boolean(explicitStartFrom);
-  const hasExplicitTargetCount = Number.isInteger(explicitTargetCount) && explicitTargetCount > 0;
+  const hasExplicitTargetCount = explicitTarget.provided;
 
   const criteria = explicitCriteria || defaultCriteria;
   const startFrom = explicitStartFrom || defaultStartFrom;
@@ -442,8 +448,11 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
     missing_fields.push("follow_up.chat.target_count");
     pending_questions.push({
       field: "follow_up.chat.target_count",
-      question: "请填写 boss-chat follow-up 本次处理人数上限（正整数，必填）。",
-      value: summary.target_count
+      question: "请填写 boss-chat follow-up 本次处理人数上限（正整数，或 all/-1 表示扫到底，必填）。",
+      value: summary.target_count,
+      accepted_examples: ["all", -1, 20, "全部候选人"],
+      ...(explicitTarget.rawValue !== undefined ? { received_target_count: explicitTarget.rawValue } : {}),
+      ...(explicitTarget.parseError ? { target_count_parse_error: explicitTarget.parseError } : {})
     });
   }
 
@@ -523,7 +532,7 @@ function buildBossChatFollowUpStatus({ payload, runId, fallbackInput = null, sta
     job: normalizeText(fallbackInput?.job) || null,
     start_from: normalizeText(fallbackInput?.start_from) || null,
     criteria: normalizeText(fallbackInput?.criteria) || null,
-    target_count: parsePositiveIntegerValue(fallbackInput?.target_count),
+    target_count: normalizePipelineTargetCountValue(fallbackInput?.target_count),
     port: parsePositiveIntegerValue(fallbackInput?.port),
     progress: {
       inspected: Number.isInteger(progress.inspected) ? progress.inspected : 0,

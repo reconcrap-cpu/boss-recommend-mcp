@@ -12,6 +12,8 @@ const VENDORED_BOSS_CHAT_DIR = path.join(packageRoot, "vendor", "boss-chat-cli")
 const DEFAULT_BOSS_CHAT_POLL_MS = 1500;
 const BOSS_CHAT_TERMINAL_STATES = new Set(["completed", "failed", "canceled"]);
 const CHAT_REQUIRED_FIELDS = ["job", "start_from", "target_count", "criteria"];
+export const TARGET_COUNT_ACCEPTED_EXAMPLES = ["all", -1, 20, "全部候选人"];
+const TARGET_COUNT_WRAPPER_KEYS = ["target_count", "targetCount", "value", "count", "limit"];
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -34,6 +36,7 @@ function isUnlimitedTargetCountToken(value) {
   const token = normalizeText(value).toLowerCase();
   if (!token) return false;
   const compact = token.replace(/\s+/g, "");
+  const withoutAnnotation = compact.replace(/[（(【[].*?[）)】\]]/gu, "");
   const knownTokens = new Set([
     "all",
     "unlimited",
@@ -52,33 +55,81 @@ function isUnlimitedTargetCountToken(value) {
     "所有人选",
     "直到完成所有人选"
   ]);
-  if (knownTokens.has(token) || knownTokens.has(compact)) return true;
+  if (knownTokens.has(token) || knownTokens.has(compact) || knownTokens.has(withoutAnnotation)) return true;
   if (/^(?:all|unlimited|infinity|inf|max|full)(?:candidate|candidates)?$/i.test(compact)) return true;
+  if (/^(?:all|unlimited|infinity|inf|max|full)(?:候选人|人选|牛人|人才|人员)?$/iu.test(withoutAnnotation)) return true;
   if (/^(?:全部|所有|全量|不限)(?:候选人|人选|牛人|人才|人员)?$/u.test(compact)) return true;
+  if (!/\d/.test(compact) && /(?:扫到底|全部候选人|所有候选人|全部人选|所有人选)/u.test(compact)) return true;
   return false;
 }
 
-function parseBossChatTargetCount(value) {
+function getWrappedTargetCountValue(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  for (const key of TARGET_COUNT_WRAPPER_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      return value[key];
+    }
+  }
+  return value;
+}
+
+export function getBossChatTargetCountValue(input = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  if (Object.prototype.hasOwnProperty.call(input, "target_count") && input.target_count !== undefined && input.target_count !== null) {
+    return input.target_count;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "targetCount") && input.targetCount !== undefined && input.targetCount !== null) {
+    return input.targetCount;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "target_count")) return input.target_count;
+  if (Object.prototype.hasOwnProperty.call(input, "targetCount")) return input.targetCount;
+  return undefined;
+}
+
+function cloneForDiagnostics(value) {
+  if (value === undefined) return undefined;
+  if (value === null || ["string", "number", "boolean"].includes(typeof value)) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return String(value);
+  }
+}
+
+export function normalizeTargetCountInput(value) {
   if (value === undefined || value === null) {
     return {
       provided: false,
       targetCount: null,
-      cliArg: null
+      cliArg: null,
+      publicValue: null,
+      rawValue: value,
+      parseError: null
     };
   }
-  const raw = normalizeText(value);
+  const unwrapped = getWrappedTargetCountValue(value);
+  if (unwrapped !== value) {
+    return normalizeTargetCountInput(unwrapped);
+  }
+  const raw = normalizeText(unwrapped);
   if (!raw) {
     return {
       provided: false,
       targetCount: null,
-      cliArg: null
+      cliArg: null,
+      publicValue: null,
+      rawValue: value,
+      parseError: null
     };
   }
   if (isUnlimitedTargetCountToken(raw)) {
     return {
       provided: true,
       targetCount: null,
-      cliArg: "-1"
+      cliArg: "-1",
+      publicValue: "all",
+      rawValue: cloneForDiagnostics(value),
+      parseError: null
     };
   }
   const parsed = Number.parseInt(String(raw), 10);
@@ -86,20 +137,29 @@ function parseBossChatTargetCount(value) {
     return {
       provided: true,
       targetCount: null,
-      cliArg: "-1"
+      cliArg: "-1",
+      publicValue: "all",
+      rawValue: cloneForDiagnostics(value),
+      parseError: null
     };
   }
   if (Number.isFinite(parsed) && parsed > 0) {
     return {
       provided: true,
       targetCount: parsed,
-      cliArg: String(parsed)
+      cliArg: String(parsed),
+      publicValue: parsed,
+      rawValue: cloneForDiagnostics(value),
+      parseError: null
     };
   }
   return {
     provided: false,
     targetCount: null,
-    cliArg: null
+    cliArg: null,
+    publicValue: null,
+    rawValue: cloneForDiagnostics(value),
+    parseError: "target_count must be a positive integer, -1, or one of: all, unlimited, 全部, 不限, 扫到底, 全量, 全部候选人, 所有候选人"
   };
 }
 
@@ -225,7 +285,7 @@ function normalizeBossChatStartInput(input = {}) {
   const startFromRaw = normalizeText(input.startFrom || input.start_from).toLowerCase();
   const startFrom = startFromRaw === "all" ? "all" : startFromRaw === "unread" ? "unread" : "";
   const criteria = normalizeText(input.criteria);
-  const parsedTarget = parseBossChatTargetCount(input.targetCount ?? input.target_count);
+  const parsedTarget = normalizeTargetCountInput(getBossChatTargetCountValue(input));
   const port = parsePositiveInteger(input.port);
   return {
     profile,
@@ -235,6 +295,9 @@ function normalizeBossChatStartInput(input = {}) {
     targetCount: parsedTarget.targetCount,
     targetCountArg: parsedTarget.cliArg,
     targetCountProvided: parsedTarget.provided,
+    targetCountPublicValue: parsedTarget.publicValue,
+    targetCountRawValue: parsedTarget.rawValue,
+    targetCountParseError: parsedTarget.parseError,
     port,
     dryRun: input.dryRun === true || input.dry_run === true,
     noState: input.noState === true || input.no_state === true,
@@ -270,7 +333,7 @@ function buildTargetCountQuestionHint(item = {}) {
     { label: "全部候选人", value: "全部候选人" },
     { label: "所有候选人", value: "所有候选人" }
   ];
-  next.examples = ["all", 20];
+  next.examples = TARGET_COUNT_ACCEPTED_EXAMPLES.slice();
   next.argument_name = "target_count";
   return next;
 }
@@ -290,11 +353,21 @@ function buildNextCallExample(input = {}, missingFields = []) {
   if (normalized.startFrom) sample.start_from = normalized.startFrom;
   if (normalized.criteria) sample.criteria = normalized.criteria;
   if (normalized.targetCountProvided) {
-    sample.target_count = normalized.targetCountArg === "-1" ? "all" : normalized.targetCount;
+    sample.target_count = normalized.targetCountPublicValue || (normalized.targetCountArg === "-1" ? "all" : normalized.targetCount);
   } else if (missingFields.includes("target_count")) {
     sample.target_count = "all";
   }
   return Object.keys(sample).length > 0 ? sample : null;
+}
+
+function buildTargetCountNeedInputDiagnostics(input = {}, missingFields = []) {
+  if (!Array.isArray(missingFields) || !missingFields.includes("target_count")) return {};
+  const normalized = normalizeBossChatStartInput(input);
+  return {
+    accepted_examples: TARGET_COUNT_ACCEPTED_EXAMPLES.slice(),
+    ...(normalized.targetCountRawValue !== undefined ? { received_target_count: normalized.targetCountRawValue } : {}),
+    ...(normalized.targetCountParseError ? { target_count_parse_error: normalized.targetCountParseError } : {})
+  };
 }
 
 function buildBossChatCliArgs(command, input, resolvedConfig) {
@@ -493,12 +566,14 @@ export async function startBossChatRun({ workspaceRoot, input = {} }) {
       : [];
     const normalizedPendingQuestions = normalizePendingQuestions(pendingQuestions);
     const nextCallExample = buildNextCallExample(input, missingFields);
+    const targetCountDiagnostics = buildTargetCountNeedInputDiagnostics(input, missingFields);
     return {
       ...prepared,
       status: "NEED_INPUT",
       required_fields: CHAT_REQUIRED_FIELDS.slice(),
       missing_fields: missingFields,
       pending_questions: normalizedPendingQuestions,
+      ...targetCountDiagnostics,
       ...(nextCallExample ? { next_call_example: nextCallExample } : {}),
       message: prepared?.message
         || "已获取 Boss 聊天页岗位列表，请先补齐 job / start_from / target_count / criteria。"
@@ -518,11 +593,13 @@ export async function prepareBossChatRun({ workspaceRoot, input = {} }) {
     ))
     : [];
   const nextCallExample = buildNextCallExample(input, missingFields);
+  const targetCountDiagnostics = buildTargetCountNeedInputDiagnostics(input, missingFields);
   return {
     ...payload,
     required_fields: CHAT_REQUIRED_FIELDS.slice(),
     missing_fields: missingFields,
     pending_questions: normalizePendingQuestions(pendingQuestions),
+    ...targetCountDiagnostics,
     ...(nextCallExample ? { next_call_example: nextCallExample } : {})
   };
 }

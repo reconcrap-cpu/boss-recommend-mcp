@@ -2,6 +2,9 @@
 
 Bundled chat-page automation skill shipped with `boss-recommend-mcp`.
 
+Package: `@reconcrap/boss-recommend-mcp` (npm)
+Source: `https://github.com/reconcrap-cpu/boss-recommend-mcp`
+
 Use this skill when the user wants a chat-only Boss workflow without installing `boss-chat` separately.
 
 ## Stable Prompt Template (Trae-CN)
@@ -27,9 +30,9 @@ Anti-loop rules:
 
 target_count mapping:
 - Positive integer means explicit cap (for example 20).
-- `all` / `unlimited` / `全部` / `不限` / `扫到底` / `全量` means unlimited.
+- `all` / `-1` / `unlimited` / `全部` / `不限` / `扫到底` / `全量` means unlimited.
 - `全部候选人` / `所有候选人` must also be treated as unlimited.
 - Always write the argument key as `target_count`.
-- For unlimited mode, send `"target_count": "all"` in the tool call.
+- For unlimited mode, prefer `"target_count": "all"` in the tool call; `-1` is accepted for compatibility and used internally by the CLI.
 - If start_boss_chat_run returns NEED_INPUT for `target_count`, the previous tool call omitted the argument. Retry once using `next_call_example` and include `"target_count": "all"` or a positive integer.
 ```

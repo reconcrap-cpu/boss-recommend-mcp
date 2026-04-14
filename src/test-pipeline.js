@@ -2224,6 +2224,94 @@ async function testFollowUpChatMissingTargetCountShouldNeedInput() {
   assert.equal(result.pending_questions.some((item) => item.field === "follow_up.chat.target_count"), true);
 }
 
+async function testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics() {
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: {},
+      overrides: {},
+      followUp: createFollowUpChat({ target_count: "not a target" })
+    },
+    {
+      parseRecommendInstruction: () => createParsed()
+    }
+  );
+
+  assert.equal(result.status, "NEED_INPUT");
+  assert.equal(result.missing_fields.includes("follow_up.chat.target_count"), true);
+  const targetQuestion = result.pending_questions.find((item) => item.field === "follow_up.chat.target_count");
+  assert.equal(targetQuestion?.received_target_count, "not a target");
+  assert.equal(Boolean(targetQuestion?.target_count_parse_error), true);
+  assert.equal(targetQuestion?.accepted_examples.includes("all"), true);
+}
+
+async function testFollowUpChatAllTargetCountShouldLaunchUnlimited() {
+  let capturedChatInput = null;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      followUp: createFollowUpChat({ target_count: "all" })
+    },
+    {
+      parseRecommendInstruction: () => createParsed(),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9555 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      listRecommendJobs: async () => createJobListResult(),
+      readRecommendTabState: async () => ({ ok: true, active_tab_status: "0" }),
+      switchRecommendTab: async () => ({ ok: true, state: "TAB_READY" }),
+      runRecommendSearchCli: async () => ({
+        ok: true,
+        summary: {
+          candidate_count: 8,
+          applied_filters: { degree: ["本科"] },
+          selected_job: DEFAULT_JOB_OPTIONS[0]
+        }
+      }),
+      runRecommendScreenCli: async () => ({
+        ok: true,
+        summary: {
+          processed_count: 6,
+          passed_count: 2,
+          skipped_count: 4,
+          output_csv: "C:/temp/recommend.csv",
+          completion_reason: "screen_completed"
+        }
+      }),
+      startBossChatRun: async ({ input }) => {
+        capturedChatInput = input;
+        return {
+          status: "ACCEPTED",
+          run_id: "chat-run-unlimited",
+          message: "chat started"
+        };
+      },
+      getBossChatRun: async () => ({
+        status: "RUN_STATUS",
+        run: {
+          runId: "chat-run-unlimited",
+          state: "completed",
+          lastMessage: "chat completed",
+          progress: {
+            inspected: 3,
+            passed: 1,
+            requested: 1,
+            skipped: 2,
+            errors: 0
+          }
+        }
+      })
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(capturedChatInput.target_count, "all");
+  assert.equal(result.follow_up?.chat?.target_count, "all");
+}
+
 async function testFinalReviewShouldIncludeFollowUpChatSummary() {
   const result = await runRecommendPipeline(
     {
@@ -2479,8 +2567,10 @@ async function main() {
   await testFollowUpChatMissingFieldsShouldExposeRecommendDefaults();
   await testFollowUpChatMissingStartFromShouldNeedInput();
   await testFollowUpChatMissingTargetCountShouldNeedInput();
+  await testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics();
   await testFinalReviewShouldIncludeFollowUpChatSummary();
   await testCompletedPipelineShouldRunChatFollowUp();
+  await testFollowUpChatAllTargetCountShouldLaunchUnlimited();
   await testCompletedPipelineShouldFailWhenChatLaunchFails();
   await testCompletedPipelineShouldFailWhenChatRunFails();
   console.log("pipeline tests passed");

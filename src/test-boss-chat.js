@@ -273,6 +273,51 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     const stateAfterStartAll = readStubState(workspaceRoot);
     assert.equal(stateAfterStartAll.last_start_args.targetCount, "-1");
 
+    for (const target_count of ["all", -1, "-1", { value: "all" }, "all（扫到底）"]) {
+      const startedVariant = await startBossChatRun({
+        workspaceRoot,
+        input: {
+          profile: "default",
+          job: "算法工程师",
+          start_from: "all",
+          criteria: "全部候选人都过一遍",
+          target_count
+        }
+      });
+      assert.equal(startedVariant.status, "ACCEPTED");
+      assert.equal(readStubState(workspaceRoot).last_start_args.targetCount, "-1");
+    }
+
+    const startedCamelCase = await startBossChatRun({
+      workspaceRoot,
+      input: {
+        profile: "default",
+        job: "算法工程师",
+        start_from: "all",
+        criteria: "全部候选人都过一遍",
+        targetCount: { targetCount: "all" }
+      }
+    });
+    assert.equal(startedCamelCase.status, "ACCEPTED");
+    assert.equal(readStubState(workspaceRoot).last_start_args.targetCount, "-1");
+
+    const invalidTarget = await startBossChatRun({
+      workspaceRoot,
+      input: {
+        profile: "default",
+        job: "算法工程师",
+        start_from: "all",
+        criteria: "全部候选人都过一遍",
+        target_count: "not a target"
+      }
+    });
+    assert.equal(invalidTarget.status, "NEED_INPUT");
+    assert.deepEqual(invalidTarget.missing_fields, ["target_count"]);
+    assert.equal(invalidTarget.received_target_count, "not a target");
+    assert.equal(Boolean(invalidTarget.target_count_parse_error), true);
+    assert.equal(invalidTarget.next_call_example.target_count, "all");
+    assert.equal(invalidTarget.accepted_examples.includes("all"), true);
+
     const running = await getBossChatRun({
       workspaceRoot,
       input: {
@@ -323,7 +368,9 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     const prepareToolSchema = tools.find((item) => item.name === TOOL_BOSS_CHAT_PREPARE_RUN).inputSchema;
     const startToolSchema = tools.find((item) => item.name === TOOL_BOSS_CHAT_START_RUN).inputSchema;
     assert.equal(prepareToolSchema.required, undefined);
-    assert.deepEqual(startToolSchema.required, ["job", "start_from", "target_count", "criteria"]);
+    assert.deepEqual(startToolSchema.required, ["job", "start_from", "criteria"]);
+    assert.equal(startToolSchema.anyOf.some((item) => item.required?.includes("target_count")), true);
+    assert.equal(startToolSchema.anyOf.some((item) => item.required?.includes("targetCount")), true);
 
     const prepared = await callTool(workspaceRoot, TOOL_BOSS_CHAT_PREPARE_RUN, {}, 101);
     assert.equal(prepared.status, "NEED_INPUT");
@@ -348,6 +395,19 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     assert.equal(missingTargetOnly.status, "NEED_INPUT");
     assert.deepEqual(missingTargetOnly.missing_fields, ["target_count"]);
     assert.equal(missingTargetOnly.next_call_example.target_count, "all");
+    assert.equal(missingTargetOnly.accepted_examples.includes(-1), true);
+
+    const invalidTargetOnly = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {
+      job: "算法工程师",
+      start_from: "all",
+      criteria: "全部候选人都过一遍",
+      target_count: "not a target"
+    }, 112);
+    assert.equal(invalidTargetOnly.status, "NEED_INPUT");
+    assert.deepEqual(invalidTargetOnly.missing_fields, ["target_count"]);
+    assert.equal(invalidTargetOnly.received_target_count, "not a target");
+    assert.equal(Boolean(invalidTargetOnly.target_count_parse_error), true);
+    assert.equal(invalidTargetOnly.next_call_example.target_count, "all");
 
     const invalidStartResponse = await handleRequest(
       makeToolCall(11, TOOL_BOSS_CHAT_START_RUN, {
@@ -383,6 +443,15 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     assert.equal(startedAll.status, "ACCEPTED");
     const stateAfterStartAll = readStubState(workspaceRoot);
     assert.equal(stateAfterStartAll.last_start_args.targetCount, "-1");
+
+    const startedCamelCase = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {
+      job: "算法工程师",
+      start_from: "all",
+      criteria: "全部候选人都过一遍",
+      targetCount: "all"
+    }, 141);
+    assert.equal(startedCamelCase.status, "ACCEPTED");
+    assert.equal(readStubState(workspaceRoot).last_start_args.targetCount, "-1");
 
     const running = await callTool(workspaceRoot, TOOL_BOSS_CHAT_GET_RUN, {
       run_id: started.run_id,

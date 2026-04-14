@@ -12,6 +12,8 @@ import {
   cancelBossChatRun,
   getBossChatHealthCheck,
   getBossChatRun,
+  getBossChatTargetCountValue,
+  normalizeTargetCountInput,
   pauseBossChatRun,
   prepareBossChatRun,
   resumeBossChatRun,
@@ -117,6 +119,53 @@ function getDefaultPollAfterSec() {
 function getLongRunPollAfterSec() {
   const fromEnv = parsePositiveInteger(process.env.BOSS_RECOMMEND_LONG_POLL_AFTER_SEC, 1800);
   return Math.max(60, fromEnv);
+}
+
+function createTargetCountInputSchema(description) {
+  return {
+    oneOf: [
+      {
+        type: "integer",
+        minimum: 1
+      },
+      {
+        type: "integer",
+        enum: [-1]
+      },
+      {
+        type: "string",
+        enum: ["all", "unlimited", "-1", "全部", "不限", "扫到底", "全量", "全部候选人", "所有候选人"]
+      },
+      {
+        type: "object",
+        properties: {
+          value: {
+            oneOf: [
+              { type: "integer", minimum: 1 },
+              { type: "integer", enum: [-1] },
+              { type: "string" }
+            ]
+          },
+          target_count: {
+            oneOf: [
+              { type: "integer", minimum: 1 },
+              { type: "integer", enum: [-1] },
+              { type: "string" }
+            ]
+          },
+          targetCount: {
+            oneOf: [
+              { type: "integer", minimum: 1 },
+              { type: "integer", enum: [-1] },
+              { type: "string" }
+            ]
+          }
+        },
+        additionalProperties: true
+      }
+    ],
+    description
+  };
 }
 
 function getRecommendedPollAfterSec(args = {}) {
@@ -387,18 +436,7 @@ function createRunInputSchema() {
                 type: "string",
                 enum: ["unread", "all"]
               },
-              target_count: {
-                oneOf: [
-                  {
-                    type: "integer",
-                    minimum: 1
-                  },
-                  {
-                    type: "string",
-                    enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量", "全部候选人", "所有候选人"]
-                  }
-                ]
-              },
+              target_count: createTargetCountInputSchema("boss-chat follow-up 本次处理人数上限；支持正整数、all 或 -1（扫到底）"),
               dry_run: { type: "boolean" },
               no_state: { type: "boolean" },
               safe_pacing: { type: "boolean" },
@@ -436,19 +474,8 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
         type: "string",
         description: "boss-chat 的筛选 criteria"
       },
-      target_count: {
-        oneOf: [
-          {
-            type: "integer",
-            minimum: 1
-          },
-          {
-            type: "string",
-            enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量", "全部候选人", "所有候选人"]
-          }
-        ],
-        description: "本次处理人数上限；支持正整数或 all/不限/全部候选人（扫到底）"
-      },
+      target_count: createTargetCountInputSchema("本次处理人数上限；支持正整数、all 或 -1（扫到底），也兼容 { value: \"all\" } 等包装对象"),
+      targetCount: createTargetCountInputSchema("兼容字段；优先使用 target_count。本次处理人数上限，支持正整数、all 或 -1（扫到底）"),
       port: {
         type: "integer",
         minimum: 1,
@@ -462,7 +489,11 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
     additionalProperties: false
   };
   if (requireFullInput) {
-    schema.required = ["job", "start_from", "target_count", "criteria"];
+    schema.required = ["job", "start_from", "criteria"];
+    schema.anyOf = [
+      { required: ["target_count"] },
+      { required: ["targetCount"] }
+    ];
   }
   return schema;
 }
@@ -727,15 +758,11 @@ function validateBossChatStartArgs(args) {
       return "criteria must be a non-empty string when provided";
     }
   }
-  if (Object.prototype.hasOwnProperty.call(args, "target_count")) {
-    const rawTargetCount = args.target_count;
-    const targetCount = Number.parseInt(String(rawTargetCount), 10);
-    const tokenAllowed =
-      typeof rawTargetCount === "string" && isUnlimitedTargetCountToken(rawTargetCount);
-    const numericUnlimited = Number.isFinite(targetCount) && targetCount === -1;
-    if ((!Number.isFinite(targetCount) || targetCount <= 0) && !tokenAllowed && !numericUnlimited) {
-      return "target_count must be a positive integer or one of: all, unlimited, 全部, 不限, 扫到底, 全量, 全部候选人, 所有候选人";
-    }
+  if (
+    Object.prototype.hasOwnProperty.call(args, "target_count")
+    || Object.prototype.hasOwnProperty.call(args, "targetCount")
+  ) {
+    normalizeTargetCountInput(getBossChatTargetCountValue(args));
   }
   if (Object.prototype.hasOwnProperty.call(args, "port")) {
     const port = Number.parseInt(String(args.port), 10);
