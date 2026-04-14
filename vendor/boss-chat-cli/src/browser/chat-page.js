@@ -629,6 +629,7 @@ function browserActivateCandidate(options = {}) {
 
 function browserScrollCustomerList(options = {}) {
   const ratio = Number(options.ratio || 0.72);
+  const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
   const isScrollable = (el) =>
     el instanceof HTMLElement &&
     Number(el.scrollHeight || 0) > Number(el.clientHeight || 0) + 16 &&
