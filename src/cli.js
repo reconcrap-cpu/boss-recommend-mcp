@@ -195,6 +195,14 @@ function parsePositivePort(raw) {
   return Number.isFinite(port) && port > 0 ? port : null;
 }
 
+function parseBossChatTargetCountOption(raw) {
+  if (raw === undefined || raw === null) return undefined;
+  const text = String(raw).trim();
+  if (!text) return undefined;
+  const parsed = parsePositivePort(text);
+  return parsed ?? text;
+}
+
 function parseBooleanOption(raw, fallback = undefined) {
   if (raw === undefined || raw === null || raw === "") return fallback;
   if (raw === true) return true;
@@ -1327,7 +1335,7 @@ function buildBossChatCliInput(options = {}) {
     job: typeof options.job === "string" ? options.job.trim() : undefined,
     start_from: String(options["start-from"] || options.start_from || "").trim().toLowerCase() || undefined,
     criteria: typeof options.criteria === "string" ? options.criteria.trim() : undefined,
-    target_count: parsePositivePort(options.targetCount || options["target-count"] || options.target_count),
+    target_count: parseBossChatTargetCountOption(options.targetCount || options["target-count"] || options.target_count),
     port: parsePositivePort(options.port),
     dry_run: options["dry-run"] === true || options.dryRun === true,
     no_state: options["no-state"] === true || options.noState === true,

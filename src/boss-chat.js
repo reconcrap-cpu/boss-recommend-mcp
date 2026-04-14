@@ -33,19 +33,29 @@ function parsePositiveInteger(value, fallback = null) {
 function isUnlimitedTargetCountToken(value) {
   const token = normalizeText(value).toLowerCase();
   if (!token) return false;
-  return [
+  const compact = token.replace(/\s+/g, "");
+  const knownTokens = new Set([
     "all",
     "unlimited",
     "infinity",
     "inf",
     "max",
     "full",
+    "allcandidates",
     "全部",
     "全量",
     "不限",
     "扫到底",
+    "全部候选人",
+    "所有候选人",
+    "全部人选",
+    "所有人选",
     "直到完成所有人选"
-  ].includes(token);
+  ]);
+  if (knownTokens.has(token) || knownTokens.has(compact)) return true;
+  if (/^(?:all|unlimited|infinity|inf|max|full)(?:candidate|candidates)?$/i.test(compact)) return true;
+  if (/^(?:全部|所有|全量|不限)(?:候选人|人选|牛人|人才|人员)?$/u.test(compact)) return true;
+  return false;
 }
 
 function parseBossChatTargetCount(value) {

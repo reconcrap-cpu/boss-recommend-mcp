@@ -242,6 +242,20 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(stateAfterStart.last_start_args.model, "gpt-4.1-mini");
     assert.equal(stateAfterStart.last_start_args.port, "9666");
 
+    const startedAll = await startBossChatRun({
+      workspaceRoot,
+      input: {
+        profile: "default",
+        job: "算法工程师",
+        start_from: "all",
+        criteria: "全部候选人都过一遍",
+        target_count: "全部候选人"
+      }
+    });
+    assert.equal(startedAll.status, "ACCEPTED");
+    const stateAfterStartAll = readStubState(workspaceRoot);
+    assert.equal(stateAfterStartAll.last_start_args.targetCount, "-1");
+
     const running = await getBossChatRun({
       workspaceRoot,
       input: {
@@ -312,6 +326,16 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
       target_count: 2
     }, 14);
     assert.equal(started.status, "ACCEPTED");
+
+    const startedAll = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {
+      job: "算法工程师",
+      start_from: "all",
+      criteria: "全部候选人都过一遍",
+      target_count: "全部候选人"
+    }, 140);
+    assert.equal(startedAll.status, "ACCEPTED");
+    const stateAfterStartAll = readStubState(workspaceRoot);
+    assert.equal(stateAfterStartAll.last_start_args.targetCount, "-1");
 
     const running = await callTool(workspaceRoot, TOOL_BOSS_CHAT_GET_RUN, {
       run_id: started.run_id,
@@ -386,6 +410,18 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
     assert.equal(typeof payload.run_id, "string");
     const state = readStubState(workspaceRoot);
     assert.equal(state.get_calls[payload.run_id] || 0, 0);
+
+    await captureConsoleLogs(async () => {
+      await cliTestables.runBossChatCliCommand("run", {
+        "workspace-root": workspaceRoot,
+        job: "算法工程师",
+        "start-from": "all",
+        criteria: "全部候选人都过一遍",
+        targetCount: "全部候选人"
+      });
+    });
+    const allState = readStubState(workspaceRoot);
+    assert.equal(allState.last_start_args.targetCount, "-1");
   });
 }
 

@@ -77,19 +77,29 @@ function normalizeText(value) {
 function isUnlimitedTargetCountToken(value) {
   const token = normalizeText(value).toLowerCase();
   if (!token) return false;
-  return [
+  const compact = token.replace(/\s+/g, "");
+  const knownTokens = new Set([
     "all",
     "unlimited",
     "infinity",
     "inf",
     "max",
     "full",
+    "allcandidates",
     "全部",
     "全量",
     "不限",
     "扫到底",
+    "全部候选人",
+    "所有候选人",
+    "全部人选",
+    "所有人选",
     "直到完成所有人选"
-  ].includes(token);
+  ]);
+  if (knownTokens.has(token) || knownTokens.has(compact)) return true;
+  if (/^(?:all|unlimited|infinity|inf|max|full)(?:candidate|candidates)?$/i.test(compact)) return true;
+  if (/^(?:全部|所有|全量|不限)(?:候选人|人选|牛人|人才|人员)?$/u.test(compact)) return true;
+  return false;
 }
 
 function parsePositiveInteger(raw, fallback) {
@@ -383,7 +393,7 @@ function createRunInputSchema() {
                   },
                   {
                     type: "string",
-                    enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量"]
+                    enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量", "全部候选人", "所有候选人"]
                   }
                 ]
               },
@@ -432,10 +442,10 @@ function createBossChatStartInputSchema() {
           },
           {
             type: "string",
-            enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量"]
+            enum: ["all", "unlimited", "全部", "不限", "扫到底", "全量", "全部候选人", "所有候选人"]
           }
         ],
-        description: "本次处理人数上限；支持正整数或 all/不限（扫到底）"
+        description: "本次处理人数上限；支持正整数或 all/不限/全部候选人（扫到底）"
       },
       port: {
         type: "integer",
@@ -713,7 +723,7 @@ function validateBossChatStartArgs(args) {
       typeof rawTargetCount === "string" && isUnlimitedTargetCountToken(rawTargetCount);
     const numericUnlimited = Number.isFinite(targetCount) && targetCount === -1;
     if ((!Number.isFinite(targetCount) || targetCount <= 0) && !tokenAllowed && !numericUnlimited) {
-      return "target_count must be a positive integer or one of: all, unlimited, 全部, 不限, 扫到底, 全量";
+      return "target_count must be a positive integer or one of: all, unlimited, 全部, 不限, 扫到底, 全量, 全部候选人, 所有候选人";
     }
   }
   if (Object.prototype.hasOwnProperty.call(args, "port")) {

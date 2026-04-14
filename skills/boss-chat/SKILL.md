@@ -37,6 +37,12 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - `safe_pacing`
 - `batch_rest_enabled`
 
+`target_count` 填写规则（关键）：
+
+- 正整数：如 `20`
+- 扫到底：`all` / `unlimited` / `全部` / `不限` / `扫到底` / `全量`
+- 同义短语也可直接用：`全部候选人` / `所有候选人`（等价于扫到底）
+
 ## Hard Rules
 
 - LLM 配置必须复用 `boss-recommend-mcp` 的 `screening-config.json`；不要再向用户单独要 `baseUrl/apiKey/model`。
@@ -46,6 +52,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
   - 不得在 recommend 任务尚未完成时并行启动独立 chat run。
 - `job` / `start_from` / `criteria` 缺一不可；缺参时只补缺口。
 - `target_count` 在 chat-only 启动前也是必填项，不能默认省略。
+- 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。
 - 禁止 agent 自行补全 `job/start_from/criteria` 并直接执行，必须由用户明确给出或确认。
 - chat-only 启动流程必须先进入聊天页并拉取岗位列表，再让用户从列表中选择 `job`。
 - 允许先用空参调用 `start_boss_chat_run` 触发 `NEED_INPUT`；若返回了 `job_options`，必须完整展示所有岗位选项给用户确认。
