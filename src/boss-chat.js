@@ -10,6 +10,8 @@ const currentFilePath = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(currentFilePath), "..");
 const VENDORED_BOSS_CHAT_DIR = path.join(packageRoot, "vendor", "boss-chat-cli");
 const DEFAULT_BOSS_CHAT_POLL_MS = 1500;
+const PREPARE_BOSS_CHAT_MAX_ATTEMPTS = 3;
+const PREPARE_BOSS_CHAT_RETRY_DELAY_MS = 1200;
 const BOSS_CHAT_TERMINAL_STATES = new Set(["completed", "failed", "canceled"]);
 const CHAT_REQUIRED_FIELDS = ["job", "start_from", "target_count", "criteria"];
 export const TARGET_COUNT_ACCEPTED_EXAMPLES = ["all", -1, 20, "全部候选人"];
@@ -583,7 +585,14 @@ export async function startBossChatRun({ workspaceRoot, input = {} }) {
 }
 
 export async function prepareBossChatRun({ workspaceRoot, input = {} }) {
-  const payload = (await spawnBossChatCli({ workspaceRoot, command: "prepare-run", input })).payload;
+  let payload = null;
+  for (let attempt = 1; attempt <= PREPARE_BOSS_CHAT_MAX_ATTEMPTS; attempt += 1) {
+    payload = (await spawnBossChatCli({ workspaceRoot, command: "prepare-run", input })).payload;
+    if (payload?.status !== "FAILED") break;
+    if (attempt >= PREPARE_BOSS_CHAT_MAX_ATTEMPTS) break;
+    await sleep(PREPARE_BOSS_CHAT_RETRY_DELAY_MS);
+  }
+
   if (payload?.status !== "NEED_INPUT") return payload;
 
   const missingFields = getMissingBossChatStartFields(input);

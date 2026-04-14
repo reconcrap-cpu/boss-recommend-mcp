@@ -69,6 +69,11 @@ function createBossChatTestWorkspace() {
     "const raw = fs.existsSync(statePath) ? fs.readFileSync(statePath, 'utf8') : '{}';",
     "const state = JSON.parse(raw || '{}');",
     "state.counter = Number.isInteger(state.counter) ? state.counter : 0;",
+    "state.prepare_calls = Number.isInteger(state.prepare_calls) ? state.prepare_calls : 0;",
+    "if (!Number.isInteger(state.prepare_fail_budget)) {",
+    "  const configured = Number.parseInt(process.env.BOSS_CHAT_STUB_PREPARE_FAILS || '0', 10);",
+    "  state.prepare_fail_budget = Number.isFinite(configured) && configured > 0 ? configured : 0;",
+    "}",
     "state.runs = state.runs && typeof state.runs === 'object' ? state.runs : {};",
     "state.get_calls = state.get_calls && typeof state.get_calls === 'object' ? state.get_calls : {};",
     "const argv = process.argv.slice(2);",
@@ -91,6 +96,12 @@ function createBossChatTestWorkspace() {
     "  process.stdout.write(`${JSON.stringify(payload)}\\n`);",
     "}",
     "if (command === 'prepare-run') {",
+    "  state.prepare_calls += 1;",
+    "  if (state.prepare_fail_budget > 0) {",
+    "    state.prepare_fail_budget -= 1;",
+    "    saveAndPrint({ status: 'FAILED', error: { code: 'CHAT_PAGE_NOT_READY', message: 'chat page is still loading' } });",
+    "    process.exit(1);",
+    "  }",
     "  state.last_prepare_args = options;",
     "  saveAndPrint({",
     "    status: 'NEED_INPUT',",
@@ -356,6 +367,29 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
       }
     });
     assert.equal(canceled.run.state, "canceled");
+  });
+}
+
+async function testBossChatPrepareShouldRetryWhenChatPageIsNotReady() {
+  await withBossChatWorkspace(async (workspaceRoot) => {
+    const previousPrepareFails = process.env.BOSS_CHAT_STUB_PREPARE_FAILS;
+    process.env.BOSS_CHAT_STUB_PREPARE_FAILS = "2";
+    try {
+      const prepared = await prepareBossChatRun({
+        workspaceRoot,
+        input: {}
+      });
+      assert.equal(prepared.status, "NEED_INPUT");
+      const state = readStubState(workspaceRoot);
+      assert.equal(state.prepare_calls, 3);
+      assert.equal(state.prepare_fail_budget, 0);
+    } finally {
+      if (previousPrepareFails === undefined) {
+        delete process.env.BOSS_CHAT_STUB_PREPARE_FAILS;
+      } else {
+        process.env.BOSS_CHAT_STUB_PREPARE_FAILS = previousPrepareFails;
+      }
+    }
   });
 }
 
@@ -806,6 +840,7 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
 
 async function main() {
   await testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli();
+  await testBossChatPrepareShouldRetryWhenChatPageIsNotReady();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
   testBossChatLlmEvidenceGateShouldDemoteMissingEvidence();
