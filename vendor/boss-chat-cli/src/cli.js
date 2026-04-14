@@ -291,7 +291,7 @@ function printUsage() {
   console.log('');
   console.log('Run options:');
   console.log('  --dry-run                       Evaluate and click, but do not request resume');
-  console.log('  --no-state                      Do not persist processed candidate state');
+  console.log('  --no-state                      Disable in-run candidate deduplication');
   console.log('  --job <text|value|index>        Select job by label/value/index');
   console.log('  --criteria <text>               Screening criteria for resume evaluation');
   console.log('  --start-from <unread|all>       Start from unread or all list');

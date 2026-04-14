@@ -630,6 +630,16 @@ function browserActivateCandidate(options = {}) {
 function browserScrollCustomerList(options = {}) {
   const ratio = Number(options.ratio || 0.72);
   const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (el) => {
+    if (!(el instanceof HTMLElement)) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 2 && rect.height > 2;
+  };
   const isOverflowScrollable = (el) => {
     if (!(el instanceof HTMLElement)) return false;
     const style = getComputedStyle(el);
@@ -706,6 +716,20 @@ function browserScrollCustomerList(options = {}) {
     return { ok: false, error: 'CHAT_LIST_CONTAINER_NOT_FOUND' };
   }
 
+  const findNoMoreTips = () => {
+    const host =
+      listContainer.closest('.chat-user, .user-container, .chat-container, .chat-main') || document;
+    const tips = Array.from(host.querySelectorAll('div[role="tfoot"] .load-tips, p.load-tips')).find((node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const text = normalize(node.textContent || '');
+      return text.includes('没有更多了') && isVisible(node);
+    });
+    return {
+      detected: Boolean(tips),
+      text: normalize(tips?.textContent || ''),
+    };
+  };
+
   const firstCard = listContainer.querySelector('div[role="listitem"]') || document.querySelector('div[role="listitem"]');
   if (firstCard instanceof HTMLElement) {
     const best = findBestScrollableContainer(firstCard);
@@ -714,6 +738,7 @@ function browserScrollCustomerList(options = {}) {
     }
   }
 
+  const noMoreBefore = findNoMoreTips();
   const before = {
     top: Number(listContainer.scrollTop || 0),
     height: Number(listContainer.scrollHeight || 0),
@@ -750,11 +775,18 @@ function browserScrollCustomerList(options = {}) {
     clientHeight: Number(listContainer.clientHeight || 0),
     cardCount: Number(listContainer.querySelectorAll('div[role="listitem"]').length || 0),
   };
+  const noMoreAfter = findNoMoreTips();
+  const atBottom = after.height <= after.clientHeight + 2 || after.top >= Math.max(0, after.height - after.clientHeight - 2);
 
   return {
     ok: true,
     before,
     after,
+    atBottom,
+    noMoreDetectedBefore: noMoreBefore.detected,
+    noMoreDetectedAfter: noMoreAfter.detected,
+    noMoreTextBefore: noMoreBefore.text,
+    noMoreTextAfter: noMoreAfter.text,
     didScroll:
       before.top !== after.top ||
       before.height !== after.height ||
@@ -1992,6 +2024,18 @@ function browserExtractResumeProfileFromModal() {
       normalized.includes('匿名牛人')
     );
   };
+  const stripNoiseText = (text) => {
+    let cleaned = normalize(text);
+    const noisePhrases = ['其他名企大厂经历牛人', '相似牛人', '推荐牛人', '匿名牛人'];
+    for (const phrase of noisePhrases) {
+      cleaned = cleaned.split(phrase).join(' ');
+    }
+    return normalize(cleaned);
+  };
+  const pickSectionText = (section) => {
+    if (!section) return '';
+    return stripNoiseText(section.innerText || section.textContent || '');
+  };
   const pickFirstText = (scope, selectors) => {
     for (const selector of selectors) {
       let nodes = [];
@@ -2057,6 +2101,8 @@ function browserExtractResumeProfileFromModal() {
       position: '',
       schools: [],
       majors: [],
+      resumeText: '',
+      evidenceCorpus: '',
     };
   }
 
@@ -2070,6 +2116,16 @@ function browserExtractResumeProfileFromModal() {
     root.querySelector('.geek-work-experience-wrap') ||
     root.querySelector('.resume-section[class*="work"]') ||
     root;
+  const projectSection =
+    root.querySelector('.resume-section.geek-project-experience-wrap') ||
+    root.querySelector('.geek-project-experience-wrap') ||
+    root.querySelector('.resume-section[class*="project"]') ||
+    null;
+  const skillSection =
+    root.querySelector('.resume-section.geek-skill-wrap') ||
+    root.querySelector('.geek-skill-wrap') ||
+    root.querySelector('.resume-section[class*="skill"]') ||
+    null;
   const baseSection =
     root.querySelector('.resume-section.geek-base-info-wrap') ||
     root.querySelector('.geek-base-info-wrap') ||
@@ -2102,6 +2158,21 @@ function browserExtractResumeProfileFromModal() {
     '.position span',
     '.position',
   ]);
+  const baseText = pickSectionText(baseSection);
+  const educationText = pickSectionText(educationSection);
+  const workText = pickSectionText(workSection);
+  const projectText = pickSectionText(projectSection);
+  const skillText = pickSectionText(skillSection);
+  const evidenceCorpus = stripNoiseText(root.innerText || root.textContent || '');
+  const resumeText = [
+    baseText ? `基础信息: ${baseText}` : '',
+    educationText ? `教育经历: ${educationText}` : '',
+    workText ? `工作经历: ${workText}` : '',
+    projectText ? `项目经历: ${projectText}` : '',
+    skillText ? `技能信息: ${skillText}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 
   return {
     ok: true,
@@ -2112,11 +2183,15 @@ function browserExtractResumeProfileFromModal() {
     position,
     schools,
     majors,
+    resumeText: resumeText || evidenceCorpus || '',
+    evidenceCorpus: evidenceCorpus || resumeText || '',
     debug: {
       rootClass: String(root.className || ''),
       educationClass: String(educationSection?.className || ''),
       workClass: String(workSection?.className || ''),
       wrapperClass: String(scope?.className || ''),
+      resumeTextLength: Number((resumeText || '').length),
+      evidenceCorpusLength: Number((evidenceCorpus || '').length),
     },
   };
 }

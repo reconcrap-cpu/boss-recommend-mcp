@@ -233,7 +233,11 @@ export class BossChatApp {
 
     let consecutiveErrors = 0;
     let exhaustedScrolls = 0;
-    const exhaustedScrollLimit = targetCount ? 3 : 8;
+    let noMoreMarkerHits = 0;
+    let fallbackBottomHits = 0;
+    const noMoreMarkerConfirmations = 2;
+    const exhaustedScrollLimit = targetCount ? 10 : 60;
+    const fallbackBottomLimit = targetCount ? 4 : 12;
 
     try {
       while (shouldContinue(summary, targetCount)) {
@@ -324,6 +328,9 @@ export class BossChatApp {
             stage: 'running',
             message: `已处理候选人：${result.name || '未知'}`,
           });
+          exhaustedScrolls = 0;
+          noMoreMarkerHits = 0;
+          fallbackBottomHits = 0;
           if (consecutiveErrors >= 3) {
             this.logger.log('连续 3 位候选人处理失败，提前停止本轮运行。');
             break;
@@ -340,13 +347,33 @@ export class BossChatApp {
         if (!nextCustomer) {
           const ratio = 0.52 + Math.random() * 0.34;
           const scrollResult = await this.page.scrollCustomerList(ratio);
+          const noMoreDetected =
+            Boolean(scrollResult.noMoreDetectedAfter) || Boolean(scrollResult.noMoreDetectedBefore);
           this.logger.log(
-            `列表滚动：ratio=${ratio.toFixed(2)} | didScroll=${Boolean(scrollResult.didScroll)} | top=${scrollResult.after?.top ?? 'n/a'} | scrollRetry=${exhaustedScrolls + 1}`,
+            `列表滚动：ratio=${ratio.toFixed(2)} | didScroll=${Boolean(scrollResult.didScroll)} | top=${scrollResult.after?.top ?? 'n/a'} | atBottom=${Boolean(scrollResult.atBottom)} | noMore=${noMoreDetected}${scrollResult.noMoreTextAfter ? `(${scrollResult.noMoreTextAfter})` : ''} | scrollRetry=${exhaustedScrolls + 1}`,
           );
+          if (noMoreDetected) {
+            noMoreMarkerHits += 1;
+            if (noMoreMarkerHits >= noMoreMarkerConfirmations) {
+              summary.exhausted = true;
+              this.logger.log('列表滚动终止：检测到“没有更多了”标识，判定为 exhausted。');
+              break;
+            }
+            await this.interaction.sleepRange(920, 260);
+            continue;
+          }
+
+          noMoreMarkerHits = 0;
           exhaustedScrolls = scrollResult.didScroll ? exhaustedScrolls + 1 : exhaustedScrolls + 2;
+          fallbackBottomHits = scrollResult.atBottom ? fallbackBottomHits + 1 : 0;
+          if (fallbackBottomHits >= fallbackBottomLimit && exhaustedScrolls >= Math.ceil(exhaustedScrollLimit / 2)) {
+            summary.exhausted = true;
+            this.logger.log('列表滚动终止：未发现“没有更多了”标识，但已多次触底且无可处理候选人，判定为 exhausted。');
+            break;
+          }
           if (exhaustedScrolls >= exhaustedScrollLimit) {
             summary.exhausted = true;
-            this.logger.log('列表滚动终止：连续无可处理候选人，判定为 exhausted。');
+            this.logger.log('列表滚动终止：连续无可处理候选人达到保护上限，判定为 exhausted。');
             break;
           }
           await this.interaction.sleepRange(920, 260);
@@ -354,6 +381,8 @@ export class BossChatApp {
         }
 
         exhaustedScrolls = 0;
+        noMoreMarkerHits = 0;
+        fallbackBottomHits = 0;
         this.logger.log(
           `准备处理候选人：name=${nextCustomer.name || '未知'} | key=${nextCustomer.customerKey} | job=${nextCustomer.sourceJob || '未知'} | domIndex=${nextCustomer.domIndex}`,
         );
@@ -578,6 +607,8 @@ export class BossChatApp {
               majors: Array.isArray(resumeProfile.majors) ? resumeProfile.majors : [],
               company: resumeProfile.company || '',
               position: resumeProfile.position || '',
+              resumeTextLength: String(resumeProfile.resumeText || '').length,
+              evidenceCorpusLength: String(resumeProfile.evidenceCorpus || '').length,
             };
           } else {
             this.logger.log(`简历结构化提取未命中：${resumeProfile?.error || 'unknown'}`);
@@ -638,6 +669,8 @@ export class BossChatApp {
             company: resumeProfile.company || '',
             position: resumeProfile.position || '',
           } : null,
+          resumeText: resumeProfile?.ok ? String(resumeProfile.resumeText || '') : '',
+          evidenceCorpus: resumeProfile?.ok ? String(resumeProfile.evidenceCorpus || '') : '',
         },
         imagePath: capture.stitchedImage,
       });
@@ -647,13 +680,37 @@ export class BossChatApp {
           `评估理由学校字段已按主简历纠偏：rawReason=${evaluation.reason} | finalReason=${finalReason}`,
         );
       }
+      if (evaluation.evidenceGateDemoted === true) {
+        this.logger.log(
+          `证据闸门降级：rawPassed=${Boolean(evaluation.rawPassed)} | evidenceRawCount=${Number(evaluation.evidenceRawCount || 0)} | evidenceMatchedCount=${Number(evaluation.evidenceMatchedCount || 0)} | mode=${evaluation.evaluationMode || 'unknown'}`,
+        );
+      }
       this.logger.log(
-        `LLM评估完成：passed=${evaluation.passed} | reason=${finalReason}`,
+        `LLM评估完成：passed=${evaluation.passed} | rawPassed=${Boolean(evaluation.rawPassed)} | mode=${evaluation.evaluationMode || 'unknown'} | reason=${finalReason}`,
       );
 
       baseResult.reason = finalReason;
       baseResult.passed = evaluation.passed;
       baseResult.decision = evaluation.passed ? 'passed' : 'skipped';
+      baseResult.artifacts.rawPassed = Boolean(evaluation.rawPassed);
+      baseResult.artifacts.finalPassed = Boolean(evaluation.passed);
+      baseResult.artifacts.evidenceRawCount = Number.isFinite(Number(evaluation.evidenceRawCount))
+        ? Number(evaluation.evidenceRawCount)
+        : 0;
+      baseResult.artifacts.evidenceMatchedCount = Number.isFinite(Number(evaluation.evidenceMatchedCount))
+        ? Number(evaluation.evidenceMatchedCount)
+        : 0;
+      baseResult.artifacts.evidenceGateDemoted = evaluation.evidenceGateDemoted === true;
+      baseResult.artifacts.evaluationMode = String(evaluation.evaluationMode || '');
+      baseResult.artifacts.evaluationChunkIndex = Number.isFinite(Number(evaluation.chunkIndex))
+        ? Number(evaluation.chunkIndex)
+        : null;
+      baseResult.artifacts.evaluationChunkTotal = Number.isFinite(Number(evaluation.chunkTotal))
+        ? Number(evaluation.chunkTotal)
+        : null;
+      baseResult.artifacts.evaluationEvidence = Array.isArray(evaluation.evidence)
+        ? evaluation.evidence.slice(0, 5).map((item) => String(item || '').trim()).filter(Boolean)
+        : [];
 
       await this.checkpoint();
       const closeResult =

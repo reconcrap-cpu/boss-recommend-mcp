@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { mkdir } from "node:fs/promises";
 
 import {
   cancelBossChatRun,
@@ -14,6 +15,8 @@ import {
 } from "./boss-chat.js";
 import { __testables as cliTestables } from "./cli.js";
 import { __testables as indexTestables } from "./index.js";
+import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
+import { LlmClient, parseLlmJson } from "../vendor/boss-chat-cli/src/services/llm.js";
 
 const { handleRequest } = indexTestables;
 
@@ -550,10 +553,265 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
   });
 }
 
+function testBossChatLlmEvidenceGateShouldDemoteMissingEvidence() {
+  const parsed = parseLlmJson(
+    JSON.stringify({
+      passed: true,
+      reason: "命中标准",
+      summary: "命中",
+      evidence: [],
+    }),
+    {
+      evidenceCorpus: "南京大学 机器学习 项目经历",
+    },
+  );
+  assert.equal(parsed.rawPassed, true);
+  assert.equal(parsed.passed, false);
+  assert.equal(parsed.evidenceGateDemoted, true);
+  assert.equal(parsed.evidenceMatchedCount, 0);
+}
+
+function testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence() {
+  const parsed = parseLlmJson(
+    JSON.stringify({
+      passed: true,
+      reason: "命中标准",
+      summary: "命中",
+      evidence: ["十年金融风控投研经验"],
+    }),
+    {
+      evidenceCorpus: "南京大学 机器学习 项目经历",
+    },
+  );
+  assert.equal(parsed.rawPassed, true);
+  assert.equal(parsed.passed, false);
+  assert.equal(parsed.evidenceGateDemoted, true);
+  assert.equal(parsed.evidenceRawCount, 1);
+  assert.equal(parsed.evidenceMatchedCount, 0);
+}
+
+async function testBossChatLlmTextChunkFallbackShouldWork() {
+  const originalChunkSize = process.env.BOSS_CHAT_TEXT_CHUNK_SIZE_CHARS;
+  const originalChunkOverlap = process.env.BOSS_CHAT_TEXT_CHUNK_OVERLAP_CHARS;
+  const originalMaxChunks = process.env.BOSS_CHAT_TEXT_MAX_CHUNKS;
+  process.env.BOSS_CHAT_TEXT_CHUNK_SIZE_CHARS = "1000";
+  process.env.BOSS_CHAT_TEXT_CHUNK_OVERLAP_CHARS = "120";
+  process.env.BOSS_CHAT_TEXT_MAX_CHUNKS = "6";
+  try {
+    class FakeChunkFallbackClient extends LlmClient {
+      constructor() {
+        super({
+          baseUrl: "https://api.example.com/v1",
+          apiKey: "sk-test",
+          model: "gpt-test",
+        });
+        this.calls = [];
+      }
+
+      async requestByPreference(payload) {
+        this.calls.push(payload);
+        if (payload.chunkTotal === 1 && !payload.imageDataUrl) {
+          const error = new Error("maximum context length exceeded");
+          throw error;
+        }
+        if (payload.chunkTotal > 1) {
+          if (payload.chunkIndex === 2) {
+            return {
+              passed: true,
+              rawPassed: true,
+              reason: "命中分段证据",
+              summary: "命中",
+              evidence: ["PASS_MARKER_ABC"],
+              evidenceRawCount: 1,
+              evidenceMatchedCount: 1,
+              evidenceGateDemoted: false,
+              chunkIndex: payload.chunkIndex,
+              chunkTotal: payload.chunkTotal,
+            };
+          }
+          return {
+            passed: false,
+            rawPassed: false,
+            reason: "本段证据不足",
+            summary: "不足",
+            evidence: [],
+            evidenceRawCount: 0,
+            evidenceMatchedCount: 0,
+            evidenceGateDemoted: false,
+            chunkIndex: payload.chunkIndex,
+            chunkTotal: payload.chunkTotal,
+          };
+        }
+        return {
+          passed: false,
+          rawPassed: false,
+          reason: "unexpected",
+          summary: "unexpected",
+          evidence: [],
+          evidenceRawCount: 0,
+          evidenceMatchedCount: 0,
+          evidenceGateDemoted: false,
+          chunkIndex: 1,
+          chunkTotal: 1,
+        };
+      }
+    }
+
+    const client = new FakeChunkFallbackClient();
+    const longResume = `${"A".repeat(1200)} PASS_MARKER_ABC ${"B".repeat(1200)} PASS_MARKER_DEF`;
+    const result = await client.evaluateResume({
+      screeningCriteria: "有 AI 项目经验",
+      candidate: {
+        name: "候选人A",
+        sourceJob: "算法工程师",
+        resumeText: longResume,
+        evidenceCorpus: longResume,
+      },
+      imagePath: null,
+    });
+    assert.equal(result.passed, true);
+    assert.equal(result.evaluationMode, "text");
+    assert.equal(result.chunkIndex, 2);
+    assert.equal(Number(result.chunkTotal) > 1, true);
+  } finally {
+    if (originalChunkSize === undefined) delete process.env.BOSS_CHAT_TEXT_CHUNK_SIZE_CHARS;
+    else process.env.BOSS_CHAT_TEXT_CHUNK_SIZE_CHARS = originalChunkSize;
+    if (originalChunkOverlap === undefined) delete process.env.BOSS_CHAT_TEXT_CHUNK_OVERLAP_CHARS;
+    else process.env.BOSS_CHAT_TEXT_CHUNK_OVERLAP_CHARS = originalChunkOverlap;
+    if (originalMaxChunks === undefined) delete process.env.BOSS_CHAT_TEXT_MAX_CHUNKS;
+    else process.env.BOSS_CHAT_TEXT_MAX_CHUNKS = originalMaxChunks;
+  }
+}
+
+async function testBossChatAppShouldPersistEvidenceArtifacts() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-artifacts-"));
+  await mkdir(tempDir, { recursive: true });
+  const records = [];
+  const page = {
+    async closeResumeModalDomOnce() {
+      return {
+        closed: true,
+        method: "dom",
+        finalState: { scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+      };
+    },
+    async waitForConversationReady() {
+      return {
+        hasOnlineResume: true,
+        hasAskResume: true,
+        hasAttachmentResume: false,
+        attachmentResumeEnabled: false,
+      };
+    },
+    async openOnlineResume() {
+      return { clicked: true, detectedOpen: true, by: "dom" };
+    },
+    async getResumeRateLimitWarning() {
+      return { hit: false, text: "" };
+    },
+    async getResumeProfileFromDom() {
+      return {
+        ok: true,
+        primarySchool: "南京大学",
+        schools: ["南京大学"],
+        major: "计算机",
+        majors: ["计算机"],
+        company: "OpenAI",
+        position: "工程师",
+        resumeText: "南京大学 计算机 PASS_MARKER_ABC",
+        evidenceCorpus: "南京大学 计算机 PASS_MARKER_ABC",
+      };
+    },
+    async getResumeModalState() {
+      return { open: true, iframeCount: 1, scopeCount: 1, closeCount: 1 };
+    },
+  };
+  const llmClient = {
+    async evaluateResume() {
+      return {
+        passed: false,
+        rawPassed: true,
+        reason: "模型未给出可在简历原文中校验的证据，按安全策略判为不通过。",
+        summary: "降级",
+        evidence: [],
+        evidenceRawCount: 1,
+        evidenceMatchedCount: 0,
+        evidenceGateDemoted: true,
+        evaluationMode: "text",
+        chunkIndex: 1,
+        chunkTotal: 1,
+      };
+    },
+  };
+  const interaction = {
+    async sleepRange() {},
+    async clickRect() {},
+  };
+  const resumeCaptureService = {
+    async captureResume({ artifactDir }) {
+      return {
+        stitchedImage: path.join(artifactDir, "resume.png"),
+        metadataFile: path.join(artifactDir, "chunks.json"),
+        chunkDir: path.join(artifactDir, "chunks"),
+        chunkCount: 1,
+        quality: { likelyBlank: false },
+      };
+    },
+  };
+  const stateStore = {
+    async record(_key, result) {
+      records.push(result);
+    },
+  };
+  const app = new BossChatApp({
+    page,
+    llmClient,
+    interaction,
+    resumeCaptureService,
+    stateStore,
+    reportStore: { async write() { return ""; } },
+    dryRun: true,
+    artifactRootDir: tempDir,
+    resumeOpenCooldownMs: 0,
+    logger: { log() {} },
+  });
+  app.waitResumeOpenCooldown = async () => {};
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-key",
+      name: "候选人A",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "1001",
+      textSnippet: "",
+    },
+    {
+      screeningCriteria: "有 AI 项目经验",
+    },
+    "run-test",
+    { skipCardClick: true },
+  );
+
+  assert.equal(result.passed, false);
+  assert.equal(result.artifacts.rawPassed, true);
+  assert.equal(result.artifacts.finalPassed, false);
+  assert.equal(result.artifacts.evidenceRawCount, 1);
+  assert.equal(result.artifacts.evidenceMatchedCount, 0);
+  assert.equal(result.artifacts.evidenceGateDemoted, true);
+  assert.equal(result.artifacts.evaluationMode, "text");
+  assert.equal(Array.isArray(records), true);
+  assert.equal(records.length, 1);
+}
+
 async function main() {
   await testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
+  testBossChatLlmEvidenceGateShouldDemoteMissingEvidence();
+  testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence();
+  await testBossChatLlmTextChunkFallbackShouldWork();
+  await testBossChatAppShouldPersistEvidenceArtifacts();
   console.log("boss-chat tests passed");
 }
 

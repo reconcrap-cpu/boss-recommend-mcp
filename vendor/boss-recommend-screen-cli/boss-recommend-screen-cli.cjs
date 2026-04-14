@@ -3949,7 +3949,8 @@ class RecommendScreenCli {
     const retryLimit = resolveVisionRetryPixelLimit(primaryLimit);
     const preparedPrimary = await this.prepareVisionImageSegmentsForModel(imagePath, primaryLimit, "primary");
     try {
-      return await this.requestVisionModel(preparedPrimary.imagePaths);
+      const primaryResult = await this.requestVisionModel(preparedPrimary.imagePaths);
+      return this.applyVisionEvidenceGate(primaryResult);
     } catch (error) {
       if (!isVisionImageSizeLimitMessage(error?.message || "")) {
         throw error;
@@ -3963,7 +3964,8 @@ class RecommendScreenCli {
     }
     const preparedRetry = await this.prepareVisionImageSegmentsForModel(imagePath, retryLimit, "retry");
     try {
-      return await this.requestVisionModel(preparedRetry.imagePaths);
+      const retryResult = await this.requestVisionModel(preparedRetry.imagePaths);
+      return this.applyVisionEvidenceGate(retryResult);
     } catch (retryError) {
       if (!isVisionImageSizeLimitMessage(retryError?.message || "")) {
         throw retryError;
@@ -3978,6 +3980,34 @@ class RecommendScreenCli {
           `last_error=${normalizeText(retryError?.message || retryError)}`
       );
     }
+  }
+
+  applyVisionEvidenceGate(result) {
+    const parsed = result && typeof result === "object" ? result : {};
+    const rawPassed = parsed?.rawPassed === true || parsed?.passed === true;
+    const parsedEvidence = toStringArray(parsed?.evidence);
+    const evidenceRawCount = Number.isFinite(Number(parsed?.evidenceRawCount))
+      ? Number(parsed.evidenceRawCount)
+      : parsedEvidence.length;
+    const evidenceMatchedCount = Number.isFinite(Number(parsed?.evidenceMatchedCount))
+      ? Number(parsed.evidenceMatchedCount)
+      : parsedEvidence.length;
+    const evidenceGateDemoted = parsed?.evidenceGateDemoted === true || (rawPassed && evidenceMatchedCount <= 0);
+    const reason = normalizeText(parsed?.reason || "");
+    const summary = normalizeText(parsed?.summary || reason);
+    const finalReason = evidenceGateDemoted
+      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`
+      : (reason || (rawPassed ? "满足筛选标准。" : "未满足筛选标准。"));
+    return {
+      passed: evidenceGateDemoted ? false : rawPassed,
+      rawPassed,
+      reason: finalReason,
+      summary: summary || finalReason,
+      evidence: parsedEvidence,
+      evidenceRawCount,
+      evidenceMatchedCount,
+      evidenceGateDemoted
+    };
   }
 
   async prepareVisionImageSegmentsForModel(imagePath, maxPixels, attemptTag = "primary") {
@@ -4234,14 +4264,23 @@ class RecommendScreenCli {
       ? json.choices[0].message.content.map((item) => item?.text || "").join("\n")
       : json?.choices?.[0]?.message?.content || "";
     const parsed = extractJsonObject(content);
+    const rawPassed = parsed.passed === true;
     const reason = normalizeText(parsed.reason);
     const summary = normalizeText(parsed.summary || reason);
     const evidence = toStringArray(parsed.evidence);
+    const evidenceGateDemoted = rawPassed && evidence.length <= 0;
+    const finalReason = evidenceGateDemoted
+      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`
+      : (reason || (rawPassed ? "满足筛选标准。" : "未满足筛选标准。"));
     return {
-      passed: parsed.passed === true,
-      reason: reason || "未满足筛选标准。",
-      summary: summary || reason || "未满足筛选标准。",
-      evidence
+      passed: evidenceGateDemoted ? false : rawPassed,
+      rawPassed,
+      reason: finalReason,
+      summary: summary || finalReason,
+      evidence,
+      evidenceRawCount: evidence.length,
+      evidenceMatchedCount: evidence.length,
+      evidenceGateDemoted
     };
   }
 

@@ -1427,6 +1427,30 @@ async function testCloseDetailPageShouldContinueWhenListReady() {
   assert.equal(closed, true);
 }
 
+async function testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-evidence-gate-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.prepareVisionImageSegmentsForModel = async () => ({
+    imagePaths: ["segment-1"],
+    source: "test",
+    sourcePixels: 100,
+    currentPixels: 100
+  });
+  cli.requestVisionModel = async () => ({
+    passed: true,
+    rawPassed: true,
+    reason: "matched",
+    summary: "matched",
+    evidence: []
+  });
+  const result = await cli.callVisionModel(path.join(tempDir, "fake.png"));
+  assert.equal(result.rawPassed, true);
+  assert.equal(result.passed, false);
+  assert.equal(result.evidenceGateDemoted, true);
+  assert.equal(result.evidenceRawCount, 0);
+  assert.equal(result.evidenceMatchedCount, 0);
+}
+
 async function main() {
   testShouldAbortResumeProbeEarly();
   await testSingleResumeCaptureFailureIsSkipped();
@@ -1470,6 +1494,7 @@ async function main() {
   await testCallTextModelShouldNotTruncateLongResume();
   await testCallTextModelShouldFallbackToChunkModeOnContextLimit();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();
+  await testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence();
   testRecoverablePostActionErrorShouldTreatGreetContinueAndNoButtonAsRecoverable();
   await testRecoverableGreetContinueButtonShouldNotAbortWhenDetailCloseFails();
   await testRecoverableGreetButtonNotFoundShouldNotAbortWhenDetailCloseFails();
