@@ -28,4 +28,6 @@ target_count mapping:
 - Positive integer means explicit cap (for example 20).
 - `all` / `unlimited` / `全部` / `不限` / `扫到底` / `全量` means unlimited.
 - `全部候选人` / `所有候选人` must also be treated as unlimited.
+- Always write the argument key as `target_count`.
+- For unlimited mode, send `"target_count": "all"` in the tool call.
 ```

@@ -53,6 +53,8 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - `job` / `start_from` / `criteria` 缺一不可；缺参时只补缺口。
 - `target_count` 在 chat-only 启动前也是必填项，不能默认省略。
 - 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。
+- 参数名必须写 `target_count`（不要写“目标数量”等中文键名）。
+- 当用户选择“扫到底/全部候选人/所有候选人”时，调用参数统一写：`"target_count": "all"`。
 - 禁止 agent 自行补全 `job/start_from/criteria` 并直接执行，必须由用户明确给出或确认。
 - chat-only 启动流程必须先进入聊天页并拉取岗位列表，再让用户从列表中选择 `job`。
 - 允许先用空参调用 `start_boss_chat_run` 触发 `NEED_INPUT`；若返回了 `job_options`，必须完整展示所有岗位选项给用户确认。

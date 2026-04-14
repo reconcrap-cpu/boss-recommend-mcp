@@ -210,6 +210,11 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.deepEqual(preflight.required_fields, ["job", "start_from", "target_count", "criteria"]);
     assert.equal(Array.isArray(preflight.job_options), true);
     assert.equal(preflight.job_options.length, 2);
+    assert.equal(Array.isArray(preflight.pending_questions), true);
+    const preflightTargetQuestion = preflight.pending_questions.find((item) => item.field === "target_count");
+    assert.equal(Boolean(preflightTargetQuestion), true);
+    assert.equal(preflightTargetQuestion.argument_name, "target_count");
+    assert.equal(Array.isArray(preflightTargetQuestion.options), true);
 
     const stateAfterPrepare = readStubState(workspaceRoot);
     assert.equal(stateAfterPrepare.last_prepare_args.profile, "default");
@@ -301,6 +306,19 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     assert.deepEqual(needInput.required_fields, ["job", "start_from", "target_count", "criteria"]);
     assert.equal(Array.isArray(needInput.job_options), true);
     assert.equal(needInput.job_options.length, 2);
+    const targetQuestion = needInput.pending_questions.find((item) => item.field === "target_count");
+    assert.equal(Boolean(targetQuestion), true);
+    assert.equal(targetQuestion.argument_name, "target_count");
+    assert.equal(targetQuestion.options.some((item) => item.value === "all"), true);
+
+    const missingTargetOnly = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {
+      job: "算法工程师",
+      start_from: "all",
+      criteria: "全部候选人都过一遍"
+    }, 111);
+    assert.equal(missingTargetOnly.status, "NEED_INPUT");
+    assert.deepEqual(missingTargetOnly.missing_fields, ["target_count"]);
+    assert.equal(missingTargetOnly.next_call_example.target_count, "all");
 
     const invalidStartResponse = await handleRequest(
       makeToolCall(11, TOOL_BOSS_CHAT_START_RUN, {

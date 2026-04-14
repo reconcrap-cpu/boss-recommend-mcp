@@ -261,6 +261,42 @@ function getMissingBossChatStartFields(input = {}) {
   return missing;
 }
 
+function buildTargetCountQuestionHint(item = {}) {
+  const next = { ...item };
+  next.question = "请输入 target_count：正整数，或 all（扫到底）。";
+  next.options = [
+    { label: "扫到底（推荐）", value: "all" },
+    { label: "不限", value: "unlimited" },
+    { label: "全部候选人", value: "全部候选人" },
+    { label: "所有候选人", value: "所有候选人" }
+  ];
+  next.examples = ["all", 20];
+  next.argument_name = "target_count";
+  return next;
+}
+
+function normalizePendingQuestions(pendingQuestions = []) {
+  return pendingQuestions.map((item) => {
+    if (String(item?.field || "") !== "target_count") return item;
+    return buildTargetCountQuestionHint(item);
+  });
+}
+
+function buildNextCallExample(input = {}, missingFields = []) {
+  if (!Array.isArray(missingFields) || missingFields.length === 0) return null;
+  const normalized = normalizeBossChatStartInput(input);
+  const sample = {};
+  if (normalized.job) sample.job = normalized.job;
+  if (normalized.startFrom) sample.start_from = normalized.startFrom;
+  if (normalized.criteria) sample.criteria = normalized.criteria;
+  if (normalized.targetCountProvided) {
+    sample.target_count = normalized.targetCountArg === "-1" ? "all" : normalized.targetCount;
+  } else if (missingFields.includes("target_count")) {
+    sample.target_count = "all";
+  }
+  return Object.keys(sample).length > 0 ? sample : null;
+}
+
 function buildBossChatCliArgs(command, input, resolvedConfig) {
   const args = [command, "--json"];
   if (command === "prepare-run") {
@@ -455,12 +491,15 @@ export async function startBossChatRun({ workspaceRoot, input = {} }) {
     const pendingQuestions = Array.isArray(prepared?.pending_questions)
       ? prepared.pending_questions.filter((item) => missingFields.includes(String(item?.field || "")))
       : [];
+    const normalizedPendingQuestions = normalizePendingQuestions(pendingQuestions);
+    const nextCallExample = buildNextCallExample(input, missingFields);
     return {
       ...prepared,
       status: "NEED_INPUT",
       required_fields: CHAT_REQUIRED_FIELDS.slice(),
       missing_fields: missingFields,
-      pending_questions: pendingQuestions,
+      pending_questions: normalizedPendingQuestions,
+      ...(nextCallExample ? { next_call_example: nextCallExample } : {}),
       message: prepared?.message
         || "已获取 Boss 聊天页岗位列表，请先补齐 job / start_from / target_count / criteria。"
     };
