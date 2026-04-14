@@ -141,10 +141,15 @@ function isUnlimitedTargetCountToken(value) {
     'inf',
     'max',
     'full',
+    'allcandidates',
     '全部',
     '全量',
     '不限',
     '扫到底',
+    '全部候选人',
+    '所有候选人',
+    '全部人选',
+    '所有人选',
     '直到完成所有人选',
   ].includes(token);
 }

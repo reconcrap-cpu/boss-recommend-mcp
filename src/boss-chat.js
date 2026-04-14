@@ -508,7 +508,23 @@ export async function startBossChatRun({ workspaceRoot, input = {} }) {
 }
 
 export async function prepareBossChatRun({ workspaceRoot, input = {} }) {
-  return (await spawnBossChatCli({ workspaceRoot, command: "prepare-run", input })).payload;
+  const payload = (await spawnBossChatCli({ workspaceRoot, command: "prepare-run", input })).payload;
+  if (payload?.status !== "NEED_INPUT") return payload;
+
+  const missingFields = getMissingBossChatStartFields(input);
+  const pendingQuestions = Array.isArray(payload?.pending_questions)
+    ? payload.pending_questions.filter((item) => (
+      missingFields.length === 0 || missingFields.includes(String(item?.field || ""))
+    ))
+    : [];
+  const nextCallExample = buildNextCallExample(input, missingFields);
+  return {
+    ...payload,
+    required_fields: CHAT_REQUIRED_FIELDS.slice(),
+    missing_fields: missingFields,
+    pending_questions: normalizePendingQuestions(pendingQuestions),
+    ...(nextCallExample ? { next_call_example: nextCallExample } : {})
+  };
 }
 
 export async function getBossChatRun({ workspaceRoot, input = {} }) {

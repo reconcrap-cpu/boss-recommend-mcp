@@ -13,6 +13,7 @@ import {
   getBossChatHealthCheck,
   getBossChatRun,
   pauseBossChatRun,
+  prepareBossChatRun,
   resumeBossChatRun,
   startBossChatRun
 } from "./boss-chat.js";
@@ -51,6 +52,7 @@ const TOOL_RUN_FEATURED_CALIBRATION = "run_featured_calibration";
 const TOOL_GET_FEATURED_CALIBRATION_STATUS = "get_featured_calibration_status";
 const TOOL_RUN_RECOMMEND_SELF_HEAL = "run_recommend_self_heal";
 const TOOL_BOSS_CHAT_HEALTH_CHECK = "boss_chat_health_check";
+const TOOL_BOSS_CHAT_PREPARE_RUN = "prepare_boss_chat_run";
 const TOOL_BOSS_CHAT_START_RUN = "start_boss_chat_run";
 const TOOL_BOSS_CHAT_GET_RUN = "get_boss_chat_run";
 const TOOL_BOSS_CHAT_PAUSE_RUN = "pause_boss_chat_run";
@@ -413,8 +415,8 @@ function createRunInputSchema() {
   };
 }
 
-function createBossChatStartInputSchema() {
-  return {
+function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
+  const schema = {
     type: "object",
     properties: {
       profile: {
@@ -459,6 +461,10 @@ function createBossChatStartInputSchema() {
     },
     additionalProperties: false
   };
+  if (requireFullInput) {
+    schema.required = ["job", "start_from", "target_count", "criteria"];
+  }
+  return schema;
 }
 
 function createRunFeaturedCalibrationInputSchema() {
@@ -610,9 +616,14 @@ function createToolsSchema() {
       }
     },
     {
-      name: TOOL_BOSS_CHAT_START_RUN,
-      description: "异步启动一次 boss-chat 任务。若缺少必填参数会先返回 NEED_INPUT（含岗位列表与待确认字段）。",
+      name: TOOL_BOSS_CHAT_PREPARE_RUN,
+      description: "预备一次 boss-chat 任务：只导航聊天页并返回岗位列表与待补字段，不会启动任务。用它先获取 job_options。",
       inputSchema: createBossChatStartInputSchema()
+    },
+    {
+      name: TOOL_BOSS_CHAT_START_RUN,
+      description: "异步启动一次 boss-chat 任务。必须一次性提供 job、start_from、target_count、criteria；扫到底请传 target_count=\"all\"。",
+      inputSchema: createBossChatStartInputSchema({ requireFullInput: true })
     },
     {
       name: TOOL_BOSS_CHAT_GET_RUN,
@@ -1776,6 +1787,10 @@ function handleBossChatHealthCheckTool(workspaceRoot, args) {
   return getBossChatHealthCheck(workspaceRoot, args);
 }
 
+async function handleBossChatPrepareRunTool({ workspaceRoot, args }) {
+  return prepareBossChatRun({ workspaceRoot, input: args });
+}
+
 async function handleBossChatStartRunTool({ workspaceRoot, args }) {
   return startBossChatRun({ workspaceRoot, input: args });
 }
@@ -1859,7 +1874,7 @@ async function handleRequest(message, workspaceRoot) {
       }
     }
 
-    if (toolName === TOOL_BOSS_CHAT_START_RUN) {
+    if ([TOOL_BOSS_CHAT_PREPARE_RUN, TOOL_BOSS_CHAT_START_RUN].includes(toolName)) {
       const inputError = validateBossChatStartArgs(args);
       if (inputError) {
         return createJsonRpcError(id, -32602, inputError);
@@ -1901,6 +1916,8 @@ async function handleRequest(message, workspaceRoot) {
         payload = await handleRunRecommendSelfHealTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_HEALTH_CHECK) {
         payload = handleBossChatHealthCheckTool(workspaceRoot, args);
+      } else if (toolName === TOOL_BOSS_CHAT_PREPARE_RUN) {
+        payload = await handleBossChatPrepareRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_START_RUN) {
         payload = await handleBossChatStartRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_GET_RUN) {

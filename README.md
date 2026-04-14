@@ -201,10 +201,12 @@ node src/cli.js chat run --job "算法工程师" --start-from unread --criteria 
 
 - CLI：
   - `boss-recommend-mcp chat health-check`
+  - `boss-recommend-mcp chat prepare-run`
   - `boss-recommend-mcp chat run --job "算法工程师" --start-from unread --targetCount 20 --criteria "有 AI Agent 经验"`（后台启动，不自动轮询）
   - `boss-recommend-mcp chat start-run|get-run|pause-run|resume-run|cancel-run`
 - MCP：
   - `boss_chat_health_check`
+  - `prepare_boss_chat_run`
   - `start_boss_chat_run`
   - `get_boss_chat_run`
   - `pause_boss_chat_run`
@@ -213,13 +215,14 @@ node src/cli.js chat run --job "算法工程师" --start-from unread --criteria 
 
 chat-only 交互建议：
 
-- 先调用一次 `start_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
-- 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count`、`criteria` 后再次调用 `start_boss_chat_run` 启动任务。
+- 先调用一次 `prepare_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
+- 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count`、`criteria` 后调用 `start_boss_chat_run` 启动任务。
 - `target_count` 支持正整数；若用户给出 `全部候选人` / `所有候选人`，会自动按不限（扫到底）处理。
 
 Trae-CN / 长对话防循环建议：
 
-- 固定流程：`boss_chat_health_check` -> `start_boss_chat_run(空参可)` -> 一次性补齐 `job/start_from/target_count/criteria` -> 再次 `start_boss_chat_run`。
+- 固定流程：`boss_chat_health_check` -> `prepare_boss_chat_run(空参可)` -> 一次性补齐 `job/start_from/target_count/criteria` -> `start_boss_chat_run`。
+- `start_boss_chat_run` 的工具 schema 已把 `job/start_from/target_count/criteria` 标记为必填；不要用它获取岗位列表。
 - `start_boss_chat_run` 返回 `ACCEPTED` 后直接结束当前回合，不要自动轮询。
 - 缺参或校验失败时，一次性列出全部缺失/错误项，避免重复同一句提示触发宿主“陷入循环”保护。
 - 仅当用户明确要求“查进度”时再调用 `get_boss_chat_run`。

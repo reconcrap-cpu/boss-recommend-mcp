@@ -21,6 +21,7 @@ import {
   getBossChatHealthCheck,
   getBossChatRun,
   pauseBossChatRun,
+  prepareBossChatRun,
   resumeBossChatRun,
   startBossChatRun
 } from "./boss-chat.js";
@@ -1356,6 +1357,14 @@ async function runBossChatCliCommand(subcommand, options = {}) {
   if (subcommand === "health-check") {
     printJson(getBossChatHealthCheck(workspaceRoot, {
       port: parsePositivePort(options.port)
+    }));
+    return;
+  }
+
+  if (subcommand === "prepare-run") {
+    printJson(await prepareBossChatRun({
+      workspaceRoot,
+      input: buildBossChatCliInput(options)
     }));
     return;
   }

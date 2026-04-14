@@ -14,6 +14,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 ## Tool Routing
 
 - 健康检查：`boss_chat_health_check`
+- 预备并获取岗位列表：`prepare_boss_chat_run`
 - 启动异步任务：`start_boss_chat_run`
 - 查询进度：`get_boss_chat_run`
 - 暂停：`pause_boss_chat_run`
@@ -29,7 +30,6 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 
 可选：
 
-- `target_count`
 - `profile`（默认 `default`）
 - `port`
 - `dry_run`
@@ -57,7 +57,9 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - 当用户选择“扫到底/全部候选人/所有候选人”时，调用参数统一写：`"target_count": "all"`。
 - 禁止 agent 自行补全 `job/start_from/criteria` 并直接执行，必须由用户明确给出或确认。
 - chat-only 启动流程必须先进入聊天页并拉取岗位列表，再让用户从列表中选择 `job`。
-- 允许先用空参调用 `start_boss_chat_run` 触发 `NEED_INPUT`；若返回了 `job_options`，必须完整展示所有岗位选项给用户确认。
+- 必须先用空参调用 `prepare_boss_chat_run` 获取 `job_options`；不要用 `start_boss_chat_run` 做预备调用。
+- `start_boss_chat_run` 只能用于真正启动，必须一次性传齐 `job` / `start_from` / `target_count` / `criteria`。
+- 若 `start_boss_chat_run` 返回 `NEED_INPUT` 且 `missing_fields` 包含 `target_count`，说明你没有把用户选择写入工具参数；下一次调用必须照 `next_call_example` 原样补上 `"target_count": "all"` 或正整数，不要重复空调用。
 - 默认不自动轮询；只有用户要求查进度时才调用 `get_boss_chat_run`。
 - `start_boss_chat_run` 返回 `ACCEPTED` 后，默认立即结束当前回合，不得主动连续调用 `get_boss_chat_run`。
 - 只有当用户明确给出“轮询频率/间隔”（例如“每30分钟查一次”）时，才允许按该频率查询进度。
@@ -73,6 +75,6 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 ## Response Style
 
 - 用结构化中文。
-- 首轮建议先调用一次 `start_boss_chat_run`（可空参）获取 `job_options` 与 `pending_questions`。
+- 首轮建议先调用一次 `prepare_boss_chat_run`（可空参）获取 `job_options` 与 `pending_questions`。
 - 缺参时必须逐项确认：`job`（来自岗位列表）、`start_from`（`unread|all`）、`target_count`、`criteria`。
 - 若健康检查失败，明确提示共享配置文件 `screening-config.json` 不可用。

@@ -8,6 +8,7 @@ import {
   getBossChatHealthCheck,
   getBossChatRun,
   pauseBossChatRun,
+  prepareBossChatRun,
   resumeBossChatRun,
   startBossChatRun
 } from "./boss-chat.js";
@@ -17,6 +18,7 @@ import { __testables as indexTestables } from "./index.js";
 const { handleRequest } = indexTestables;
 
 const TOOL_BOSS_CHAT_HEALTH_CHECK = "boss_chat_health_check";
+const TOOL_BOSS_CHAT_PREPARE_RUN = "prepare_boss_chat_run";
 const TOOL_BOSS_CHAT_START_RUN = "start_boss_chat_run";
 const TOOL_BOSS_CHAT_GET_RUN = "get_boss_chat_run";
 const TOOL_BOSS_CHAT_PAUSE_RUN = "pause_boss_chat_run";
@@ -202,6 +204,16 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(health.shared_llm_config, true);
     assert.equal(health.debug_port, 9666);
 
+    const prepared = await prepareBossChatRun({
+      workspaceRoot,
+      input: {}
+    });
+    assert.equal(prepared.status, "NEED_INPUT");
+    assert.deepEqual(prepared.missing_fields, ["job", "start_from", "target_count", "criteria"]);
+    const preparedTargetQuestion = prepared.pending_questions.find((item) => item.field === "target_count");
+    assert.equal(preparedTargetQuestion.argument_name, "target_count");
+    assert.equal(prepared.next_call_example.target_count, "all");
+
     const preflight = await startBossChatRun({
       workspaceRoot,
       input: {}
@@ -301,6 +313,23 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
 
 async function testBossChatMcpToolsShouldValidateAndRoute() {
   await withBossChatWorkspace(async (workspaceRoot) => {
+    const toolsResponse = await handleRequest({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/list",
+      params: {}
+    }, workspaceRoot);
+    const tools = toolsResponse.result.tools;
+    const prepareToolSchema = tools.find((item) => item.name === TOOL_BOSS_CHAT_PREPARE_RUN).inputSchema;
+    const startToolSchema = tools.find((item) => item.name === TOOL_BOSS_CHAT_START_RUN).inputSchema;
+    assert.equal(prepareToolSchema.required, undefined);
+    assert.deepEqual(startToolSchema.required, ["job", "start_from", "target_count", "criteria"]);
+
+    const prepared = await callTool(workspaceRoot, TOOL_BOSS_CHAT_PREPARE_RUN, {}, 101);
+    assert.equal(prepared.status, "NEED_INPUT");
+    assert.deepEqual(prepared.missing_fields, ["job", "start_from", "target_count", "criteria"]);
+    assert.equal(prepared.pending_questions.find((item) => item.field === "target_count").argument_name, "target_count");
+
     const needInput = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {}, 11);
     assert.equal(needInput.status, "NEED_INPUT");
     assert.deepEqual(needInput.required_fields, ["job", "start_from", "target_count", "criteria"]);
@@ -413,6 +442,15 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
   }
 
   await withBossChatWorkspace(async (workspaceRoot) => {
+    const prepareLogs = await captureConsoleLogs(async () => {
+      await cliTestables.runBossChatCliCommand("prepare-run", {
+        "workspace-root": workspaceRoot
+      });
+    });
+    const prepared = JSON.parse(prepareLogs[0]);
+    assert.equal(prepared.status, "NEED_INPUT");
+    assert.equal(prepared.pending_questions.find((item) => item.field === "target_count").argument_name, "target_count");
+
     const logs = await captureConsoleLogs(async () => {
       await cliTestables.runBossChatCliCommand("run", {
         "workspace-root": workspaceRoot,
