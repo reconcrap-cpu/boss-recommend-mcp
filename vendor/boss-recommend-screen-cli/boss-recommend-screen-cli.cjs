@@ -32,6 +32,8 @@ const INPUT_SUMMARY_HEADER = ["运行输入字段", "运行输入值"].join(",")
 const RESUME_CAPTURE_WAIT_MS = 60000;
 const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
 const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
+const NETWORK_RESUME_WAIT_MS = 4200;
+const NETWORK_RESUME_RETRY_WAIT_MS = 2000;
 const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
 const DEFAULT_VISION_MAX_IMAGE_PIXELS = 36000000;
 const DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS = 30000000;
@@ -517,6 +519,104 @@ function matchEvidenceAgainstResume(evidenceText, rawResumeText, normalizedResum
     mode: "token_fuzzy",
     matchedTokens
   };
+}
+
+function truncateText(value, maxLength = 96) {
+  const text = normalizeText(value);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(12, maxLength - 1))}…`;
+}
+
+function isMaskedName(value) {
+  return /[*＊]/.test(normalizeText(value));
+}
+
+function normalizeNameForCompare(value) {
+  return normalizeText(value).replace(/[*＊]/g, "");
+}
+
+function isLikelyNameMatch(expected, actual) {
+  const left = normalizeNameForCompare(expected);
+  const right = normalizeNameForCompare(actual);
+  if (!left || !right) return true;
+  if (left === right) return true;
+  if (left.includes(right) || right.includes(left)) return true;
+  return left[0] === right[0];
+}
+
+function isLikelyTextMatch(expected, actual) {
+  const left = toLowerSafe(normalizeText(expected));
+  const right = toLowerSafe(normalizeText(actual));
+  if (!left || !right) return true;
+  return left === right || left.includes(right) || right.includes(left);
+}
+
+function preferReadableName(...values) {
+  const normalized = values.map((item) => normalizeText(item)).filter(Boolean);
+  if (normalized.length <= 0) return "";
+  const nonMasked = normalized.find((item) => !isMaskedName(item));
+  return nonMasked || normalized[0];
+}
+
+function mergeCandidateProfiles(...profiles) {
+  const list = profiles.filter((item) => item && typeof item === "object");
+  const takeFirst = (field) => {
+    for (const item of list) {
+      const text = normalizeText(item?.[field] || "");
+      if (text) return text;
+    }
+    return "";
+  };
+  return {
+    name: preferReadableName(...list.map((item) => item?.name || "")),
+    school: takeFirst("school"),
+    major: takeFirst("major"),
+    company: takeFirst("company"),
+    position: takeFirst("position")
+  };
+}
+
+function isDomProfileConsistentWithCard(cardProfile, domProfile) {
+  if (!cardProfile || !domProfile) return true;
+  let compared = 0;
+  let mismatched = 0;
+  const compareField = (field, matcher) => {
+    const expected = normalizeText(cardProfile?.[field] || "");
+    const actual = normalizeText(domProfile?.[field] || "");
+    if (!expected || !actual) return;
+    compared += 1;
+    if (!matcher(expected, actual)) {
+      mismatched += 1;
+    }
+  };
+  compareField("name", isLikelyNameMatch);
+  compareField("school", isLikelyTextMatch);
+  compareField("major", isLikelyTextMatch);
+  if (compared <= 0) return true;
+  return mismatched <= 1;
+}
+
+function isGenericReason(reason) {
+  const text = normalizeText(reason);
+  if (!text) return true;
+  if (text.length < 24) return true;
+  return /^(候选人同时满足全部筛选条件|满足筛选标准|不满足筛选标准|模型判定不通过|通过|不通过)[。！!?]?$/u.test(text);
+}
+
+function enrichReasonWithEvidence(reason, summary, evidence = [], passed = false) {
+  const normalizedReason = normalizeText(reason);
+  if (!isGenericReason(normalizedReason)) return normalizedReason;
+  const normalizedSummary = normalizeText(summary);
+  const evidenceItems = toStringArray(evidence, 4).map((item, index) => `${index + 1}) ${truncateText(item, 72)}`);
+  const evidenceText = evidenceItems.length > 0 ? evidenceItems.join("；") : "";
+  const base = normalizedReason || (passed ? "候选人满足筛选标准。" : "候选人未满足筛选标准。");
+  if (evidenceText) {
+    return `${base} 关键依据：${evidenceText}`;
+  }
+  if (normalizedSummary && normalizedSummary !== normalizedReason) {
+    return `${base} 摘要：${normalizedSummary}`;
+  }
+  return base;
 }
 
 function formatEducationDegree(edu) {
@@ -1493,6 +1593,20 @@ function buildListCandidatesExpr(processedKeys) {
     const featuredCards = ${buildSelectorCollectionExpression(FEATURED_CARD_SELECTORS, "doc")};
     const latestCards = ${buildSelectorCollectionExpression(LATEST_CARD_SELECTORS, "doc")};
     const textOf = (el) => String(el ? el.textContent : '').replace(/\s+/g, ' ').trim();
+    const pickText = (root, selectors) => {
+      if (!root) return '';
+      for (const selector of selectors || []) {
+        let node = null;
+        try {
+          node = root.querySelector(selector);
+        } catch {
+          node = null;
+        }
+        const text = textOf(node);
+        if (text) return text;
+      }
+      return '';
+    };
     const tabs = ${buildSelectorCollectionExpression(RECOMMEND_TAB_SELECTORS, "doc")};
     const activeTab = tabs.find((node) => /(?:^|\\s)(?:curr|current|active|selected)(?:\\s|$)/i.test(String(node.className || ''))) || null;
     const activeStatus = activeTab ? String(activeTab.getAttribute('data-status') || '') : '';
@@ -1502,7 +1616,7 @@ function buildListCandidatesExpr(processedKeys) {
       const geekId = inner.getAttribute('data-geekid');
       if (!geekId) return null;
       const rect = card.getBoundingClientRect();
-      const nameEl = card.querySelector('.name');
+      const name = pickText(card, ['.geek-name-wrap .name', '.name-wrap .name', 'span.name', '.name']);
       const eduSpans = Array.from(card.querySelectorAll('.edu-wrap .edu-exp span, .edu-wrap .content span, .edu-wrap span'))
         .map((item) => textOf(item))
         .filter(Boolean);
@@ -1515,7 +1629,7 @@ function buildListCandidatesExpr(processedKeys) {
         index,
         key: geekId,
         geek_id: geekId,
-        name: textOf(nameEl),
+        name,
         school: eduSpans[0] || '',
         major: eduSpans[1] || '',
         degree: eduSpans[2] || '',
@@ -1534,7 +1648,7 @@ function buildListCandidatesExpr(processedKeys) {
       const geekId = anchor.getAttribute('data-geekid');
       if (!geekId) return null;
       const rect = card.getBoundingClientRect();
-      const nameEl = card.querySelector('.name, .geek-name, .name-wrap .name');
+      const name = pickText(card, ['.geek-name-wrap .name', '.name-wrap .name', '.name', '.geek-name']);
       const tags = Array.from(card.querySelectorAll('.base-info span, .desc span, .tag-wrap span, .edu-wrap span'))
         .map((item) => textOf(item))
         .filter(Boolean);
@@ -1543,7 +1657,7 @@ function buildListCandidatesExpr(processedKeys) {
         index,
         key: geekId,
         geek_id: geekId,
-        name: textOf(nameEl),
+        name,
         school: tags[0] || '',
         major: tags[1] || '',
         degree: tags[2] || '',
@@ -1562,7 +1676,7 @@ function buildListCandidatesExpr(processedKeys) {
       const geekId = inner.getAttribute('data-geek');
       if (!geekId) return null;
       const rect = card.getBoundingClientRect();
-      const nameEl = card.querySelector('.name, .name-wrap .name, .name-wrap');
+      const name = pickText(card, ['.geek-name-wrap .name', '.name-wrap .name', '.name-wrap', '.name']);
       const tags = Array.from(card.querySelectorAll('.base-info span, .edu-wrap span, .desc span, .tag-wrap span, .tag-item'))
         .map((item) => textOf(item))
         .filter(Boolean);
@@ -1575,7 +1689,7 @@ function buildListCandidatesExpr(processedKeys) {
         index,
         key: geekId,
         geek_id: geekId,
-        name: textOf(nameEl),
+        name,
         school: tags[0] || '',
         major: tags[1] || '',
         degree: tags[2] || '',
@@ -2945,6 +3059,12 @@ class RecommendScreenCli {
         if (item.kind === "dom_fallback_error") {
           return `${prefix} candidate=${item.candidate_key || "-"} error=${item.error || "unknown"}`;
         }
+        if (item.kind === "dom_profile_mismatch") {
+          return `${prefix} candidate=${item.candidate_key || "-"} card=${item.card_name || "-"} dom=${item.dom_name || "-"}`;
+        }
+        if (item.kind === "dom_profile_mismatch_retry_failed") {
+          return `${prefix} candidate=${item.candidate_key || "-"} error=${item.error || "unknown"}`;
+        }
         return `${prefix} ${item.url || item.reason || "n/a"}`;
       });
   }
@@ -3047,44 +3167,63 @@ class RecommendScreenCli {
     }
   }
 
-  tryExtractNetworkResumeForCandidate(candidate) {
+  tryExtractNetworkResumeForCandidate(candidate, options = {}) {
     const candidateKey = normalizeText(candidate?.key || candidate?.geek_id || "");
+    const minTs = Number.isFinite(Number(options?.minTs)) ? Number(options.minTs) : 0;
     if (candidateKey && this.resumeNetworkByGeekId.has(candidateKey)) {
-      return this.resumeNetworkByGeekId.get(candidateKey)?.candidateInfo || null;
+      const wrapped = this.resumeNetworkByGeekId.get(candidateKey);
+      const payloadTs = Number(wrapped?.ts || 0);
+      if (payloadTs >= minTs) {
+        return {
+          candidateInfo: wrapped?.candidateInfo || null,
+          source: "geek_id_map",
+          ts: payloadTs
+        };
+      }
     }
     if (this.latestResumeNetworkPayload) {
-      const ageMs = Date.now() - Number(this.latestResumeNetworkPayload.ts || 0);
-      const latestGeekIds = Array.isArray(this.latestResumeNetworkPayload.geekIds)
-        ? this.latestResumeNetworkPayload.geekIds.map((id) => normalizeText(id)).filter(Boolean)
+      const wrapped = this.latestResumeNetworkPayload;
+      const payloadTs = Number(wrapped?.ts || 0);
+      const ageMs = Date.now() - payloadTs;
+      const latestGeekIds = Array.isArray(wrapped?.geekIds)
+        ? wrapped.geekIds.map((id) => normalizeText(id)).filter(Boolean)
         : [];
-      if (!candidateKey && ageMs <= 12000) {
-        return this.latestResumeNetworkPayload.candidateInfo || null;
+      const withinAge = ageMs <= 12000;
+      const withinTs = payloadTs >= minTs;
+      if (!candidateKey && withinAge && withinTs) {
+        return {
+          candidateInfo: wrapped?.candidateInfo || null,
+          source: "latest_payload",
+          ts: payloadTs
+        };
       }
-      if (candidateKey && ageMs <= 12000 && latestGeekIds.includes(candidateKey)) {
-        return this.latestResumeNetworkPayload.candidateInfo || null;
+      if (candidateKey && withinAge && withinTs && latestGeekIds.includes(candidateKey)) {
+        return {
+          candidateInfo: wrapped?.candidateInfo || null,
+          source: "latest_payload_key_match",
+          ts: payloadTs
+        };
       }
     }
     return null;
   }
 
-  async waitForNetworkResumeCandidateInfo(candidate, timeoutMs = 2200) {
+  async waitForNetworkResumeCandidateInfo(candidate, timeoutMs = 2200, options = {}) {
     const waitStartedAt = Date.now();
     const candidateKey = normalizeText(candidate?.key || candidate?.geek_id || "");
+    const minTs = Number.isFinite(Number(options?.minTs)) ? Number(options.minTs) : 0;
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const info = this.tryExtractNetworkResumeForCandidate(candidate);
+      const match = this.tryExtractNetworkResumeForCandidate(candidate, { minTs });
+      const info = match?.candidateInfo || null;
       if (info && normalizeText(info.resumeText)) {
-        const latestGeekIds = Array.isArray(this.latestResumeNetworkPayload?.geekIds)
-          ? this.latestResumeNetworkPayload.geekIds.map((id) => normalizeText(id)).filter(Boolean)
-          : [];
-        const source = candidateKey && this.resumeNetworkByGeekId.has(candidateKey)
-          ? "geek_id_map"
-          : (candidateKey && latestGeekIds.includes(candidateKey) ? "latest_payload_key_match" : "latest_payload");
         this.recordResumeNetworkDiagnostic({
           kind: "wait_hit",
           candidate_key: candidateKey,
-          source,
+          source: match?.source || "unknown",
           waited_ms: Date.now() - waitStartedAt,
+          min_ts: minTs || null,
+          payload_ts: Number(match?.ts || 0) || null,
           resume_text_len: normalizeText(info.resumeText).length
         });
         return info;
@@ -3095,6 +3234,7 @@ class RecommendScreenCli {
       kind: "wait_timeout",
       candidate_key: candidateKey,
       waited_ms: Date.now() - waitStartedAt,
+      min_ts: minTs || null,
       reason: "resume_text_not_ready"
     });
     return null;
@@ -3142,7 +3282,7 @@ class RecommendScreenCli {
     }
 
     const info = {
-      name: normalizeText(extracted.name || candidate?.name || ""),
+      name: preferReadableName(extracted.name || "", candidate?.name || ""),
       school: normalizeText(extracted.school || candidate?.school || ""),
       major: normalizeText(extracted.major || candidate?.major || ""),
       company: normalizeText(extracted.company || candidate?.last_company || ""),
@@ -3888,6 +4028,83 @@ class RecommendScreenCli {
     })(${JSON.stringify(candidateKey)})`);
   }
 
+  async extractCandidateProfileFromCard(candidate) {
+    const candidateKey = candidate?.key || candidate?.geek_id || null;
+    if (!candidateKey) {
+      return null;
+    }
+    let profile = null;
+    try {
+      profile = await this.evaluate(`((candidateKey) => {
+        const frame = ${buildFirstSelectorLookupExpression(RECOMMEND_IFRAME_SELECTORS)};
+        if (!frame || !frame.contentDocument) {
+          return { ok: false, error: "NO_RECOMMEND_IFRAME" };
+        }
+        const doc = frame.contentDocument;
+        const textOf = (el) => String(el ? el.textContent : "").replace(/\\s+/g, " ").trim();
+        const pick = (root, selectors) => {
+          if (!root) return "";
+          for (const selector of selectors || []) {
+            let node = null;
+            try {
+              node = root.querySelector(selector);
+            } catch {
+              node = null;
+            }
+            const text = textOf(node);
+            if (text) return text;
+          }
+          return "";
+        };
+        const recommendInner = Array.from(doc.querySelectorAll(".card-inner[data-geekid]"))
+          .find((item) => (item.getAttribute("data-geekid") || "") === String(candidateKey)) || null;
+        const latestInner = recommendInner
+          ? null
+          : ${buildSelectorCollectionExpression([".candidate-card-wrap .card-inner[data-geek]", ".candidate-card-wrap [data-geek]"], "doc")}
+            .find((item) => (item.getAttribute("data-geek") || "") === String(candidateKey)) || null;
+        const featuredAnchor = (recommendInner || latestInner)
+          ? null
+          : ${buildSelectorCollectionExpression(["li.geek-info-card a[data-geekid]", "a[data-geekid]"], "doc")}
+            .find((item) => (item.getAttribute("data-geekid") || "") === String(candidateKey)) || null;
+        const card = recommendInner
+          ? (recommendInner.closest("li.card-item") || recommendInner.closest(".card-item"))
+          : latestInner
+            ? (latestInner.closest(".candidate-card-wrap") || latestInner.closest("li.card-item") || latestInner.closest(".card-item"))
+            : (featuredAnchor ? (featuredAnchor.closest("li.geek-info-card") || featuredAnchor.closest(".geek-info-card")) : null);
+        if (!card) {
+          return { ok: false, error: "CANDIDATE_CARD_NOT_FOUND" };
+        }
+        const eduSpans = Array.from(card.querySelectorAll(".edu-wrap .edu-exp span, .edu-wrap .content span, .edu-wrap span"))
+          .map((item) => textOf(item))
+          .filter(Boolean);
+        const latestWork = card.querySelector(".timeline-wrap.work-exps .timeline-item");
+        const workSpans = latestWork
+          ? Array.from(latestWork.querySelectorAll(".join-text-wrap.content span")).map((item) => textOf(item)).filter(Boolean)
+          : [];
+        return {
+          ok: true,
+          name: pick(card, [".geek-name-wrap .name", ".name-wrap .name", "span.name", ".name"]),
+          school: eduSpans[0] || pick(card, [".edu-wrap .school-name", ".base-info .school-name", ".school-name"]),
+          major: eduSpans[1] || pick(card, [".edu-wrap .major", ".major"]),
+          company: workSpans[0] || pick(card, [".company-name-wrap .name", ".company-name"]),
+          position: workSpans[1] || pick(card, [".position span", ".position"])
+        };
+      })(${JSON.stringify(candidateKey)})`);
+    } catch {
+      profile = null;
+    }
+    if (!profile?.ok) {
+      return null;
+    }
+    return {
+      name: normalizeText(profile?.name || ""),
+      school: normalizeText(profile?.school || ""),
+      major: normalizeText(profile?.major || ""),
+      company: normalizeText(profile?.company || ""),
+      position: normalizeText(profile?.position || "")
+    };
+  }
+
   async clickCandidate(candidate) {
     const centered = await this.getCenteredCandidateClickPoint(candidate);
     if (centered?.ok) {
@@ -4204,6 +4421,10 @@ class RecommendScreenCli {
           `筛选标准:\n${this.args.criteria}\n\n` +
           "你将收到候选人完整简历的一个或多个顺序分段图片。必须完整阅读全部分段后再判断，" +
           "严禁编造任何不存在的经历、项目、学校、公司或时间线；证据不足时必须判定为不通过。\n\n" +
+          "要求：\n" +
+          "1) reason 必须写出可审计的判定依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
+          "2) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
+          "3) evidence 至少给出 2 条可在简历中定位的原文短句。\n\n" +
           "请返回严格 JSON: " +
           "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
       }
@@ -4272,11 +4493,13 @@ class RecommendScreenCli {
     const finalReason = evidenceGateDemoted
       ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`
       : (reason || (rawPassed ? "满足筛选标准。" : "未满足筛选标准。"));
+    const passed = evidenceGateDemoted ? false : rawPassed;
+    const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, evidence, passed);
     return {
-      passed: evidenceGateDemoted ? false : rawPassed,
+      passed,
       rawPassed,
-      reason: finalReason,
-      summary: summary || finalReason,
+      reason: enrichedReason,
+      summary: summary || enrichedReason,
       evidence,
       evidenceRawCount: evidence.length,
       evidenceMatchedCount: evidence.length,
@@ -4380,6 +4603,9 @@ class RecommendScreenCli {
             "1) 必须完整阅读上面的全部简历文本。\n" +
             "2) 只能依据简历中真实出现的信息判断，严禁编造不存在的经历/项目/学历/公司。\n" +
             "3) 若证据不足，必须返回 passed=false。\n\n" +
+            "4) reason 必须写出可审计依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
+            "5) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
+            "6) evidence 至少给出 2 条可在简历原文定位的证据短句。\n\n" +
             "请返回严格 JSON: " +
             "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
         }
@@ -4435,11 +4661,12 @@ class RecommendScreenCli {
         );
       }
     }
+    const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, evidence, passed);
     return {
       passed,
       rawPassed,
-      reason: finalReason,
-      summary: summary || finalReason,
+      reason: enrichedReason,
+      summary: summary || enrichedReason,
       evidence,
       evidenceRawCount: parsedEvidence.length,
       evidenceMatchedCount: evidence.length,
@@ -4941,17 +5168,31 @@ class RecommendScreenCli {
         let resumeSource = "";
         let resumeTextLength = null;
         let screening = null;
-        let candidateProfile = {
-          name: nextCandidate.name || "",
-          school: nextCandidate.school || "",
-          major: nextCandidate.major || "",
-          company: nextCandidate.last_company || "",
-          position: nextCandidate.last_position || ""
-        };
+        let candidateProfile = mergeCandidateProfiles(
+          {
+            name: nextCandidate.name || "",
+            school: nextCandidate.school || "",
+            major: nextCandidate.major || "",
+            company: nextCandidate.last_company || "",
+            position: nextCandidate.last_position || ""
+          }
+        );
         let allowDetailCloseFailure = false;
 
         try {
           this.currentCandidateKey = nextCandidate.key || nextCandidate.geek_id || null;
+          const cardProfile = await this.extractCandidateProfileFromCard(nextCandidate);
+          candidateProfile = mergeCandidateProfiles(
+            cardProfile || null,
+            {
+              name: nextCandidate.name || "",
+              school: nextCandidate.school || "",
+              major: nextCandidate.major || "",
+              company: nextCandidate.last_company || "",
+              position: nextCandidate.last_position || ""
+            }
+          );
+          const candidateCaptureStartedAt = Date.now();
           await this.clickCandidate(nextCandidate);
           const detailOpen = await this.ensureDetailOpen();
           if (!detailOpen) {
@@ -4959,9 +5200,11 @@ class RecommendScreenCli {
           }
 
           let capture = null;
-          const networkWaitMs = 4200;
+          const networkWaitMs = NETWORK_RESUME_WAIT_MS;
           const networkWaitStartedAt = Date.now();
-          const networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, networkWaitMs);
+          let networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, networkWaitMs, {
+            minTs: candidateCaptureStartedAt
+          });
           let domCandidateInfo = null;
           if (!normalizeText(networkCandidateInfo?.resumeText)) {
             if (typeof this.logResumeNetworkMissDiagnostics === "function") {
@@ -4970,16 +5213,75 @@ class RecommendScreenCli {
                 waitStartedAt: networkWaitStartedAt
               });
             }
+            await sleep(NETWORK_RESUME_RETRY_WAIT_MS);
+            networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
+              nextCandidate,
+              NETWORK_RESUME_RETRY_WAIT_MS,
+              {
+                minTs: candidateCaptureStartedAt
+              }
+            );
+          }
+          if (!normalizeText(networkCandidateInfo?.resumeText)) {
             domCandidateInfo = await this.extractResumeTextFromDom(nextCandidate);
+            if (domCandidateInfo && !isDomProfileConsistentWithCard(cardProfile, domCandidateInfo)) {
+              this.recordResumeNetworkDiagnostic({
+                kind: "dom_profile_mismatch",
+                candidate_key: normalizeText(nextCandidate?.key || nextCandidate?.geek_id || ""),
+                card_name: normalizeText(cardProfile?.name || ""),
+                dom_name: normalizeText(domCandidateInfo?.name || ""),
+                card_school: normalizeText(cardProfile?.school || ""),
+                dom_school: normalizeText(domCandidateInfo?.school || "")
+              });
+              log(
+                `[DOM简历疑似错位] candidate=${nextCandidate?.key || nextCandidate?.geek_id || "unknown"} ` +
+                `card=${normalizeText(cardProfile?.name || "-")} dom=${normalizeText(domCandidateInfo?.name || "-")}，尝试重试一次点击+监听。`
+              );
+              try {
+                const retryCaptureStartedAt = Date.now();
+                await this.clickCandidate(nextCandidate);
+                const retryDetailOpen = await this.ensureDetailOpen();
+                if (retryDetailOpen) {
+                  networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
+                    nextCandidate,
+                    NETWORK_RESUME_RETRY_WAIT_MS,
+                    { minTs: retryCaptureStartedAt }
+                  );
+                  if (!normalizeText(networkCandidateInfo?.resumeText)) {
+                    const retryDomCandidateInfo = await this.extractResumeTextFromDom(nextCandidate);
+                    if (retryDomCandidateInfo && isDomProfileConsistentWithCard(cardProfile, retryDomCandidateInfo)) {
+                      domCandidateInfo = retryDomCandidateInfo;
+                    } else {
+                      domCandidateInfo = null;
+                    }
+                  } else {
+                    domCandidateInfo = null;
+                  }
+                } else {
+                  domCandidateInfo = null;
+                }
+              } catch (retryError) {
+                domCandidateInfo = null;
+                this.recordResumeNetworkDiagnostic({
+                  kind: "dom_profile_mismatch_retry_failed",
+                  candidate_key: normalizeText(nextCandidate?.key || nextCandidate?.geek_id || ""),
+                  error: normalizeText(retryError?.message || retryError)
+                });
+              }
+            }
           }
           const resumeCandidateInfo = networkCandidateInfo?.resumeText ? networkCandidateInfo : domCandidateInfo;
-          candidateProfile = {
-            name: resumeCandidateInfo?.name || nextCandidate.name || "",
-            school: resumeCandidateInfo?.school || nextCandidate.school || "",
-            major: resumeCandidateInfo?.major || nextCandidate.major || "",
-            company: resumeCandidateInfo?.company || nextCandidate.last_company || "",
-            position: resumeCandidateInfo?.position || nextCandidate.last_position || ""
-          };
+          candidateProfile = mergeCandidateProfiles(
+            resumeCandidateInfo || null,
+            cardProfile || null,
+            {
+              name: nextCandidate.name || "",
+              school: nextCandidate.school || "",
+              major: nextCandidate.major || "",
+              company: nextCandidate.last_company || "",
+              position: nextCandidate.last_position || ""
+            }
+          );
 
           if (networkCandidateInfo?.resumeText) {
             screening = await this.callTextModel(networkCandidateInfo.resumeText);
