@@ -1,6 +1,19 @@
 import assert from "node:assert/strict";
 import { parseRecommendInstruction } from "./parser.js";
 
+const REPRODUCTION_INSTRUCTION = `启动boss推荐任务。条件如下：
+
+页面选择：推荐；
+学校标签：985/211/国内外名校；
+学历：本科及以上；
+性别：不限；
+是否过滤近14天看过：近14天没有；
+目标筛选数：152；
+通过筛选后动作：打招呼；
+最大招呼数：152；
+岗位：研发工程师（AI应用方向）-2026届校招 _ 杭州；
+筛选条件：需同时满足全部条件：1）如果有本科学历，本科学历必须为 211 及以上或 QS 前 500 海外院校；2）至少一段学历为 985、QS 前 100 海外院校或中科院；3）具备大模型 / AI / 图形学 / 计算机视觉 / 3D相关的算法或工程经验（实习、项目、科研均可）。学校是否是985、211、qs排名等判断如果简历内没有明确标明，需要通过学校名称来判断；4）必须是25年应届生或者26年应届生或者27年应届生，除了标签以外需要通过人选最高学历的求学年份判断（比如：本科简历里写了2021 - 2025，应该理解为25年毕业，属于25年应届生）；5）年龄必须35岁以内。`;
+
 function testNeedConfirmationIncludesPostAction() {
   const result = parseRecommendInstruction({
     instruction: "推荐页上筛选985男生，近14天没有，有大模型平台经验，符合标准的收藏",
@@ -606,6 +619,85 @@ function testPageScopeOverrideShouldNotBypassConfirmation() {
   assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
 }
 
+function testExplicitCriteriaBlockShouldKeepAllCoreRulesAndExcludeMetaFields() {
+  const result = parseRecommendInstruction({
+    instruction: REPRODUCTION_INSTRUCTION,
+    confirmation: null,
+    overrides: null
+  });
+  const criteria = result.screenParams.criteria || "";
+
+  assert.equal(criteria.includes("需同时满足全部条件"), true);
+  assert.equal(criteria.includes("1）如果有本科学历，本科学历必须为 211 及以上或 QS 前 500 海外院校"), true);
+  assert.equal(criteria.includes("2）至少一段学历为 985、QS 前 100 海外院校或中科院"), true);
+  assert.equal(criteria.includes("3）具备大模型 / AI / 图形学 / 计算机视觉 / 3D相关的算法或工程经验"), true);
+  assert.equal(criteria.includes("4）必须是25年应届生或者26年应届生或者27年应届生"), true);
+  assert.equal(criteria.includes("5）年龄必须35岁以内"), true);
+
+  assert.equal(criteria.includes("页面选择"), false);
+  assert.equal(criteria.includes("目标筛选数"), false);
+  assert.equal(criteria.includes("通过筛选后动作"), false);
+  assert.equal(criteria.includes("最大招呼数"), false);
+  assert.equal(criteria.includes("岗位"), false);
+}
+
+function testFallbackCriteriaShouldStillWorkWithoutExplicitMarker() {
+  const result = parseRecommendInstruction({
+    instruction: "页面选择：推荐；学校标签：985/211；岗位：算法工程师；候选人需满足至少两段 AI 项目经验；最大招呼数：20；",
+    confirmation: null,
+    overrides: null
+  });
+  const criteria = result.screenParams.criteria || "";
+
+  assert.equal(criteria.includes("至少两段 AI 项目经验"), true);
+  assert.equal(criteria.includes("页面选择"), false);
+  assert.equal(criteria.includes("岗位"), false);
+  assert.equal(criteria.includes("最大招呼数"), false);
+}
+
+function testOverrideCriteriaShouldHaveHighestPriorityOverExplicitCriteriaBlock() {
+  const result = parseRecommendInstruction({
+    instruction: REPRODUCTION_INSTRUCTION,
+    confirmation: null,
+    overrides: {
+      criteria: "只看有开源 Agent 项目经验的人选"
+    }
+  });
+
+  assert.equal(result.screenParams.criteria, "只看有开源 Agent 项目经验的人选");
+}
+
+function testFallbackCriteriaShouldNotDropReal985211QsRules() {
+  const result = parseRecommendInstruction({
+    instruction: "页面选择：推荐；目标筛选数：10；至少一段学历为985或QS前100海外院校；如果有本科学历，本科必须211或QS前500；岗位：算法工程师；",
+    confirmation: null,
+    overrides: null
+  });
+  const criteria = result.screenParams.criteria || "";
+
+  assert.equal(criteria.includes("985"), true);
+  assert.equal(criteria.includes("QS前100"), true);
+  assert.equal(criteria.includes("211"), true);
+  assert.equal(criteria.includes("QS前500"), true);
+}
+
+function testMetaHintsShouldBeProposedFromInstruction() {
+  const result = parseRecommendInstruction({
+    instruction: `页面选择：推荐；目标筛选数：5；通过筛选后动作：打招呼；最大招呼数：3；岗位：研发工程师（AI应用方向）-2026届校招 _ 杭州；筛选条件：需同时满足全部条件：1）具备AI经验；`,
+    confirmation: null,
+    overrides: null
+  });
+
+  assert.equal(result.proposed_page_scope, "recommend");
+  assert.equal(result.proposed_target_count, 5);
+  assert.equal(result.proposed_post_action, "greet");
+  assert.equal(result.proposed_max_greet_count, 3);
+  assert.equal(result.job_selection_hint, "研发工程师（AI应用方向）-2026届校招 _ 杭州");
+  assert.equal(result.screenParams.target_count, null);
+  assert.equal(result.screenParams.post_action, null);
+  assert.equal(result.screenParams.max_greet_count, null);
+}
+
 function main() {
   testNeedConfirmationIncludesPostAction();
   testConfirmedPostActionAndOverrides();
@@ -639,6 +731,11 @@ function main() {
   testLatestKeywordShouldProposeLatestPageScope();
   testConfirmedPageScopeShouldBeResolved();
   testPageScopeOverrideShouldNotBypassConfirmation();
+  testExplicitCriteriaBlockShouldKeepAllCoreRulesAndExcludeMetaFields();
+  testFallbackCriteriaShouldStillWorkWithoutExplicitMarker();
+  testOverrideCriteriaShouldHaveHighestPriorityOverExplicitCriteriaBlock();
+  testFallbackCriteriaShouldNotDropReal985211QsRules();
+  testMetaHintsShouldBeProposedFromInstruction();
   console.log("parser tests passed");
 }
 

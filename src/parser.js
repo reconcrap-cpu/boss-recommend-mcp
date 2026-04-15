@@ -86,26 +86,33 @@ const RECENT_NOT_VIEW_NEGATIVE_PATTERNS = [
   /保留[^。；;\n]{0,12}14天/i
 ];
 const TARGET_COUNT_PATTERNS = [
+  /目标筛选数(?:量)?(?:为|是|:|：)?\s*(\d+)/i,
+  /目标通过数(?:量)?(?:为|是|:|：)?\s*(\d+)/i,
   /目标(?:处理|筛选|通过)?(?:人数|数量)?(?:为|是|:|：)?\s*(\d+)/i,
   /至少(?:处理|筛选|通过)\s*(\d+)\s*(?:位|人)/i,
   /(?:处理|筛选|通过)\s*(\d+)\s*(?:位|人)/i
 ];
 const MAX_GREET_COUNT_PATTERNS = [
+  /最大招呼数(?:量)?(?:为|是|:|：)?\s*(\d+)/i,
+  /最大(?:打招呼|招呼|沟通|联系)(?:人数|数量|数)?(?:为|是|:|：)?\s*(\d+)/i,
   /最多(?:打招呼|沟通|联系)\s*(\d+)\s*(?:位|人|个)?/i,
   /(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多)(?:为|是|:|：)?\s*(\d+)/i
 ];
-const FILTER_CLAUSE_PATTERNS = [
-  /学校标签|院校标签|985|211|双一流|留学|国内外名校|公办本科/i,
-  /学历|学位|教育|初中及以下|中专|中技|高中|大专|专科|本科|硕士|研究生|博士/i,
-  /性别|男生|女生|男性|女性|男\b|女\b/i,
-  /近?14天(?:内)?没有|近?14天(?:内)?没看过|近?14天(?:内)?未查看|过滤[^。；;\n]{0,12}14天|排除[^。；;\n]{0,12}14天/i,
-  /目标(?:处理|筛选|通过)?(?:人数|数量)?|至少(?:处理|筛选|通过)|(?:处理|筛选|通过)\s*\d+\s*(?:位|人)/i,
-  /最多(?:打招呼|沟通|联系)|(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多)/i,
-  /收藏|打招呼|直接沟通|什么也不做|不做任何操作|不操作|仅筛选|只筛选/i
+const CRITERIA_EXPLICIT_MARKER_PATTERN = /筛选条件\s*[：:]/i;
+const CRITERIA_EXPLICIT_STOP_PATTERN = /(?:^|[\n；;])\s*(?:页面选择|学校标签|院校标签|学历|学位|性别|是否过滤近14天看过|目标筛选数|目标通过人数|通过筛选后动作|最大招呼数|最大打招呼数|岗位)\s*[：:]/i;
+const CRITERIA_META_FIELD_PREFIX_PATTERNS = [
+  /^(?:页面选择|学校标签|院校标签|学历|学位|性别|是否过滤近14天看过|目标筛选数|目标通过人数|通过筛选后动作|最大招呼数|最大打招呼数|岗位)\s*(?:[:：]|$)/i,
+  /^(?:近?14天(?:内)?(?:没有|没看过|未查看)|(?:不过滤|保留|过滤|排除)[^。；;\n]{0,12}14天)\s*(?:[:：]|$)?/i,
+  /^(?:目标(?:处理|筛选|通过)?(?:人数|数量)?|至少(?:处理|筛选|通过)|(?:处理|筛选|通过)\s*\d+\s*(?:位|人))(?:[:：\s]|$)/i,
+  /^(?:最多(?:打招呼|沟通|联系)|(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多))(?:[:：\s]|$)/i,
+  /^(?:(?:通过筛选后)?动作|post[_\s-]?action|max[_\s-]?greet[_\s-]?count|target[_\s-]?count)\s*(?:[:：]|$)/i
 ];
 const META_CLAUSE_PATTERNS = [
-  /推荐页|推荐页面|boss推荐/i,
-  /帮我|请|运行|skill/i
+  /^推荐页|^推荐页面|^boss推荐/i,
+  /^帮我|^请|^运行|^使用.*skill/i,
+  /^启动boss推荐任务/i,
+  /^条件如下(?:[:：]|$)/i,
+  /^(?:符合标准(?:的人选)?(?:都)?(?:的)?(?:动作)?[:：]?\s*)?(?:收藏|打招呼|直接沟通|什么也不做|不做任何操作|不操作|仅筛选|只筛选)(?:[:：]|$)/i
 ];
 const FEATURED_SCOPE_PATTERN = /(?:精选牛人|精选页|精选页面|精选tab|精选标签|tab[^。；;\n]{0,6}精选|精选)/i;
 const LATEST_SCOPE_PATTERN = /(?:最新页|最新页面|最新tab|最新标签|tab[^。；;\n]{0,6}最新|最新)/i;
@@ -394,6 +401,13 @@ function extractMaxGreetCount(text) {
   return null;
 }
 
+function extractJobSelectionHint(text) {
+  const normalized = String(text || "").replace(/\r\n/g, "\n");
+  const match = normalized.match(/(?:^|[\n；;])\s*(?:岗位|职位|job)\s*[：:]\s*([^\n；;]+)/i);
+  if (!match?.[1]) return null;
+  return normalizeText(String(match[1] || "").replace(/[。；;]+$/, "").trim());
+}
+
 function sanitizeClause(clause) {
   let current = normalizeText(clause);
   for (const pattern of LEADING_NOISE_PATTERNS) {
@@ -408,25 +422,128 @@ function sanitizeClause(clause) {
   return current;
 }
 
-function buildCriteria(text, overrideCriteria) {
-  const normalizedOverride = normalizeText(overrideCriteria);
-  if (normalizedOverride) {
-    return normalizedOverride;
+function isMetaClause(clause) {
+  const normalized = sanitizeClause(clause);
+  if (!normalized) return true;
+  const withoutNumbering = normalized.replace(/^\d+\s*[)）]\s*/, "").trim();
+  if (!withoutNumbering) return true;
+  if (CRITERIA_META_FIELD_PREFIX_PATTERNS.some((pattern) => pattern.test(withoutNumbering))) return true;
+  if (META_CLAUSE_PATTERNS.some((pattern) => pattern.test(withoutNumbering))) return true;
+  return false;
+}
+
+function splitRawCriteriaClauses(text) {
+  const normalized = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) return [];
+  const firstNumberedIndex = normalized.search(/\d+\s*[)）]/);
+  if (firstNumberedIndex === -1) {
+    return normalized
+      .split(/[；;\n]+/)
+      .map((item) => String(item || "").trim())
+      .filter(Boolean);
   }
 
-  const clauses = sanitizeInstruction(text)
-    .split(/[，,。；;\n]/)
-    .map((item) => sanitizeClause(item))
+  const prefix = normalized
+    .slice(0, firstNumberedIndex)
+    .replace(/[；;，,。]+$/, "")
+    .trim();
+  const numberedClauses = normalized
+    .slice(firstNumberedIndex)
+    .split(/(?=\d+\s*[)）])/)
+    .map((item) => String(item || "").trim())
     .filter(Boolean);
 
-  const filtered = clauses.filter((clause) => {
-    if (FILTER_CLAUSE_PATTERNS.some((pattern) => pattern.test(clause))) return false;
-    if (META_CLAUSE_PATTERNS.some((pattern) => pattern.test(clause))) return false;
-    return true;
-  });
+  return prefix ? [prefix, ...numberedClauses] : numberedClauses;
+}
 
-  const result = uniqueList(filtered.map(normalizeText)).join("；");
-  return result || null;
+function normalizeRawCriteriaClauses(clauses = []) {
+  const filtered = clauses
+    .map((item) => String(item || "").replace(/^[；;，,。]+/, "").replace(/[；;，,。]+$/, "").trim())
+    .filter(Boolean)
+    .filter((item) => !isMetaClause(item));
+  const unique = uniqueList(filtered);
+  if (!unique.length) return null;
+  return unique.reduce((acc, clause) => {
+    if (!acc) return clause;
+    if (/[：:]$/.test(acc) && /^\d+\s*[)）]/.test(clause)) {
+      return `${acc}${clause}`;
+    }
+    return `${acc}；${clause}`;
+  }, "");
+}
+
+function normalizeCriteriaClauses(clauses = []) {
+  const filtered = clauses
+    .map((item) => sanitizeClause(item))
+    .map((item) => item.replace(/^[；;，,。]+/, "").replace(/[；;，,。]+$/, "").trim())
+    .filter(Boolean)
+    .filter((item) => !isMetaClause(item));
+  const unique = uniqueList(filtered.map((item) => normalizeText(item)));
+  if (!unique.length) return null;
+  return unique.reduce((acc, clause) => {
+    if (!acc) return clause;
+    if (/[：:]$/.test(acc) && /^\d+\s*[)）]/.test(clause)) {
+      return `${acc}${clause}`;
+    }
+    return `${acc}；${clause}`;
+  }, "");
+}
+
+function extractExplicitCriteriaBlock(text) {
+  const normalizedText = String(text || "").replace(/\r\n/g, "\n");
+  const markerMatch = normalizedText.match(CRITERIA_EXPLICIT_MARKER_PATTERN);
+  if (!markerMatch) return {
+    raw: null,
+    normalized: null
+  };
+
+  let block = normalizedText.slice(markerMatch.index + markerMatch[0].length);
+  const stopMatch = block.match(CRITERIA_EXPLICIT_STOP_PATTERN);
+  if (stopMatch && stopMatch.index > 0) {
+    block = block.slice(0, stopMatch.index);
+  }
+  const rawClauses = splitRawCriteriaClauses(block);
+  return {
+    raw: normalizeRawCriteriaClauses(rawClauses),
+    normalized: normalizeCriteriaClauses(rawClauses)
+  };
+}
+
+function buildFallbackCriteria(text) {
+  const clauses = sanitizeInstruction(text)
+    .split(/[，,。；;\n]/)
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  return {
+    raw: normalizeRawCriteriaClauses(clauses),
+    normalized: normalizeCriteriaClauses(clauses)
+  };
+}
+
+function buildCriteria({ instruction, rawInstruction, overrideCriteria }) {
+  const rawOverride = String(overrideCriteria || "").trim();
+  const normalizedOverride = normalizeText(rawOverride);
+  if (normalizedOverride) {
+    return {
+      raw: rawOverride || normalizedOverride,
+      normalized: normalizedOverride,
+      source: "override"
+    };
+  }
+
+  const explicitCriteria = extractExplicitCriteriaBlock(rawInstruction || instruction);
+  if (explicitCriteria.raw) {
+    return {
+      ...explicitCriteria,
+      source: "explicit"
+    };
+  }
+
+  const fallbackCriteria = buildFallbackCriteria(rawInstruction || instruction);
+  return {
+    ...fallbackCriteria,
+    source: fallbackCriteria.raw ? "fallback" : null
+  };
 }
 
 function resolvePostAction({ instruction, confirmation, overrides }) {
@@ -550,7 +667,8 @@ function collectSuspiciousFields({ invalidOverrideSchoolTags, maxGreetCountResol
 }
 
 export function parseRecommendInstruction({ instruction, confirmation, overrides }) {
-  const text = normalizeText(instruction);
+  const rawInstruction = String(instruction || "");
+  const text = normalizeText(rawInstruction);
   const detectedSchoolTags = extractSchoolTags(text);
   const detectedDegrees = extractDegrees(text);
   const schoolTagAudit = auditSchoolTagSelections(overrides?.school_tag);
@@ -563,7 +681,17 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const overrideRecentNotView = normalizeRecentNotView(overrides?.recent_not_view);
   const confirmationRecentNotView = normalizeRecentNotView(confirmation?.recent_not_view_value);
   const overrideCriteria = overrides?.criteria;
-  const jobSelectionHint = normalizeText(overrides?.job || confirmation?.job_value || "");
+  const criteriaResolution = buildCriteria({
+    instruction: text,
+    rawInstruction,
+    overrideCriteria
+  });
+  const jobSelectionHint = normalizeText(
+    overrides?.job
+    || confirmation?.job_value
+    || extractJobSelectionHint(rawInstruction)
+    || ""
+  );
   const pageScopeResolution = resolvePageScope({ instruction: text, confirmation, overrides });
 
   const inferredSchoolTag = detectedSchoolTags.length > 0
@@ -584,7 +712,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     recent_not_view: overrideRecentNotView || confirmationRecentNotView || extractRecentNotView(text) || "不限"
   };
   const screenParams = {
-    criteria: buildCriteria(text, overrideCriteria),
+    criteria: criteriaResolution.raw || criteriaResolution.normalized || null,
     target_count: null,
     post_action: null,
     max_greet_count: null
@@ -765,6 +893,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     needs_post_action_confirmation,
     needs_max_greet_count_confirmation,
     needs_page_confirmation,
+    criteria_normalized: criteriaResolution.normalized,
     proposed_target_count: targetCountResolution.proposed_target_count,
     proposed_post_action: postActionResolution.proposed_post_action,
     proposed_max_greet_count: maxGreetCountResolution.proposed_max_greet_count,
@@ -777,13 +906,17 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       extracted_search_params: searchParams,
       extracted_screen_params: {
         criteria: screenParams.criteria,
+        criteria_normalized: criteriaResolution.normalized,
         target_count: targetCountResolution.proposed_target_count,
         post_action: postActionResolution.proposed_post_action,
         max_greet_count: maxGreetCountResolution.proposed_max_greet_count
       },
       current_page_scope: pageScopeResolution.page_scope,
       current_search_params: searchParams,
-      current_screen_params: screenParams,
+      current_screen_params: {
+        ...screenParams,
+        criteria_normalized: criteriaResolution.normalized
+      },
       missing_fields,
       suspicious_fields,
       pending_questions
