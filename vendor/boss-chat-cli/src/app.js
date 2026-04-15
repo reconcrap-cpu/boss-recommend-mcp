@@ -76,7 +76,7 @@ export class BossChatApp {
     logger = console,
     dryRun = false,
     artifactRootDir = '',
-    resumeOpenCooldownMs = 16000,
+    resumeOpenCooldownMs = 3000,
     onProgress = null,
   }) {
     this.page = page;
@@ -93,7 +93,7 @@ export class BossChatApp {
     this.resumeOpenBlockedUntil = 0;
     this.resumeOpenCooldownMs = Number.isFinite(Number(resumeOpenCooldownMs))
       ? Math.max(0, Number(resumeOpenCooldownMs))
-      : 16000;
+      : 3000;
     this.onProgress = typeof onProgress === 'function' ? onProgress : null;
   }
 
@@ -555,7 +555,7 @@ export class BossChatApp {
       let capture = null;
       let lastResumeError = null;
       let resumeProfile = null;
-      await this.waitResumeOpenCooldown(this.resumeOpenCooldownMs + Math.floor(Math.random() * 1800));
+      await this.waitResumeOpenCooldown(this.resumeOpenCooldownMs + Math.floor(Math.random() * 200));
       await this.checkpoint();
       const openResult = await this.page.openOnlineResume();
       let openDetected = openResult ? Boolean(openResult?.detectedOpen) : true;

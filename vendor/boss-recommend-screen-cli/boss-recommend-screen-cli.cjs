@@ -4931,12 +4931,12 @@ class RecommendScreenCli {
   async takeBreakIfNeeded() {
     this.restCounter += 1;
     if (Math.random() < 0.08) {
-      const pauseMs = 3000 + Math.floor(Math.random() * 4000);
+      const pauseMs = 0;
       log(`[随机休息] 暂停 ${Math.round(pauseMs / 1000)} 秒`);
       await sleep(pauseMs);
     }
     if (this.restCounter >= this.restThreshold) {
-      const pauseMs = 15000 + Math.floor(Math.random() * 15000);
+      const pauseMs = 0;
       log(`[批次休息] 已连续处理 ${this.restCounter} 人，暂停 ${Math.round(pauseMs / 1000)} 秒`);
       await sleep(pauseMs);
       this.restCounter = 0;
