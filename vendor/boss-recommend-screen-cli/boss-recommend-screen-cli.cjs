@@ -3305,6 +3305,60 @@ class RecommendScreenCli {
     return info;
   }
 
+  async resolveDomResumeFallback(candidate, cardProfile) {
+    let domCandidateInfo = await this.extractResumeTextFromDom(candidate);
+    let networkCandidateInfo = null;
+    if (domCandidateInfo && !isDomProfileConsistentWithCard(cardProfile, domCandidateInfo)) {
+      this.recordResumeNetworkDiagnostic({
+        kind: "dom_profile_mismatch",
+        candidate_key: normalizeText(candidate?.key || candidate?.geek_id || ""),
+        card_name: normalizeText(cardProfile?.name || ""),
+        dom_name: normalizeText(domCandidateInfo?.name || ""),
+        card_school: normalizeText(cardProfile?.school || ""),
+        dom_school: normalizeText(domCandidateInfo?.school || "")
+      });
+      log(
+        `[DOM简历疑似错位] candidate=${candidate?.key || candidate?.geek_id || "unknown"} ` +
+        `card=${normalizeText(cardProfile?.name || "-")} dom=${normalizeText(domCandidateInfo?.name || "-")}，尝试重试一次点击+监听。`
+      );
+      try {
+        const retryCaptureStartedAt = Date.now();
+        await this.clickCandidate(candidate);
+        const retryDetailOpen = await this.ensureDetailOpen();
+        if (retryDetailOpen) {
+          networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
+            candidate,
+            NETWORK_RESUME_RETRY_WAIT_MS,
+            { minTs: retryCaptureStartedAt }
+          );
+          if (!normalizeText(networkCandidateInfo?.resumeText)) {
+            const retryDomCandidateInfo = await this.extractResumeTextFromDom(candidate);
+            if (retryDomCandidateInfo && isDomProfileConsistentWithCard(cardProfile, retryDomCandidateInfo)) {
+              domCandidateInfo = retryDomCandidateInfo;
+            } else {
+              domCandidateInfo = null;
+            }
+          } else {
+            domCandidateInfo = null;
+          }
+        } else {
+          domCandidateInfo = null;
+        }
+      } catch (retryError) {
+        domCandidateInfo = null;
+        this.recordResumeNetworkDiagnostic({
+          kind: "dom_profile_mismatch_retry_failed",
+          candidate_key: normalizeText(candidate?.key || candidate?.geek_id || ""),
+          error: normalizeText(retryError?.message || retryError)
+        });
+      }
+    }
+    return {
+      domCandidateInfo,
+      networkCandidateInfo
+    };
+  }
+
   handleNetworkRequestWillBeSent(params) {
     const url = normalizeText(params?.request?.url || "");
     const postData = params?.request?.postData || "";
@@ -5222,82 +5276,69 @@ class RecommendScreenCli {
               }
             );
           }
-          if (!normalizeText(networkCandidateInfo?.resumeText)) {
-            domCandidateInfo = await this.extractResumeTextFromDom(nextCandidate);
-            if (domCandidateInfo && !isDomProfileConsistentWithCard(cardProfile, domCandidateInfo)) {
-              this.recordResumeNetworkDiagnostic({
-                kind: "dom_profile_mismatch",
-                candidate_key: normalizeText(nextCandidate?.key || nextCandidate?.geek_id || ""),
-                card_name: normalizeText(cardProfile?.name || ""),
-                dom_name: normalizeText(domCandidateInfo?.name || ""),
-                card_school: normalizeText(cardProfile?.school || ""),
-                dom_school: normalizeText(domCandidateInfo?.school || "")
-              });
-              log(
-                `[DOM简历疑似错位] candidate=${nextCandidate?.key || nextCandidate?.geek_id || "unknown"} ` +
-                `card=${normalizeText(cardProfile?.name || "-")} dom=${normalizeText(domCandidateInfo?.name || "-")}，尝试重试一次点击+监听。`
-              );
-              try {
-                const retryCaptureStartedAt = Date.now();
-                await this.clickCandidate(nextCandidate);
-                const retryDetailOpen = await this.ensureDetailOpen();
-                if (retryDetailOpen) {
-                  networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
-                    nextCandidate,
-                    NETWORK_RESUME_RETRY_WAIT_MS,
-                    { minTs: retryCaptureStartedAt }
-                  );
-                  if (!normalizeText(networkCandidateInfo?.resumeText)) {
-                    const retryDomCandidateInfo = await this.extractResumeTextFromDom(nextCandidate);
-                    if (retryDomCandidateInfo && isDomProfileConsistentWithCard(cardProfile, retryDomCandidateInfo)) {
-                      domCandidateInfo = retryDomCandidateInfo;
-                    } else {
-                      domCandidateInfo = null;
-                    }
-                  } else {
-                    domCandidateInfo = null;
-                  }
-                } else {
-                  domCandidateInfo = null;
-                }
-              } catch (retryError) {
-                domCandidateInfo = null;
-                this.recordResumeNetworkDiagnostic({
-                  kind: "dom_profile_mismatch_retry_failed",
-                  candidate_key: normalizeText(nextCandidate?.key || nextCandidate?.geek_id || ""),
-                  error: normalizeText(retryError?.message || retryError)
-                });
-              }
-            }
-          }
-          const resumeCandidateInfo = networkCandidateInfo?.resumeText ? networkCandidateInfo : domCandidateInfo;
-          candidateProfile = mergeCandidateProfiles(
-            resumeCandidateInfo || null,
-            cardProfile || null,
-            {
-              name: nextCandidate.name || "",
-              school: nextCandidate.school || "",
-              major: nextCandidate.major || "",
-              company: nextCandidate.last_company || "",
-              position: nextCandidate.last_position || ""
-            }
-          );
 
           if (networkCandidateInfo?.resumeText) {
             screening = await this.callTextModel(networkCandidateInfo.resumeText);
             resumeSource = "network";
             resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
             this.resumeSourceStats.network += 1;
-          } else if (domCandidateInfo?.resumeText) {
-            screening = await this.callTextModel(domCandidateInfo.resumeText);
-            resumeSource = "dom_fallback";
-            resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
-            this.resumeSourceStats.dom_fallback += 1;
+            candidateProfile = mergeCandidateProfiles(
+              networkCandidateInfo || null,
+              cardProfile || null,
+              {
+                name: nextCandidate.name || "",
+                school: nextCandidate.school || "",
+                major: nextCandidate.major || "",
+                company: nextCandidate.last_company || "",
+                position: nextCandidate.last_position || ""
+              }
+            );
           } else {
-            resumeSource = "image_fallback";
-            capture = await this.captureResumeImage(nextCandidate);
-            screening = await this.callVisionModel(capture.stitchedImage);
-            this.resumeSourceStats.image_fallback += 1;
+            try {
+              resumeSource = "image_fallback";
+              capture = await this.captureResumeImage(nextCandidate);
+              screening = await this.callVisionModel(capture.stitchedImage);
+              this.resumeSourceStats.image_fallback += 1;
+            } catch (imageFallbackError) {
+              const domFallback = await this.resolveDomResumeFallback(nextCandidate, cardProfile || null);
+              if (domFallback?.networkCandidateInfo?.resumeText) {
+                networkCandidateInfo = domFallback.networkCandidateInfo;
+                screening = await this.callTextModel(networkCandidateInfo.resumeText);
+                resumeSource = "network";
+                resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
+                this.resumeSourceStats.network += 1;
+                candidateProfile = mergeCandidateProfiles(
+                  networkCandidateInfo || null,
+                  cardProfile || null,
+                  {
+                    name: nextCandidate.name || "",
+                    school: nextCandidate.school || "",
+                    major: nextCandidate.major || "",
+                    company: nextCandidate.last_company || "",
+                    position: nextCandidate.last_position || ""
+                  }
+                );
+              } else if (domFallback?.domCandidateInfo?.resumeText) {
+                domCandidateInfo = domFallback.domCandidateInfo;
+                screening = await this.callTextModel(domCandidateInfo.resumeText);
+                resumeSource = "dom_fallback";
+                resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
+                this.resumeSourceStats.dom_fallback += 1;
+                candidateProfile = mergeCandidateProfiles(
+                  domCandidateInfo || null,
+                  cardProfile || null,
+                  {
+                    name: nextCandidate.name || "",
+                    school: nextCandidate.school || "",
+                    major: nextCandidate.major || "",
+                    company: nextCandidate.last_company || "",
+                    position: nextCandidate.last_position || ""
+                  }
+                );
+              } else {
+                throw imageFallbackError;
+              }
+            }
           }
           this.resetResumeCaptureFailureStreak();
           log(`筛选结果: ${screening.passed ? "通过" : "不通过"}`);

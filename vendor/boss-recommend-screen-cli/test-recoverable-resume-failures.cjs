@@ -467,7 +467,7 @@ async function testRecommendShouldPreferNetworkResumeWhenAvailable() {
   assert.equal(result.result.resume_source, "network");
 }
 
-async function testNetworkMissShouldFallbackToDomBeforeImageCapture() {
+async function testNetworkMissShouldFallbackToImageThenDom() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-network-dom-fallback-"));
   const candidate = { key: "dom-1", geek_id: "dom-1", name: "dom candidate" };
   const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
@@ -485,13 +485,15 @@ async function testNetworkMissShouldFallbackToDomBeforeImageCapture() {
   });
 
   cli.waitForNetworkResumeCandidateInfo = async () => null;
+  let captureAttempted = false;
   cli.callTextModel = async (resumeText) => ({
     passed: true,
     reason: resumeText.includes("华中科技大学") ? "dom fallback used" : "unexpected",
     summary: "dom fallback used"
   });
   cli.captureResumeImage = async () => {
-    throw new Error("capture should not be called when dom fallback resume exists");
+    captureAttempted = true;
+    throw new Error("capture failed, should fallback to dom");
   };
 
   const result = await cli.run();
@@ -501,6 +503,7 @@ async function testNetworkMissShouldFallbackToDomBeforeImageCapture() {
   assert.equal(cli.passedCandidates.length, 1);
   assert.equal(cli.passedCandidates[0].school, "华中科技大学");
   assert.equal(cli.passedCandidates[0].resumeSource, "dom_fallback");
+  assert.equal(captureAttempted, true);
 }
 
 async function testNetworkMissShouldFallbackToImageCapture() {
@@ -600,7 +603,7 @@ function testLatestPayloadShouldRemainAvailableWhenCandidateKeyMissing() {
     key: "",
     geek_id: ""
   });
-  assert.equal(extracted?.resumeText, "recent resume payload");
+  assert.equal(extracted?.candidateInfo?.resumeText, "recent resume payload");
 }
 
 async function testVisionModelFailureShouldSkipCandidateAndContinue() {
@@ -638,25 +641,44 @@ async function testVisionModelFailureShouldSkipCandidateAndContinue() {
   assert.equal(result.result.skipped_count, 1);
 }
 
-async function testFeaturedNetworkMissShouldSkipWithoutImageCapture() {
+async function testFeaturedNetworkMissShouldFallbackToDomAfterImageFailure() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-featured-network-only-"));
   const args = createArgs(tempDir);
   args.pageScope = "featured";
   const candidate = { key: "featured-no-network", geek_id: "featured-no-network", name: "featured no network" };
   const cli = new FakeRecommendScreenCli(args, {
-    candidates: [candidate]
+    candidates: [candidate],
+    domResumeByKey: new Map([
+      ["featured-no-network", {
+        name: "featured no network",
+        school: "华中科技大学",
+        major: "软件工程",
+        company: "测试公司",
+        position: "后端工程师",
+        resumeText: "featured network miss 后应在截图失败后走 DOM 兜底。"
+      }]
+    ])
   });
   cli.waitForNetworkResumeCandidateInfo = async () => null;
+  let captureAttempted = false;
+  cli.callTextModel = async () => ({
+    passed: true,
+    reason: "dom fallback used",
+    summary: "dom fallback used"
+  });
   cli.captureResumeImage = async () => {
-    throw new Error("capture should not be called for featured scope");
+    captureAttempted = true;
+    throw new Error("capture failed for featured scope");
   };
 
   const result = await cli.run();
   assert.equal(result.status, "COMPLETED");
   assert.equal(result.result.processed_count, 1);
-  assert.equal(result.result.passed_count, 0);
-  assert.equal(result.result.skipped_count, 1);
-  assert.equal(result.result.resume_source, "network");
+  assert.equal(result.result.passed_count, 1);
+  assert.equal(result.result.skipped_count, 0);
+  assert.equal(result.result.resume_source, "dom_fallback");
+  assert.equal(captureAttempted, true);
+  assert.equal(cli.passedCandidates[0].resumeSource, "dom_fallback");
 }
 
 async function testFeaturedFavoriteShouldNotUseDomFallback() {
@@ -1461,14 +1483,14 @@ async function main() {
   await testTargetCountShouldNotTreatProcessedCountAsReached();
   await testFeaturedShouldUseNetworkResumeOnly();
   await testRecommendShouldPreferNetworkResumeWhenAvailable();
-  await testNetworkMissShouldFallbackToDomBeforeImageCapture();
+  await testNetworkMissShouldFallbackToImageThenDom();
   await testNetworkMissShouldFallbackToImageCapture();
   await testLatestShouldPreferNetworkResumeWhenAvailable();
   await testLatestNetworkMissShouldFallbackToImageCapture();
   testLatestPayloadShouldNotLeakAcrossCandidates();
   testLatestPayloadShouldRemainAvailableWhenCandidateKeyMissing();
   await testVisionModelFailureShouldSkipCandidateAndContinue();
-  await testFeaturedNetworkMissShouldSkipWithoutImageCapture();
+  await testFeaturedNetworkMissShouldFallbackToDomAfterImageFailure();
   await testFeaturedFavoriteShouldNotUseDomFallback();
   await testFeaturedFavoriteShouldSkipClickWhenAlreadyInterested();
   await testFeaturedFavoriteShouldRecognizeAlreadyFavoritedByDelThenAdd();
