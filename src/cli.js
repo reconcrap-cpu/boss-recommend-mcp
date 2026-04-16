@@ -45,6 +45,10 @@ const recommendMcpBinaryName = "boss-recommend-mcp";
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h"]);
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
+const installConfigDefaults = Object.freeze({
+  llmThinkingLevel: "low",
+  humanRestEnabled: false
+});
 
 function getSkillSourceDir(name = skillName) {
   return path.join(packageRoot, "skills", name);
@@ -655,6 +659,21 @@ function resolveCliConfigTarget(options = {}) {
   };
 }
 
+function applyMissingInstallConfigDefaults(config = {}) {
+  const nextConfig = { ...config };
+  const patchedKeys = [];
+  for (const [key, defaultValue] of Object.entries(installConfigDefaults)) {
+    if (!Object.prototype.hasOwnProperty.call(nextConfig, key)) {
+      nextConfig[key] = defaultValue;
+      patchedKeys.push(key);
+    }
+  }
+  return {
+    nextConfig,
+    patchedKeys
+  };
+}
+
 function ensureUserConfig(options = {}) {
   const { configPath, workspacePreferred } = resolveCliConfigTarget(options);
   const writeTargets = dedupePaths([configPath, workspacePreferred]).filter(Boolean);
@@ -671,7 +690,27 @@ function ensureUserConfig(options = {}) {
       }
       const stat = fs.statSync(targetPath);
       if (stat.isFile()) {
-        return { path: targetPath, created: false };
+        try {
+          const existingConfig = readJsonObjectFile(targetPath);
+          const patched = applyMissingInstallConfigDefaults(existingConfig);
+          if (patched.patchedKeys.length > 0) {
+            fs.writeFileSync(targetPath, JSON.stringify(patched.nextConfig, null, 2), "utf8");
+          }
+          return {
+            path: targetPath,
+            created: false,
+            patched: patched.patchedKeys.length > 0,
+            patched_keys: patched.patchedKeys
+          };
+        } catch (error) {
+          return {
+            path: targetPath,
+            created: false,
+            patched: false,
+            patched_keys: [],
+            patch_error: error?.message || "screening-config.json 解析失败，跳过自动补字段。"
+          };
+        }
       }
       lastError = new Error(`Config target is a directory and cannot be used as file: ${targetPath}`);
     } catch (error) {
@@ -1286,6 +1325,11 @@ function installAll(options = {}) {
       ? `screening-config.json created: ${configResult.path}`
       : `screening-config.json already exists: ${configResult.path}`
   );
+  if (Array.isArray(configResult.patched_keys) && configResult.patched_keys.length > 0) {
+    console.log(`screening-config.json patched missing defaults: ${configResult.patched_keys.join(", ")}`);
+  } else if (configResult.patch_error) {
+    console.warn(`screening-config.json skip default patch: ${configResult.patch_error}`);
+  }
   console.log(`请在该目录修改 baseUrl/apiKey/model 并替换占位词后再运行：${path.dirname(configResult.path)}`);
   console.log(`MCP config templates exported to: ${mcpTemplateResult.outputDir}`);
   for (const item of mcpTemplateResult.files) {
@@ -1482,6 +1526,11 @@ export async function runCli(argv = process.argv) {
     case "init-config": {
       const result = ensureUserConfig(options);
       console.log(result.created ? `Config template created at: ${result.path}` : `Config already exists at: ${result.path}`);
+      if (Array.isArray(result.patched_keys) && result.patched_keys.length > 0) {
+        console.log(`Config patched missing defaults: ${result.patched_keys.join(", ")}`);
+      } else if (result.patch_error) {
+        console.warn(`Config skip default patch: ${result.patch_error}`);
+      }
       break;
     }
     case "set-port": {
