@@ -21,6 +21,12 @@ const screenConfigTemplateDefaults = {
   apiKey: "replace-with-openai-api-key",
   model: "gpt-4.1-mini"
 };
+const LLM_THINKING_LEVEL_FIELDS = [
+  "llmThinkingLevel",
+  "thinkingLevel",
+  "reasoningEffort",
+  "reasoning_effort"
+];
 const DEFAULT_RECOMMEND_SCREEN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const PAGE_SCOPE_TO_TAB_STATUS = {
   recommend: "0",
@@ -365,6 +371,15 @@ function validateScreenConfig(config) {
     };
   }
   return { ok: true, reason: "OK", message: "screening-config.json 校验通过。" };
+}
+
+function resolveLlmThinkingLevel(config = {}) {
+  if (!config || typeof config !== "object") return "";
+  for (const field of LLM_THINKING_LEVEL_FIELDS) {
+    const value = String(config[field] ?? "").trim();
+    if (value) return value;
+  }
+  return "";
 }
 
 function resolveWorkspaceDebugPort(workspaceRoot) {
@@ -2917,6 +2932,10 @@ export async function runRecommendScreenCli({
   }
   if (loaded.config.openaiProject) {
     args.push("--openai-project", loaded.config.openaiProject);
+  }
+  const llmThinkingLevel = resolveLlmThinkingLevel(loaded.config);
+  if (llmThinkingLevel) {
+    args.push("--thinking-level", llmThinkingLevel);
   }
   if (Number.isInteger(screenParams.target_count) && screenParams.target_count > 0) {
     args.push("--targetCount", String(screenParams.target_count));

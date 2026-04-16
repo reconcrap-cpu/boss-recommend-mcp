@@ -16,6 +16,12 @@ const BOSS_CHAT_TERMINAL_STATES = new Set(["completed", "failed", "canceled"]);
 const CHAT_REQUIRED_FIELDS = ["job", "start_from", "target_count", "criteria"];
 export const TARGET_COUNT_ACCEPTED_EXAMPLES = ["all", -1, 20, "全部候选人"];
 const TARGET_COUNT_WRAPPER_KEYS = ["target_count", "targetCount", "value", "count", "limit"];
+const LLM_THINKING_LEVEL_FIELDS = [
+  "llmThinkingLevel",
+  "thinkingLevel",
+  "reasoningEffort",
+  "reasoning_effort"
+];
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -228,6 +234,15 @@ function validateRecommendScreenConfig(config) {
   return { ok: true };
 }
 
+function resolveLlmThinkingLevel(config = {}) {
+  if (!config || typeof config !== "object") return "";
+  for (const field of LLM_THINKING_LEVEL_FIELDS) {
+    const value = normalizeText(config[field]);
+    if (value) return value;
+  }
+  return "";
+}
+
 function resolveBossChatScreenConfig(workspaceRoot) {
   const resolution = getScreenConfigResolution(workspaceRoot);
   const configPath = resolution.resolved_path || resolution.writable_path || resolution.legacy_path || null;
@@ -274,6 +289,7 @@ function resolveBossChatScreenConfig(workspaceRoot) {
       baseUrl: normalizeText(parsed.baseUrl).replace(/\/+$/, ""),
       apiKey: normalizeText(parsed.apiKey),
       model: normalizeText(parsed.model),
+      llmThinkingLevel: resolveLlmThinkingLevel(parsed),
       debugPort: parsePositiveInteger(parsed.debugPort, 9222)
     },
     config_path: configPath,
@@ -385,6 +401,9 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     args.push("--baseurl", resolvedConfig.baseUrl);
     args.push("--apikey", resolvedConfig.apiKey);
     args.push("--model", resolvedConfig.model);
+    if (resolvedConfig.llmThinkingLevel) {
+      args.push("--thinking-level", resolvedConfig.llmThinkingLevel);
+    }
     return args;
   }
 
@@ -402,6 +421,9 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     args.push("--baseurl", resolvedConfig.baseUrl);
     args.push("--apikey", resolvedConfig.apiKey);
     args.push("--model", resolvedConfig.model);
+    if (resolvedConfig.llmThinkingLevel) {
+      args.push("--thinking-level", resolvedConfig.llmThinkingLevel);
+    }
     args.push("--port", String(normalized.port || resolvedConfig.debugPort || 9222));
     if (typeof normalized.safePacing === "boolean") {
       args.push("--safe-pacing", String(normalized.safePacing));

@@ -2,6 +2,7 @@
   "baseUrl": "https://api.openai.com/v1",
   "apiKey": "replace-with-openai-api-key",
   "model": "gpt-4.1-mini",
+  "llmThinkingLevel": "off",
   "openaiOrganization": "optional-org-id",
   "openaiProject": "optional-project-id"
 }

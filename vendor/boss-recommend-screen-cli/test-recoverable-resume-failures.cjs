@@ -238,6 +238,31 @@ function testShouldAbortResumeProbeEarly() {
   assert.equal(shouldAbort, true);
 }
 
+function testResumeViewportStabilityRequiresSettledScrollAndClip() {
+  const previous = {
+    ok: true,
+    scrollTop: 200,
+    scrollHeight: 1000,
+    clientHeight: 400,
+    maxScroll: 600,
+    clip: { x: 10, y: 20, width: 300, height: 400 }
+  };
+  const current = {
+    ok: true,
+    scrollTop: 200.5,
+    scrollHeight: 1000,
+    clientHeight: 400,
+    maxScroll: 600,
+    clip: { x: 10, y: 20, width: 300, height: 400 }
+  };
+  assert.equal(captureTestables.isStableResumeViewport(previous, current, 200), true);
+  assert.equal(captureTestables.isStableResumeViewport(previous, { ...current, scrollTop: 180 }, 200), false);
+  assert.equal(
+    captureTestables.isStableResumeViewport(previous, { ...current, clip: { ...current.clip, height: 360 } }, 200),
+    false
+  );
+}
+
 async function testSingleResumeCaptureFailureIsSkipped() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-skip-"));
   const badCandidate = { key: "bad", geek_id: "bad", name: "bad candidate" };
@@ -523,6 +548,64 @@ async function testNetworkMissShouldFallbackToImageCapture() {
   const result = await cli.run();
   assert.equal(result.status, "COMPLETED");
   assert.equal(result.result.resume_source, "image_fallback");
+}
+
+async function testImageModeShouldUseShortNetworkGraceWindow() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-image-mode-grace-"));
+  const first = { key: "img-mode-1", geek_id: "img-mode-1", name: "image mode one" };
+  const second = { key: "img-mode-2", geek_id: "img-mode-2", name: "image mode two" };
+  const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
+    candidates: [first, second],
+    captureOutcomes: new Map([
+      [first.key, { stitchedImage: path.join(tempDir, "img-mode-1.png") }],
+      [second.key, { stitchedImage: path.join(tempDir, "img-mode-2.png") }]
+    ]),
+    screeningByKey: new Map([
+      [first.key, { passed: false, reason: "image one", summary: "image one" }],
+      [second.key, { passed: false, reason: "image two", summary: "image two" }]
+    ])
+  });
+  const waits = [];
+  cli.waitForNetworkResumeCandidateInfo = async (_candidate, timeoutMs) => {
+    waits.push(timeoutMs);
+    return null;
+  };
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(cli.resumeAcquisitionMode, "image");
+  assert.deepEqual(waits.slice(-1), [__testables.NETWORK_RESUME_IMAGE_MODE_GRACE_MS]);
+}
+
+async function testImageFailureShouldLateRetryNetworkBeforeDomFallback() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-image-fail-late-network-"));
+  const candidate = { key: "late-network-1", geek_id: "late-network-1", name: "late network candidate" };
+  const cli = new FakeRecommendScreenCli(createArgs(tempDir), {
+    candidates: [candidate]
+  });
+  let domUsed = false;
+  cli.waitForNetworkResumeCandidateInfo = async (_candidate, timeoutMs) => (
+    timeoutMs === __testables.NETWORK_RESUME_LATE_RETRY_MS
+      ? { resumeText: "late network resume text" }
+      : null
+  );
+  cli.captureResumeImage = async () => {
+    throw createResumeCaptureError("image capture failed before late network");
+  };
+  cli.extractResumeTextFromDom = async () => {
+    domUsed = true;
+    return null;
+  };
+  cli.callTextModel = async () => ({
+    passed: true,
+    reason: "late network used",
+    summary: "late network used"
+  });
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(result.result.resume_source, "network");
+  assert.equal(domUsed, false);
 }
 
 async function testLatestShouldPreferNetworkResumeWhenAvailable() {
@@ -1348,6 +1431,75 @@ async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
   }
 }
 
+async function testTextModelShouldDefaultThinkingOffForVolcengine() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-thinking-off-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.args.baseUrl = "https://ark.cn-beijing.volces.com/api/v3";
+  cli.args.model = "doubao-seed-2-0-mini-260215";
+  const originalFetch = global.fetch;
+  let capturedPayload = null;
+  global.fetch = async (_url, options = {}) => {
+    capturedPayload = JSON.parse(String(options.body || "{}"));
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": false, \"reason\": \"not matched\", \"summary\": \"not matched\", \"evidence\": [\"resume\"]}"
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    await cli.callTextModel("resume");
+    assert.deepEqual(capturedPayload?.thinking, { type: "disabled" });
+    assert.equal(capturedPayload?.reasoning_effort, "minimal");
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testTextModelShouldSupportLowThinkingForVolcengine() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-thinking-low-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.args.baseUrl = "https://ark.cn-beijing.volces.com/api/v3";
+  cli.args.model = "doubao-seed-2-0-mini-260215";
+  cli.args.thinkingLevel = "low";
+  const originalFetch = global.fetch;
+  let capturedPayload = null;
+  global.fetch = async (_url, options = {}) => {
+    capturedPayload = JSON.parse(String(options.body || "{}"));
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": false, \"reason\": \"not matched\", \"summary\": \"not matched\", \"evidence\": [\"resume\"]}"
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    await cli.callTextModel("resume");
+    assert.deepEqual(capturedPayload?.thinking, { type: "enabled" });
+    assert.equal(capturedPayload?.reasoning_effort, "low");
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 async function testPrepareVisionImageSegmentsShouldSplitLongImage() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-segments-"));
   const cli = new RecommendScreenCli(createArgs(tempDir));
@@ -1473,8 +1625,55 @@ async function testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence() 
   assert.equal(result.evidenceMatchedCount, 0);
 }
 
+async function testVisionModelShouldSendAllOrderedChunks() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-all-chunks-"));
+  const chunkPaths = [];
+  for (let index = 0; index < 3; index += 1) {
+    const chunkPath = path.join(tempDir, `chunk-${index + 1}.png`);
+    await sharp({
+      create: { width: 16, height: 16, channels: 3, background: { r: 255 - index, g: 250, b: 245 } }
+    }).png().toFile(chunkPath);
+    chunkPaths.push(chunkPath);
+  }
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const originalFetch = global.fetch;
+  let capturedPayload = null;
+  global.fetch = async (_url, options = {}) => {
+    capturedPayload = JSON.parse(String(options.body || "{}"));
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": false, \"reason\": \"checked all chunks\", \"summary\": \"checked\", \"evidence\": [\"chunk evidence\", \"more evidence\"]}"
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    const result = await cli.requestVisionModel(chunkPaths);
+    assert.equal(result.passed, false);
+    const userContent = capturedPayload?.messages?.[1]?.content || [];
+    assert.equal(userContent.filter((item) => item?.type === "image_url").length, 3);
+    const text = userContent.map((item) => item?.text || "").join("\n");
+    assert.equal(text.includes("简历分段 1/3"), true);
+    assert.equal(text.includes("简历分段 2/3"), true);
+    assert.equal(text.includes("简历分段 3/3"), true);
+    assert.equal(text.includes("不能只根据前几段下结论"), true);
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
 async function main() {
   testShouldAbortResumeProbeEarly();
+  testResumeViewportStabilityRequiresSettledScrollAndClip();
   await testSingleResumeCaptureFailureIsSkipped();
   await testConsecutiveResumeCaptureFailuresStillAbort();
   await testPageExhaustedBeforeTargetShouldRaiseRecoverableError();
@@ -1485,6 +1684,8 @@ async function main() {
   await testRecommendShouldPreferNetworkResumeWhenAvailable();
   await testNetworkMissShouldFallbackToImageThenDom();
   await testNetworkMissShouldFallbackToImageCapture();
+  await testImageModeShouldUseShortNetworkGraceWindow();
+  await testImageFailureShouldLateRetryNetworkBeforeDomFallback();
   await testLatestShouldPreferNetworkResumeWhenAvailable();
   await testLatestNetworkMissShouldFallbackToImageCapture();
   testLatestPayloadShouldNotLeakAcrossCandidates();
@@ -1515,8 +1716,11 @@ async function main() {
   testParseArgsShouldSupportInputSummaryJson();
   await testCallTextModelShouldNotTruncateLongResume();
   await testCallTextModelShouldFallbackToChunkModeOnContextLimit();
+  await testTextModelShouldDefaultThinkingOffForVolcengine();
+  await testTextModelShouldSupportLowThinkingForVolcengine();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();
   await testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence();
+  await testVisionModelShouldSendAllOrderedChunks();
   testRecoverablePostActionErrorShouldTreatGreetContinueAndNoButtonAsRecoverable();
   await testRecoverableGreetContinueButtonShouldNotAbortWhenDetailCloseFails();
   await testRecoverableGreetButtonNotFoundShouldNotAbortWhenDetailCloseFails();

@@ -71,6 +71,7 @@ export function buildCliArgs(command, input = {}) {
       pushValueArg(args, 'baseurl', input.baseUrl);
       pushValueArg(args, 'apikey', input.apiKey);
       pushValueArg(args, 'model', input.model);
+      pushValueArg(args, 'thinking-level', input.thinkingLevel || input.llmThinkingLevel || input.reasoningEffort);
 
       const port = normalizePositiveInt(input.port);
       if (port) {
@@ -190,4 +191,3 @@ export async function runCliJsonCommand(command, input = {}) {
     });
   });
 }
-

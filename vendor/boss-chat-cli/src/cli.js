@@ -249,6 +249,12 @@ function parseArgs(argv) {
       case 'model':
         args.overrides.llm.model = value || '';
         break;
+      case 'thinking-level':
+      case 'thinkingLevel':
+      case 'llm-thinking-level':
+      case 'reasoning-effort':
+        args.overrides.llm.thinkingLevel = value || '';
+        break;
       case 'port':
         args.overrides.chrome.port = Number.parseInt(value, 10);
         break;
@@ -299,6 +305,7 @@ function printUsage() {
   console.log('  --baseurl <url>                 Override LLM base URL');
   console.log('  --apikey <key>                  Override LLM API key');
   console.log('  --model <name>                  Override LLM model');
+  console.log('  --thinking-level <level>        LLM thinking level: off|low|medium|high|current');
   console.log('  --port <n>                      Override Chrome remote debugging port');
 }
 
@@ -767,6 +774,9 @@ function buildDetachedRunArgs(args, runId) {
   }
   if (args.overrides.llm.model) {
     workerArgs.push('--model', String(args.overrides.llm.model));
+  }
+  if (args.overrides.llm.thinkingLevel) {
+    workerArgs.push('--thinking-level', String(args.overrides.llm.thinkingLevel));
   }
   if (Number.isFinite(args.overrides.chrome.port)) {
     workerArgs.push('--port', String(args.overrides.chrome.port));

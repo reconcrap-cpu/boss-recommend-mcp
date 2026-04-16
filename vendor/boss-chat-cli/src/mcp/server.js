@@ -74,6 +74,7 @@ function registerTools(server) {
         baseUrl: z.string().optional().describe('覆盖 LLM baseUrl'),
         apiKey: z.string().optional().describe('覆盖 LLM apiKey'),
         model: z.string().optional().describe('覆盖 LLM 模型'),
+        thinkingLevel: z.string().optional().describe('覆盖 LLM thinking/reasoning 级别：off/low/medium/high/current'),
         port: z.number().int().positive().optional().describe('Chrome 调试端口'),
         safePacing: z.boolean().optional().describe('是否启用安全节奏控制'),
         batchRestEnabled: z.boolean().optional().describe('是否启用批次休息'),
@@ -146,4 +147,3 @@ main().catch((error) => {
   console.error('[boss-chat-mcp] server failed:', error?.stack || error?.message || String(error));
   process.exit(1);
 });
-

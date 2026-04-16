@@ -717,6 +717,94 @@ async function testBossChatLlmTextChunkFallbackShouldWork() {
   }
 }
 
+async function testBossChatLlmShouldApplyThinkingDefaultsAndOverrides() {
+  const completionResponse = {
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [
+          {
+            message: {
+              content: "{\"passed\": false, \"reason\": \"not matched\", \"summary\": \"not matched\", \"evidence\": [\"resume\"]}"
+            }
+          }
+        ]
+      };
+    }
+  };
+  const responsesResponse = {
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        output_text: "{\"passed\": false, \"reason\": \"not matched\", \"summary\": \"not matched\", \"evidence\": [\"resume\"]}"
+      };
+    }
+  };
+
+  let volcCompletionPayload = null;
+  const volcClient = new LlmClient({
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    apiKey: "sk-test",
+    model: "doubao-seed-2-0-mini-260215",
+  }, {
+    fetchImpl: async (_url, options = {}) => {
+      volcCompletionPayload = JSON.parse(String(options.body || "{}"));
+      return completionResponse;
+    },
+  });
+  await volcClient.requestCompletions({ prompt: "prompt", evidenceCorpus: "resume" });
+  assert.deepEqual(volcCompletionPayload.thinking, { type: "disabled" });
+  assert.equal(volcCompletionPayload.reasoning_effort, "minimal");
+
+  let lowCompletionPayload = null;
+  const lowClient = new LlmClient({
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+    apiKey: "sk-test",
+    model: "doubao-seed-2-0-mini-260215",
+    thinkingLevel: "low",
+  }, {
+    fetchImpl: async (_url, options = {}) => {
+      lowCompletionPayload = JSON.parse(String(options.body || "{}"));
+      return completionResponse;
+    },
+  });
+  await lowClient.requestCompletions({ prompt: "prompt", evidenceCorpus: "resume" });
+  assert.deepEqual(lowCompletionPayload.thinking, { type: "enabled" });
+  assert.equal(lowCompletionPayload.reasoning_effort, "low");
+
+  let openaiCompletionPayload = null;
+  const openaiClient = new LlmClient({
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-test",
+    model: "gpt-test",
+  }, {
+    fetchImpl: async (_url, options = {}) => {
+      openaiCompletionPayload = JSON.parse(String(options.body || "{}"));
+      return completionResponse;
+    },
+  });
+  await openaiClient.requestCompletions({ prompt: "prompt", evidenceCorpus: "resume" });
+  assert.equal(openaiCompletionPayload.thinking, undefined);
+  assert.equal(openaiCompletionPayload.reasoning_effort, "minimal");
+
+  let responsesPayload = null;
+  const responsesClient = new LlmClient({
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-test",
+    model: "gpt-test",
+    thinkingLevel: "low",
+  }, {
+    fetchImpl: async (_url, options = {}) => {
+      responsesPayload = JSON.parse(String(options.body || "{}"));
+      return responsesResponse;
+    },
+  });
+  await responsesClient.requestResponses({ prompt: "prompt", evidenceCorpus: "resume" });
+  assert.deepEqual(responsesPayload.reasoning, { effort: "low" });
+}
+
 async function testBossChatAppShouldPersistEvidenceArtifacts() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-artifacts-"));
   await mkdir(tempDir, { recursive: true });
@@ -846,6 +934,7 @@ async function main() {
   testBossChatLlmEvidenceGateShouldDemoteMissingEvidence();
   testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence();
   await testBossChatLlmTextChunkFallbackShouldWork();
+  await testBossChatLlmShouldApplyThinkingDefaultsAndOverrides();
   await testBossChatAppShouldPersistEvidenceArtifacts();
   console.log("boss-chat tests passed");
 }

@@ -23,6 +23,8 @@ const SHOULD_BRING_TO_FRONT = shouldBringChromeToFront();
 
 const EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS = 5000;
 const EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS = 4;
+const RESUME_VIEWPORT_STABILITY_POLL_MS = 80;
+const RESUME_VIEWPORT_STABLE_POLLS = 2;
 
 function clampInteger(value, low, high) {
   return Math.max(low, Math.min(high, value));
@@ -112,6 +114,63 @@ function shouldAbortResumeProbeEarly({ probe, stableNoResumeIframePolls, elapsed
   const minWaitMs = Math.min(waitResumeMs, EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS);
   return stableNoResumeIframePolls >= EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS
     && elapsedMs >= minWaitMs;
+}
+
+function parseBooleanOption(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function numbersClose(left, right, tolerance = 1) {
+  return Math.abs(Number(left || 0) - Number(right || 0)) <= tolerance;
+}
+
+function isStableResumeViewport(previous, current, targetScroll) {
+  if (!previous?.ok || !current?.ok) return false;
+  const target = Number(targetScroll || 0);
+  const scrollTop = Number(current.scrollTop || 0);
+  const maxScroll = Number(current.maxScroll || 0);
+  const targetReached = numbersClose(scrollTop, target, 2)
+    || (target >= maxScroll && numbersClose(scrollTop, maxScroll, 2));
+  if (!targetReached) return false;
+  const prevClip = previous.clip || {};
+  const currentClip = current.clip || {};
+  return numbersClose(previous.scrollTop, current.scrollTop, 1)
+    && numbersClose(previous.scrollHeight, current.scrollHeight, 1)
+    && numbersClose(previous.clientHeight, current.clientHeight, 1)
+    && numbersClose(prevClip.x, currentClip.x, 1)
+    && numbersClose(prevClip.y, currentClip.y, 1)
+    && numbersClose(prevClip.width, currentClip.width, 1)
+    && numbersClose(prevClip.height, currentClip.height, 1);
+}
+
+async function waitForStableResumeViewport(evaluate, targetScroll, maxWaitMs) {
+  const maxWait = Math.max(160, Number(maxWaitMs || 0));
+  const start = Date.now();
+  let previous = null;
+  let latest = null;
+  let stablePolls = 0;
+  while (Date.now() - start < maxWait) {
+    await sleep(RESUME_VIEWPORT_STABILITY_POLL_MS);
+    const current = await evaluate(buildResumeProbeExpr({ init: false, targetScroll: null }));
+    if (current?.ok) {
+      latest = current;
+      if (isStableResumeViewport(previous, current, targetScroll)) {
+        stablePolls += 1;
+        if (stablePolls >= RESUME_VIEWPORT_STABLE_POLLS) {
+          return current;
+        }
+      } else {
+        stablePolls = 0;
+      }
+      previous = current;
+    }
+  }
+  return latest;
 }
 
 async function stitchWithSharp(metadataFile, stitchedImage) {
@@ -493,6 +552,10 @@ async function captureFullResumeCanvas(options = {}) {
   const port = Number(options.port || process.env.CDP_PORT || 9222);
   const waitResumeMs = Number(options.waitResumeMs || process.env.WAIT_RESUME_MS || 30000);
   const scrollSettleMs = Number(options.scrollSettleMs || process.env.SCROLL_SETTLE_MS || 500);
+  const stitchFullImage = parseBooleanOption(
+    options.stitchFullImage,
+    parseBooleanOption(process.env.BOSS_RECOMMEND_STITCH_FULL_IMAGE, true)
+  );
   const outPrefix = options.outPrefix || process.env.OUT_PREFIX || path.resolve(process.cwd(), "recommend_resume_full");
   const targetPattern = options.targetPattern || process.env.TARGET_PATTERN || "/web/chat/recommend";
   const stitchScript = path.resolve(__dirname, "stitch_resume_chunks.py");
@@ -636,8 +699,7 @@ async function captureFullResumeCanvas(options = {}) {
     for (let index = 0; index < uniquePositions.length; index += 1) {
       const targetScroll = uniquePositions[index];
       await evaluate(buildResumeProbeExpr({ init: false, targetScroll }));
-      await sleep(scrollSettleMs);
-      const current = await evaluate(buildResumeProbeExpr({ init: false, targetScroll: null }));
+      const current = await waitForStableResumeViewport(evaluate, targetScroll, scrollSettleMs);
       if (!current?.ok) continue;
 
       const actualScroll = Number(current.scrollTop || 0);
@@ -688,30 +750,35 @@ async function captureFullResumeCanvas(options = {}) {
     };
     fs.writeFileSync(metadataFile, JSON.stringify(metadata, null, 2), "utf8");
 
-    let stitchEngine = "sharp";
-    try {
-      await stitchWithSharp(metadataFile, stitchedImage);
-    } catch (sharpError) {
-      const fallback = stitchWithAvailablePython(stitchScript, metadataFile, stitchedImage);
-      if (!fallback.ok) {
-        const fallbackSummary = fallback.attempts
-          .map((item) => {
-            const message = item.stderr || item.stdout || item.error || "unknown error";
-            return `${item.command}(status=${item.status ?? "null"}): ${message}`;
-          })
-          .join(" | ");
-        throw new Error(
-          `Stitch failed (sharp + python fallback). sharp=${sharpError?.message || sharpError}; fallback=${fallbackSummary}`
-        );
+    let stitchEngine = "skipped";
+    if (stitchFullImage) {
+      stitchEngine = "sharp";
+      try {
+        await stitchWithSharp(metadataFile, stitchedImage);
+      } catch (sharpError) {
+        const fallback = stitchWithAvailablePython(stitchScript, metadataFile, stitchedImage);
+        if (!fallback.ok) {
+          const fallbackSummary = fallback.attempts
+            .map((item) => {
+              const message = item.stderr || item.stdout || item.error || "unknown error";
+              return `${item.command}(status=${item.status ?? "null"}): ${message}`;
+            })
+            .join(" | ");
+          throw new Error(
+            `Stitch failed (sharp + python fallback). sharp=${sharpError?.message || sharpError}; fallback=${fallbackSummary}`
+          );
+        }
+        stitchEngine = fallback.command || "python";
       }
-      stitchEngine = fallback.command || "python";
     }
 
     return {
-      stitchedImage,
+      stitchedImage: stitchFullImage ? stitchedImage : "",
       metadataFile,
       chunkDir,
       chunkCount: chunks.length,
+      chunkFiles: chunks.map((chunk) => chunk.file),
+      modelImagePaths: chunks.map((chunk) => chunk.file),
       stitch_engine: stitchEngine,
       target: {
         title: target.title,
@@ -731,6 +798,7 @@ module.exports = {
     EARLY_FAIL_NO_RESUME_IFRAME_MIN_WAIT_MS,
     EARLY_FAIL_NO_RESUME_IFRAME_STABLE_POLLS,
     isStableNoResumeIframeProbe,
+    isStableResumeViewport,
     shouldAbortResumeProbeEarly,
     stitchWithAvailablePython,
     stitchWithSharp

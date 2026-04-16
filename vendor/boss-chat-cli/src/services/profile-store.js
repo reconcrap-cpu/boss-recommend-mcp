@@ -10,6 +10,7 @@ const DEFAULT_PROFILE = {
     baseUrl: '',
     apiKey: '',
     model: '',
+    thinkingLevel: '',
   },
   chrome: {
     port: 9222,
@@ -78,6 +79,7 @@ export function toPersistentProfile(profile = {}) {
       baseUrl: normalized.llm.baseUrl,
       apiKey: normalized.llm.apiKey,
       model: normalized.llm.model,
+      thinkingLevel: normalized.llm.thinkingLevel,
     },
     chrome: {
       port: normalized.chrome.port,
@@ -99,6 +101,9 @@ export function normalizeProfile(profile = {}) {
   merged.llm.baseUrl = String(merged.llm.baseUrl || '').trim().replace(/\/+$/, '');
   merged.llm.apiKey = String(merged.llm.apiKey || '').trim();
   merged.llm.model = String(merged.llm.model || '').trim();
+  merged.llm.thinkingLevel = String(
+    merged.llm.thinkingLevel || merged.llm.llmThinkingLevel || merged.llm.reasoningEffort || merged.llm.reasoning_effort || '',
+  ).trim();
   merged.runtime.batchRestEnabled = merged.runtime.batchRestEnabled !== false;
   merged.runtime.safePacing = merged.runtime.safePacing !== false;
   return merged;

@@ -768,6 +768,11 @@ function setScreeningConfig(options = {}) {
     apiKey,
     model
   };
+  if (typeof options["thinking-level"] === "string" && options["thinking-level"].trim()) {
+    nextConfig.llmThinkingLevel = options["thinking-level"].trim();
+  } else if (typeof options.llmThinkingLevel === "string" && options.llmThinkingLevel.trim()) {
+    nextConfig.llmThinkingLevel = options.llmThinkingLevel.trim();
+  }
   if (typeof options["openai-organization"] === "string") {
     nextConfig.openaiOrganization = options["openai-organization"];
   }
@@ -1247,7 +1252,7 @@ function printHelp() {
   console.log("Run command:");
   console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}'] [--follow-up-json '{...}']");
   console.log("  boss-recommend-mcp chat run --job \"算法工程师\" --start-from unread --criteria \"有 AI Agent 经验\" --targetCount 20    # 后台启动，不自动轮询");
-  console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--openai-organization <id>] [--openai-project <id>]");
+  console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
   console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");
   console.log("  boss-recommend-mcp calibrate --port 9222 [--timeout-ms 60000] [--output <path>]");

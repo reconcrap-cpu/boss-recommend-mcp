@@ -4,6 +4,12 @@ const DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS = 24000;
 const DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS = 1200;
 const DEFAULT_TEXT_MODEL_MAX_CHUNKS = 12;
 const MAX_EVIDENCE_TOKENS = 12;
+const LLM_THINKING_ENV_KEYS = [
+  'BOSS_CHAT_LLM_THINKING_LEVEL',
+  'BOSS_RECOMMEND_LLM_THINKING_LEVEL',
+  'BOSS_LLM_THINKING_LEVEL',
+  'LLM_THINKING_LEVEL',
+];
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -65,6 +71,84 @@ function normalizeBool(value, fallback = false) {
   if (['true', '1', 'yes', 'y', 'on'].includes(normalized)) return true;
   if (['false', '0', 'no', 'n', 'off'].includes(normalized)) return false;
   return fallback;
+}
+
+function normalizeLlmThinkingLevel(value) {
+  const normalized = normalizeText(value).toLowerCase().replace(/[_\s]+/g, '-');
+  if (!normalized) return '';
+  if (['off', 'disabled', 'disable', 'minimal', 'none', 'false', '0'].includes(normalized)) return 'off';
+  if (
+    ['low', 'medium', 'high', 'auto', 'current', 'default', 'provider-default', 'unchanged', 'inherit'].includes(
+      normalized,
+    )
+  ) {
+    return normalized;
+  }
+  return '';
+}
+
+function getEnvLlmThinkingLevel() {
+  for (const key of LLM_THINKING_ENV_KEYS) {
+    const normalized = normalizeLlmThinkingLevel(process.env[key]);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function resolveLlmThinkingLevel(config = {}, options = {}) {
+  return (
+    normalizeLlmThinkingLevel(options.thinkingLevel) ||
+    normalizeLlmThinkingLevel(options.llmThinkingLevel) ||
+    normalizeLlmThinkingLevel(config.llmThinkingLevel) ||
+    normalizeLlmThinkingLevel(config.thinkingLevel) ||
+    normalizeLlmThinkingLevel(config.reasoningEffort) ||
+    normalizeLlmThinkingLevel(config.reasoning_effort) ||
+    getEnvLlmThinkingLevel() ||
+    'off'
+  );
+}
+
+function isProviderDefaultThinkingLevel(level) {
+  return ['current', 'default', 'provider-default', 'unchanged', 'inherit'].includes(level);
+}
+
+function isVolcengineModel(baseUrl, model) {
+  const combined = `${baseUrl || ''} ${model || ''}`;
+  return /volces\.com|volcengine|ark\.cn-|doubao|seed/i.test(combined);
+}
+
+function applyChatCompletionThinking(payload, { baseUrl = '', model = '', thinkingLevel = '' } = {}) {
+  const level = normalizeLlmThinkingLevel(thinkingLevel) || 'off';
+  if (isProviderDefaultThinkingLevel(level)) return payload;
+  const isVolc = isVolcengineModel(baseUrl, model);
+  if (isVolc) {
+    if (level === 'auto') {
+      payload.thinking = { type: 'auto' };
+      return payload;
+    }
+    if (level === 'off') {
+      payload.thinking = { type: 'disabled' };
+      payload.reasoning_effort = 'minimal';
+      return payload;
+    }
+    payload.thinking = { type: 'enabled' };
+    payload.reasoning_effort = level;
+    return payload;
+  }
+  if (level !== 'auto') {
+    payload.reasoning_effort = level === 'off' ? 'minimal' : level;
+  }
+  return payload;
+}
+
+function applyResponsesThinking(payload, { thinkingLevel = '' } = {}) {
+  const level = normalizeLlmThinkingLevel(thinkingLevel) || 'off';
+  if (isProviderDefaultThinkingLevel(level) || level === 'auto') return payload;
+  payload.reasoning = {
+    ...(payload.reasoning || {}),
+    effort: level === 'off' ? 'minimal' : level,
+  };
+  return payload;
 }
 
 function toStringArray(value, maxItems = 8) {
@@ -378,8 +462,9 @@ export class LlmClient {
       options.preferCompletions !== undefined
         ? normalizeBool(options.preferCompletions, false)
         : config.preferCompletions !== undefined
-          ? normalizeBool(config.preferCompletions, false)
-          : /doubao|seed/i.test(String(this.model || ''));
+        ? normalizeBool(config.preferCompletions, false)
+        : /doubao|seed/i.test(String(this.model || ''));
+    this.thinkingLevel = resolveLlmThinkingLevel(config, options);
   }
 
   async readImageAsDataUrl(imagePath) {
@@ -405,23 +490,26 @@ export class LlmClient {
     if (imageDataUrl) {
       content.push({ type: 'input_image', image_url: imageDataUrl });
     }
+    const payload = {
+      model: this.model,
+      temperature: 0.1,
+      max_output_tokens: this.responseMaxOutputTokens,
+      input: [
+        {
+          role: 'user',
+          content,
+        },
+      ],
+    };
+    applyResponsesThinking(payload, { thinkingLevel: this.thinkingLevel });
+
     const response = await this.fetchImpl(`${this.baseUrl}/responses`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.apiKey}`,
       },
-      body: JSON.stringify({
-        model: this.model,
-        temperature: 0.1,
-        max_output_tokens: this.responseMaxOutputTokens,
-        input: [
-          {
-            role: 'user',
-            content,
-          },
-        ],
-      }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 
@@ -477,23 +565,30 @@ export class LlmClient {
     if (imageDataUrl) {
       content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
     }
+    const payload = {
+      model: this.model,
+      temperature: 0.1,
+      max_tokens: this.completionMaxTokens,
+      messages: [
+        {
+          role: 'user',
+          content,
+        },
+      ],
+    };
+    applyChatCompletionThinking(payload, {
+      baseUrl: this.baseUrl,
+      model: this.model,
+      thinkingLevel: this.thinkingLevel,
+    });
+
     const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${this.apiKey}`,
       },
-      body: JSON.stringify({
-        model: this.model,
-        temperature: 0.1,
-        max_tokens: this.completionMaxTokens,
-        messages: [
-          {
-            role: 'user',
-            content,
-          },
-        ],
-      }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
 

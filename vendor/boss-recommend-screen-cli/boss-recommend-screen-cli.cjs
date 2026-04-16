@@ -26,7 +26,21 @@ const CSV_HEADER = [
   "证据门控降级",
   "错误码",
   "错误信息",
-  "候选人ID"
+  "候选人ID",
+  "总耗时ms",
+  "候选卡片读取ms",
+  "点击候选人ms",
+  "详情打开ms",
+  "network简历等待ms",
+  "文本模型ms",
+  "截图获取ms",
+  "视觉模型ms",
+  "late network retry ms",
+  "DOM fallback ms",
+  "通过后动作ms",
+  "关闭详情ms",
+  "休息ms",
+  "checkpoint保存ms"
 ].join(",");
 const INPUT_SUMMARY_HEADER = ["运行输入字段", "运行输入值"].join(",");
 const RESUME_CAPTURE_WAIT_MS = 60000;
@@ -34,6 +48,8 @@ const RESUME_CAPTURE_MAX_ATTEMPTS = 4;
 const RESUME_CAPTURE_RETRY_DELAY_MS = 1200;
 const NETWORK_RESUME_WAIT_MS = 4200;
 const NETWORK_RESUME_RETRY_WAIT_MS = 2000;
+const NETWORK_RESUME_IMAGE_MODE_GRACE_MS = 1000;
+const NETWORK_RESUME_LATE_RETRY_MS = 3000;
 const MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES = 10;
 const DEFAULT_VISION_MAX_IMAGE_PIXELS = 36000000;
 const DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS = 30000000;
@@ -962,12 +978,69 @@ function shouldBringChromeToFront() {
 }
 
 const SHOULD_BRING_TO_FRONT = shouldBringChromeToFront();
+const LLM_THINKING_ENV_KEYS = [
+  "BOSS_RECOMMEND_LLM_THINKING_LEVEL",
+  "BOSS_LLM_THINKING_LEVEL",
+  "LLM_THINKING_LEVEL"
+];
+
+function normalizeLlmThinkingLevel(value) {
+  const normalized = normalizeText(value).toLowerCase().replace(/[_\s]+/g, "-");
+  if (!normalized) return "";
+  if (["off", "disabled", "disable", "minimal", "none", "false", "0"].includes(normalized)) return "off";
+  if (["low", "medium", "high", "auto", "current", "default", "provider-default", "unchanged", "inherit"].includes(normalized)) {
+    return normalized;
+  }
+  return "";
+}
+
+function getEnvLlmThinkingLevel() {
+  for (const key of LLM_THINKING_ENV_KEYS) {
+    const normalized = normalizeLlmThinkingLevel(process.env[key]);
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function resolveLlmThinkingLevel(value) {
+  return normalizeLlmThinkingLevel(value) || getEnvLlmThinkingLevel() || "off";
+}
+
+function isVolcengineModel(baseUrl, model) {
+  const combined = `${baseUrl || ""} ${model || ""}`;
+  return /volces\.com|volcengine|ark\.cn-|doubao|seed/i.test(combined);
+}
+
+function applyChatCompletionThinking(payload, { baseUrl = "", model = "", thinkingLevel = "" } = {}) {
+  const level = resolveLlmThinkingLevel(thinkingLevel);
+  if (["current", "default", "provider-default", "unchanged", "inherit"].includes(level)) return payload;
+  const isVolc = isVolcengineModel(baseUrl, model);
+  if (isVolc) {
+    if (level === "auto") {
+      payload.thinking = { type: "auto" };
+      return payload;
+    }
+    if (level === "off") {
+      payload.thinking = { type: "disabled" };
+      payload.reasoning_effort = "minimal";
+      return payload;
+    }
+    payload.thinking = { type: "enabled" };
+    payload.reasoning_effort = level;
+    return payload;
+  }
+  if (level !== "auto") {
+    payload.reasoning_effort = level === "off" ? "minimal" : level;
+  }
+  return payload;
+}
 
 function parseArgs(argv) {
   const parsed = {
     baseUrl: null,
     apiKey: null,
     model: null,
+    thinkingLevel: null,
     openaiOrganization: null,
     openaiProject: null,
     criteria: null,
@@ -988,6 +1061,7 @@ function parseArgs(argv) {
       baseUrl: false,
       apiKey: false,
       model: false,
+      thinkingLevel: false,
       criteria: false,
       targetCount: false,
       maxGreetCount: false,
@@ -1015,6 +1089,10 @@ function parseArgs(argv) {
     } else if (token === "--model" && (inlineValue || next)) {
       parsed.model = inlineValue || next;
       parsed.__provided.model = true;
+      if (!inlineValue) index += 1;
+    } else if ((token === "--thinking-level" || token === "--thinkingLevel" || token === "--llm-thinking-level" || token === "--reasoning-effort") && (inlineValue || next)) {
+      parsed.thinkingLevel = inlineValue || next;
+      parsed.__provided.thinkingLevel = true;
       if (!inlineValue) index += 1;
     } else if (token === "--openai-organization" && (inlineValue || next)) {
       parsed.openaiOrganization = inlineValue || next;
@@ -1206,6 +1284,30 @@ function generateBezierPath(start, end, steps = 18) {
 
 function csvEscape(value) {
   return `"${String(value || "").replace(/"/g, '""')}"`;
+}
+
+function normalizeTimingMs(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.round(parsed);
+}
+
+function sanitizeTimingBreakdown(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const result = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const normalizedKey = normalizeText(key);
+    if (!normalizedKey) continue;
+    const normalizedValue = normalizeTimingMs(raw);
+    if (normalizedValue === null) continue;
+    result[normalizedKey] = normalizedValue;
+  }
+  return result;
+}
+
+function getTimingMs(timing, key) {
+  const normalized = normalizeTimingMs(timing?.[key]);
+  return normalized === null ? "" : normalized;
 }
 
 function stringifyInputSummaryValue(value) {
@@ -2844,6 +2946,8 @@ class RecommendScreenCli {
       dom_fallback: 0,
       image_fallback: 0
     };
+    this.resumeAcquisitionMode = "unknown";
+    this.resumeAcquisitionModeReason = "";
     this.lastActiveTabStatus = PAGE_SCOPE_TAB_STATUS[this.args.pageScope] || null;
     this.featuredCalibration = this.args.pageScope === "featured"
       ? loadCalibrationPosition(this.args.calibrationPath)
@@ -2890,6 +2994,8 @@ class RecommendScreenCli {
       skipped_count: this.skippedCount,
       greet_count: this.greetCount,
       greet_limit_fallback_count: this.greetLimitFallbackCount,
+      resume_acquisition_mode: this.resumeAcquisitionMode,
+      resume_acquisition_mode_reason: this.resumeAcquisitionModeReason,
       processed_keys: Array.from(this.processedKeys),
       passed_candidates: this.passedCandidates.map((item) => ({
         name: item?.name || "",
@@ -2926,7 +3032,8 @@ class RecommendScreenCli {
         error_code: item?.error_code || "",
         error_message: item?.error_message || "",
         chunk_index: Number.isFinite(Number(item?.chunk_index)) ? Number(item.chunk_index) : null,
-        chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null
+        chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null,
+        timing_ms: sanitizeTimingBreakdown(item?.timing_ms)
       })),
       input_summary: sanitizeInputSummary(this.inputSummary)
     };
@@ -2942,6 +3049,7 @@ class RecommendScreenCli {
       checkpoint_path: this.checkpointPath,
       selected_page: this.args.pageScope || "recommend",
       active_tab_status: this.lastActiveTabStatus || PAGE_SCOPE_TAB_STATUS[this.args.pageScope] || null,
+      resume_acquisition_mode: this.resumeAcquisitionMode,
       resume_source: this.resumeSourceStats.image_fallback > 0
         ? "image_fallback"
         : this.resumeSourceStats.dom_fallback > 0
@@ -3092,12 +3200,29 @@ class RecommendScreenCli {
       error_code: normalizeText(entry?.error_code || "") || "",
       error_message: normalizeText(entry?.error_message || "") || "",
       chunk_index: Number.isFinite(Number(entry?.chunk_index)) ? Number(entry.chunk_index) : null,
-      chunk_total: Number.isFinite(Number(entry?.chunk_total)) ? Number(entry.chunk_total) : null
+      chunk_total: Number.isFinite(Number(entry?.chunk_total)) ? Number(entry.chunk_total) : null,
+      timing_ms: sanitizeTimingBreakdown(entry?.timing_ms)
     };
     this.candidateAudits.push(normalized);
     const maxItems = parsePositiveInteger(process.env.BOSS_RECOMMEND_MAX_CANDIDATE_AUDITS);
     if (maxItems && this.candidateAudits.length > maxItems) {
       this.candidateAudits = this.candidateAudits.slice(-maxItems);
+    }
+  }
+
+  updateCandidateAuditTiming(candidateKey, timing = {}) {
+    const normalizedKey = normalizeText(candidateKey || "");
+    if (!normalizedKey) return;
+    const timingMs = sanitizeTimingBreakdown(timing);
+    for (let index = this.candidateAudits.length - 1; index >= 0; index -= 1) {
+      const audit = this.candidateAudits[index];
+      if (
+        normalizeText(audit?.candidate_key || "") === normalizedKey
+        || normalizeText(audit?.geek_id || "") === normalizedKey
+      ) {
+        audit.timing_ms = timingMs;
+        return;
+      }
     }
   }
 
@@ -3237,6 +3362,60 @@ class RecommendScreenCli {
       min_ts: minTs || null,
       reason: "resume_text_not_ready"
     });
+    return null;
+  }
+
+  setResumeAcquisitionMode(mode, reason = "") {
+    if (!["unknown", "network", "image"].includes(mode)) return;
+    if (this.resumeAcquisitionMode === mode) return;
+    this.resumeAcquisitionMode = mode;
+    this.resumeAcquisitionModeReason = normalizeText(reason || "");
+    log(`[简历获取模式] mode=${mode}${this.resumeAcquisitionModeReason ? ` reason=${this.resumeAcquisitionModeReason}` : ""}`);
+  }
+
+  async waitForResumeNetworkByMode(candidate, options = {}) {
+    const minTs = Number.isFinite(Number(options?.minTs)) ? Number(options.minTs) : 0;
+    const mode = this.resumeAcquisitionMode || "unknown";
+    const firstWaitMs = mode === "image" ? NETWORK_RESUME_IMAGE_MODE_GRACE_MS : NETWORK_RESUME_WAIT_MS;
+    const waitStartedAt = Date.now();
+    let networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(candidate, firstWaitMs, { minTs });
+    if (normalizeText(networkCandidateInfo?.resumeText)) {
+      this.setResumeAcquisitionMode("network", "network_resume_hit");
+      return networkCandidateInfo;
+    }
+    if (typeof this.logResumeNetworkMissDiagnostics === "function") {
+      this.logResumeNetworkMissDiagnostics(candidate, {
+        timeoutMs: firstWaitMs,
+        waitStartedAt
+      });
+    }
+    if (mode === "image") {
+      return null;
+    }
+    await sleep(NETWORK_RESUME_RETRY_WAIT_MS);
+    networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
+      candidate,
+      NETWORK_RESUME_RETRY_WAIT_MS,
+      { minTs }
+    );
+    if (normalizeText(networkCandidateInfo?.resumeText)) {
+      this.setResumeAcquisitionMode("network", "network_resume_retry_hit");
+      return networkCandidateInfo;
+    }
+    return null;
+  }
+
+  async waitForLateNetworkResumeCandidateInfo(candidate, options = {}) {
+    const minTs = Number.isFinite(Number(options?.minTs)) ? Number(options.minTs) : 0;
+    const networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
+      candidate,
+      NETWORK_RESUME_LATE_RETRY_MS,
+      { minTs }
+    );
+    if (normalizeText(networkCandidateInfo?.resumeText)) {
+      this.setResumeAcquisitionMode("network", "late_network_resume_hit");
+      return networkCandidateInfo;
+    }
     return null;
   }
 
@@ -3637,7 +3816,8 @@ class RecommendScreenCli {
           error_code: normalizeText(item?.error_code || "") || "",
           error_message: normalizeText(item?.error_message || "") || "",
           chunk_index: Number.isFinite(Number(item?.chunk_index)) ? Number(item.chunk_index) : null,
-          chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null
+          chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null,
+          timing_ms: sanitizeTimingBreakdown(item?.timing_ms)
         }))
       : [];
     if (!this.inputSummary) {
@@ -3664,6 +3844,17 @@ class RecommendScreenCli {
       } else if (snapshotSource === "image_fallback") {
         this.resumeSourceStats.image_fallback = 1;
       }
+    }
+    const checkpointMode = normalizeText(parsed.resume_acquisition_mode || "").toLowerCase();
+    if (["network", "image"].includes(checkpointMode)) {
+      this.resumeAcquisitionMode = checkpointMode;
+      this.resumeAcquisitionModeReason = normalizeText(parsed.resume_acquisition_mode_reason || "checkpoint");
+    } else if (this.resumeSourceStats.network > 0) {
+      this.resumeAcquisitionMode = "network";
+      this.resumeAcquisitionModeReason = "checkpoint_source_stats";
+    } else if (this.resumeSourceStats.image_fallback > 0) {
+      this.resumeAcquisitionMode = "image";
+      this.resumeAcquisitionModeReason = "checkpoint_source_stats";
     }
 
     return true;
@@ -4191,7 +4382,8 @@ class RecommendScreenCli {
           outPrefix,
           targetPattern: RECOMMEND_URL_FRAGMENT,
           waitResumeMs: RESUME_CAPTURE_WAIT_MS,
-          scrollSettleMs: 500
+          scrollSettleMs: 500,
+          stitchFullImage: false
         });
       } catch (error) {
         lastError = error;
@@ -4218,7 +4410,7 @@ class RecommendScreenCli {
       DEFAULT_VISION_MAX_IMAGE_PIXELS
     );
     const retryLimit = resolveVisionRetryPixelLimit(primaryLimit);
-    const preparedPrimary = await this.prepareVisionImageSegmentsForModel(imagePath, primaryLimit, "primary");
+    const preparedPrimary = await this.prepareVisionInputsForModel(imagePath, primaryLimit, "primary");
     try {
       const primaryResult = await this.requestVisionModel(preparedPrimary.imagePaths);
       return this.applyVisionEvidenceGate(primaryResult);
@@ -4233,7 +4425,7 @@ class RecommendScreenCli {
         `segments=${preparedPrimary.imagePaths?.length || 1}`
       );
     }
-    const preparedRetry = await this.prepareVisionImageSegmentsForModel(imagePath, retryLimit, "retry");
+    const preparedRetry = await this.prepareVisionInputsForModel(imagePath, retryLimit, "retry");
     try {
       const retryResult = await this.requestVisionModel(preparedRetry.imagePaths);
       return this.applyVisionEvidenceGate(retryResult);
@@ -4251,6 +4443,37 @@ class RecommendScreenCli {
           `last_error=${normalizeText(retryError?.message || retryError)}`
       );
     }
+  }
+
+  async prepareVisionInputsForModel(imageInput, maxPixels, attemptTag = "primary") {
+    const sourcePaths = Array.isArray(imageInput) ? imageInput.filter(Boolean) : [imageInput].filter(Boolean);
+    if (sourcePaths.length <= 0) {
+      return {
+        imagePaths: [],
+        source: "empty",
+        sourcePixels: null,
+        currentPixels: null
+      };
+    }
+    const preparedItems = [];
+    for (let index = 0; index < sourcePaths.length; index += 1) {
+      const prepared = await this.prepareVisionImageSegmentsForModel(
+        sourcePaths[index],
+        maxPixels,
+        `${attemptTag}.input${String(index + 1).padStart(3, "0")}`
+      );
+      preparedItems.push(prepared);
+    }
+    return {
+      imagePaths: preparedItems.flatMap((item) => item.imagePaths || []),
+      source: sourcePaths.length > 1 ? "ordered_chunks" : (preparedItems[0]?.source || "single"),
+      sourcePixels: preparedItems.reduce((acc, item) => (
+        Number.isFinite(Number(item?.sourcePixels)) ? acc + Number(item.sourcePixels) : acc
+      ), 0) || null,
+      currentPixels: preparedItems.reduce((acc, item) => (
+        Number.isFinite(Number(item?.currentPixels)) ? acc + Number(item.currentPixels) : acc
+      ), 0) || null
+    };
   }
 
   applyVisionEvidenceGate(result) {
@@ -4474,6 +4697,7 @@ class RecommendScreenCli {
           "请根据以下标准判断候选人是否通过筛选。\n\n" +
           `筛选标准:\n${this.args.criteria}\n\n` +
           "你将收到候选人完整简历的一个或多个顺序分段图片。必须完整阅读全部分段后再判断，" +
+          "不能只根据前几段下结论；后续分段中的教育、项目、经历或否定信息必须纳入最终判断。" +
           "严禁编造任何不存在的经历、项目、学校、公司或时间线；证据不足时必须判定为不通过。\n\n" +
           "要求：\n" +
           "1) reason 必须写出可审计的判定依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
@@ -4518,6 +4742,11 @@ class RecommendScreenCli {
         }
       ]
     };
+    applyChatCompletionThinking(payload, {
+      baseUrl,
+      model: this.args.model,
+      thinkingLevel: this.args.thinkingLevel
+    });
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.args.apiKey}`
@@ -4665,6 +4894,11 @@ class RecommendScreenCli {
         }
       ]
     };
+    applyChatCompletionThinking(payload, {
+      baseUrl,
+      model: this.args.model,
+      thinkingLevel: this.args.thinkingLevel
+    });
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.args.apiKey}`
@@ -5044,6 +5278,7 @@ class RecommendScreenCli {
       const finalPassed = audit?.final_passed === true || normalizeText(audit?.outcome || "") === "passed";
       const screeningReason = normalizeText(audit?.screening_reason || passedItem?.reason || "");
       const passReason = finalPassed ? screeningReason : "";
+      const timing = sanitizeTimingBreakdown(audit?.timing_ms);
       lines.push([
         csvEscape(audit?.candidate_name || passedItem?.name || ""),
         csvEscape(audit?.school || passedItem?.school || ""),
@@ -5062,7 +5297,21 @@ class RecommendScreenCli {
         csvEscape(audit?.evidence_gate_demoted === true ? "true" : "false"),
         csvEscape(audit?.error_code || ""),
         csvEscape(audit?.error_message || ""),
-        csvEscape(auditGeekId || passedItem?.geekId || "")
+        csvEscape(auditGeekId || passedItem?.geekId || ""),
+        csvEscape(getTimingMs(timing, "total_ms")),
+        csvEscape(getTimingMs(timing, "card_profile_ms")),
+        csvEscape(getTimingMs(timing, "click_candidate_ms")),
+        csvEscape(getTimingMs(timing, "detail_open_ms")),
+        csvEscape(getTimingMs(timing, "network_resume_wait_ms")),
+        csvEscape(getTimingMs(timing, "text_model_ms")),
+        csvEscape(getTimingMs(timing, "image_capture_ms")),
+        csvEscape(getTimingMs(timing, "vision_model_ms")),
+        csvEscape(getTimingMs(timing, "late_network_retry_ms")),
+        csvEscape(getTimingMs(timing, "dom_fallback_ms")),
+        csvEscape(getTimingMs(timing, "post_action_ms")),
+        csvEscape(getTimingMs(timing, "close_detail_ms")),
+        csvEscape(getTimingMs(timing, "rest_ms")),
+        csvEscape(getTimingMs(timing, "checkpoint_save_ms"))
       ].join(","));
     }
     fs.mkdirSync(path.dirname(this.args.output), { recursive: true });
@@ -5218,6 +5467,29 @@ class RecommendScreenCli {
         this.scrollRetryCount = 0;
         this.processedCount += 1;
         log(`处理第 ${this.processedCount} 位候选人: ${nextCandidate.name || nextCandidate.geek_id}`);
+        const candidateStartedAt = Date.now();
+        const candidateTiming = {};
+        const candidateKeyForTiming = nextCandidate.key || nextCandidate.geek_id || "";
+        const addCandidateTiming = (key, startedAt) => {
+          const elapsed = Math.max(0, Date.now() - startedAt);
+          candidateTiming[key] = Math.round((Number(candidateTiming[key]) || 0) + elapsed);
+        };
+        const timeCandidateStage = async (key, fn) => {
+          const startedAt = Date.now();
+          try {
+            return await fn();
+          } finally {
+            addCandidateTiming(key, startedAt);
+          }
+        };
+        const timeCandidateStageSync = (key, fn) => {
+          const startedAt = Date.now();
+          try {
+            return fn();
+          } finally {
+            addCandidateTiming(key, startedAt);
+          }
+        };
         let shouldMarkProcessed = true;
         let resumeSource = "";
         let resumeTextLength = null;
@@ -5235,7 +5507,10 @@ class RecommendScreenCli {
 
         try {
           this.currentCandidateKey = nextCandidate.key || nextCandidate.geek_id || null;
-          const cardProfile = await this.extractCandidateProfileFromCard(nextCandidate);
+          const cardProfile = await timeCandidateStage(
+            "card_profile_ms",
+            () => this.extractCandidateProfileFromCard(nextCandidate)
+          );
           candidateProfile = mergeCandidateProfiles(
             cardProfile || null,
             {
@@ -5247,38 +5522,26 @@ class RecommendScreenCli {
             }
           );
           const candidateCaptureStartedAt = Date.now();
-          await this.clickCandidate(nextCandidate);
-          const detailOpen = await this.ensureDetailOpen();
+          await timeCandidateStage("click_candidate_ms", () => this.clickCandidate(nextCandidate));
+          const detailOpen = await timeCandidateStage("detail_open_ms", () => this.ensureDetailOpen());
           if (!detailOpen) {
             throw this.buildError("DETAIL_OPEN_FAILED", "详情页打开超时");
           }
 
           let capture = null;
-          const networkWaitMs = NETWORK_RESUME_WAIT_MS;
-          const networkWaitStartedAt = Date.now();
-          let networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(nextCandidate, networkWaitMs, {
-            minTs: candidateCaptureStartedAt
-          });
+          let networkCandidateInfo = await timeCandidateStage(
+            "network_resume_wait_ms",
+            () => this.waitForResumeNetworkByMode(nextCandidate, {
+              minTs: candidateCaptureStartedAt
+            })
+          );
           let domCandidateInfo = null;
-          if (!normalizeText(networkCandidateInfo?.resumeText)) {
-            if (typeof this.logResumeNetworkMissDiagnostics === "function") {
-              this.logResumeNetworkMissDiagnostics(nextCandidate, {
-                timeoutMs: networkWaitMs,
-                waitStartedAt: networkWaitStartedAt
-              });
-            }
-            await sleep(NETWORK_RESUME_RETRY_WAIT_MS);
-            networkCandidateInfo = await this.waitForNetworkResumeCandidateInfo(
-              nextCandidate,
-              NETWORK_RESUME_RETRY_WAIT_MS,
-              {
-                minTs: candidateCaptureStartedAt
-              }
-            );
-          }
 
           if (networkCandidateInfo?.resumeText) {
-            screening = await this.callTextModel(networkCandidateInfo.resumeText);
+            screening = await timeCandidateStage(
+              "text_model_ms",
+              () => this.callTextModel(networkCandidateInfo.resumeText)
+            );
             resumeSource = "network";
             resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
             this.resumeSourceStats.network += 1;
@@ -5296,14 +5559,29 @@ class RecommendScreenCli {
           } else {
             try {
               resumeSource = "image_fallback";
-              capture = await this.captureResumeImage(nextCandidate);
-              screening = await this.callVisionModel(capture.stitchedImage);
+              capture = await timeCandidateStage(
+                "image_capture_ms",
+                () => this.captureResumeImage(nextCandidate)
+              );
+              this.setResumeAcquisitionMode("image", "image_capture_success");
+              screening = await timeCandidateStage(
+                "vision_model_ms",
+                () => this.callVisionModel(capture.modelImagePaths || capture.stitchedImage)
+              );
               this.resumeSourceStats.image_fallback += 1;
             } catch (imageFallbackError) {
-              const domFallback = await this.resolveDomResumeFallback(nextCandidate, cardProfile || null);
-              if (domFallback?.networkCandidateInfo?.resumeText) {
-                networkCandidateInfo = domFallback.networkCandidateInfo;
-                screening = await this.callTextModel(networkCandidateInfo.resumeText);
+              const lateNetworkCandidateInfo = await timeCandidateStage(
+                "late_network_retry_ms",
+                () => this.waitForLateNetworkResumeCandidateInfo(nextCandidate, {
+                  minTs: candidateCaptureStartedAt
+                })
+              );
+              if (lateNetworkCandidateInfo?.resumeText) {
+                networkCandidateInfo = lateNetworkCandidateInfo;
+                screening = await timeCandidateStage(
+                  "text_model_ms",
+                  () => this.callTextModel(networkCandidateInfo.resumeText)
+                );
                 resumeSource = "network";
                 resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
                 this.resumeSourceStats.network += 1;
@@ -5318,25 +5596,54 @@ class RecommendScreenCli {
                     position: nextCandidate.last_position || ""
                   }
                 );
-              } else if (domFallback?.domCandidateInfo?.resumeText) {
-                domCandidateInfo = domFallback.domCandidateInfo;
-                screening = await this.callTextModel(domCandidateInfo.resumeText);
-                resumeSource = "dom_fallback";
-                resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
-                this.resumeSourceStats.dom_fallback += 1;
-                candidateProfile = mergeCandidateProfiles(
-                  domCandidateInfo || null,
-                  cardProfile || null,
-                  {
-                    name: nextCandidate.name || "",
-                    school: nextCandidate.school || "",
-                    major: nextCandidate.major || "",
-                    company: nextCandidate.last_company || "",
-                    position: nextCandidate.last_position || ""
-                  }
-                );
               } else {
-                throw imageFallbackError;
+                const domFallback = await timeCandidateStage(
+                  "dom_fallback_ms",
+                  () => this.resolveDomResumeFallback(nextCandidate, cardProfile || null)
+                );
+                if (domFallback?.networkCandidateInfo?.resumeText) {
+                  networkCandidateInfo = domFallback.networkCandidateInfo;
+                  screening = await timeCandidateStage(
+                    "text_model_ms",
+                    () => this.callTextModel(networkCandidateInfo.resumeText)
+                  );
+                  resumeSource = "network";
+                  resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
+                  this.resumeSourceStats.network += 1;
+                  candidateProfile = mergeCandidateProfiles(
+                    networkCandidateInfo || null,
+                    cardProfile || null,
+                    {
+                      name: nextCandidate.name || "",
+                      school: nextCandidate.school || "",
+                      major: nextCandidate.major || "",
+                      company: nextCandidate.last_company || "",
+                      position: nextCandidate.last_position || ""
+                    }
+                  );
+                } else if (domFallback?.domCandidateInfo?.resumeText) {
+                  domCandidateInfo = domFallback.domCandidateInfo;
+                  screening = await timeCandidateStage(
+                    "text_model_ms",
+                    () => this.callTextModel(domCandidateInfo.resumeText)
+                  );
+                  resumeSource = "dom_fallback";
+                  resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
+                  this.resumeSourceStats.dom_fallback += 1;
+                  candidateProfile = mergeCandidateProfiles(
+                    domCandidateInfo || null,
+                    cardProfile || null,
+                    {
+                      name: nextCandidate.name || "",
+                      school: nextCandidate.school || "",
+                      major: nextCandidate.major || "",
+                      company: nextCandidate.last_company || "",
+                      position: nextCandidate.last_position || ""
+                    }
+                  );
+                } else {
+                  throw imageFallbackError;
+                }
               }
             }
           }
@@ -5356,13 +5663,16 @@ class RecommendScreenCli {
             }
             let actionResult = { actionTaken: "none" };
             try {
-              actionResult = effectiveAction === "favorite"
-                ? await this.favoriteCandidate({
-                  alreadyInterested: networkCandidateInfo?.alreadyInterested === true
-                })
-                : effectiveAction === "greet"
-                  ? await this.greetCandidate()
-                  : { actionTaken: "none" };
+              actionResult = await timeCandidateStage(
+                "post_action_ms",
+                () => effectiveAction === "favorite"
+                  ? this.favoriteCandidate({
+                    alreadyInterested: networkCandidateInfo?.alreadyInterested === true
+                  })
+                  : effectiveAction === "greet"
+                    ? this.greetCandidate()
+                    : Promise.resolve({ actionTaken: "none" })
+              );
             } catch (postActionError) {
               if (!isRecoverablePostActionError(postActionError, effectiveAction)) {
                 throw postActionError;
@@ -5395,7 +5705,7 @@ class RecommendScreenCli {
               action: actionResult.actionTaken,
               geekId: nextCandidate.geek_id,
               summary: screening.summary,
-              imagePath: capture?.stitchedImage || "",
+              imagePath: capture?.stitchedImage || capture?.modelImagePaths?.[0] || capture?.chunkFiles?.[0] || "",
               resumeSource
             });
             this.recordCandidateAudit({
@@ -5527,7 +5837,7 @@ class RecommendScreenCli {
             );
           }
         } finally {
-          const closed = await this.closeDetailPage();
+          const closed = await timeCandidateStage("close_detail_ms", () => this.closeDetailPage());
           if (!closed) {
             if (allowDetailCloseFailure) {
               log("[详情关闭兜底] 本候选人 post_action 失败后详情页关闭未确认，已记录错误并继续下一位候选人。");
@@ -5540,12 +5850,31 @@ class RecommendScreenCli {
           }
         }
 
-        await this.takeBreakIfNeeded();
+        await timeCandidateStage("rest_ms", () => this.takeBreakIfNeeded());
+        candidateTiming.total_ms = Math.max(0, Date.now() - candidateStartedAt);
+        this.updateCandidateAuditTiming(candidateKeyForTiming, candidateTiming);
         try {
-          this.saveCheckpoint();
+          timeCandidateStageSync("checkpoint_save_ms", () => this.saveCheckpoint());
+          candidateTiming.total_ms = Math.max(0, Date.now() - candidateStartedAt);
+          this.updateCandidateAuditTiming(candidateKeyForTiming, candidateTiming);
         } catch (checkpointError) {
           log(`[保存checkpoint失败] ${checkpointError.message || checkpointError}`);
         }
+        try {
+          this.saveCsv();
+        } catch (csvError) {
+          log(`[增量保存CSV失败] ${csvError.message || csvError}`);
+        }
+        log(
+          `[TIMING] candidate=${candidateKeyForTiming || nextCandidate.name || "unknown"} ` +
+          `total_ms=${candidateTiming.total_ms ?? ""} ` +
+          `network_ms=${candidateTiming.network_resume_wait_ms ?? 0} ` +
+          `text_model_ms=${candidateTiming.text_model_ms ?? 0} ` +
+          `image_capture_ms=${candidateTiming.image_capture_ms ?? 0} ` +
+          `vision_model_ms=${candidateTiming.vision_model_ms ?? 0} ` +
+          `post_action_ms=${candidateTiming.post_action_ms ?? 0} ` +
+          `close_ms=${candidateTiming.close_detail_ms ?? 0}`
+        );
       }
 
       if (this.args.targetCount && this.passedCandidates.length < this.args.targetCount) {
@@ -5606,7 +5935,7 @@ async function main() {
     console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> [--input-summary-json <json>] --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
+          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --thinking-level off|low|medium|high|current --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> [--input-summary-json <json>] --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
         }
       }));
     return;
@@ -5646,6 +5975,8 @@ if (require.main === module) {
       MAX_CONSECUTIVE_RESUME_CAPTURE_FAILURES,
       RESUME_CAPTURE_MAX_ATTEMPTS,
       RESUME_CAPTURE_WAIT_MS,
+      NETWORK_RESUME_IMAGE_MODE_GRACE_MS,
+      NETWORK_RESUME_LATE_RETRY_MS,
       parseFavoriteActionFromPostData,
       parseFavoriteActionFromRequest,
       parseFavoriteActionFromKnownRequest,
