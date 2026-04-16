@@ -1525,8 +1525,8 @@ async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
   }
 }
 
-async function testTextModelShouldDefaultThinkingOffForVolcengine() {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-thinking-off-"));
+async function testTextModelShouldDefaultThinkingLowForVolcengine() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-thinking-low-default-"));
   const cli = new RecommendScreenCli(createArgs(tempDir));
   cli.args.baseUrl = "https://ark.cn-beijing.volces.com/api/v3";
   cli.args.model = "doubao-seed-2-0-mini-260215";
@@ -1552,8 +1552,8 @@ async function testTextModelShouldDefaultThinkingOffForVolcengine() {
   };
   try {
     await cli.callTextModel("resume");
-    assert.deepEqual(capturedPayload?.thinking, { type: "disabled" });
-    assert.equal(capturedPayload?.reasoning_effort, "minimal");
+    assert.deepEqual(capturedPayload?.thinking, { type: "enabled" });
+    assert.equal(capturedPayload?.reasoning_effort, "low");
   } finally {
     global.fetch = originalFetch;
   }
@@ -1812,7 +1812,7 @@ async function main() {
   testParseArgsShouldSupportInputSummaryJson();
   await testCallTextModelShouldNotTruncateLongResume();
   await testCallTextModelShouldFallbackToChunkModeOnContextLimit();
-  await testTextModelShouldDefaultThinkingOffForVolcengine();
+  await testTextModelShouldDefaultThinkingLowForVolcengine();
   await testTextModelShouldSupportLowThinkingForVolcengine();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();
   await testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence();

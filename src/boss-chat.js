@@ -40,6 +40,30 @@ function parsePositiveInteger(value, fallback = null) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseBooleanValue(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["1", "true", "yes", "y", "on", "是"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off", "否"].includes(normalized)) return false;
+  return null;
+}
+
+function resolveHumanRestEnabled(config = {}) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  const candidates = [
+    config.humanRestEnabled,
+    config.human_rest_enabled,
+    config.humanLikeRestEnabled,
+    config.human_like_rest_enabled
+  ];
+  for (const candidate of candidates) {
+    const parsed = parseBooleanValue(candidate);
+    if (typeof parsed === "boolean") return parsed;
+  }
+  return false;
+}
+
 function isUnlimitedTargetCountToken(value) {
   const token = normalizeText(value).toLowerCase();
   if (!token) return false;
@@ -290,7 +314,8 @@ function resolveBossChatScreenConfig(workspaceRoot) {
       apiKey: normalizeText(parsed.apiKey),
       model: normalizeText(parsed.model),
       llmThinkingLevel: resolveLlmThinkingLevel(parsed),
-      debugPort: parsePositiveInteger(parsed.debugPort, 9222)
+      debugPort: parsePositiveInteger(parsed.debugPort, 9222),
+      humanRestEnabled: resolveHumanRestEnabled(parsed)
     },
     config_path: configPath,
     config_dir: path.dirname(configPath)
@@ -430,6 +455,8 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     }
     if (typeof normalized.batchRestEnabled === "boolean") {
       args.push("--batch-rest", String(normalized.batchRestEnabled));
+    } else if (typeof resolvedConfig?.humanRestEnabled === "boolean") {
+      args.push("--batch-rest", String(resolvedConfig.humanRestEnabled));
     }
     return args;
   }

@@ -1288,7 +1288,7 @@ function getEnvLlmThinkingLevel() {
 }
 
 function resolveLlmThinkingLevel(value) {
-  return normalizeLlmThinkingLevel(value) || getEnvLlmThinkingLevel() || "off";
+  return normalizeLlmThinkingLevel(value) || getEnvLlmThinkingLevel() || "low";
 }
 
 function isVolcengineModel(baseUrl, model) {
@@ -1339,6 +1339,7 @@ function parseArgs(argv) {
     checkpointPath: null,
     pauseControlPath: null,
     resume: false,
+    humanRestEnabled: false,
     postAction: null,
     postActionConfirmed: null,
     help: false,
@@ -1353,6 +1354,7 @@ function parseArgs(argv) {
       pageScope: false,
       calibrationPath: false,
       port: false,
+      humanRest: false,
       postAction: false,
       postActionConfirmed: false
     }
@@ -1420,6 +1422,11 @@ function parseArgs(argv) {
       if (!inlineValue) index += 1;
     } else if (token === "--pause-control-path" && (inlineValue || next)) {
       parsed.pauseControlPath = path.resolve(inlineValue || next);
+      if (!inlineValue) index += 1;
+    } else if ((token === "--human-rest" || token === "--humanRest" || token === "--human_rest") && (inlineValue || next)) {
+      const parsedBoolean = parseBoolean(inlineValue || next);
+      parsed.humanRestEnabled = parsedBoolean === true;
+      parsed.__provided.humanRest = parsedBoolean !== null;
       if (!inlineValue) index += 1;
     } else if (token === "--resume") {
       parsed.resume = true;
@@ -5743,12 +5750,12 @@ class RecommendScreenCli {
   async takeBreakIfNeeded() {
     this.restCounter += 1;
     if (Math.random() < 0.08) {
-      const pauseMs = 0;
+      const pauseMs = this.args.humanRestEnabled ? 3000 + Math.floor(Math.random() * 4000) : 0;
       log(`[随机休息] 暂停 ${Math.round(pauseMs / 1000)} 秒`);
       await sleep(pauseMs);
     }
     if (this.restCounter >= this.restThreshold) {
-      const pauseMs = 0;
+      const pauseMs = this.args.humanRestEnabled ? 15000 + Math.floor(Math.random() * 15000) : 0;
       log(`[批次休息] 已连续处理 ${this.restCounter} 人，暂停 ${Math.round(pauseMs / 1000)} 秒`);
       await sleep(pauseMs);
       this.restCounter = 0;
@@ -6469,7 +6476,7 @@ async function main() {
     console.log(JSON.stringify({
         status: "COMPLETED",
         result: {
-          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --thinking-level off|low|medium|high|current --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --output <csv-path> [--input-summary-json <json>] --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
+          usage: "node boss-recommend-screen-cli.cjs --criteria \"有 MCP 开发经验\" --post-action <favorite|greet|none> --max-greet-count 10 --post-action-confirmed true --baseurl <url> --apikey <key> --model <model> --thinking-level off|low|medium|high|current --page-scope recommend|latest|featured --calibration <favorite-calibration.json> --port 9222 --human-rest <true|false> --output <csv-path> [--input-summary-json <json>] --checkpoint-path <checkpoint.json> --pause-control-path <pause-control.json> [--resume]"
         }
       }));
     return;

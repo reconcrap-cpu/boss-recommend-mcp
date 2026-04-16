@@ -755,8 +755,8 @@ async function testBossChatLlmShouldApplyThinkingDefaultsAndOverrides() {
     },
   });
   await volcClient.requestCompletions({ prompt: "prompt", evidenceCorpus: "resume" });
-  assert.deepEqual(volcCompletionPayload.thinking, { type: "disabled" });
-  assert.equal(volcCompletionPayload.reasoning_effort, "minimal");
+  assert.deepEqual(volcCompletionPayload.thinking, { type: "enabled" });
+  assert.equal(volcCompletionPayload.reasoning_effort, "low");
 
   let lowCompletionPayload = null;
   const lowClient = new LlmClient({
@@ -787,7 +787,7 @@ async function testBossChatLlmShouldApplyThinkingDefaultsAndOverrides() {
   });
   await openaiClient.requestCompletions({ prompt: "prompt", evidenceCorpus: "resume" });
   assert.equal(openaiCompletionPayload.thinking, undefined);
-  assert.equal(openaiCompletionPayload.reasoning_effort, "minimal");
+  assert.equal(openaiCompletionPayload.reasoning_effort, "low");
 
   let responsesPayload = null;
   const responsesClient = new LlmClient({

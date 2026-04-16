@@ -167,7 +167,8 @@ config/screening-config.example.json
 - `openaiProject`
 - `debugPort`
 - `outputDir`
-- `llmThinkingLevel`：默认 `off`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。
+- `llmThinkingLevel`：默认 `low`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。
+- `humanRestEnabled`：默认 `false`。`false` 时 recommend-screen 随机休息/批次休息与 boss-chat 批次休息均为 `0ms`；`true` 时恢复随机休息节奏。
 
 ## 常用命令
 

@@ -104,7 +104,7 @@ function resolveLlmThinkingLevel(config = {}, options = {}) {
     normalizeLlmThinkingLevel(config.reasoningEffort) ||
     normalizeLlmThinkingLevel(config.reasoning_effort) ||
     getEnvLlmThinkingLevel() ||
-    'off'
+    'low'
   );
 }
 
@@ -118,7 +118,7 @@ function isVolcengineModel(baseUrl, model) {
 }
 
 function applyChatCompletionThinking(payload, { baseUrl = '', model = '', thinkingLevel = '' } = {}) {
-  const level = normalizeLlmThinkingLevel(thinkingLevel) || 'off';
+  const level = normalizeLlmThinkingLevel(thinkingLevel) || 'low';
   if (isProviderDefaultThinkingLevel(level)) return payload;
   const isVolc = isVolcengineModel(baseUrl, model);
   if (isVolc) {
@@ -142,7 +142,7 @@ function applyChatCompletionThinking(payload, { baseUrl = '', model = '', thinki
 }
 
 function applyResponsesThinking(payload, { thinkingLevel = '' } = {}) {
-  const level = normalizeLlmThinkingLevel(thinkingLevel) || 'off';
+  const level = normalizeLlmThinkingLevel(thinkingLevel) || 'low';
   if (isProviderDefaultThinkingLevel(level) || level === 'auto') return payload;
   payload.reasoning = {
     ...(payload.reasoning || {}),

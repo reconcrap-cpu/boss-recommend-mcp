@@ -47,7 +47,7 @@ export class InteractionController {
       return 0;
     }
 
-    const restMs = 0;
+    const restMs = 4000 + Math.floor(Math.random() * 4000);
     logger.log(`短暂休息 ${restMs}ms，保持处理节奏稳定...`);
     await this.wait(restMs);
     this.nextRestAt = processedCount + this.randomRestThreshold();

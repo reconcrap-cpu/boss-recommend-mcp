@@ -121,6 +121,30 @@ function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function parseBooleanValue(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["1", "true", "yes", "y", "on", "是"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off", "否"].includes(normalized)) return false;
+  return null;
+}
+
+function resolveHumanRestEnabled(config = {}) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return false;
+  const candidates = [
+    config.humanRestEnabled,
+    config.human_rest_enabled,
+    config.humanLikeRestEnabled,
+    config.human_like_rest_enabled
+  ];
+  for (const candidate of candidates) {
+    const parsed = parseBooleanValue(candidate);
+    if (typeof parsed === "boolean") return parsed;
+  }
+  return false;
+}
+
 function serializeInputSummary(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   try {
@@ -2937,6 +2961,7 @@ export async function runRecommendScreenCli({
   if (llmThinkingLevel) {
     args.push("--thinking-level", llmThinkingLevel);
   }
+  args.push("--human-rest", String(resolveHumanRestEnabled(loaded.config)));
   if (Number.isInteger(screenParams.target_count) && screenParams.target_count > 0) {
     args.push("--targetCount", String(screenParams.target_count));
   }
