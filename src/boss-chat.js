@@ -14,7 +14,8 @@ const PREPARE_BOSS_CHAT_MAX_ATTEMPTS = 3;
 const PREPARE_BOSS_CHAT_RETRY_DELAY_MS = 1200;
 const BOSS_CHAT_TERMINAL_STATES = new Set(["completed", "failed", "canceled"]);
 const CHAT_REQUIRED_FIELDS = ["job", "start_from", "target_count", "criteria"];
-export const TARGET_COUNT_ACCEPTED_EXAMPLES = ["all", -1, 20, "全部候选人"];
+export const TARGET_COUNT_CANONICAL_ALL = "all";
+export const TARGET_COUNT_ACCEPTED_EXAMPLES = [TARGET_COUNT_CANONICAL_ALL, -1, 20, "全部候选人"];
 const TARGET_COUNT_WRAPPER_KEYS = ["target_count", "targetCount", "value", "count", "limit"];
 const LLM_THINKING_LEVEL_FIELDS = [
   "llmThinkingLevel",
@@ -126,6 +127,55 @@ function cloneForDiagnostics(value) {
   } catch {
     return String(value);
   }
+}
+
+export function buildTargetCountCompatibilityHints({
+  argumentName = "target_count",
+  recommendedArgumentPatch = { target_count: TARGET_COUNT_CANONICAL_ALL },
+  includeOptions = true
+} = {}) {
+  const normalizedArgumentName = normalizeText(argumentName) || "target_count";
+  const clonedRecommendedPatch = cloneForDiagnostics(recommendedArgumentPatch)
+    || { target_count: TARGET_COUNT_CANONICAL_ALL };
+  const literal = `${normalizedArgumentName}="${TARGET_COUNT_CANONICAL_ALL}"`;
+  const base = {
+    argument_name: normalizedArgumentName,
+    answer_format: `${normalizedArgumentName} = 正整数 | "${TARGET_COUNT_CANONICAL_ALL}"`,
+    canonical_unlimited_value: TARGET_COUNT_CANONICAL_ALL,
+    recommended_value: TARGET_COUNT_CANONICAL_ALL,
+    recommended_argument_patch: clonedRecommendedPatch,
+    accepted_examples: TARGET_COUNT_ACCEPTED_EXAMPLES.slice()
+  };
+  if (!includeOptions) return base;
+  return {
+    ...base,
+    options: [
+      {
+        label: `扫到底（必须传 ${literal}，推荐）`,
+        value: TARGET_COUNT_CANONICAL_ALL,
+        canonical_value: TARGET_COUNT_CANONICAL_ALL,
+        argument_patch: cloneForDiagnostics(clonedRecommendedPatch)
+      },
+      {
+        label: `不限（等价于 ${literal}）`,
+        value: "unlimited",
+        canonical_value: TARGET_COUNT_CANONICAL_ALL,
+        argument_patch: cloneForDiagnostics(clonedRecommendedPatch)
+      },
+      {
+        label: `全部候选人（等价于 ${literal}）`,
+        value: "全部候选人",
+        canonical_value: TARGET_COUNT_CANONICAL_ALL,
+        argument_patch: cloneForDiagnostics(clonedRecommendedPatch)
+      },
+      {
+        label: `所有候选人（等价于 ${literal}）`,
+        value: "所有候选人",
+        canonical_value: TARGET_COUNT_CANONICAL_ALL,
+        argument_patch: cloneForDiagnostics(clonedRecommendedPatch)
+      }
+    ]
+  };
 }
 
 export function normalizeTargetCountInput(value) {
@@ -369,16 +419,16 @@ function getMissingBossChatStartFields(input = {}) {
 
 function buildTargetCountQuestionHint(item = {}) {
   const next = { ...item };
-  next.question = "请输入 target_count：正整数，或 all（扫到底）。";
-  next.options = [
-    { label: "扫到底（推荐）", value: "all" },
-    { label: "不限", value: "unlimited" },
-    { label: "全部候选人", value: "全部候选人" },
-    { label: "所有候选人", value: "所有候选人" }
-  ];
-  next.examples = TARGET_COUNT_ACCEPTED_EXAMPLES.slice();
-  next.argument_name = "target_count";
-  return next;
+  const hints = buildTargetCountCompatibilityHints({
+    argumentName: "target_count",
+    recommendedArgumentPatch: { target_count: TARGET_COUNT_CANONICAL_ALL }
+  });
+  return {
+    ...next,
+    ...hints,
+    question: `请输入 target_count：正整数，或直接填写 "${TARGET_COUNT_CANONICAL_ALL}"（扫到底）。`,
+    examples: TARGET_COUNT_ACCEPTED_EXAMPLES.slice()
+  };
 }
 
 function normalizePendingQuestions(pendingQuestions = []) {
@@ -406,8 +456,13 @@ function buildNextCallExample(input = {}, missingFields = []) {
 function buildTargetCountNeedInputDiagnostics(input = {}, missingFields = []) {
   if (!Array.isArray(missingFields) || !missingFields.includes("target_count")) return {};
   const normalized = normalizeBossChatStartInput(input);
+  const hints = buildTargetCountCompatibilityHints({
+    argumentName: "target_count",
+    recommendedArgumentPatch: { target_count: TARGET_COUNT_CANONICAL_ALL },
+    includeOptions: false
+  });
   return {
-    accepted_examples: TARGET_COUNT_ACCEPTED_EXAMPLES.slice(),
+    ...hints,
     ...(normalized.targetCountRawValue !== undefined ? { received_target_count: normalized.targetCountRawValue } : {}),
     ...(normalized.targetCountParseError ? { target_count_parse_error: normalized.targetCountParseError } : {})
   };

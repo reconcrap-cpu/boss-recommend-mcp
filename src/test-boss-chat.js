@@ -226,6 +226,9 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.deepEqual(prepared.missing_fields, ["job", "start_from", "target_count", "criteria"]);
     const preparedTargetQuestion = prepared.pending_questions.find((item) => item.field === "target_count");
     assert.equal(preparedTargetQuestion.argument_name, "target_count");
+    assert.equal(preparedTargetQuestion.recommended_value, "all");
+    assert.equal(preparedTargetQuestion.recommended_argument_patch.target_count, "all");
+    assert.equal(preparedTargetQuestion.options.some((item) => item.label.includes('target_count="all"')), true);
     assert.equal(prepared.next_call_example.target_count, "all");
 
     const preflight = await startBossChatRun({
@@ -240,6 +243,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     const preflightTargetQuestion = preflight.pending_questions.find((item) => item.field === "target_count");
     assert.equal(Boolean(preflightTargetQuestion), true);
     assert.equal(preflightTargetQuestion.argument_name, "target_count");
+    assert.equal(preflightTargetQuestion.recommended_argument_patch.target_count, "all");
     assert.equal(Array.isArray(preflightTargetQuestion.options), true);
 
     const stateAfterPrepare = readStubState(workspaceRoot);
@@ -331,6 +335,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(Boolean(invalidTarget.target_count_parse_error), true);
     assert.equal(invalidTarget.next_call_example.target_count, "all");
     assert.equal(invalidTarget.accepted_examples.includes("all"), true);
+    assert.equal(invalidTarget.recommended_argument_patch.target_count, "all");
 
     const running = await getBossChatRun({
       workspaceRoot,
@@ -408,11 +413,15 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     assert.deepEqual(startToolSchema.required, ["job", "start_from", "criteria"]);
     assert.equal(startToolSchema.anyOf.some((item) => item.required?.includes("target_count")), true);
     assert.equal(startToolSchema.anyOf.some((item) => item.required?.includes("targetCount")), true);
+    assert.equal(startToolSchema.properties.target_count.examples.includes("all"), true);
+    assert.equal(startToolSchema.examples.some((item) => item.target_count === "all"), true);
 
     const prepared = await callTool(workspaceRoot, TOOL_BOSS_CHAT_PREPARE_RUN, {}, 101);
     assert.equal(prepared.status, "NEED_INPUT");
     assert.deepEqual(prepared.missing_fields, ["job", "start_from", "target_count", "criteria"]);
-    assert.equal(prepared.pending_questions.find((item) => item.field === "target_count").argument_name, "target_count");
+    const preparedTargetCountQuestion = prepared.pending_questions.find((item) => item.field === "target_count");
+    assert.equal(preparedTargetCountQuestion.argument_name, "target_count");
+    assert.equal(preparedTargetCountQuestion.recommended_argument_patch.target_count, "all");
 
     const needInput = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {}, 11);
     assert.equal(needInput.status, "NEED_INPUT");
@@ -422,7 +431,9 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     const targetQuestion = needInput.pending_questions.find((item) => item.field === "target_count");
     assert.equal(Boolean(targetQuestion), true);
     assert.equal(targetQuestion.argument_name, "target_count");
+    assert.equal(targetQuestion.recommended_argument_patch.target_count, "all");
     assert.equal(targetQuestion.options.some((item) => item.value === "all"), true);
+    assert.equal(targetQuestion.options.some((item) => item.label.includes('target_count="all"')), true);
 
     const missingTargetOnly = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {
       job: "算法工程师",
@@ -445,6 +456,7 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
     assert.equal(invalidTargetOnly.received_target_count, "not a target");
     assert.equal(Boolean(invalidTargetOnly.target_count_parse_error), true);
     assert.equal(invalidTargetOnly.next_call_example.target_count, "all");
+    assert.equal(invalidTargetOnly.recommended_argument_patch.target_count, "all");
 
     const invalidStartResponse = await handleRequest(
       makeToolCall(11, TOOL_BOSS_CHAT_START_RUN, {

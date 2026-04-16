@@ -164,7 +164,8 @@ function createTargetCountInputSchema(description) {
         additionalProperties: true
       }
     ],
-    description
+    description: `${description} 若用户选择扫到底/不限/全部候选人，优先字面传 "all"。`,
+    examples: ["all", 20, { value: "all" }]
   };
 }
 
@@ -486,7 +487,21 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       safe_pacing: { type: "boolean" },
       batch_rest_enabled: { type: "boolean" }
     },
-    additionalProperties: false
+    additionalProperties: false,
+    examples: [
+      {
+        job: "530272634",
+        start_from: "unread",
+        target_count: "all",
+        criteria: "请扫到底筛选符合条件的人选"
+      },
+      {
+        job: "530272634",
+        start_from: "unread",
+        target_count: 20,
+        criteria: "请筛选 20 位符合条件的人选"
+      }
+    ]
   };
   if (requireFullInput) {
     schema.required = ["job", "start_from", "criteria"];
@@ -653,7 +668,7 @@ function createToolsSchema() {
     },
     {
       name: TOOL_BOSS_CHAT_START_RUN,
-      description: "异步启动一次 boss-chat 任务。必须一次性提供 job、start_from、target_count、criteria；扫到底请传 target_count=\"all\"。",
+      description: "异步启动一次 boss-chat 任务。必须一次性提供 job、start_from、target_count、criteria；若用户选择扫到底/不限/全部候选人，必须字面传 target_count=\"all\"。",
       inputSchema: createBossChatStartInputSchema({ requireFullInput: true })
     },
     {

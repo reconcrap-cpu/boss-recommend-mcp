@@ -55,6 +55,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。
 - 参数名必须写 `target_count`（不要写“目标数量”等中文键名）。
 - 当用户选择“扫到底/全部候选人/所有候选人”时，调用参数优先写：`"target_count": "all"`；`-1` 只作为兼容输入和内部 CLI 表示。
+- 若工具或提问选项里出现“扫到底（必须传 `target_count=\"all\"`）”之类字样，下一次工具调用时必须直接照抄这个字面量，不要只保留“扫到底”语义。
 - 禁止 agent 自行补全 `job/start_from/criteria` 并直接执行，必须由用户明确给出或确认。
 - chat-only 启动流程必须先进入聊天页并拉取岗位列表，再让用户从列表中选择 `job`。
 - 必须先用空参调用 `prepare_boss_chat_run` 获取 `job_options`；不要用 `start_boss_chat_run` 做预备调用。

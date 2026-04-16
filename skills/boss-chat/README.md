@@ -34,5 +34,6 @@ target_count mapping:
 - `全部候选人` / `所有候选人` must also be treated as unlimited.
 - Always write the argument key as `target_count`.
 - For unlimited mode, prefer `"target_count": "all"` in the tool call; `-1` is accepted for compatibility and used internally by the CLI.
+- If the tool/UI shows `扫到底（必须传 target_count="all"）`, copy that literal into the next tool call instead of paraphrasing it.
 - If start_boss_chat_run returns NEED_INPUT for `target_count`, the previous tool call omitted the argument. Retry once using `next_call_example` and include `"target_count": "all"` or a positive integer.
 ```

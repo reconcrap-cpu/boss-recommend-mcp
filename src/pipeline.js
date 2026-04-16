@@ -14,6 +14,7 @@ import {
   switchRecommendTab
 } from "./adapters.js";
 import {
+  buildTargetCountCompatibilityHints,
   cancelBossChatRun,
   getBossChatRun,
   normalizeTargetCountInput,
@@ -445,12 +446,22 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
     });
   }
   if (!hasExplicitTargetCount) {
+    const targetCountHints = buildTargetCountCompatibilityHints({
+      argumentName: "follow_up.chat.target_count",
+      recommendedArgumentPatch: {
+        follow_up: {
+          chat: {
+            target_count: "all"
+          }
+        }
+      }
+    });
     missing_fields.push("follow_up.chat.target_count");
     pending_questions.push({
+      ...targetCountHints,
       field: "follow_up.chat.target_count",
-      question: "请填写 boss-chat follow-up 本次处理人数上限（正整数，或 all/-1 表示扫到底，必填）。",
+      question: "请填写 boss-chat follow-up 本次处理人数上限。若扫到底，请在 follow_up.chat.target_count 里字面填写 \"all\"。",
       value: summary.target_count,
-      accepted_examples: ["all", -1, 20, "全部候选人"],
       ...(explicitTarget.rawValue !== undefined ? { received_target_count: explicitTarget.rawValue } : {}),
       ...(explicitTarget.parseError ? { target_count_parse_error: explicitTarget.parseError } : {})
     });

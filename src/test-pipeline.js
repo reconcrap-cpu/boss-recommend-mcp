@@ -2184,6 +2184,8 @@ async function testFollowUpChatMissingFieldsShouldExposeRecommendDefaults() {
   assert.equal(criteriaQuestion?.value, "默认沿用 recommend 的筛选条件");
   assert.equal(startFromQuestion?.value, "unread");
   assert.equal(targetCountQuestion?.value, 18);
+  assert.equal(targetCountQuestion?.recommended_argument_patch?.follow_up?.chat?.target_count, "all");
+  assert.equal(targetCountQuestion?.options?.some((item) => item.label.includes('follow_up.chat.target_count="all"')), true);
 }
 
 async function testFollowUpChatMissingStartFromShouldNeedInput() {
@@ -2221,7 +2223,9 @@ async function testFollowUpChatMissingTargetCountShouldNeedInput() {
 
   assert.equal(result.status, "NEED_INPUT");
   assert.equal(result.missing_fields.includes("follow_up.chat.target_count"), true);
-  assert.equal(result.pending_questions.some((item) => item.field === "follow_up.chat.target_count"), true);
+  const targetQuestion = result.pending_questions.find((item) => item.field === "follow_up.chat.target_count");
+  assert.equal(Boolean(targetQuestion), true);
+  assert.equal(targetQuestion.recommended_argument_patch?.follow_up?.chat?.target_count, "all");
 }
 
 async function testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics() {
@@ -2244,6 +2248,7 @@ async function testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics(
   assert.equal(targetQuestion?.received_target_count, "not a target");
   assert.equal(Boolean(targetQuestion?.target_count_parse_error), true);
   assert.equal(targetQuestion?.accepted_examples.includes("all"), true);
+  assert.equal(targetQuestion?.recommended_argument_patch?.follow_up?.chat?.target_count, "all");
 }
 
 async function testFollowUpChatAllTargetCountShouldLaunchUnlimited() {
