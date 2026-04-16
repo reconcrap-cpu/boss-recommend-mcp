@@ -652,6 +652,101 @@ function formatEducationSchoolTags(edu) {
   return tags.join("、");
 }
 
+function inferDegreeRank(degreeText) {
+  const normalized = normalizeText(degreeText).toLowerCase();
+  if (!normalized) return 0;
+  if (/博士|phd|doctor/.test(normalized)) return 7;
+  if (/硕士|master/.test(normalized)) return 6;
+  if (/本科|学士|bachelor/.test(normalized)) return 5;
+  if (/大专|专科|junior/.test(normalized)) return 4;
+  if (/高中/.test(normalized)) return 3;
+  if (/中专|中技/.test(normalized)) return 2;
+  if (/初中|小学|及以下/.test(normalized)) return 1;
+  return 0;
+}
+
+function normalizeResumeDateToken(value) {
+  const raw = normalizeText(value);
+  if (!raw) return "";
+  const digits = raw.replace(/[^\d]/g, "");
+  if (/^\d{8}$/.test(digits)) {
+    return `${digits.slice(0, 4)}.${digits.slice(4, 6)}`;
+  }
+  if (/^\d{6}$/.test(digits)) {
+    return `${digits.slice(0, 4)}.${digits.slice(4, 6)}`;
+  }
+  if (/^\d{4}$/.test(digits)) {
+    return digits;
+  }
+  return raw;
+}
+
+function formatResumeTimeRange(startRaw, endRaw, fallbackEnd = "") {
+  const start = normalizeResumeDateToken(startRaw);
+  const end = normalizeResumeDateToken(endRaw) || normalizeText(fallbackEnd);
+  if (start && end) return `${start} ~ ${end}`;
+  if (start) return `${start} ~`;
+  if (end) return `~ ${end}`;
+  return "";
+}
+
+function formatResumeTimeRangeFromFields(source, startFields = [], endFields = [], fallbackEnd = "") {
+  const startRaw = startFields
+    .map((field) => source?.[field])
+    .find((value) => normalizeText(value));
+  const endRaw = endFields
+    .map((field) => source?.[field])
+    .find((value) => normalizeText(value));
+  return formatResumeTimeRange(startRaw, endRaw, fallbackEnd);
+}
+
+function formatNamedListText(items = []) {
+  if (!Array.isArray(items) || items.length <= 0) return "";
+  return items
+    .map((item) => normalizeText(item?.name || item?.subjectName || item?.title || item))
+    .filter(Boolean)
+    .join("、");
+}
+
+function extractYearFromResumeDate(value) {
+  const token = normalizeResumeDateToken(value);
+  if (!token) return "";
+  const match = token.match(/(19|20)\d{2}/);
+  return match ? match[0] : "";
+}
+
+function deriveHighestEducation(eduExpList = []) {
+  const list = Array.isArray(eduExpList) ? eduExpList : [];
+  let selected = null;
+  for (const edu of list) {
+    const degree = formatEducationDegree(edu);
+    const rank = inferDegreeRank(degree);
+    const endYear = extractYearFromResumeDate(
+      edu?.endYearMonStr || edu?.endYearStr || edu?.endDateDesc || edu?.endDate || ""
+    );
+    const candidate = {
+      school: normalizeText(edu?.school || edu?.schoolName || ""),
+      degree,
+      rank,
+      endYear
+    };
+    if (!selected) {
+      selected = candidate;
+      continue;
+    }
+    const selectedYear = Number(selected.endYear || 0);
+    const candidateYear = Number(candidate.endYear || 0);
+    if (candidate.rank > selected.rank) {
+      selected = candidate;
+      continue;
+    }
+    if (candidate.rank === selected.rank && candidateYear > selectedYear) {
+      selected = candidate;
+    }
+  }
+  return selected || { school: "", degree: "", rank: 0, endYear: "" };
+}
+
 function splitTextByChunks(text, chunkSize, overlap, maxChunks) {
   const source = String(text || "");
   if (!source) return [];
@@ -1536,12 +1631,21 @@ function formatResumeApiData(data) {
   const parts = [];
   const geekDetail = data?.geekDetail || data?.geekDetailInfo || data || {};
   const baseInfo = geekDetail.geekBaseInfo || {};
-  const expectList = geekDetail.geekExpectList || [];
+  const expectList = Array.isArray(geekDetail.geekExpectList) && geekDetail.geekExpectList.length > 0
+    ? geekDetail.geekExpectList
+    : Array.isArray(geekDetail.geekExpPosList) && geekDetail.geekExpPosList.length > 0
+      ? geekDetail.geekExpPosList
+      : geekDetail.showExpectPosition
+        ? [geekDetail.showExpectPosition]
+        : [];
   const workExpList = geekDetail.geekWorkExpList || [];
   const projExpList = geekDetail.geekProjExpList || [];
   const eduExpList = geekDetail.geekEduExpList || geekDetail.geekEducationList || [];
   const advantage = geekDetail.geekAdvantage || baseInfo.userDesc || baseInfo.userDescription || "";
   const skillList = geekDetail.geekSkillList || geekDetail.skillList || [];
+  const certificationList = geekDetail.geekCertificationList || [];
+  const workExpCheckRes = Array.isArray(geekDetail.workExpCheckRes) ? geekDetail.workExpCheckRes : [];
+  const highestEdu = deriveHighestEducation(eduExpList);
 
   parts.push("=== 基本信息 ===");
   if (baseInfo.name) parts.push(`姓名: ${baseInfo.name}`);
@@ -1549,6 +1653,9 @@ function formatResumeApiData(data) {
   if (baseInfo.gender !== undefined) parts.push(`性别: ${baseInfo.gender === 1 ? "男" : "女"}`);
   if (baseInfo.degreeCategory) parts.push(`学历: ${baseInfo.degreeCategory}`);
   if (baseInfo.workYearDesc) parts.push(`工作经验: ${baseInfo.workYearDesc}`);
+  if (typeof baseInfo.freshGraduate === "number") parts.push(`应届状态: ${baseInfo.freshGraduate === 1 ? "应届生" : "非应届生"}`);
+  const workDate = normalizeResumeDateToken(baseInfo.workDate8);
+  if (workDate) parts.push(`参加工作时间: ${workDate}`);
   if (baseInfo.activeTimeDesc) parts.push(`活跃状态: ${baseInfo.activeTimeDesc}`);
   if (baseInfo.applyStatusContent) parts.push(`求职状态: ${baseInfo.applyStatusContent}`);
 
@@ -1573,12 +1680,26 @@ function formatResumeApiData(data) {
       const company = exp.company || "";
       const position = stripHtml(exp.positionName || "");
       parts.push(`${index + 1}. ${company} - ${position}`);
-      if (exp.startYearMonStr) {
-        parts.push(`   时间: ${exp.startYearMonStr} ~ ${exp.endYearMonStr || "至今"}`);
+      const workTime = formatResumeTimeRangeFromFields(
+        exp,
+        ["startYearMonStr", "startYearStr", "startDateDesc", "startDate"],
+        ["endYearMonStr", "endYearStr", "endDateDesc", "endDate"],
+        "至今"
+      );
+      if (workTime) {
+        parts.push(`   时间: ${workTime}`);
       }
       const workContent = exp.responsibility || exp.workContent || "";
       if (workContent) {
         parts.push(`   职责: ${stripHtml(workContent)}`);
+      }
+      const workPerformance = exp.workPerformance || exp.performance || "";
+      if (workPerformance) {
+        parts.push(`   成果: ${stripHtml(workPerformance)}`);
+      }
+      const workEmphasis = exp.workEmphasis || "";
+      if (workEmphasis) {
+        parts.push(`   补充: ${stripHtml(workEmphasis)}`);
       }
     });
   }
@@ -1588,8 +1709,14 @@ function formatResumeApiData(data) {
     projExpList.forEach((proj, index) => {
       parts.push(`${index + 1}. ${proj.name || proj.projectName || "未知项目"}`);
       if (proj.roleName) parts.push(`   角色: ${proj.roleName}`);
-      if (proj.startYearMonStr) {
-        parts.push(`   时间: ${proj.startYearMonStr} ~ ${proj.endYearMonStr || "至今"}`);
+      const projTime = formatResumeTimeRangeFromFields(
+        proj,
+        ["startYearMonStr", "startYearStr", "startDateDesc", "startDate"],
+        ["endYearMonStr", "endYearStr", "endDateDesc", "endDate"],
+        "至今"
+      );
+      if (projTime) {
+        parts.push(`   时间: ${projTime}`);
       }
       const projectDescription = proj.description || proj.projectDescription || "";
       if (projectDescription) parts.push(`   描述: ${stripHtml(projectDescription)}`);
@@ -1605,14 +1732,34 @@ function formatResumeApiData(data) {
       if (edu.major || edu.majorName) parts.push(`   专业: ${edu.major || edu.majorName}`);
       const eduDegree = formatEducationDegree(edu);
       if (eduDegree) parts.push(`   学历: ${eduDegree}`);
-      const eduStart = edu.startYearMonStr || edu.startYearStr;
-      if (eduStart) {
-        const eduEnd = edu.endYearMonStr || edu.endYearStr || "";
-        parts.push(`   时间: ${eduStart} ~ ${eduEnd}`);
+      const eduTime = formatResumeTimeRangeFromFields(
+        edu,
+        ["startYearMonStr", "startYearStr", "startDateDesc", "startDate"],
+        ["endYearMonStr", "endYearStr", "endDateDesc", "endDate"]
+      );
+      if (eduTime) {
+        parts.push(`   时间: ${eduTime}`);
       }
       const schoolTags = formatEducationSchoolTags(edu);
       if (schoolTags) {
         parts.push(`   学校标签: ${schoolTags}`);
+      }
+      const eduDescription = stripHtml(edu.eduDescription || edu.description || "");
+      if (eduDescription) {
+        parts.push(`   描述: ${eduDescription}`);
+      }
+      const courseDesc = stripHtml(edu.courseDesc || "");
+      if (courseDesc) {
+        parts.push(`   课程/研究: ${courseDesc}`);
+      }
+      const keySubjects = formatNamedListText(edu.keySubjectList || []);
+      if (keySubjects) {
+        parts.push(`   核心课程: ${keySubjects}`);
+      }
+      const thesisTitle = normalizeText(edu.thesisTitle || "");
+      const thesisDesc = stripHtml(edu.thesisDesc || "");
+      if (thesisTitle || thesisDesc) {
+        parts.push(`   论文: ${thesisTitle}${thesisDesc ? ` - ${thesisDesc}` : ""}`);
       }
     });
   }
@@ -1625,6 +1772,33 @@ function formatResumeApiData(data) {
       }
     });
   }
+
+  if (certificationList.length > 0) {
+    parts.push("\n=== 资格证书 ===");
+    certificationList.forEach((cert) => {
+      const certName = normalizeText(cert?.certName || cert?.name || "");
+      if (certName) parts.push(`- ${certName}`);
+    });
+  }
+
+  parts.push("\n=== 结构化判定线索 ===");
+  if (highestEdu.degree) parts.push(`最高学历: ${highestEdu.degree}`);
+  if (highestEdu.school) parts.push(`最高学历学校: ${highestEdu.school}`);
+  if (highestEdu.endYear) parts.push(`最高学历毕业年份: ${highestEdu.endYear}`);
+  parts.push(`是否有工作经历: ${workExpList.length > 0 ? "是" : "否"}`);
+  parts.push(`是否有项目经历: ${projExpList.length > 0 ? "是" : "否"}`);
+  parts.push("相关经验硬判口径: 仅工作经历/项目经历可作为“相关经验”硬性证据；教育/课程/技能仅作补充。");
+  if (workExpCheckRes.length > 0) {
+    const riskText = workExpCheckRes
+      .map((item) => normalizeText(item?.desc || item?.firstTip || item?.chatDesc || ""))
+      .filter(Boolean)
+      .slice(0, 3)
+      .join("；");
+    if (riskText) {
+      parts.push(`软风险提示(需追问，不直接淘汰): ${riskText}`);
+    }
+  }
+  parts.push("判定忽略项: 活跃度/沟通热度/受欢迎度等运营指标不参与通过判定。");
 
   return parts.join("\n");
 }
@@ -4698,7 +4872,12 @@ class RecommendScreenCli {
           `筛选标准:\n${this.args.criteria}\n\n` +
           "你将收到候选人完整简历的一个或多个顺序分段图片。必须完整阅读全部分段后再判断，" +
           "不能只根据前几段下结论；后续分段中的教育、项目、经历或否定信息必须纳入最终判断。" +
-          "严禁编造任何不存在的经历、项目、学校、公司或时间线；证据不足时必须判定为不通过。\n\n" +
+          "严禁编造任何不存在的经历、项目、学校、公司或时间线；证据不足时必须判定为不通过。\n" +
+          "当筛选条件涉及应届/毕业年份时，必须以最高学历毕业年份作为主依据；若简历中出现教育起止时间、毕业时间或可推断年份信息，必须先推断再判断，" +
+          "只有完全不存在可推断时间信息时才可以写“无法判断”。\n" +
+          "当筛选条件提及“相关经验”时，必须以工作经历或项目经历作为硬性证据；教育/课程/论文/技能/个人优势只能作为补充，不能单独判定满足。\n" +
+          "workExpCheckRes 等经历校验项仅作为“需追问”软风险，不得直接据此判定不通过。\n" +
+          "活跃度、沟通热度、受欢迎度等运营指标不参与筛选通过判定。\n\n" +
           "要求：\n" +
           "1) reason 必须写出可审计的判定依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
           "2) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
@@ -4886,9 +5065,14 @@ class RecommendScreenCli {
             "1) 必须完整阅读上面的全部简历文本。\n" +
             "2) 只能依据简历中真实出现的信息判断，严禁编造不存在的经历/项目/学历/公司。\n" +
             "3) 若证据不足，必须返回 passed=false。\n\n" +
-            "4) reason 必须写出可审计依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
-            "5) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
-            "6) evidence 至少给出 2 条可在简历原文定位的证据短句。\n\n" +
+            "4) 当筛选条件涉及应届/毕业年份时，必须以最高学历毕业年份作为主依据；若简历中存在教育时间、毕业时间或可推断年份信息，必须先推断再判断；" +
+            "只有完全不存在时间线信息时才可写“无法判断”。\n" +
+            "5) 当筛选条件提及“相关经验”时，必须以工作经历或项目经历作为硬性证据；教育/课程/论文/技能/个人优势只能作为补充，不能单独判定满足。\n" +
+            "6) workExpCheckRes 等经历校验项仅作为“需追问”软风险，不得直接据此判定不通过。\n" +
+            "7) 活跃度、沟通热度、受欢迎度等运营指标不参与筛选通过判定。\n" +
+            "8) reason 必须写出可审计依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
+            "9) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
+            "10) evidence 至少给出 2 条可在简历原文定位的证据短句。\n\n" +
             "请返回严格 JSON: " +
             "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
         }

@@ -959,6 +959,60 @@ function testFormatResumeApiDataShouldPreserveEducationTagsAndProjectDescription
   assert.equal(formatted.includes("描述: 采用stable diffusion进行编辑实验"), true);
 }
 
+function testFormatResumeApiDataShouldIncludeStructuredJudgementHints() {
+  const source = {
+    geekDetailInfo: {
+      geekBaseInfo: {
+        name: "测试候选人",
+        degreeCategory: "硕士"
+      },
+      geekWorkExpList: [
+        {
+          company: "中科院",
+          positionName: "科研助理",
+          startDate: "20241001",
+          endDate: "",
+          responsibility: "科研以及项目"
+        }
+      ],
+      geekProjExpList: [],
+      geekEduExpList: [
+        {
+          school: "科克大学",
+          major: "理学",
+          degreeName: "硕士",
+          startDateDesc: "2020",
+          endDateDesc: "2023"
+        },
+        {
+          school: "东北大学",
+          major: "数学与应用数学",
+          degreeName: "本科",
+          startDate: "20140101",
+          endDate: "20180101"
+        }
+      ],
+      workExpCheckRes: [
+        {
+          desc: "毕业同年未填写工作经历"
+        }
+      ],
+      jobCompetitive: {
+        tips: [{ content: "受欢迎程度高" }]
+      }
+    }
+  };
+  const formatted = __testables.formatResumeApiData(source);
+  assert.equal(formatted.includes("=== 结构化判定线索 ==="), true);
+  assert.equal(formatted.includes("最高学历: 硕士"), true);
+  assert.equal(formatted.includes("最高学历毕业年份: 2023"), true);
+  assert.equal(formatted.includes("是否有工作经历: 是"), true);
+  assert.equal(formatted.includes("是否有项目经历: 否"), true);
+  assert.equal(formatted.includes("相关经验硬判口径"), true);
+  assert.equal(formatted.includes("软风险提示(需追问，不直接淘汰): 毕业同年未填写工作经历"), true);
+  assert.equal(formatted.includes("判定忽略项: 活跃度/沟通热度/受欢迎度等运营指标不参与通过判定。"), true);
+}
+
 function testEvidenceTokenMatcherShouldSupportParaphrasedEvidence() {
   const resume = [
     "南京大学 专业: 数学",
@@ -1702,6 +1756,7 @@ async function main() {
   testFavoriteActionParserShouldOnlyTrustKnownRequestShapes();
   testFinishedWrapClassifierShouldNotTreatLoadMoreAsBottom();
   testFormatResumeApiDataShouldPreserveEducationTagsAndProjectDescription();
+  testFormatResumeApiDataShouldIncludeStructuredJudgementHints();
   testEvidenceTokenMatcherShouldSupportParaphrasedEvidence();
   testCheckpointPayloadShouldIncludeCandidateAudits();
   testCheckpointShouldPersistAndRestoreInputSummary();
