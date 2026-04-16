@@ -1013,6 +1013,46 @@ function testFormatResumeApiDataShouldIncludeStructuredJudgementHints() {
   assert.equal(formatted.includes("判定忽略项: 活跃度/沟通热度/受欢迎度等运营指标不参与通过判定。"), true);
 }
 
+function testEnrichCandidateInfoWithCardProfileShouldAppendCardFallbackWhenDomInfoMissing() {
+  const candidateInfo = {
+    name: "",
+    school: "",
+    major: "",
+    company: "",
+    position: "",
+    resumeText: "=== 基本信息 ===\n姓名: 赵梓轩\n"
+  };
+  const cardProfile = {
+    name: "赵梓轩",
+    age: "29岁",
+    gender: "男",
+    highestDegree: "硕士",
+    workYears: "2年",
+    company: "中科院",
+    position: "科研助理",
+    latestWorkStart: "2024.10",
+    latestWorkEnd: "至今",
+    educationList: [
+      { school: "科克大学", major: "理学", degree: "硕士", start: "2020", end: "2023" },
+      { school: "东北大学", major: "数学与应用数学", degree: "本科", start: "2014", end: "2018" }
+    ]
+  };
+
+  const enriched = __testables.enrichCandidateInfoWithCardProfile(candidateInfo, cardProfile);
+  assert.equal(enriched.name, "赵梓轩");
+  assert.equal(enriched.company, "中科院");
+  assert.equal(enriched.position, "科研助理");
+  assert.equal(enriched.resumeText.includes("=== 人选卡片兜底信息（仅在简历缺失时使用） ==="), true);
+  assert.equal(enriched.resumeText.includes("年龄: 29岁"), true);
+  assert.equal(enriched.resumeText.includes("性别: 男"), true);
+  assert.equal(enriched.resumeText.includes("最近一份工作在职日期: 2024.10 ~ 至今"), true);
+  assert.equal(enriched.resumeText.includes("1. 学校=科克大学；专业=理学；学历=硕士；时间=2020 ~ 2023"), true);
+  assert.equal(enriched.resumeText.includes("2. 学校=东北大学；专业=数学与应用数学；学历=本科；时间=2014 ~ 2018"), true);
+
+  const enrichedAgain = __testables.enrichCandidateInfoWithCardProfile(enriched, cardProfile);
+  assert.equal((enrichedAgain.resumeText.match(/人选卡片兜底信息（仅在简历缺失时使用）/g) || []).length, 1);
+}
+
 function testEvidenceTokenMatcherShouldSupportParaphrasedEvidence() {
   const resume = [
     "南京大学 专业: 数学",
@@ -1757,6 +1797,7 @@ async function main() {
   testFinishedWrapClassifierShouldNotTreatLoadMoreAsBottom();
   testFormatResumeApiDataShouldPreserveEducationTagsAndProjectDescription();
   testFormatResumeApiDataShouldIncludeStructuredJudgementHints();
+  testEnrichCandidateInfoWithCardProfileShouldAppendCardFallbackWhenDomInfoMissing();
   testEvidenceTokenMatcherShouldSupportParaphrasedEvidence();
   testCheckpointPayloadShouldIncludeCandidateAudits();
   testCheckpointShouldPersistAndRestoreInputSummary();

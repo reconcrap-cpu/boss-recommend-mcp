@@ -16,7 +16,7 @@ const CSV_HEADER = [
   "最近工作职位",
   "评估通过详细原因",
   "处理结果",
-  "筛选原因",
+  "判断依据(CoT)",
   "动作执行结果",
   "简历来源",
   "原始判定通过",
@@ -592,6 +592,101 @@ function mergeCandidateProfiles(...profiles) {
   };
 }
 
+function buildCardProfileFallbackText(cardProfile = {}) {
+  const profile = cardProfile && typeof cardProfile === "object" ? cardProfile : {};
+  const educationList = Array.isArray(profile.educationList)
+    ? profile.educationList
+        .map((item) => ({
+          school: normalizeText(item?.school || ""),
+          major: normalizeText(item?.major || ""),
+          degree: normalizeText(item?.degree || ""),
+          start: normalizeText(item?.start || ""),
+          end: normalizeText(item?.end || "")
+        }))
+        .filter((item) => item.school || item.major || item.degree || item.start || item.end)
+        .slice(0, 2)
+    : [];
+  const hasCore = Boolean(
+    normalizeText(profile.name || "")
+    || normalizeText(profile.age || "")
+    || normalizeText(profile.gender || "")
+    || normalizeText(profile.highestDegree || "")
+    || normalizeText(profile.workYears || "")
+    || normalizeText(profile.company || "")
+    || normalizeText(profile.position || "")
+    || normalizeText(profile.latestWorkStart || "")
+    || normalizeText(profile.latestWorkEnd || "")
+    || educationList.length > 0
+  );
+  if (!hasCore) return "";
+
+  const lines = ["=== 人选卡片兜底信息（仅在简历缺失时使用） ==="];
+  const pushField = (label, value) => {
+    const text = normalizeText(value);
+    if (!text) return;
+    lines.push(`${label}: ${text}`);
+  };
+
+  pushField("姓名", profile.name);
+  pushField("年龄", profile.age);
+  pushField("性别", profile.gender);
+  pushField("最高学历", profile.highestDegree);
+  pushField("工作年限", profile.workYears);
+  pushField("最近一份工作公司", profile.company);
+  pushField("最近一份职位", profile.position);
+  const workPeriod = formatResumeTimeRange(profile.latestWorkStart, profile.latestWorkEnd, "至今");
+  if (workPeriod) {
+    lines.push(`最近一份工作在职日期: ${workPeriod}`);
+  }
+  if (educationList.length > 0) {
+    lines.push("最近两段学校经历:");
+    educationList.forEach((item, index) => {
+      const eduPeriod = formatResumeTimeRange(item.start, item.end);
+      const detailParts = [
+        item.school ? `学校=${item.school}` : "",
+        item.major ? `专业=${item.major}` : "",
+        item.degree ? `学历=${item.degree}` : "",
+        eduPeriod ? `时间=${eduPeriod}` : ""
+      ].filter(Boolean);
+      if (detailParts.length > 0) {
+        lines.push(`${index + 1}. ${detailParts.join("；")}`);
+      }
+    });
+  }
+  return lines.join("\n");
+}
+
+function enrichCandidateInfoWithCardProfile(candidateInfo = {}, cardProfile = null) {
+  const info = candidateInfo && typeof candidateInfo === "object" ? candidateInfo : {};
+  const profile = cardProfile && typeof cardProfile === "object" ? cardProfile : null;
+  if (!profile) return { ...info };
+
+  const educationList = Array.isArray(profile.educationList) ? profile.educationList : [];
+  const firstEducation = educationList[0] || {};
+  const merged = {
+    ...info,
+    name: preferReadableName(info?.name || "", profile?.name || ""),
+    school: normalizeText(info?.school || "") || normalizeText(profile?.school || "") || normalizeText(firstEducation?.school || ""),
+    major: normalizeText(info?.major || "") || normalizeText(profile?.major || "") || normalizeText(firstEducation?.major || ""),
+    company: normalizeText(info?.company || "") || normalizeText(profile?.company || ""),
+    position: normalizeText(info?.position || "") || normalizeText(profile?.position || ""),
+    alreadyInterested: info?.alreadyInterested === true
+  };
+
+  const baseResumeText = normalizeText(info?.resumeText || "");
+  const cardFallbackText = buildCardProfileFallbackText(profile);
+  if (cardFallbackText) {
+    merged.resumeText = baseResumeText.includes("=== 人选卡片兜底信息（仅在简历缺失时使用） ===")
+      ? baseResumeText
+      : baseResumeText
+        ? `${baseResumeText}\n\n${cardFallbackText}`
+        : cardFallbackText;
+  } else {
+    merged.resumeText = baseResumeText;
+  }
+  return merged;
+}
+
 function isDomProfileConsistentWithCard(cardProfile, domProfile) {
   if (!cardProfile || !domProfile) return true;
   let compared = 0;
@@ -807,6 +902,101 @@ function parseBoolean(value) {
   if (["1", "true", "yes", "y", "是"].includes(normalized)) return true;
   if (["0", "false", "no", "n", "否"].includes(normalized)) return false;
   return null;
+}
+
+function parsePassedDecision(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (value === 1) return true;
+    if (value === 0) return false;
+  }
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (/不符合|不通过|未通过|未命中|不匹配|不满足/.test(normalized)) return false;
+  if (/符合|通过|命中|匹配|满足/.test(normalized)) return true;
+  return null;
+}
+
+function parsePassedDecisionFromContent(content) {
+  const raw = String(content || "");
+  const explicit = raw.match(/"passed"\s*:\s*(true|false)/i);
+  if (explicit) {
+    return explicit[1].toLowerCase() === "true";
+  }
+  return parsePassedDecision(raw);
+}
+
+function flattenChatMessageContent(content) {
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object") {
+          return item.text || item.content || item.reasoning_content || "";
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  return String(content || "");
+}
+
+function collectNestedText(value, out = [], depth = 0) {
+  if (depth > 6 || value === null || value === undefined) return out;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    const normalized = normalizeText(String(value));
+    if (normalized) out.push(normalized);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNestedText(item, out, depth + 1);
+    }
+    return out;
+  }
+  if (typeof value === "object") {
+    const priorityKeys = ["text", "reasoning_content", "summary_text", "summary", "content", "cot", "reason"];
+    const seen = new Set();
+    for (const key of priorityKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        seen.add(key);
+        collectNestedText(value[key], out, depth + 1);
+      }
+    }
+    for (const [key, nested] of Object.entries(value)) {
+      if (seen.has(key)) continue;
+      collectNestedText(nested, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+function extractCotFromChoice(choice, parsed = {}) {
+  const fragments = [];
+  const candidates = [
+    choice?.message?.reasoning_content,
+    choice?.message?.reasoning,
+    choice?.reasoning_content,
+    choice?.reasoning,
+    parsed?.cot,
+    parsed?.reasoning_content,
+    parsed?.reasoning,
+    parsed?.summary_text,
+    parsed?.summary,
+    parsed?.reason
+  ];
+  for (const candidate of candidates) {
+    collectNestedText(candidate, fragments);
+  }
+  const deduped = [];
+  const seen = new Set();
+  for (const item of fragments) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    deduped.push(item);
+  }
+  return deduped.join("\n");
 }
 
 function normalizeCliOptionToken(rawToken) {
@@ -1808,9 +1998,17 @@ function extractJsonObject(text) {
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) {
-    throw new Error("Vision model response did not contain JSON");
+    throw new Error("Model response did not contain JSON");
   }
   return JSON.parse(raw.slice(start, end + 1));
+}
+
+function tryExtractJsonObject(text) {
+  try {
+    return extractJsonObject(text);
+  } catch {
+    return {};
+  }
 }
 
 async function promptPostAction() {
@@ -4475,6 +4673,18 @@ class RecommendScreenCli {
           }
           return "";
         };
+        const rankDegree = (value) => {
+          const text = normalize(value).toLowerCase();
+          if (!text) return 0;
+          if (/博士|phd|doctor/.test(text)) return 7;
+          if (/硕士|master/.test(text)) return 6;
+          if (/本科|学士|bachelor/.test(text)) return 5;
+          if (/大专|专科/.test(text)) return 4;
+          if (/高中/.test(text)) return 3;
+          if (/中专|中技/.test(text)) return 2;
+          if (/初中|小学/.test(text)) return 1;
+          return 0;
+        };
         const recommendInner = Array.from(doc.querySelectorAll(".card-inner[data-geekid]"))
           .find((item) => (item.getAttribute("data-geekid") || "") === String(candidateKey)) || null;
         const latestInner = recommendInner
@@ -4500,13 +4710,84 @@ class RecommendScreenCli {
         const workSpans = latestWork
           ? Array.from(latestWork.querySelectorAll(".join-text-wrap.content span")).map((item) => textOf(item)).filter(Boolean)
           : [];
+        const workTimeSpans = latestWork
+          ? Array.from(latestWork.querySelectorAll(".join-text-wrap.time span")).map((item) => textOf(item)).filter(Boolean)
+          : [];
+        const eduItems = Array.from(card.querySelectorAll(".timeline-wrap.edu-exps .timeline-item"))
+          .map((item) => {
+            const timeSpans = Array.from(item.querySelectorAll(".join-text-wrap.time span")).map((node) => textOf(node)).filter(Boolean);
+            const contentSpans = Array.from(item.querySelectorAll(".join-text-wrap.content span")).map((node) => textOf(node)).filter(Boolean);
+            return {
+              school: contentSpans[0] || "",
+              major: contentSpans[1] || "",
+              degree: contentSpans[2] || "",
+              start: timeSpans[0] || "",
+              end: timeSpans[1] || ""
+            };
+          })
+          .filter((item) => item.school || item.major || item.degree || item.start || item.end)
+          .slice(0, 2);
+        if (eduItems.length === 0 && (eduSpans[0] || eduSpans[1] || eduSpans[2])) {
+          eduItems.push({
+            school: eduSpans[0] || "",
+            major: eduSpans[1] || "",
+            degree: eduSpans[2] || "",
+            start: "",
+            end: ""
+          });
+        }
+        const baseInfoTokens = Array.from(card.querySelectorAll(".join-text-wrap.base-info span, .base-info span"))
+          .map((item) => textOf(item))
+          .filter(Boolean);
+        let age = "";
+        let workYears = "";
+        let highestDegree = "";
+        for (const token of baseInfoTokens) {
+          if (!age && /\d+\s*岁/u.test(token)) {
+            age = token;
+            continue;
+          }
+          if (!workYears && /(\d+\s*年|应届|在校)/u.test(token) && !/\d+\s*岁/u.test(token)) {
+            workYears = token;
+            continue;
+          }
+          if (!highestDegree && /(博士|硕士|本科|大专|专科|高中|中专|中技|初中)/u.test(token)) {
+            highestDegree = token;
+          }
+        }
+        const genderUse = card.querySelector("svg.gender use, .gender use, svg[class*='gender'] use");
+        const genderHref = String(
+          (genderUse && (genderUse.getAttribute("xlink:href") || genderUse.getAttribute("href") || ""))
+          || ""
+        ).toLowerCase();
+        let gender = "";
+        if (/(man|male|boy|icon-man|男)/.test(genderHref)) {
+          gender = "男";
+        } else if (/(woman|female|girl|icon-woman|女)/.test(genderHref)) {
+          gender = "女";
+        }
+        if (!highestDegree) {
+          const degreeFromEdu = eduItems
+            .slice()
+            .sort((a, b) => rankDegree(b.degree) - rankDegree(a.degree))[0];
+          if (degreeFromEdu?.degree) {
+            highestDegree = degreeFromEdu.degree;
+          }
+        }
         return {
           ok: true,
           name: pick(card, [".geek-name-wrap .name", ".name-wrap .name", "span.name", ".name"]),
           school: eduSpans[0] || pick(card, [".edu-wrap .school-name", ".base-info .school-name", ".school-name"]),
           major: eduSpans[1] || pick(card, [".edu-wrap .major", ".major"]),
           company: workSpans[0] || pick(card, [".company-name-wrap .name", ".company-name"]),
-          position: workSpans[1] || pick(card, [".position span", ".position"])
+          position: workSpans[1] || pick(card, [".position span", ".position"]),
+          age,
+          gender,
+          highest_degree: highestDegree,
+          work_years: workYears,
+          latest_work_start: workTimeSpans[0] || "",
+          latest_work_end: workTimeSpans[1] || "",
+          education_list: eduItems
         };
       })(${JSON.stringify(candidateKey)})`);
     } catch {
@@ -4520,7 +4801,25 @@ class RecommendScreenCli {
       school: normalizeText(profile?.school || ""),
       major: normalizeText(profile?.major || ""),
       company: normalizeText(profile?.company || ""),
-      position: normalizeText(profile?.position || "")
+      position: normalizeText(profile?.position || ""),
+      age: normalizeText(profile?.age || ""),
+      gender: normalizeText(profile?.gender || ""),
+      highestDegree: normalizeText(profile?.highest_degree || ""),
+      workYears: normalizeText(profile?.work_years || ""),
+      latestWorkStart: normalizeText(profile?.latest_work_start || ""),
+      latestWorkEnd: normalizeText(profile?.latest_work_end || ""),
+      educationList: Array.isArray(profile?.education_list)
+        ? profile.education_list
+            .map((item) => ({
+              school: normalizeText(item?.school || ""),
+              major: normalizeText(item?.major || ""),
+              degree: normalizeText(item?.degree || ""),
+              start: normalizeText(item?.start || ""),
+              end: normalizeText(item?.end || "")
+            }))
+            .filter((item) => item.school || item.major || item.degree || item.start || item.end)
+            .slice(0, 2)
+        : []
     };
   }
 
@@ -4653,22 +4952,32 @@ class RecommendScreenCli {
   applyVisionEvidenceGate(result) {
     const parsed = result && typeof result === "object" ? result : {};
     const rawPassed = parsed?.rawPassed === true || parsed?.passed === true;
-    const parsedEvidence = toStringArray(parsed?.evidence);
-    const evidenceRawCount = Number.isFinite(Number(parsed?.evidenceRawCount))
-      ? Number(parsed.evidenceRawCount)
-      : parsedEvidence.length;
-    const evidenceMatchedCount = Number.isFinite(Number(parsed?.evidenceMatchedCount))
-      ? Number(parsed.evidenceMatchedCount)
-      : parsedEvidence.length;
-    const evidenceGateDemoted = parsed?.evidenceGateDemoted === true || (rawPassed && evidenceMatchedCount <= 0);
-    const reason = normalizeText(parsed?.reason || "");
-    const summary = normalizeText(parsed?.summary || reason);
+    const evidenceGateEligible = parsed?.evidenceGateEligible === true
+      || Array.isArray(parsed?.evidence)
+      || Number.isFinite(Number(parsed?.evidenceRawCount))
+      || Number.isFinite(Number(parsed?.evidenceMatchedCount));
+    const parsedEvidence = evidenceGateEligible ? toStringArray(parsed?.evidence) : [];
+    const evidenceRawCount = evidenceGateEligible
+      ? (Number.isFinite(Number(parsed?.evidenceRawCount))
+        ? Number(parsed.evidenceRawCount)
+        : parsedEvidence.length)
+      : null;
+    const evidenceMatchedCount = evidenceGateEligible
+      ? (Number.isFinite(Number(parsed?.evidenceMatchedCount))
+        ? Number(parsed.evidenceMatchedCount)
+        : parsedEvidence.length)
+      : null;
+    const evidenceGateDemoted = parsed?.evidenceGateDemoted === true
+      || (evidenceGateEligible && rawPassed && evidenceMatchedCount <= 0);
+    const cot = normalizeText(parsed?.cot || parsed?.reason || "");
+    const summary = normalizeText(parsed?.summary || cot);
     const finalReason = evidenceGateDemoted
-      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`
-      : (reason || (rawPassed ? "满足筛选标准。" : "未满足筛选标准。"));
+      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${cot ? ` 原始判断依据(CoT): ${cot}` : ""}`
+      : (cot || (rawPassed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。"));
     return {
       passed: evidenceGateDemoted ? false : rawPassed,
       rawPassed,
+      cot: finalReason,
       reason: finalReason,
       summary: summary || finalReason,
       evidence: parsedEvidence,
@@ -4879,11 +5188,10 @@ class RecommendScreenCli {
           "workExpCheckRes 等经历校验项仅作为“需追问”软风险，不得直接据此判定不通过。\n" +
           "活跃度、沟通热度、受欢迎度等运营指标不参与筛选通过判定。\n\n" +
           "要求：\n" +
-          "1) reason 必须写出可审计的判定依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
-          "2) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
-          "3) evidence 至少给出 2 条可在简历中定位的原文短句。\n\n" +
+          "1) 只做结论判断：候选人是否符合筛选标准。\n" +
+          "2) 只返回 passed 布尔值，不要在 JSON 中输出 reason/summary/evidence 等字段。\n\n" +
           "请返回严格 JSON: " +
-          "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
+          "{\"passed\": true/false}"
       }
     ];
     for (let index = 0; index < imagePaths.length; index += 1) {
@@ -4943,28 +5251,47 @@ class RecommendScreenCli {
       throw this.buildError("VISION_MODEL_FAILED", `Vision model request failed: ${response.status} ${body.slice(0, 400)}`);
     }
     const json = await response.json();
-    const content = Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((item) => item?.text || "").join("\n")
-      : json?.choices?.[0]?.message?.content || "";
-    const parsed = extractJsonObject(content);
-    const rawPassed = parsed.passed === true;
-    const reason = normalizeText(parsed.reason);
-    const summary = normalizeText(parsed.summary || reason);
-    const evidence = toStringArray(parsed.evidence);
-    const evidenceGateDemoted = rawPassed && evidence.length <= 0;
+    const choice = json?.choices?.[0] || {};
+    const content = flattenChatMessageContent(choice?.message?.content);
+    const parsed = tryExtractJsonObject(content);
+    const parsedPassed = parsePassedDecision(parsed?.passed);
+    const fallbackPassed = parsePassedDecisionFromContent(content);
+    const rawPassed = parsedPassed !== null ? parsedPassed : fallbackPassed;
+    if (rawPassed === null) {
+      throw this.buildError(
+        "VISION_MODEL_FAILED",
+        `Vision model response missing boolean passed decision. content=${truncateText(content, 180)}`
+      );
+    }
+    const cot = normalizeText(extractCotFromChoice(choice, parsed));
+    const reason = cot || (rawPassed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
+    const summary = reason;
+    const evidenceGateEligible = Array.isArray(parsed?.evidence)
+      || Number.isFinite(Number(parsed?.evidenceRawCount))
+      || Number.isFinite(Number(parsed?.evidenceMatchedCount));
+    const parsedEvidence = evidenceGateEligible ? toStringArray(parsed?.evidence) : [];
+    const evidenceRawCount = evidenceGateEligible
+      ? (Number.isFinite(Number(parsed?.evidenceRawCount)) ? Number(parsed.evidenceRawCount) : parsedEvidence.length)
+      : null;
+    const evidenceMatchedCount = evidenceGateEligible
+      ? (Number.isFinite(Number(parsed?.evidenceMatchedCount)) ? Number(parsed.evidenceMatchedCount) : parsedEvidence.length)
+      : null;
+    const evidenceGateDemoted = evidenceGateEligible && rawPassed && (evidenceMatchedCount ?? 0) <= 0;
     const finalReason = evidenceGateDemoted
-      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`
-      : (reason || (rawPassed ? "满足筛选标准。" : "未满足筛选标准。"));
+      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始判断依据(CoT): ${reason}` : ""}`
+      : reason;
     const passed = evidenceGateDemoted ? false : rawPassed;
-    const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, evidence, passed);
+    const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, parsedEvidence, passed);
     return {
       passed,
       rawPassed,
+      cot: reason,
       reason: enrichedReason,
       summary: summary || enrichedReason,
-      evidence,
-      evidenceRawCount: evidence.length,
-      evidenceMatchedCount: evidence.length,
+      evidence: parsedEvidence,
+      evidenceRawCount,
+      evidenceMatchedCount,
+      evidenceGateEligible,
       evidenceGateDemoted
     };
   }
@@ -5064,17 +5391,17 @@ class RecommendScreenCli {
             "要求：\n" +
             "1) 必须完整阅读上面的全部简历文本。\n" +
             "2) 只能依据简历中真实出现的信息判断，严禁编造不存在的经历/项目/学历/公司。\n" +
-            "3) 若证据不足，必须返回 passed=false。\n\n" +
-            "4) 当筛选条件涉及应届/毕业年份时，必须以最高学历毕业年份作为主依据；若简历中存在教育时间、毕业时间或可推断年份信息，必须先推断再判断；" +
+            "3) 若文本中包含“人选卡片兜底信息（仅在简历缺失时使用）”段落，只能在主简历缺失对应字段时引用该段，不可覆盖主简历已明确字段。\n" +
+            "4) 若证据不足，必须返回 passed=false。\n\n" +
+            "5) 当筛选条件涉及应届/毕业年份时，必须以最高学历毕业年份作为主依据；若简历中存在教育时间、毕业时间或可推断年份信息，必须先推断再判断；" +
             "只有完全不存在时间线信息时才可写“无法判断”。\n" +
-            "5) 当筛选条件提及“相关经验”时，必须以工作经历或项目经历作为硬性证据；教育/课程/论文/技能/个人优势只能作为补充，不能单独判定满足。\n" +
-            "6) workExpCheckRes 等经历校验项仅作为“需追问”软风险，不得直接据此判定不通过。\n" +
-            "7) 活跃度、沟通热度、受欢迎度等运营指标不参与筛选通过判定。\n" +
-            "8) reason 必须写出可审计依据，至少包含 2 条与筛选标准直接相关的事实。\n" +
-            "9) 禁止只写“候选人同时满足全部筛选条件/不满足筛选条件”等泛化句。\n" +
-            "10) evidence 至少给出 2 条可在简历原文定位的证据短句。\n\n" +
+            "6) 当筛选条件提及“相关经验”时，必须以工作经历或项目经历作为硬性证据；教育/课程/论文/技能/个人优势只能作为补充，不能单独判定满足。\n" +
+            "7) workExpCheckRes 等经历校验项仅作为“需追问”软风险，不得直接据此判定不通过。\n" +
+            "8) 活跃度、沟通热度、受欢迎度等运营指标不参与筛选通过判定。\n" +
+            "9) 只做结论判断：候选人是否符合筛选标准。\n" +
+            "10) 只返回 passed 布尔值，不要在 JSON 中输出 reason/summary/evidence 等字段。\n\n" +
             "请返回严格 JSON: " +
-            "{\"passed\": true/false, \"reason\": \"...\", \"summary\": \"...\", \"evidence\": [\"证据原文1\", \"证据原文2\"]}"
+            "{\"passed\": true/false}"
         }
       ]
     };
@@ -5100,32 +5427,43 @@ class RecommendScreenCli {
       throw this.buildError("TEXT_MODEL_FAILED", `Text model request failed: ${response.status} ${body.slice(0, 400)}`);
     }
     const json = await response.json();
-    const content = Array.isArray(json?.choices?.[0]?.message?.content)
-      ? json.choices[0].message.content.map((item) => item?.text || "").join("\n")
-      : json?.choices?.[0]?.message?.content || "";
-    const parsed = extractJsonObject(content);
-    const reason = normalizeText(parsed.reason);
-    const summary = normalizeText(parsed.summary || reason);
+    const choice = json?.choices?.[0] || {};
+    const content = flattenChatMessageContent(choice?.message?.content);
+    const parsed = tryExtractJsonObject(content);
+    const cot = normalizeText(extractCotFromChoice(choice, parsed));
     const normalizedResume = normalizeText(safeResumeText);
     const normalizedResumeLower = toLowerSafe(normalizedResume);
-    const parsedEvidence = toStringArray(parsed.evidence);
+    const evidenceGateEligible = Array.isArray(parsed?.evidence)
+      || Number.isFinite(Number(parsed?.evidenceRawCount))
+      || Number.isFinite(Number(parsed?.evidenceMatchedCount));
+    const parsedEvidence = evidenceGateEligible ? toStringArray(parsed.evidence) : [];
     const evidence = [];
     const unmatchedEvidence = [];
-    for (const item of parsedEvidence) {
-      const matched = matchEvidenceAgainstResume(item, safeResumeText, normalizedResume, normalizedResumeLower);
-      if (matched.matched) {
-        evidence.push(item);
-      } else {
-        unmatchedEvidence.push(item);
+    if (evidenceGateEligible) {
+      for (const item of parsedEvidence) {
+        const matched = matchEvidenceAgainstResume(item, safeResumeText, normalizedResume, normalizedResumeLower);
+        if (matched.matched) {
+          evidence.push(item);
+        } else {
+          unmatchedEvidence.push(item);
+        }
       }
     }
-    const rawPassed = parsed.passed === true;
+    const parsedPassed = parsePassedDecision(parsed?.passed);
+    const fallbackPassed = parsePassedDecisionFromContent(content);
+    const rawPassed = parsedPassed !== null ? parsedPassed : fallbackPassed;
+    if (rawPassed === null) {
+      throw this.buildError(
+        "TEXT_MODEL_FAILED",
+        `Text model response missing boolean passed decision. content=${truncateText(content, 180)}`
+      );
+    }
     let passed = rawPassed;
-    let finalReason = reason || (passed ? "满足筛选标准。" : "不满足筛选标准。");
-    const evidenceGateDemoted = rawPassed && evidence.length <= 0;
+    let finalReason = cot || (passed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
+    const evidenceGateDemoted = evidenceGateEligible && rawPassed && evidence.length <= 0;
     if (evidenceGateDemoted) {
       passed = false;
-      finalReason = `模型未给出可在简历原文中校验的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ""}`;
+      finalReason = `模型未给出可在简历原文中校验的证据，按安全策略判为不通过。${finalReason ? ` 原始判断依据(CoT): ${finalReason}` : ""}`;
       if (unmatchedEvidence.length > 0) {
         log(
           `[EVIDENCE_GATE] passed=true 但证据未命中简历原文，已降级为不通过；` +
@@ -5133,15 +5471,17 @@ class RecommendScreenCli {
         );
       }
     }
+    const summary = finalReason;
     const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, evidence, passed);
     return {
       passed,
       rawPassed,
+      cot: finalReason,
       reason: enrichedReason,
       summary: summary || enrichedReason,
       evidence,
-      evidenceRawCount: parsedEvidence.length,
-      evidenceMatchedCount: evidence.length,
+      evidenceRawCount: evidenceGateEligible ? parsedEvidence.length : null,
+      evidenceMatchedCount: evidenceGateEligible ? evidence.length : null,
       evidenceGateDemoted,
       chunkIndex,
       chunkTotal
@@ -5722,6 +6062,7 @@ class RecommendScreenCli {
           let domCandidateInfo = null;
 
           if (networkCandidateInfo?.resumeText) {
+            networkCandidateInfo = enrichCandidateInfoWithCardProfile(networkCandidateInfo, cardProfile || null);
             screening = await timeCandidateStage(
               "text_model_ms",
               () => this.callTextModel(networkCandidateInfo.resumeText)
@@ -5761,7 +6102,10 @@ class RecommendScreenCli {
                 })
               );
               if (lateNetworkCandidateInfo?.resumeText) {
-                networkCandidateInfo = lateNetworkCandidateInfo;
+                networkCandidateInfo = enrichCandidateInfoWithCardProfile(
+                  lateNetworkCandidateInfo,
+                  cardProfile || null
+                );
                 screening = await timeCandidateStage(
                   "text_model_ms",
                   () => this.callTextModel(networkCandidateInfo.resumeText)
@@ -5786,7 +6130,10 @@ class RecommendScreenCli {
                   () => this.resolveDomResumeFallback(nextCandidate, cardProfile || null)
                 );
                 if (domFallback?.networkCandidateInfo?.resumeText) {
-                  networkCandidateInfo = domFallback.networkCandidateInfo;
+                  networkCandidateInfo = enrichCandidateInfoWithCardProfile(
+                    domFallback.networkCandidateInfo,
+                    cardProfile || null
+                  );
                   screening = await timeCandidateStage(
                     "text_model_ms",
                     () => this.callTextModel(networkCandidateInfo.resumeText)
@@ -5806,7 +6153,10 @@ class RecommendScreenCli {
                     }
                   );
                 } else if (domFallback?.domCandidateInfo?.resumeText) {
-                  domCandidateInfo = domFallback.domCandidateInfo;
+                  domCandidateInfo = enrichCandidateInfoWithCardProfile(
+                    domFallback.domCandidateInfo,
+                    cardProfile || null
+                  );
                   screening = await timeCandidateStage(
                     "text_model_ms",
                     () => this.callTextModel(domCandidateInfo.resumeText)
@@ -6169,6 +6519,8 @@ if (require.main === module) {
       isRecoverablePostActionError,
       classifyFinishedWrapState,
       formatResumeApiData,
+      buildCardProfileFallbackText,
+      enrichCandidateInfoWithCardProfile,
       extractEvidenceTokens,
       matchEvidenceAgainstResume
     }
