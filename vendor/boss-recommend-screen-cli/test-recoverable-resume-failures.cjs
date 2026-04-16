@@ -1695,7 +1695,7 @@ async function testCloseDetailPageShouldContinueWhenListReady() {
   assert.equal(closed, true);
 }
 
-async function testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence() {
+async function testVisionEvidenceGateShouldKeepRawPassWithoutExplicitEvidenceProtocol() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-evidence-gate-"));
   const cli = new RecommendScreenCli(createArgs(tempDir));
   cli.prepareVisionImageSegmentsForModel = async () => ({
@@ -1710,6 +1710,33 @@ async function testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence() 
     reason: "matched",
     summary: "matched",
     evidence: []
+  });
+  const result = await cli.callVisionModel(path.join(tempDir, "fake.png"));
+  assert.equal(result.rawPassed, true);
+  assert.equal(result.passed, true);
+  assert.equal(result.evidenceGateDemoted, false);
+  assert.equal(result.evidenceRawCount, null);
+  assert.equal(result.evidenceMatchedCount, null);
+}
+
+async function testVisionEvidenceGateShouldDemoteWhenExplicitlyArmedWithoutEvidence() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-evidence-gate-explicit-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  cli.prepareVisionImageSegmentsForModel = async () => ({
+    imagePaths: ["segment-1"],
+    source: "test",
+    sourcePixels: 100,
+    currentPixels: 100
+  });
+  cli.requestVisionModel = async () => ({
+    passed: true,
+    rawPassed: true,
+    reason: "matched",
+    summary: "matched",
+    evidence: [],
+    evidenceGateEligible: true,
+    evidenceRawCount: 0,
+    evidenceMatchedCount: 0
   });
   const result = await cli.callVisionModel(path.join(tempDir, "fake.png"));
   assert.equal(result.rawPassed, true);
@@ -1815,7 +1842,8 @@ async function main() {
   await testTextModelShouldDefaultThinkingLowForVolcengine();
   await testTextModelShouldSupportLowThinkingForVolcengine();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();
-  await testVisionEvidenceGateShouldDemoteImageFallbackWithoutEvidence();
+  await testVisionEvidenceGateShouldKeepRawPassWithoutExplicitEvidenceProtocol();
+  await testVisionEvidenceGateShouldDemoteWhenExplicitlyArmedWithoutEvidence();
   await testVisionModelShouldSendAllOrderedChunks();
   testRecoverablePostActionErrorShouldTreatGreetContinueAndNoButtonAsRecoverable();
   await testRecoverableGreetContinueButtonShouldNotAbortWhenDetailCloseFails();

@@ -475,6 +475,15 @@ function toStringArray(value, maxItems = 8) {
   return normalized;
 }
 
+function hasEvidenceGateSignal(parsed, parsedEvidence = null) {
+  if (!parsed || typeof parsed !== "object") return false;
+  if (parsed?.evidenceGateEligible === true) return true;
+  if (Number.isFinite(Number(parsed?.evidenceRawCount))) return true;
+  if (Number.isFinite(Number(parsed?.evidenceMatchedCount))) return true;
+  const normalizedEvidence = Array.isArray(parsedEvidence) ? parsedEvidence : toStringArray(parsed?.evidence);
+  return normalizedEvidence.length > 0;
+}
+
 function toLowerSafe(text) {
   return String(text || "").toLowerCase();
 }
@@ -4959,11 +4968,8 @@ class RecommendScreenCli {
   applyVisionEvidenceGate(result) {
     const parsed = result && typeof result === "object" ? result : {};
     const rawPassed = parsed?.rawPassed === true || parsed?.passed === true;
-    const evidenceGateEligible = parsed?.evidenceGateEligible === true
-      || Array.isArray(parsed?.evidence)
-      || Number.isFinite(Number(parsed?.evidenceRawCount))
-      || Number.isFinite(Number(parsed?.evidenceMatchedCount));
-    const parsedEvidence = evidenceGateEligible ? toStringArray(parsed?.evidence) : [];
+    const parsedEvidence = toStringArray(parsed?.evidence);
+    const evidenceGateEligible = hasEvidenceGateSignal(parsed, parsedEvidence);
     const evidenceRawCount = evidenceGateEligible
       ? (Number.isFinite(Number(parsed?.evidenceRawCount))
         ? Number(parsed.evidenceRawCount)
@@ -5273,10 +5279,8 @@ class RecommendScreenCli {
     const cot = normalizeText(extractCotFromChoice(choice, parsed));
     const reason = cot || (rawPassed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
     const summary = reason;
-    const evidenceGateEligible = Array.isArray(parsed?.evidence)
-      || Number.isFinite(Number(parsed?.evidenceRawCount))
-      || Number.isFinite(Number(parsed?.evidenceMatchedCount));
-    const parsedEvidence = evidenceGateEligible ? toStringArray(parsed?.evidence) : [];
+    const parsedEvidence = toStringArray(parsed?.evidence);
+    const evidenceGateEligible = hasEvidenceGateSignal(parsed, parsedEvidence);
     const evidenceRawCount = evidenceGateEligible
       ? (Number.isFinite(Number(parsed?.evidenceRawCount)) ? Number(parsed.evidenceRawCount) : parsedEvidence.length)
       : null;
@@ -5440,10 +5444,8 @@ class RecommendScreenCli {
     const cot = normalizeText(extractCotFromChoice(choice, parsed));
     const normalizedResume = normalizeText(safeResumeText);
     const normalizedResumeLower = toLowerSafe(normalizedResume);
-    const evidenceGateEligible = Array.isArray(parsed?.evidence)
-      || Number.isFinite(Number(parsed?.evidenceRawCount))
-      || Number.isFinite(Number(parsed?.evidenceMatchedCount));
-    const parsedEvidence = evidenceGateEligible ? toStringArray(parsed.evidence) : [];
+    const parsedEvidence = toStringArray(parsed?.evidence);
+    const evidenceGateEligible = hasEvidenceGateSignal(parsed, parsedEvidence);
     const evidence = [];
     const unmatchedEvidence = [];
     if (evidenceGateEligible) {
