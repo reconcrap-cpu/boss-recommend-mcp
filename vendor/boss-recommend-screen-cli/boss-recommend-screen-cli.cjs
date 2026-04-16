@@ -475,15 +475,6 @@ function toStringArray(value, maxItems = 8) {
   return normalized;
 }
 
-function hasEvidenceGateSignal(parsed, parsedEvidence = null) {
-  if (!parsed || typeof parsed !== "object") return false;
-  if (parsed?.evidenceGateEligible === true) return true;
-  if (Number.isFinite(Number(parsed?.evidenceRawCount))) return true;
-  if (Number.isFinite(Number(parsed?.evidenceMatchedCount))) return true;
-  const normalizedEvidence = Array.isArray(parsedEvidence) ? parsedEvidence : toStringArray(parsed?.evidence);
-  return normalizedEvidence.length > 0;
-}
-
 function toLowerSafe(text) {
   return String(text || "").toLowerCase();
 }
@@ -4969,26 +4960,17 @@ class RecommendScreenCli {
     const parsed = result && typeof result === "object" ? result : {};
     const rawPassed = parsed?.rawPassed === true || parsed?.passed === true;
     const parsedEvidence = toStringArray(parsed?.evidence);
-    const evidenceGateEligible = hasEvidenceGateSignal(parsed, parsedEvidence);
-    const evidenceRawCount = evidenceGateEligible
-      ? (Number.isFinite(Number(parsed?.evidenceRawCount))
-        ? Number(parsed.evidenceRawCount)
-        : parsedEvidence.length)
-      : null;
-    const evidenceMatchedCount = evidenceGateEligible
-      ? (Number.isFinite(Number(parsed?.evidenceMatchedCount))
-        ? Number(parsed.evidenceMatchedCount)
-        : parsedEvidence.length)
-      : null;
-    const evidenceGateDemoted = parsed?.evidenceGateDemoted === true
-      || (evidenceGateEligible && rawPassed && evidenceMatchedCount <= 0);
+    const evidenceRawCount = Number.isFinite(Number(parsed?.evidenceRawCount))
+      ? Number(parsed.evidenceRawCount)
+      : parsedEvidence.length;
+    const evidenceMatchedCount = Number.isFinite(Number(parsed?.evidenceMatchedCount))
+      ? Number(parsed.evidenceMatchedCount)
+      : parsedEvidence.length;
     const cot = normalizeText(parsed?.cot || parsed?.reason || "");
     const summary = normalizeText(parsed?.summary || cot);
-    const finalReason = evidenceGateDemoted
-      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${cot ? ` 原始判断依据(CoT): ${cot}` : ""}`
-      : (cot || (rawPassed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。"));
+    const finalReason = cot || (rawPassed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
     return {
-      passed: evidenceGateDemoted ? false : rawPassed,
+      passed: rawPassed,
       rawPassed,
       cot: finalReason,
       reason: finalReason,
@@ -4996,7 +4978,7 @@ class RecommendScreenCli {
       evidence: parsedEvidence,
       evidenceRawCount,
       evidenceMatchedCount,
-      evidenceGateDemoted
+      evidenceGateDemoted: false
     };
   }
 
@@ -5280,19 +5262,14 @@ class RecommendScreenCli {
     const reason = cot || (rawPassed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
     const summary = reason;
     const parsedEvidence = toStringArray(parsed?.evidence);
-    const evidenceGateEligible = hasEvidenceGateSignal(parsed, parsedEvidence);
-    const evidenceRawCount = evidenceGateEligible
-      ? (Number.isFinite(Number(parsed?.evidenceRawCount)) ? Number(parsed.evidenceRawCount) : parsedEvidence.length)
-      : null;
-    const evidenceMatchedCount = evidenceGateEligible
-      ? (Number.isFinite(Number(parsed?.evidenceMatchedCount)) ? Number(parsed.evidenceMatchedCount) : parsedEvidence.length)
-      : null;
-    const evidenceGateDemoted = evidenceGateEligible && rawPassed && (evidenceMatchedCount ?? 0) <= 0;
-    const finalReason = evidenceGateDemoted
-      ? `模型未给出可在简历截图中引用的证据，按安全策略判为不通过。${reason ? ` 原始判断依据(CoT): ${reason}` : ""}`
-      : reason;
-    const passed = evidenceGateDemoted ? false : rawPassed;
-    const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, parsedEvidence, passed);
+    const evidenceRawCount = Number.isFinite(Number(parsed?.evidenceRawCount))
+      ? Number(parsed.evidenceRawCount)
+      : parsedEvidence.length;
+    const evidenceMatchedCount = Number.isFinite(Number(parsed?.evidenceMatchedCount))
+      ? Number(parsed.evidenceMatchedCount)
+      : parsedEvidence.length;
+    const passed = rawPassed;
+    const enrichedReason = enrichReasonWithEvidence(reason, summary || reason, parsedEvidence, passed);
     return {
       passed,
       rawPassed,
@@ -5302,8 +5279,8 @@ class RecommendScreenCli {
       evidence: parsedEvidence,
       evidenceRawCount,
       evidenceMatchedCount,
-      evidenceGateEligible,
-      evidenceGateDemoted
+      evidenceGateEligible: false,
+      evidenceGateDemoted: false
     };
   }
 
@@ -5445,17 +5422,11 @@ class RecommendScreenCli {
     const normalizedResume = normalizeText(safeResumeText);
     const normalizedResumeLower = toLowerSafe(normalizedResume);
     const parsedEvidence = toStringArray(parsed?.evidence);
-    const evidenceGateEligible = hasEvidenceGateSignal(parsed, parsedEvidence);
     const evidence = [];
-    const unmatchedEvidence = [];
-    if (evidenceGateEligible) {
-      for (const item of parsedEvidence) {
-        const matched = matchEvidenceAgainstResume(item, safeResumeText, normalizedResume, normalizedResumeLower);
-        if (matched.matched) {
-          evidence.push(item);
-        } else {
-          unmatchedEvidence.push(item);
-        }
+    for (const item of parsedEvidence) {
+      const matched = matchEvidenceAgainstResume(item, safeResumeText, normalizedResume, normalizedResumeLower);
+      if (matched.matched) {
+        evidence.push(item);
       }
     }
     const parsedPassed = parsePassedDecision(parsed?.passed);
@@ -5467,19 +5438,8 @@ class RecommendScreenCli {
         `Text model response missing boolean passed decision. content=${truncateText(content, 180)}`
       );
     }
-    let passed = rawPassed;
-    let finalReason = cot || (passed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
-    const evidenceGateDemoted = evidenceGateEligible && rawPassed && evidence.length <= 0;
-    if (evidenceGateDemoted) {
-      passed = false;
-      finalReason = `模型未给出可在简历原文中校验的证据，按安全策略判为不通过。${finalReason ? ` 原始判断依据(CoT): ${finalReason}` : ""}`;
-      if (unmatchedEvidence.length > 0) {
-        log(
-          `[EVIDENCE_GATE] passed=true 但证据未命中简历原文，已降级为不通过；` +
-          `chunk=${chunkIndex}/${chunkTotal}; unmatched=${unmatchedEvidence.slice(0, 3).join(" | ")}`
-        );
-      }
-    }
+    const passed = rawPassed;
+    const finalReason = cot || (passed ? "模型判定符合筛选标准。" : "模型判定不符合筛选标准。");
     const summary = finalReason;
     const enrichedReason = enrichReasonWithEvidence(finalReason, summary || finalReason, evidence, passed);
     return {
@@ -5489,9 +5449,9 @@ class RecommendScreenCli {
       reason: enrichedReason,
       summary: summary || enrichedReason,
       evidence,
-      evidenceRawCount: evidenceGateEligible ? parsedEvidence.length : null,
-      evidenceMatchedCount: evidenceGateEligible ? evidence.length : null,
-      evidenceGateDemoted,
+      evidenceRawCount: parsedEvidence.length,
+      evidenceMatchedCount: evidence.length,
+      evidenceGateDemoted: false,
       chunkIndex,
       chunkTotal
     };

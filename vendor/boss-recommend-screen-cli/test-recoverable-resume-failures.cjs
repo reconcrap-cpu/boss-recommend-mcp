@@ -1715,11 +1715,11 @@ async function testVisionEvidenceGateShouldKeepRawPassWithoutExplicitEvidencePro
   assert.equal(result.rawPassed, true);
   assert.equal(result.passed, true);
   assert.equal(result.evidenceGateDemoted, false);
-  assert.equal(result.evidenceRawCount, null);
-  assert.equal(result.evidenceMatchedCount, null);
+  assert.equal(result.evidenceRawCount, 0);
+  assert.equal(result.evidenceMatchedCount, 0);
 }
 
-async function testVisionEvidenceGateShouldDemoteWhenExplicitlyArmedWithoutEvidence() {
+async function testVisionEvidenceGateShouldNotDemoteWhenExplicitlyArmedWithoutEvidence() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-vision-evidence-gate-explicit-"));
   const cli = new RecommendScreenCli(createArgs(tempDir));
   cli.prepareVisionImageSegmentsForModel = async () => ({
@@ -1740,10 +1740,46 @@ async function testVisionEvidenceGateShouldDemoteWhenExplicitlyArmedWithoutEvide
   });
   const result = await cli.callVisionModel(path.join(tempDir, "fake.png"));
   assert.equal(result.rawPassed, true);
-  assert.equal(result.passed, false);
-  assert.equal(result.evidenceGateDemoted, true);
+  assert.equal(result.passed, true);
+  assert.equal(result.evidenceGateDemoted, false);
   assert.equal(result.evidenceRawCount, 0);
   assert.equal(result.evidenceMatchedCount, 0);
+}
+
+async function testTextModelShouldNotDemoteRawPassWhenEvidenceDoesNotMatchResume() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-no-demote-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [
+          {
+            message: {
+              content: JSON.stringify({
+                passed: true,
+                reason: "matched",
+                summary: "matched",
+                evidence: ["完全不在简历里的证据"]
+              })
+            }
+          }
+        ]
+      };
+    }
+  });
+  try {
+    const result = await cli.callTextModel("这是简历原文，没有那条证据");
+    assert.equal(result.rawPassed, true);
+    assert.equal(result.passed, true);
+    assert.equal(result.evidenceGateDemoted, false);
+    assert.equal(result.evidenceRawCount, 1);
+    assert.equal(result.evidenceMatchedCount, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
 }
 
 async function testVisionModelShouldSendAllOrderedChunks() {
@@ -1843,7 +1879,8 @@ async function main() {
   await testTextModelShouldSupportLowThinkingForVolcengine();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();
   await testVisionEvidenceGateShouldKeepRawPassWithoutExplicitEvidenceProtocol();
-  await testVisionEvidenceGateShouldDemoteWhenExplicitlyArmedWithoutEvidence();
+  await testVisionEvidenceGateShouldNotDemoteWhenExplicitlyArmedWithoutEvidence();
+  await testTextModelShouldNotDemoteRawPassWhenEvidenceDoesNotMatchResume();
   await testVisionModelShouldSendAllOrderedChunks();
   testRecoverablePostActionErrorShouldTreatGreetContinueAndNoButtonAsRecoverable();
   await testRecoverableGreetContinueButtonShouldNotAbortWhenDetailCloseFails();
