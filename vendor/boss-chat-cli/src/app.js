@@ -64,6 +64,9 @@ function hasResumeRequestSentMessage(state = {}) {
   return recent.some((item) => normalizeText(item).includes('简历请求已发送'));
 }
 
+const CANDIDATE_LIST_WAIT_AFTER_CONTEXT_MS = 5000;
+const CANDIDATE_LIST_WAIT_POLL_MS = 500;
+
 export class BossChatApp {
   constructor({
     page,
@@ -152,6 +155,65 @@ export class BossChatApp {
       : this.page.activateUnreadFilter();
   }
 
+  async waitForCandidateList({
+    reason = 'unknown',
+    maxWaitMs = CANDIDATE_LIST_WAIT_AFTER_CONTEXT_MS,
+    pollMs = CANDIDATE_LIST_WAIT_POLL_MS,
+  } = {}) {
+    const startedAt = Date.now();
+    let attempts = 0;
+    let lastState = null;
+    let lastError = '';
+
+    while (Date.now() - startedAt <= maxWaitMs) {
+      attempts += 1;
+      try {
+        if (typeof this.page.getPageState === 'function') {
+          lastState = await this.page.getPageState();
+          if (Number(lastState?.listItemCount || 0) > 0) {
+            return {
+              ready: true,
+              waitedMs: Date.now() - startedAt,
+              attempts,
+              listItemCount: Number(lastState?.listItemCount || 0),
+              lastState,
+              lastError,
+            };
+          }
+        } else if (typeof this.page.getLoadedCustomers === 'function') {
+          const customers = await this.page.getLoadedCustomers();
+          if (Array.isArray(customers) && customers.length > 0) {
+            return {
+              ready: true,
+              waitedMs: Date.now() - startedAt,
+              attempts,
+              listItemCount: customers.length,
+              lastState,
+              lastError,
+            };
+          }
+        }
+      } catch (error) {
+        lastError = String(error?.message || error || '');
+      }
+
+      if (Date.now() - startedAt >= maxWaitMs) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+
+    return {
+      ready: false,
+      waitedMs: Date.now() - startedAt,
+      attempts,
+      listItemCount: Number(lastState?.listItemCount || 0),
+      lastState,
+      lastError,
+      reason,
+    };
+  }
+
   async run(profile) {
     const startedAt = new Date().toISOString();
     const runId = runToken(new Date());
@@ -168,8 +230,34 @@ export class BossChatApp {
     } catch (error) {
       this.logger.log(`页面就绪检查告警：${error?.message || error}，将继续执行预热恢复流程。`);
     }
-    const filterResult = await this.restoreListContext(profile);
+    let filterResult = await this.restoreListContext(profile);
     await this.interaction.sleepRange(420, 160);
+    let initialListWait = await this.waitForCandidateList({
+      reason: 'initial-context-restore',
+    });
+    if (initialListWait.ready) {
+      this.logger.log(
+        `候选人列表已就绪：reason=initial-context-restore | waited=${initialListWait.waitedMs}ms | attempts=${initialListWait.attempts} | count=${initialListWait.listItemCount}`,
+      );
+    } else {
+      this.logger.log(
+        `候选人列表等待超时：reason=initial-context-restore | waited=${initialListWait.waitedMs}ms | attempts=${initialListWait.attempts} | count=${initialListWait.listItemCount} | lastError=${initialListWait.lastError || 'n/a'}，继续尝试预热。`,
+      );
+      filterResult = await this.restoreListContext(profile);
+      await this.interaction.sleepRange(420, 160);
+      initialListWait = await this.waitForCandidateList({
+        reason: 'initial-context-restore-reapply',
+      });
+      if (initialListWait.ready) {
+        this.logger.log(
+          `候选人列表二次恢复成功：reason=initial-context-restore-reapply | waited=${initialListWait.waitedMs}ms | attempts=${initialListWait.attempts} | count=${initialListWait.listItemCount}`,
+        );
+      } else {
+        this.logger.log(
+          `候选人列表二次等待仍超时：reason=initial-context-restore-reapply | waited=${initialListWait.waitedMs}ms | attempts=${initialListWait.attempts} | count=${initialListWait.listItemCount} | lastError=${initialListWait.lastError || 'n/a'}，继续尝试预热。`,
+        );
+      }
+    }
     this.logger.log('预热步骤：准备点击首位人选初始化聊天容器...');
     let primedCustomer = null;
 
@@ -269,13 +357,22 @@ export class BossChatApp {
               message,
             )
           ) {
+            const delayedListWait = await this.waitForCandidateList({
+              reason: `main-loop:${message}`,
+            });
+            if (delayedListWait.ready) {
+              this.logger.log(
+                `候选人列表延迟恢复成功：reason=main-loop:${message} | waited=${delayedListWait.waitedMs}ms | attempts=${delayedListWait.attempts} | count=${delayedListWait.listItemCount}，继续重试扫描。`,
+              );
+              continue;
+            }
             try {
               const recover = await this.page.recoverToChatIndex();
               this.logger.log(
                 `页面恢复：changed=${recover.changed} | href=${recover.href || 'unknown'}，准备重新预热并继续。`,
               );
               await this.interaction.sleepRange(900, 220);
-              const recoveredFilterResult = await this.restoreListContext(profile);
+              let recoveredFilterResult = await this.restoreListContext(profile);
               this.logger.log(
                 `恢复后列表上下文：岗位=${profile.jobSelection?.label || profile.jobSelection?.value || '未知'}；列表范围: ${filterLabel}${
                   recoveredFilterResult.changed
@@ -285,6 +382,41 @@ export class BossChatApp {
                     : '（已在目标筛选）'
                 }${recoveredFilterResult?.activeLabel ? ` | active=${recoveredFilterResult.activeLabel}` : ''}`,
               );
+              let recoveredListWait = await this.waitForCandidateList({
+                reason: 'post-recovery-context-restore',
+              });
+              if (recoveredListWait.ready) {
+                this.logger.log(
+                  `恢复后候选人列表已就绪：reason=post-recovery-context-restore | waited=${recoveredListWait.waitedMs}ms | attempts=${recoveredListWait.attempts} | count=${recoveredListWait.listItemCount}`,
+                );
+              } else {
+                this.logger.log(
+                  `恢复后候选人列表等待超时：reason=post-recovery-context-restore | waited=${recoveredListWait.waitedMs}ms | attempts=${recoveredListWait.attempts} | count=${recoveredListWait.listItemCount} | lastError=${recoveredListWait.lastError || 'n/a'}，继续尝试预热。`,
+                );
+                recoveredFilterResult = await this.restoreListContext(profile);
+                this.logger.log(
+                  `恢复后二次应用列表上下文：岗位=${profile.jobSelection?.label || profile.jobSelection?.value || '未知'}；列表范围: ${filterLabel}${
+                    recoveredFilterResult.changed
+                      ? recoveredFilterResult.verified === false
+                        ? '（已尝试切换，未验证 active）'
+                        : '（已切换）'
+                      : '（已在目标筛选）'
+                  }${recoveredFilterResult?.activeLabel ? ` | active=${recoveredFilterResult.activeLabel}` : ''}`,
+                );
+                await this.interaction.sleepRange(420, 160);
+                recoveredListWait = await this.waitForCandidateList({
+                  reason: 'post-recovery-context-restore-reapply',
+                });
+                if (recoveredListWait.ready) {
+                  this.logger.log(
+                    `恢复后二次候选人列表恢复成功：reason=post-recovery-context-restore-reapply | waited=${recoveredListWait.waitedMs}ms | attempts=${recoveredListWait.attempts} | count=${recoveredListWait.listItemCount}`,
+                  );
+                } else {
+                  this.logger.log(
+                    `恢复后二次候选人列表等待仍超时：reason=post-recovery-context-restore-reapply | waited=${recoveredListWait.waitedMs}ms | attempts=${recoveredListWait.attempts} | count=${recoveredListWait.listItemCount} | lastError=${recoveredListWait.lastError || 'n/a'}，继续尝试预热。`,
+                  );
+                }
+              }
               const prime = await this.page.primeConversationByFirstCandidate();
               const candidate = prime?.candidate || {};
               const candidateBase = {
