@@ -16,6 +16,7 @@ import {
 import { __testables as cliTestables } from "./cli.js";
 import { __testables as indexTestables } from "./index.js";
 import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
+import { __testables as vendorCliTestables } from "../vendor/boss-chat-cli/src/cli.js";
 import { BossChatPage } from "../vendor/boss-chat-cli/src/browser/chat-page.js";
 import { LlmClient, parseLlmJson } from "../vendor/boss-chat-cli/src/services/llm.js";
 
@@ -684,6 +685,118 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
   });
 }
 
+async function testVendorBossChatCliShouldWaitForHydratedChatShell() {
+  const pageStates = [
+    { href: "https://www.zhipin.com/web/chat/index", hasListContainer: false, listItemCount: 0 },
+    { href: "https://www.zhipin.com/web/chat/index", hasListContainer: false, listItemCount: 0 },
+    { href: "https://www.zhipin.com/web/chat/index", hasListContainer: true, listItemCount: 40 },
+  ];
+  const jobsPerAttempt = [
+    [],
+    [],
+    [{ value: "job-1", label: "AI应用开发工程师（2026） _ 杭州", active: false }],
+  ];
+  let ensureCallCount = 0;
+  let listJobsCallCount = 0;
+  const page = {
+    async ensureOnChatPage() {
+      const next = pageStates[Math.min(ensureCallCount, pageStates.length - 1)];
+      ensureCallCount += 1;
+      return next;
+    },
+    async listJobs() {
+      const next = jobsPerAttempt[Math.min(listJobsCallCount, jobsPerAttempt.length - 1)];
+      listJobsCallCount += 1;
+      return next;
+    },
+  };
+
+  const hydrated = await vendorCliTestables.waitForChatShellHydration({
+    page,
+    maxAttempts: 4,
+    delayMs: 0,
+  });
+  assert.equal(Array.isArray(hydrated.jobs), true);
+  assert.equal(hydrated.jobs.length, 1);
+  assert.equal(hydrated.pageState.listItemCount, 40);
+  assert.equal(ensureCallCount >= 3, true);
+}
+
+async function testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile() {
+  const page = {
+    _attempt: 0,
+    async ensureOnChatPage() {
+      return {
+        href: "https://www.zhipin.com/web/chat/index",
+        hasListContainer: this._attempt >= 1,
+        listItemCount: this._attempt >= 1 ? 10 : 0,
+      };
+    },
+    async listJobs() {
+      this._attempt += 1;
+      if (this._attempt < 2) {
+        return [];
+      }
+      return [
+        {
+          value: "job-1",
+          label: "AI应用开发工程师（2026） _ 杭州",
+          active: false,
+        },
+      ];
+    },
+  };
+
+  const profile = await vendorCliTestables.promptRunProfile({
+    page,
+    persistentProfile: {
+      llm: {
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk-test-key",
+        model: "gpt-4.1-mini",
+      },
+      chrome: {
+        port: 9222,
+      },
+      runtime: {},
+    },
+    overrides: {
+      jobSelection: "AI应用开发工程师（2026） _ 杭州",
+      startFrom: "unread",
+      screeningCriteria: "小样本联通性验证",
+      targetCount: 1,
+    },
+  });
+  assert.equal(profile.jobSelection.label, "AI应用开发工程师（2026） _ 杭州");
+  assert.equal(profile.startFrom, "unread");
+  assert.equal(profile.targetCount, 1);
+}
+
+function testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig() {
+  const installedSpecifier = cliTestables.getDefaultMcpPackageSpecifier({
+    packageVersion: "1.3.25",
+    packageRootPath: "C:\\Users\\yaolin\\AppData\\Roaming\\npm\\node_modules\\@reconcrap\\boss-recommend-mcp",
+  });
+  assert.equal(installedSpecifier, "@reconcrap/boss-recommend-mcp@1.3.25");
+
+  const cachedSpecifier = cliTestables.getDefaultMcpPackageSpecifier({
+    packageVersion: "1.3.25",
+    packageRootPath: "C:\\Users\\yaolin\\AppData\\Local\\npm-cache\\_npx\\abcd1234\\node_modules\\@reconcrap\\boss-recommend-mcp",
+  });
+  assert.equal(cachedSpecifier, "@reconcrap/boss-recommend-mcp@1.3.25");
+
+  const sourceSpecifier = cliTestables.getDefaultMcpPackageSpecifier({
+    packageVersion: "1.3.25-dev",
+    packageRootPath: "C:\\Users\\yaolin\\Documents\\codex_projects\\boss recommend pipeline\\boss-recommend-mcp",
+  });
+  assert.equal(sourceSpecifier, "@reconcrap/boss-recommend-mcp@latest");
+
+  const launchConfig = cliTestables.buildMcpLaunchConfig({});
+  assert.equal(launchConfig.command, "npx");
+  assert.equal(Array.isArray(launchConfig.args), true);
+  assert.equal(launchConfig.args[0], "-y");
+}
+
 function testBossChatLlmEvidenceGateShouldDemoteMissingEvidence() {
   const parsed = parseLlmJson(
     JSON.stringify({
@@ -1030,6 +1143,9 @@ async function main() {
   await testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
+  await testVendorBossChatCliShouldWaitForHydratedChatShell();
+  await testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile();
+  testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig();
   testBossChatLlmEvidenceGateShouldDemoteMissingEvidence();
   testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence();
   await testBossChatLlmTextChunkFallbackShouldWork();

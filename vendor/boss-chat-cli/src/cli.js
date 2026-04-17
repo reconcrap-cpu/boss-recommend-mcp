@@ -45,6 +45,10 @@ const MINIMAL_TERMINAL_PATTERNS = [/^进度: /, /^候选人结果: /];
 const CHAT_INDEX_URL = 'https://www.zhipin.com/web/chat/index';
 const CHAT_START_REQUIRED_FIELDS = ['job', 'start_from', 'target_count', 'criteria'];
 const CHAT_PAGE_RENAVIGATE_MAX_ATTEMPTS = 3;
+const CHAT_PAGE_HYDRATION_MAX_ATTEMPTS = 12;
+const CHAT_PAGE_HYDRATION_DELAY_MS = 250;
+const CHAT_JOB_LIST_MAX_ATTEMPTS = 16;
+const CHAT_JOB_LIST_DELAY_MS = 250;
 
 function sanitizePathToken(value, fallback = 'run') {
   const token = String(value || '')
@@ -69,6 +73,10 @@ function formatLogLineArgs(args) {
 
 function shouldPrintToMinimalTerminal(message) {
   return MINIMAL_TERMINAL_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function createRunLogger(dataDir, { runId = '', detachedWorker = false } = {}) {
@@ -498,7 +506,7 @@ function resolveJobSelection(jobs, input) {
 }
 
 async function promptRunProfile({ page, persistentProfile, overrides }) {
-  const jobs = await page.listJobs();
+  const jobs = await resolveJobsWithRetry({ page });
   if (!Array.isArray(jobs) || jobs.length === 0) {
     throw new Error('未解析到岗位列表，请确认岗位下拉可见。');
   }
@@ -647,6 +655,102 @@ function buildPreparePendingQuestions(args, jobs = []) {
   return pendingQuestions;
 }
 
+function hasHydratedChatShell(pageState, jobs = []) {
+  const hasChatList =
+    Boolean(pageState?.hasListContainer)
+    || Number(pageState?.listItemCount || 0) > 0;
+  return hasChatList || (Array.isArray(jobs) && jobs.length > 0);
+}
+
+async function waitForChatShellHydration({
+  page,
+  maxAttempts = CHAT_PAGE_HYDRATION_MAX_ATTEMPTS,
+  delayMs = CHAT_PAGE_HYDRATION_DELAY_MS,
+} = {}) {
+  let lastPageState = null;
+  let lastJobs = [];
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      lastPageState = await page.ensureOnChatPage();
+    } catch (error) {
+      lastError = error;
+      break;
+    }
+
+    try {
+      lastJobs = await page.listJobs();
+    } catch (error) {
+      lastError = error;
+      lastJobs = [];
+    }
+
+    if (hasHydratedChatShell(lastPageState, lastJobs)) {
+      return {
+        pageState: lastPageState,
+        jobs: lastJobs,
+      };
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(delayMs);
+    }
+  }
+
+  const lastErrorMessage = String(lastError?.message || lastError || '');
+  if (/ACTIVE_TAB_IS_NOT_BOSS_CHAT_PAGE/.test(lastErrorMessage)) {
+    throw lastError;
+  }
+
+  return {
+    pageState: lastPageState,
+    jobs: lastJobs,
+  };
+}
+
+async function resolveJobsWithRetry({
+  page,
+  maxAttempts = CHAT_JOB_LIST_MAX_ATTEMPTS,
+  delayMs = CHAT_JOB_LIST_DELAY_MS,
+} = {}) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const jobs = await page.listJobs();
+      if (Array.isArray(jobs) && jobs.length > 0) {
+        return jobs;
+      }
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || error || '');
+      if (/ACTIVE_TAB_IS_NOT_BOSS_CHAT_PAGE/.test(message)) {
+        throw error;
+      }
+    }
+
+    const hydrated = await waitForChatShellHydration({
+      page,
+      maxAttempts: 1,
+      delayMs,
+    });
+    if (Array.isArray(hydrated?.jobs) && hydrated.jobs.length > 0) {
+      return hydrated.jobs;
+    }
+
+    if (attempt < maxAttempts) {
+      await sleep(delayMs);
+    }
+  }
+
+  if (lastError) {
+    throw lastError;
+  }
+
+  return [];
+}
+
 async function connectBossChatPage(chromeClient) {
   const isBossDomainTarget = (target) =>
     target?.type === 'page' && /zhipin\.com/i.test(String(target?.url || ''));
@@ -674,13 +778,25 @@ async function connectBossChatPage(chromeClient) {
       };
     } catch (error) {
       const message = String(error?.message || error || '');
+      if (/CHAT_LIST_CONTAINER_NOT_FOUND/.test(message)) {
+        blankChatPage = true;
+        const hydrated = await waitForChatShellHydration({ page });
+        if (hasHydratedChatShell(hydrated?.pageState, hydrated?.jobs)) {
+          return {
+            target,
+            page,
+            recoveredToChatIndex,
+            blankChatPage,
+            renavigateAttempts,
+          };
+        }
+      }
       const canRetry =
         /ACTIVE_TAB_IS_NOT_BOSS_CHAT_PAGE|CHAT_LIST_CONTAINER_NOT_FOUND/.test(message)
         && attempt <= CHAT_PAGE_RENAVIGATE_MAX_ATTEMPTS;
 
       if (!canRetry) {
         if (/CHAT_LIST_CONTAINER_NOT_FOUND/.test(message)) {
-          blankChatPage = true;
           await page.ensureOnChatPage();
           break;
         }
@@ -734,7 +850,7 @@ async function handlePrepareRunCommand(args, dataDir) {
   try {
     chromeClient = new ChromeClient(mergedProfile.chrome.port);
     const { target, page, recoveredToChatIndex, blankChatPage, renavigateAttempts } = await connectBossChatPage(chromeClient);
-    const jobs = await page.listJobs();
+    const jobs = await resolveJobsWithRetry({ page });
     if (!Array.isArray(jobs) || jobs.length === 0) {
       return {
         status: 'FAILED',
@@ -1423,12 +1539,22 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const runLogPath = String(error?.runLogPath || '').trim();
-  if (runLogPath) {
-    console.error(`执行失败，详细日志见: ${runLogPath}`);
-  } else {
-    console.error(`执行失败: ${error.message}`);
-  }
-  process.exitCode = 1;
-});
+export const __testables = {
+  connectBossChatPage,
+  hasHydratedChatShell,
+  promptRunProfile,
+  resolveJobsWithRetry,
+  waitForChatShellHydration,
+};
+
+if (process.argv[1] && path.resolve(process.argv[1]) === CLI_FILE_PATH) {
+  main().catch((error) => {
+    const runLogPath = String(error?.runLogPath || '').trim();
+    if (runLogPath) {
+      console.error(`执行失败，详细日志见: ${runLogPath}`);
+    } else {
+      console.error(`执行失败: ${error.message}`);
+    }
+    process.exitCode = 1;
+  });
+}

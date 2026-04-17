@@ -39,7 +39,6 @@ const chromeOnboardingUrlPattern = /^chrome:\/\/(welcome|intro|newtab|signin|his
 const supportedMcpClients = ["generic", "cursor", "trae", "claudecode", "openclaw"];
 const defaultMcpServerName = "boss-recommend";
 const defaultMcpCommand = "npx";
-const defaultMcpArgs = ["-y", "@reconcrap/boss-recommend-mcp@latest", "start"];
 const recommendMcpPackageName = "@reconcrap/boss-recommend-mcp";
 const recommendMcpBinaryName = "boss-recommend-mcp";
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h"]);
@@ -64,6 +63,29 @@ function getPackageVersion() {
 }
 
 const packageVersion = getPackageVersion();
+
+function isInstalledPackageRoot(rootPath = packageRoot) {
+  const normalized = path.resolve(String(rootPath || ""))
+    .replace(/\\/g, "/")
+    .toLowerCase();
+  return (
+    normalized.includes("/appdata/local/npm-cache/_npx/")
+    || normalized.includes("/node_modules/@reconcrap/boss-recommend-mcp")
+  );
+}
+
+function getDefaultMcpPackageSpecifier(options = {}) {
+  const version = String(options.packageVersion || packageVersion).trim();
+  const rootPath = options.packageRootPath || packageRoot;
+  if (version && version !== "0.0.0" && isInstalledPackageRoot(rootPath)) {
+    return `${recommendMcpPackageName}@${version}`;
+  }
+  return `${recommendMcpPackageName}@latest`;
+}
+
+function buildDefaultMcpArgs(options = {}) {
+  return ["-y", getDefaultMcpPackageSpecifier(options), "start"];
+}
 
 function getCodexHome() {
   return process.env.CODEX_HOME
@@ -338,7 +360,7 @@ function buildMcpLaunchConfig(options = {}) {
     ? args
     : command === "boss-recommend-mcp"
       ? ["start"]
-      : defaultMcpArgs.slice();
+      : buildDefaultMcpArgs();
   const launchConfig = { command, args: launchArgs };
   if (env && typeof env === "object" && !Array.isArray(env) && Object.keys(env).length > 0) {
     launchConfig.env = env;
@@ -1606,9 +1628,13 @@ export async function runCli(argv = process.argv) {
 
 export const __testables = {
   buildBossChatCliInput,
+  buildDefaultMcpArgs,
+  buildMcpLaunchConfig,
   getBossChatCliRunTarget,
+  getDefaultMcpPackageSpecifier,
   getRunFollowUp,
   installSkill,
+  isInstalledPackageRoot,
   runBossChatCliCommand,
   runPipelineOnce
 };
