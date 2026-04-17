@@ -4,7 +4,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { getScreenConfigResolution } from "./adapters.js";
+import { getScreenConfigResolution, resolveSharedLlmTransportConfig } from "./adapters.js";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(currentFilePath), "..");
@@ -364,6 +364,7 @@ function resolveBossChatScreenConfig(workspaceRoot) {
       apiKey: normalizeText(parsed.apiKey),
       model: normalizeText(parsed.model),
       llmThinkingLevel: resolveLlmThinkingLevel(parsed),
+      ...resolveSharedLlmTransportConfig(parsed),
       debugPort: parsePositiveInteger(parsed.debugPort, 9222),
       humanRestEnabled: resolveHumanRestEnabled(parsed)
     },
@@ -484,6 +485,12 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     if (resolvedConfig.llmThinkingLevel) {
       args.push("--thinking-level", resolvedConfig.llmThinkingLevel);
     }
+    if (resolvedConfig.llmTimeoutMs) {
+      args.push("--llm-timeout-ms", String(resolvedConfig.llmTimeoutMs));
+    }
+    if (resolvedConfig.llmMaxRetries) {
+      args.push("--llm-max-retries", String(resolvedConfig.llmMaxRetries));
+    }
     return args;
   }
 
@@ -503,6 +510,12 @@ function buildBossChatCliArgs(command, input, resolvedConfig) {
     args.push("--model", resolvedConfig.model);
     if (resolvedConfig.llmThinkingLevel) {
       args.push("--thinking-level", resolvedConfig.llmThinkingLevel);
+    }
+    if (resolvedConfig.llmTimeoutMs) {
+      args.push("--llm-timeout-ms", String(resolvedConfig.llmTimeoutMs));
+    }
+    if (resolvedConfig.llmMaxRetries) {
+      args.push("--llm-max-retries", String(resolvedConfig.llmMaxRetries));
     }
     args.push("--port", String(normalized.port || resolvedConfig.debugPort || 9222));
     if (typeof normalized.safePacing === "boolean") {

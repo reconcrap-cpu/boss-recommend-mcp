@@ -11,6 +11,8 @@ const DEFAULT_PROFILE = {
     apiKey: '',
     model: '',
     thinkingLevel: '',
+    timeoutMs: 60000,
+    maxRetries: 3,
   },
   chrome: {
     port: 9222,
@@ -80,6 +82,8 @@ export function toPersistentProfile(profile = {}) {
       apiKey: normalized.llm.apiKey,
       model: normalized.llm.model,
       thinkingLevel: normalized.llm.thinkingLevel,
+      timeoutMs: normalized.llm.timeoutMs,
+      maxRetries: normalized.llm.maxRetries,
     },
     chrome: {
       port: normalized.chrome.port,
@@ -104,6 +108,8 @@ export function normalizeProfile(profile = {}) {
   merged.llm.thinkingLevel = String(
     merged.llm.thinkingLevel || merged.llm.llmThinkingLevel || merged.llm.reasoningEffort || merged.llm.reasoning_effort || '',
   ).trim();
+  merged.llm.timeoutMs = normalizeNumber(merged.llm.timeoutMs, DEFAULT_PROFILE.llm.timeoutMs);
+  merged.llm.maxRetries = normalizeNumber(merged.llm.maxRetries, DEFAULT_PROFILE.llm.maxRetries);
   merged.runtime.batchRestEnabled = merged.runtime.batchRestEnabled !== false;
   merged.runtime.safePacing = merged.runtime.safePacing !== false;
   return merged;

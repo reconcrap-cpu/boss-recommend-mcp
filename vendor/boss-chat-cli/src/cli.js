@@ -38,6 +38,7 @@ import {
 } from './services/profile-store.js';
 import { ReportStore } from './services/report-store.js';
 import { ResumeCaptureService } from './services/resume-capture.js';
+import { ResumeNetworkTracker } from './services/resume-network.js';
 import { NoopStateStore, StateStore } from './services/state-store.js';
 
 const CLI_FILE_PATH = fileURLToPath(import.meta.url);
@@ -264,6 +265,14 @@ function parseArgs(argv) {
       case 'reasoning-effort':
         args.overrides.llm.thinkingLevel = value || '';
         break;
+      case 'llm-timeout-ms':
+      case 'timeout-ms':
+        args.overrides.llm.timeoutMs = Number.parseInt(value, 10);
+        break;
+      case 'llm-max-retries':
+      case 'max-retries':
+        args.overrides.llm.maxRetries = Number.parseInt(value, 10);
+        break;
       case 'port':
         args.overrides.chrome.port = Number.parseInt(value, 10);
         break;
@@ -315,6 +324,8 @@ function printUsage() {
   console.log('  --apikey <key>                  Override LLM API key');
   console.log('  --model <name>                  Override LLM model');
   console.log('  --thinking-level <level>        LLM thinking level: off|low|medium|high|current');
+  console.log('  --llm-timeout-ms <n>            Override per-request LLM timeout (default: 60000)');
+  console.log('  --llm-max-retries <n>           Override per-request LLM retry count (default: 3)');
   console.log('  --port <n>                      Override Chrome remote debugging port');
 }
 
@@ -925,6 +936,12 @@ function buildDetachedRunArgs(args, runId) {
   if (args.overrides.llm.thinkingLevel) {
     workerArgs.push('--thinking-level', String(args.overrides.llm.thinkingLevel));
   }
+  if (Number.isFinite(args.overrides.llm.timeoutMs) && args.overrides.llm.timeoutMs > 0) {
+    workerArgs.push('--llm-timeout-ms', String(args.overrides.llm.timeoutMs));
+  }
+  if (Number.isFinite(args.overrides.llm.maxRetries) && args.overrides.llm.maxRetries > 0) {
+    workerArgs.push('--llm-max-retries', String(args.overrides.llm.maxRetries));
+  }
   if (Number.isFinite(args.overrides.chrome.port)) {
     workerArgs.push('--port', String(args.overrides.chrome.port));
   }
@@ -1341,6 +1358,7 @@ async function executeRunCommand(args, dataDir) {
     });
     const llmClient = new LlmClient(runProfile.llm);
     const resumeCaptureService = new ResumeCaptureService({ chromeClient, logger });
+    const resumeNetworkTracker = new ResumeNetworkTracker({ chromeClient, logger });
     const stateStore = args.noState ? new NoopStateStore() : new StateStore(dataDir, args.profile);
     const reportStore = new ReportStore(dataDir);
     const app = new BossChatApp({
@@ -1350,6 +1368,7 @@ async function executeRunCommand(args, dataDir) {
       resumeCaptureService,
       stateStore,
       reportStore,
+      resumeNetworkTracker,
       runControl,
       logger,
       dryRun: args.dryRun,
@@ -1540,6 +1559,7 @@ async function main() {
 }
 
 export const __testables = {
+  parseArgs,
   connectBossChatPage,
   hasHydratedChatShell,
   promptRunProfile,

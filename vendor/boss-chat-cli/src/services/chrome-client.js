@@ -15,14 +15,20 @@ export class ChromeClient {
     }
 
     this.client = await CDP({ port: this.port, target });
-    const { Runtime, DOM, Page, Input } = this.client;
+    const { Runtime, DOM, Page, Input, Network } = this.client;
 
-    await Promise.all([Runtime.enable(), DOM.enable(), Page.enable()]);
+    await Promise.all([
+      Runtime.enable(),
+      DOM.enable(),
+      Page.enable(),
+      Network && typeof Network.enable === 'function' ? Network.enable() : Promise.resolve(),
+    ]);
 
     this.Runtime = Runtime;
     this.DOM = DOM;
     this.Page = Page;
     this.Input = Input;
+    this.Network = Network || null;
 
     return target;
   }

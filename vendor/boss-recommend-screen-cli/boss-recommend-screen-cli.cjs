@@ -56,6 +56,8 @@ const DEFAULT_VISION_RETRY_MAX_IMAGE_PIXELS = 30000000;
 const DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS = 24000;
 const DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS = 1200;
 const DEFAULT_TEXT_MODEL_MAX_CHUNKS = 12;
+const DEFAULT_LLM_TIMEOUT_MS = 60000;
+const DEFAULT_LLM_MAX_RETRIES = 3;
 const MAX_EVIDENCE_TOKENS = 12;
 let visionSharpFactory = null;
 const PAGE_SCOPE_TAB_STATUS = {
@@ -1326,6 +1328,8 @@ function parseArgs(argv) {
     apiKey: null,
     model: null,
     thinkingLevel: null,
+    llmTimeoutMs: DEFAULT_LLM_TIMEOUT_MS,
+    llmMaxRetries: DEFAULT_LLM_MAX_RETRIES,
     openaiOrganization: null,
     openaiProject: null,
     criteria: null,
@@ -1348,6 +1352,8 @@ function parseArgs(argv) {
       apiKey: false,
       model: false,
       thinkingLevel: false,
+      llmTimeoutMs: false,
+      llmMaxRetries: false,
       criteria: false,
       targetCount: false,
       maxGreetCount: false,
@@ -1380,6 +1386,14 @@ function parseArgs(argv) {
     } else if ((token === "--thinking-level" || token === "--thinkingLevel" || token === "--llm-thinking-level" || token === "--reasoning-effort") && (inlineValue || next)) {
       parsed.thinkingLevel = inlineValue || next;
       parsed.__provided.thinkingLevel = true;
+      if (!inlineValue) index += 1;
+    } else if ((token === "--llm-timeout-ms" || token === "--timeout-ms") && (inlineValue || next)) {
+      parsed.llmTimeoutMs = parsePositiveInteger(inlineValue || next) || DEFAULT_LLM_TIMEOUT_MS;
+      parsed.__provided.llmTimeoutMs = true;
+      if (!inlineValue) index += 1;
+    } else if ((token === "--llm-max-retries" || token === "--max-retries") && (inlineValue || next)) {
+      parsed.llmMaxRetries = parsePositiveInteger(inlineValue || next) || DEFAULT_LLM_MAX_RETRIES;
+      parsed.__provided.llmMaxRetries = true;
       if (!inlineValue) index += 1;
     } else if (token === "--openai-organization" && (inlineValue || next)) {
       parsed.openaiOrganization = inlineValue || next;
@@ -3340,6 +3354,34 @@ class RecommendScreenCli {
     fs.mkdirSync(this.debugDir, { recursive: true });
   }
 
+  getLlmTimeoutMs() {
+    return parsePositiveInteger(this.args?.llmTimeoutMs) || DEFAULT_LLM_TIMEOUT_MS;
+  }
+
+  getLlmMaxRetries() {
+    return parsePositiveInteger(this.args?.llmMaxRetries) || DEFAULT_LLM_MAX_RETRIES;
+  }
+
+  async fetchWithLlmRetries(label, url, options) {
+    const maxRetries = this.getLlmMaxRetries();
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+      try {
+        return await fetch(url, {
+          ...options,
+          signal: AbortSignal.timeout(this.getLlmTimeoutMs())
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt >= maxRetries) {
+          break;
+        }
+      }
+    }
+    const message = normalizeText(lastError?.message || String(lastError || ""));
+    throw this.buildError(label, `${label} request failed after ${maxRetries} attempts: ${message || "unknown error"}`);
+  }
+
   readPauseControlState() {
     if (!this.pauseControlPath) return { pause_requested: false };
     try {
@@ -5236,7 +5278,7 @@ class RecommendScreenCli {
     if (this.args.openaiOrganization) headers["OpenAI-Organization"] = this.args.openaiOrganization;
     if (this.args.openaiProject) headers["OpenAI-Project"] = this.args.openaiProject;
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await this.fetchWithLlmRetries("VISION_MODEL_FAILED", `${baseUrl}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify(payload)
@@ -5405,7 +5447,7 @@ class RecommendScreenCli {
     if (this.args.openaiOrganization) headers["OpenAI-Organization"] = this.args.openaiOrganization;
     if (this.args.openaiProject) headers["OpenAI-Project"] = this.args.openaiProject;
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await this.fetchWithLlmRetries("TEXT_MODEL_FAILED", `${baseUrl}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify(payload)

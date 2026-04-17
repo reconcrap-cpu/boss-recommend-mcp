@@ -293,133 +293,47 @@ function browserProbeResumeContext(options = {}) {
   };
 }
 
-async function stitchWithSharp(chunks, stitchedImage) {
-  const sorted = chunks
-    .map((chunk, index) => ({
-      ...chunk,
-      index: Number.isInteger(chunk.index) ? chunk.index : index,
-      scrollTop: Number(chunk.scrollTop || 0),
-      clipHeightCss: Number(chunk.clipHeightCss || 0),
-    }))
-    .sort((left, right) => {
-      if (left.scrollTop !== right.scrollTop) return left.scrollTop - right.scrollTop;
-      return left.index - right.index;
-    });
+async function detectLikelyBlankChunks(chunkFiles = []) {
+  const normalizedFiles = Array.isArray(chunkFiles) ? chunkFiles.filter(Boolean) : [];
+  if (normalizedFiles.length <= 0) {
+    return { likelyBlank: false, luma: 0, avgStd: 0, blankChunks: 0, totalChunks: 0 };
+  }
 
-  const composites = [];
-  const used = [];
-  let outWidth = 1;
-  let outHeight = 0;
-  let prevChunk = null;
+  let lumaTotal = 0;
+  let stdTotal = 0;
+  let blankChunks = 0;
 
-  for (const chunk of sorted) {
-    const info = await sharp(chunk.file).metadata();
-    const width = Number(info?.width || 0);
-    const height = Number(info?.height || 0);
-    if (width <= 0 || height <= 0) {
-      throw new Error(`Invalid chunk image size: ${chunk.file}`);
-    }
-
-    if (prevChunk) {
-      const deltaCss = chunk.scrollTop - prevChunk.scrollTop;
-      if (!(deltaCss > 0.5)) {
-        prevChunk = chunk;
-        continue;
-      }
-      const clipHeightCss = chunk.clipHeightCss > 1 ? chunk.clipHeightCss : prevChunk.clipHeightCss;
-      const ratio = clipHeightCss > 1 ? height / clipHeightCss : 1;
-      const newPixels = clamp(Math.round(deltaCss * ratio), 1, height);
-      const cropTop = clamp(height - newPixels, 0, height - 1);
-      const segHeight = height - cropTop;
-      const segment = await sharp(chunk.file)
-        .removeAlpha()
-        .extract({
-          left: 0,
-          top: cropTop,
-          width,
-          height: segHeight,
-        })
-        .png()
-        .toBuffer();
-      composites.push({
-        input: segment,
-        top: outHeight,
-        left: 0,
-      });
-      used.push({
-        file: chunk.file,
-        scrollTop: chunk.scrollTop,
-        cropTopPx: cropTop,
-        keptHeightPx: segHeight,
-      });
-      outWidth = Math.max(outWidth, width);
-      outHeight += segHeight;
-      prevChunk = chunk;
+  for (const file of normalizedFiles) {
+    const stats = await sharp(file).stats();
+    const channels = stats?.channels || [];
+    if (channels.length < 3) {
       continue;
     }
-
-    const segment = await sharp(chunk.file).removeAlpha().png().toBuffer();
-    composites.push({
-      input: segment,
-      top: outHeight,
-      left: 0,
-    });
-    used.push({
-      file: chunk.file,
-      scrollTop: chunk.scrollTop,
-      cropTopPx: 0,
-      keptHeightPx: height,
-    });
-    outWidth = Math.max(outWidth, width);
-    outHeight += height;
-    prevChunk = chunk;
+    const meanR = Number(channels[0]?.mean || 0);
+    const meanG = Number(channels[1]?.mean || 0);
+    const meanB = Number(channels[2]?.mean || 0);
+    const stdR = Number(channels[0]?.stdev || 0);
+    const stdG = Number(channels[1]?.stdev || 0);
+    const stdB = Number(channels[2]?.stdev || 0);
+    const luma = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
+    const avgStd = (stdR + stdG + stdB) / 3;
+    lumaTotal += luma;
+    stdTotal += avgStd;
+    if (luma >= 244 && avgStd <= 9) {
+      blankChunks += 1;
+    }
   }
 
-  if (composites.length === 0 || outHeight <= 0 || outWidth <= 0) {
-    throw new Error('No valid segments to stitch with sharp.');
-  }
-
-  await sharp({
-    create: {
-      width: outWidth,
-      height: outHeight,
-      channels: 3,
-      background: { r: 255, g: 255, b: 255 },
-    },
-  })
-    .composite(composites)
-    .png()
-    .toFile(stitchedImage);
-
-  return {
-    segments: composites.length,
-    size: {
-      width: outWidth,
-      height: outHeight,
-    },
-    used,
-  };
-}
-
-async function detectLikelyBlankImage(imagePath) {
-  const stats = await sharp(imagePath).stats();
-  const channels = stats?.channels || [];
-  if (channels.length < 3) {
-    return { likelyBlank: false, luma: 0, avgStd: 0 };
-  }
-  const meanR = Number(channels[0]?.mean || 0);
-  const meanG = Number(channels[1]?.mean || 0);
-  const meanB = Number(channels[2]?.mean || 0);
-  const stdR = Number(channels[0]?.stdev || 0);
-  const stdG = Number(channels[1]?.stdev || 0);
-  const stdB = Number(channels[2]?.stdev || 0);
-  const luma = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
-  const avgStd = (stdR + stdG + stdB) / 3;
-  const likelyBlank = luma >= 244 && avgStd <= 9;
+  const totalChunks = normalizedFiles.length;
+  const avgLuma = totalChunks > 0 ? lumaTotal / totalChunks : 0;
+  const avgStd = totalChunks > 0 ? stdTotal / totalChunks : 0;
+  const likelyBlank = blankChunks === totalChunks;
   return {
     likelyBlank,
-    luma: Number(luma.toFixed(2)),
+    luma: Number(avgLuma.toFixed(2)),
     avgStd: Number(avgStd.toFixed(2)),
+    blankChunks,
+    totalChunks,
   };
 }
 
@@ -459,7 +373,6 @@ export class ResumeCaptureService {
     const chunkDir = path.join(artifactDir, 'chunks');
     await mkdir(chunkDir, { recursive: true });
     const metadataFile = path.join(artifactDir, 'chunks.json');
-    const stitchedImage = path.join(artifactDir, 'resume.png');
 
     const probe = await this.waitForProbe({ waitResumeMs });
     const maxScroll = Math.max(0, Number(probe.maxScroll || 0));
@@ -535,19 +448,21 @@ export class ResumeCaptureService {
       chunks,
     };
     await writeFile(metadataFile, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
-    const stitched = await stitchWithSharp(chunks, stitchedImage);
-    const blank = await detectLikelyBlankImage(stitchedImage);
+    const chunkFiles = chunks.map((chunk) => path.resolve(chunk.file));
+    const blank = await detectLikelyBlankChunks(chunkFiles);
     this.logger.log(
-      `简历截图完成: chunks=${chunks.length}, stitched=${stitchedImage}, size=${stitched.size.width}x${stitched.size.height}, likelyBlank=${blank.likelyBlank}, luma=${blank.luma}, std=${blank.avgStd}`,
+      `简历截图完成: chunks=${chunks.length}, modelImages=${chunkFiles.length}, likelyBlank=${blank.likelyBlank}, blankChunks=${blank.blankChunks}/${blank.totalChunks}, luma=${blank.luma}, std=${blank.avgStd}`,
     );
 
     return {
-      stitchedImage,
       metadataFile,
       chunkDir,
       chunkCount: chunks.length,
-      stitchEngine: 'sharp',
-      stitched,
+      chunkFiles,
+      modelImagePaths: chunkFiles,
+      stitchedImage: '',
+      stitchEngine: 'skipped',
+      stitched: null,
       quality: blank,
     };
   }

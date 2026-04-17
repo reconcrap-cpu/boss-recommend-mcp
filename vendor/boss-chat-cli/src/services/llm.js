@@ -300,8 +300,9 @@ function buildImagePrompt({ screeningCriteria, candidate }) {
     '若无法在教育经历模块确认学校名称，不要编造学校名；按信息不足处理。',
     '必须完整阅读全部简历截图分段后再判断。',
     '必须且只能返回 JSON，不要输出 Markdown。',
-    '返回格式：{"passed":true/false,"reason":"简短中文原因","summary":"简短总结","evidence":["证据原文1","证据原文2"]}',
-    '当信息不足以支持通过时，返回 passed=false。',
+    '返回格式：{"passed":true} 或 {"passed":false}。',
+    '不要返回理由、总结、证据、思维过程或额外字段。',
+    '当信息不足以支持通过时，返回 {"passed":false}。',
     '',
     `筛选标准：${screeningCriteria}`,
     '',
@@ -316,7 +317,7 @@ function buildTextPrompt({ screeningCriteria, candidate, resumeText, chunkIndex 
   const profileContext = buildProfileContext(candidate);
   const chunkHint =
     chunkTotal > 1
-      ? `\n\n当前输入是简历分段 ${chunkIndex}/${chunkTotal}。请严格基于本分段文本判断；如果本分段证据不足，必须返回 passed=false。`
+      ? `\n\n当前输入是简历分段 ${chunkIndex}/${chunkTotal}。请严格基于本分段文本判断；如果本分段证据不足，必须返回 {"passed":false}。`
       : '';
   return [
     '你是招聘筛选助手，请基于简历文本判断候选人是否符合筛选标准。',
@@ -325,8 +326,9 @@ function buildTextPrompt({ screeningCriteria, candidate, resumeText, chunkIndex 
     '必须忽略推荐模块与匿名卡片信息（例如“其他名企大厂经历牛人”“相似牛人”“推荐牛人”）。',
     '若无法在教育经历模块确认学校名称，不要编造学校名；按信息不足处理。',
     '必须且只能返回 JSON，不要输出 Markdown。',
-    '返回格式：{"passed":true/false,"reason":"简短中文原因","summary":"简短总结","evidence":["证据原文1","证据原文2"]}',
-    '当信息不足以支持通过时，返回 passed=false。',
+    '返回格式：{"passed":true} 或 {"passed":false}。',
+    '不要返回理由、总结、证据、思维过程或额外字段。',
+    '当信息不足以支持通过时，返回 {"passed":false}。',
     '',
     `筛选标准：${screeningCriteria}`,
     '',
@@ -345,6 +347,28 @@ export function parseLlmJson(content, options = {}) {
     throw new Error('LLM returned empty content');
   }
 
+  const normalizedText = normalizeText(text);
+  const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
+  const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
+
+  if (/^(pass|passed|true)$/i.test(normalizedText)) {
+    return {
+      passed: true,
+      rawOutputText: text,
+      chunkIndex,
+      chunkTotal,
+    };
+  }
+
+  if (/^(fail|failed|false)$/i.test(normalizedText)) {
+    return {
+      passed: false,
+      rawOutputText: text,
+      chunkIndex,
+      chunkTotal,
+    };
+  }
+
   const codeFenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   const candidate = codeFenceMatch ? codeFenceMatch[1] : text;
   const jsonMatch = candidate.match(/\{[\s\S]*\}/);
@@ -353,54 +377,23 @@ export function parseLlmJson(content, options = {}) {
   }
 
   const parsed = JSON.parse(jsonMatch[0]);
-  const parsedPassed = typeof parsed.passed === 'boolean' ? parsed.passed : parsed.matched;
+  const parsedPassed =
+    typeof parsed.passed === 'boolean'
+      ? parsed.passed
+      : typeof parsed.matched === 'boolean'
+      ? parsed.matched
+      : /^pass$/i.test(String(parsed.decision || '').trim())
+      ? true
+      : /^fail$/i.test(String(parsed.decision || '').trim())
+      ? false
+      : null;
   if (typeof parsedPassed !== 'boolean') {
     throw new Error('LLM response missing boolean "passed"');
   }
-  if (typeof parsed.reason !== 'string' || !parsed.reason.trim()) {
-    throw new Error('LLM response missing string "reason"');
-  }
-
-  const reason = normalizeText(parsed.reason);
-  const summary = normalizeText(parsed.summary || reason);
-  const parsedEvidence = toStringArray(parsed.evidence);
-
-  const evidenceCorpus = normalizeText(options.evidenceCorpus || options.rawResumeText || '');
-  const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
-  const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
-
-  let evidence = parsedEvidence;
-  let evidenceMatchedCount = parsedEvidence.length;
-  if (evidenceCorpus) {
-    const normalizedCorpus = normalizeText(evidenceCorpus);
-    const normalizedCorpusLower = toLowerSafe(normalizedCorpus);
-    evidence = [];
-    for (const item of parsedEvidence) {
-      const matched = matchEvidenceAgainstResume(item, evidenceCorpus, normalizedCorpus, normalizedCorpusLower);
-      if (matched.matched) {
-        evidence.push(item);
-      }
-    }
-    evidenceMatchedCount = evidence.length;
-  }
-
-  const rawPassed = parsedPassed === true;
-  const evidenceRawCount = parsedEvidence.length;
-  const evidenceGateDemoted = rawPassed && evidenceMatchedCount <= 0;
-  const passed = evidenceGateDemoted ? false : rawPassed;
-  const finalReason = evidenceGateDemoted
-    ? `模型未给出可在简历原文中校验的证据，按安全策略判为不通过。${reason ? ` 原始原因: ${reason}` : ''}`
-    : reason;
 
   return {
-    passed,
-    rawPassed,
-    reason: finalReason || '模型未返回有效理由。',
-    summary: summary || finalReason || '模型未返回有效总结。',
-    evidence,
-    evidenceRawCount,
-    evidenceMatchedCount,
-    evidenceGateDemoted,
+    passed: parsedPassed,
+    rawOutputText: text,
     chunkIndex,
     chunkTotal,
   };
@@ -485,10 +478,16 @@ export class LlmClient {
     throw lastError || new Error(`${label} evaluation failed`);
   }
 
-  async requestResponses({ prompt, imageDataUrl = null, evidenceCorpus = '', chunkIndex = 1, chunkTotal = 1 }) {
+  async requestResponses({ prompt, imageDataUrl = null, imageDataUrls = [], evidenceCorpus = '', chunkIndex = 1, chunkTotal = 1 }) {
     const content = [{ type: 'input_text', text: prompt }];
+    const normalizedImageDataUrls = Array.isArray(imageDataUrls)
+      ? imageDataUrls.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
     if (imageDataUrl) {
-      content.push({ type: 'input_image', image_url: imageDataUrl });
+      normalizedImageDataUrls.unshift(String(imageDataUrl));
+    }
+    for (const item of normalizedImageDataUrls) {
+      content.push({ type: 'input_image', image_url: item });
     }
     const payload = {
       model: this.model,
@@ -560,10 +559,16 @@ export class LlmClient {
     }
   }
 
-  async requestCompletions({ prompt, imageDataUrl = null, evidenceCorpus = '', chunkIndex = 1, chunkTotal = 1 }) {
+  async requestCompletions({ prompt, imageDataUrl = null, imageDataUrls = [], evidenceCorpus = '', chunkIndex = 1, chunkTotal = 1 }) {
     const content = [{ type: 'text', text: prompt }];
+    const normalizedImageDataUrls = Array.isArray(imageDataUrls)
+      ? imageDataUrls.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
     if (imageDataUrl) {
-      content.push({ type: 'image_url', image_url: { url: imageDataUrl } });
+      normalizedImageDataUrls.unshift(String(imageDataUrl));
+    }
+    for (const item of normalizedImageDataUrls) {
+      content.push({ type: 'image_url', image_url: { url: item } });
     }
     const payload = {
       model: this.model,
@@ -648,20 +653,33 @@ export class LlmClient {
     }
   }
 
-  async evaluateImageResume({ screeningCriteria, candidate, imagePath }) {
+  async evaluateImageResume({ screeningCriteria, candidate, imagePath, imagePaths = [] }) {
     const prompt = buildImagePrompt({ screeningCriteria, candidate });
-    const imageDataUrl = await this.readImageAsDataUrl(imagePath);
+    const normalizedImagePaths = Array.isArray(imagePaths)
+      ? imagePaths.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    if (imagePath) {
+      normalizedImagePaths.unshift(String(imagePath));
+    }
+    const uniqueImagePaths = [...new Set(normalizedImagePaths)];
+    if (uniqueImagePaths.length <= 0) {
+      throw new Error('IMAGE_MODEL_FAILED: missing image paths');
+    }
+    const imageDataUrls = await Promise.all(
+      uniqueImagePaths.map((item) => this.readImageAsDataUrl(item)),
+    );
     const evidenceCorpus = normalizeText(candidate?.evidenceCorpus || candidate?.resumeText || '');
     const result = await this.requestByPreference({
       prompt,
-      imageDataUrl,
+      imageDataUrls,
       evidenceCorpus,
       chunkIndex: 1,
       chunkTotal: 1,
     });
     return {
       ...result,
-      evaluationMode: 'image',
+      evaluationMode: uniqueImagePaths.length > 1 ? 'image-multi-chunk' : 'image',
+      imageCount: uniqueImagePaths.length,
     };
   }
 
@@ -736,47 +754,39 @@ export class LlmClient {
       };
     }
 
-    const firstReason = chunkResults.map((item) => normalizeText(item?.reason)).find(Boolean);
     return {
       passed: false,
-      rawPassed: chunkResults.some((item) => item?.rawPassed === true),
-      reason: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
-      summary: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
-      evidence: [],
-      evidenceRawCount: chunkResults.reduce(
-        (acc, item) =>
-          acc + (Number.isFinite(Number(item?.evidenceRawCount)) ? Number(item.evidenceRawCount) : 0),
-        0,
-      ),
-      evidenceMatchedCount: chunkResults.reduce(
-        (acc, item) =>
-          acc + (Number.isFinite(Number(item?.evidenceMatchedCount)) ? Number(item.evidenceMatchedCount) : 0),
-        0,
-      ),
-      evidenceGateDemoted: chunkResults.some((item) => item?.evidenceGateDemoted === true),
+      rawOutputText:
+        chunkResults.map((item) => normalizeText(item?.rawOutputText)).find(Boolean) ||
+        `{"passed":false,"mode":"text-chunk-fallback","chunks":${chunks.length}}`,
       chunkIndex: null,
       chunkTotal: chunks.length,
       evaluationMode: 'text',
     };
   }
 
-  async evaluateResume({ screeningCriteria, candidate, imagePath }) {
+  async evaluateResume({ screeningCriteria, candidate, imagePath, imagePaths = [] }) {
+    const normalizedImagePaths = Array.isArray(imagePaths)
+      ? imagePaths.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    if (imagePath) {
+      normalizedImagePaths.unshift(String(imagePath));
+    }
+    const uniqueImagePaths = [...new Set(normalizedImagePaths)];
+    if (uniqueImagePaths.length > 0) {
+      return this.evaluateImageResume({
+        screeningCriteria,
+        candidate,
+        imagePaths: uniqueImagePaths,
+      });
+    }
+
     const hasResumeText = Boolean(normalizeText(candidate?.resumeText || ''));
     if (hasResumeText) {
-      try {
-        return await this.evaluateTextResume({ screeningCriteria, candidate });
-      } catch (textError) {
-        if (!imagePath) {
-          throw textError;
-        }
-        const imageResult = await this.evaluateImageResume({ screeningCriteria, candidate, imagePath });
-        return {
-          ...imageResult,
-          textFallbackError: normalizeText(textError?.message || textError),
-        };
-      }
+      return this.evaluateTextResume({ screeningCriteria, candidate });
     }
-    return this.evaluateImageResume({ screeningCriteria, candidate, imagePath });
+
+    throw new Error('LLM evaluation requires at least one resume image or non-empty resume text');
   }
 }
 

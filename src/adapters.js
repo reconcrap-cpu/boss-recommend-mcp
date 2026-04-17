@@ -27,6 +27,8 @@ const LLM_THINKING_LEVEL_FIELDS = [
   "reasoningEffort",
   "reasoning_effort"
 ];
+const DEFAULT_SHARED_LLM_TIMEOUT_MS = 60000;
+const DEFAULT_SHARED_LLM_MAX_RETRIES = 3;
 const DEFAULT_RECOMMEND_SCREEN_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const PAGE_SCOPE_TO_TAB_STATUS = {
   recommend: "0",
@@ -404,6 +406,19 @@ function resolveLlmThinkingLevel(config = {}) {
     if (value) return value;
   }
   return "";
+}
+
+export function resolveSharedLlmTransportConfig(config = {}) {
+  const timeoutMs = parsePositiveInteger(config?.llmTimeoutMs)
+    || parsePositiveInteger(config?.llm_timeout_ms)
+    || DEFAULT_SHARED_LLM_TIMEOUT_MS;
+  const maxRetries = parsePositiveInteger(config?.llmMaxRetries)
+    || parsePositiveInteger(config?.llm_max_retries)
+    || DEFAULT_SHARED_LLM_MAX_RETRIES;
+  return {
+    llmTimeoutMs: timeoutMs,
+    llmMaxRetries: maxRetries
+  };
 }
 
 function resolveWorkspaceDebugPort(workspaceRoot) {
@@ -2960,6 +2975,13 @@ export async function runRecommendScreenCli({
   const llmThinkingLevel = resolveLlmThinkingLevel(loaded.config);
   if (llmThinkingLevel) {
     args.push("--thinking-level", llmThinkingLevel);
+  }
+  const sharedLlmTransport = resolveSharedLlmTransportConfig(loaded.config);
+  if (sharedLlmTransport.llmTimeoutMs) {
+    args.push("--llm-timeout-ms", String(sharedLlmTransport.llmTimeoutMs));
+  }
+  if (sharedLlmTransport.llmMaxRetries) {
+    args.push("--llm-max-retries", String(sharedLlmTransport.llmMaxRetries));
   }
   args.push("--human-rest", String(resolveHumanRestEnabled(loaded.config)));
   if (Number.isInteger(screenParams.target_count) && screenParams.target_count > 0) {

@@ -7,6 +7,7 @@ import {
   runPipelinePreflight,
   runRecommendSearchCli,
   runRecommendScreenCli,
+  resolveSharedLlmTransportConfig,
   __testables as adapterTestables
 } from "./adapters.js";
 
@@ -107,6 +108,23 @@ function testResolveScreenTimeoutDefaultsTo24Hours() {
   }
 }
 
+function testResolveSharedLlmTransportConfigShouldUseDefaultsAndOverrides() {
+  assert.deepEqual(resolveSharedLlmTransportConfig({}), {
+    llmTimeoutMs: 60000,
+    llmMaxRetries: 3,
+  });
+  assert.deepEqual(
+    resolveSharedLlmTransportConfig({
+      llmTimeoutMs: 90000,
+      llmMaxRetries: 5,
+    }),
+    {
+      llmTimeoutMs: 90000,
+      llmMaxRetries: 5,
+    },
+  );
+}
+
 function testBuildRecommendScreenProcessErrorMapsTimeout() {
   const error = buildRecommendScreenProcessError({ code: -1, error_code: "TIMEOUT" }, 86400000);
   assert.equal(error?.code, "TIMEOUT");
@@ -151,6 +169,76 @@ async function testResumeRequiresCheckpointFile() {
     } else {
       process.env.BOSS_RECOMMEND_HOME = previousHome;
     }
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+}
+
+async function testRecommendScreenCliShouldPassSharedLlmTransportArgs() {
+  const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-stub-"));
+  const screenDir = path.join(workspaceRoot, "boss-recommend-screen-cli");
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-screen-home-"));
+  const previousHome = process.env.BOSS_RECOMMEND_HOME;
+  fs.mkdirSync(screenDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(screenDir, "boss-recommend-screen-cli.cjs"),
+    [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const argv = process.argv.slice(2);",
+      "const parsed = {};",
+      "for (let i = 0; i < argv.length; i += 1) {",
+      "  const token = argv[i];",
+      "  if (!token.startsWith('--')) continue;",
+      "  const next = argv[i + 1];",
+      "  parsed[token.slice(2)] = next && !next.startsWith('--') ? next : true;",
+      "  if (next && !next.startsWith('--')) i += 1;",
+      "}",
+      "const output = path.join(process.env.BOSS_RECOMMEND_HOME, 'screen-cli-args.json');",
+      "fs.writeFileSync(output, JSON.stringify(parsed, null, 2));",
+      "console.log(JSON.stringify({ status: 'COMPLETED', result: { processed_count: 0, output_csv: parsed.output || '' } }));",
+    ].join("\n"),
+    "utf8",
+  );
+
+  process.env.BOSS_RECOMMEND_HOME = tempHome;
+  fs.writeFileSync(
+    path.join(tempHome, "screening-config.json"),
+    JSON.stringify(
+      {
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "sk-valid-test",
+        model: "gpt-4.1-mini",
+        llmTimeoutMs: 75000,
+        llmMaxRetries: 6,
+      },
+      null,
+      2,
+    ),
+  );
+
+  try {
+    const result = await runRecommendScreenCli({
+      workspaceRoot,
+      screenParams: {
+        criteria: "有 MCP 经验",
+        target_count: null,
+        post_action: "none",
+        max_greet_count: null,
+      },
+      pageScope: "recommend",
+    });
+    assert.equal(result.ok, true);
+    const parsed = JSON.parse(fs.readFileSync(path.join(tempHome, "screen-cli-args.json"), "utf8"));
+    assert.equal(parsed["llm-timeout-ms"], "75000");
+    assert.equal(parsed["llm-max-retries"], "6");
+  } finally {
+    if (previousHome === undefined) {
+      delete process.env.BOSS_RECOMMEND_HOME;
+    } else {
+      process.env.BOSS_RECOMMEND_HOME = previousHome;
+    }
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 }
@@ -520,8 +608,10 @@ async function main() {
   testParsePausedStructuredOutput();
   testParseScreenProgressLineShouldCountFavoriteFailureAsSkipped();
   testResolveScreenTimeoutDefaultsTo24Hours();
+  testResolveSharedLlmTransportConfigShouldUseDefaultsAndOverrides();
   testBuildRecommendScreenProcessErrorMapsTimeout();
   await testResumeRequiresCheckpointFile();
+  await testRecommendScreenCliShouldPassSharedLlmTransportArgs();
   testPreflightShouldCheckSharpInsteadOfPython();
   testPreflightFeaturedShouldRequireFavoriteCalibration();
   testPreflightRecommendShouldKeepFavoriteCalibrationOptional();

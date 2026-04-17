@@ -1,6 +1,7 @@
 import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
+import { isDomProfileConsistentWithCard, NETWORK_RESUME_RETRY_WAIT_MS } from './services/resume-network.js';
 import { createCustomerAliases, createCustomerKey } from './utils/customer-key.js';
 
 function runToken(date = new Date()) {
@@ -15,39 +16,6 @@ function safePathToken(value) {
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function sanitizeReasonWithResumeProfile(reason, resumeProfile) {
-  const rawReason = normalizeText(reason);
-  if (!rawReason) return rawReason;
-  const schools = Array.isArray(resumeProfile?.schools)
-    ? resumeProfile.schools.map((item) => normalizeText(item)).filter(Boolean)
-    : [];
-  const primarySchool = normalizeText(resumeProfile?.primarySchool || schools[0] || '');
-  const schoolPool = primarySchool ? [primarySchool, ...schools] : schools;
-  if (schoolPool.length <= 0) return rawReason;
-
-  if (schoolPool.some((school) => rawReason.includes(school))) {
-    return rawReason;
-  }
-  if (!/(大学|学院|院校|中科院|学校)/.test(rawReason)) {
-    return rawReason;
-  }
-
-  const sentences = rawReason
-    .split(/[。；;]+/)
-    .map((item) => normalizeText(item))
-    .filter(Boolean);
-  const filtered = sentences.filter((sentence) => {
-    if (!/(大学|学院|院校|中科院|学校)/.test(sentence)) return true;
-    return schoolPool.some((school) => sentence.includes(school));
-  });
-
-  const prefix = `教育经历学校以简历主内容为准：${schoolPool[0]}`;
-  if (filtered.length <= 0) {
-    return `${prefix}。`;
-  }
-  return `${prefix}。${filtered.join('；')}。`;
 }
 
 function shouldContinue(summary, targetCount) {
@@ -75,6 +43,7 @@ export class BossChatApp {
     resumeCaptureService,
     stateStore,
     reportStore,
+    resumeNetworkTracker = null,
     runControl = null,
     logger = console,
     dryRun = false,
@@ -88,6 +57,7 @@ export class BossChatApp {
     this.resumeCaptureService = resumeCaptureService;
     this.stateStore = stateStore;
     this.reportStore = reportStore;
+    this.resumeNetworkTracker = resumeNetworkTracker;
     this.runControl = runControl;
     this.logger = logger;
     this.dryRun = dryRun;
@@ -143,6 +113,347 @@ export class BossChatApp {
         meta,
       );
     } catch {}
+  }
+
+  buildCardProfile(customer = {}) {
+    return {
+      name: normalizeText(customer.name || ''),
+      school: normalizeText(customer.school || ''),
+      major: normalizeText(customer.major || ''),
+      company: normalizeText(customer.company || customer.lastCompany || customer.last_company || ''),
+      position: normalizeText(customer.position || customer.lastPosition || customer.last_position || ''),
+    };
+  }
+
+  buildResumeCandidateContext(customer = {}, candidateInfo = null) {
+    const info = candidateInfo && typeof candidateInfo === 'object' ? candidateInfo : {};
+    const schools = Array.isArray(info.schools) ? info.schools.map((item) => normalizeText(item)).filter(Boolean) : [];
+    const majors = Array.isArray(info.majors) ? info.majors.map((item) => normalizeText(item)).filter(Boolean) : [];
+    const primarySchool = normalizeText(info.school || info.primarySchool || schools[0] || '');
+    const primaryMajor = normalizeText(info.major || majors[0] || '');
+    const company = normalizeText(info.company || '');
+    const position = normalizeText(info.position || '');
+    const hasProfileContext = Boolean(primarySchool || primaryMajor || company || position || schools.length || majors.length);
+    return {
+      name: customer.name || info.name || '',
+      sourceJob: customer.sourceJob || '',
+      resumeProfile: hasProfileContext
+        ? {
+            primarySchool,
+            schools: schools.length > 0 ? schools : primarySchool ? [primarySchool] : [],
+            major: primaryMajor,
+            majors: majors.length > 0 ? majors : primaryMajor ? [primaryMajor] : [],
+            company,
+            position,
+          }
+        : null,
+      resumeText: String(info.resumeText || ''),
+      evidenceCorpus: String(info.evidenceCorpus || info.resumeText || ''),
+    };
+  }
+
+  async extractDomResumeCandidateInfo(customer = {}) {
+    if (typeof this.page.getResumeProfileFromDom !== 'function') {
+      return null;
+    }
+    const result = await this.page.getResumeProfileFromDom();
+    if (!result?.ok) {
+      return null;
+    }
+    const resumeText = normalizeText(result.resumeText || '');
+    if (!resumeText) {
+      return null;
+    }
+    return {
+      name: normalizeText(result.name || customer.name || ''),
+      school: normalizeText(result.primarySchool || ''),
+      schools: Array.isArray(result.schools) ? result.schools.map((item) => normalizeText(item)).filter(Boolean) : [],
+      major: normalizeText(result.major || ''),
+      majors: Array.isArray(result.majors) ? result.majors.map((item) => normalizeText(item)).filter(Boolean) : [],
+      company: normalizeText(result.company || ''),
+      position: normalizeText(result.position || ''),
+      resumeText: String(result.resumeText || ''),
+      evidenceCorpus: String(result.evidenceCorpus || result.resumeText || ''),
+    };
+  }
+
+  async retryCandidateResumeContext(customer = {}) {
+    if (typeof this.page.closeResumeModalDomOnce === 'function') {
+      try {
+        await this.page.closeResumeModalDomOnce();
+      } catch {}
+    }
+    await this.checkpoint();
+    if (typeof this.page.activateCandidate === 'function') {
+      await this.page.activateCandidate(customer, 0);
+    } else {
+      const rect = await this.page.centerCustomerCard(customer.domIndex, 0);
+      await this.interaction.clickRect(rect);
+    }
+    await this.interaction.sleepRange(520, 140);
+    await this.page.waitForCandidateActivated(customer, {
+      maxAttempts: 8,
+      delayMs: 180,
+    });
+    await this.page.waitForConversationReady({
+      maxAttempts: 8,
+      delayMs: 220,
+    });
+    const retryStartedAt = Date.now();
+    const openResult = await this.page.openOnlineResume();
+    await this.interaction.sleepRange(520, 140);
+    return {
+      retryStartedAt,
+      openResult,
+    };
+  }
+
+  async resolveDomResumeFallback(customer = {}, cardProfile = null) {
+    let domCandidateInfo = await this.extractDomResumeCandidateInfo(customer);
+    let networkCandidateInfo = null;
+    let acquisitionReason = domCandidateInfo?.resumeText ? 'dom_initial_hit' : '';
+
+    if (domCandidateInfo && !isDomProfileConsistentWithCard(cardProfile, domCandidateInfo)) {
+      this.logger.log(
+        `DOM简历疑似错位：expected=${cardProfile?.name || 'unknown'} | actual=${domCandidateInfo?.name || 'unknown'}，尝试重试点击并短暂回查 network。`,
+      );
+      acquisitionReason = 'dom_profile_mismatch_retry';
+      try {
+        const retryContext = await this.retryCandidateResumeContext(customer);
+        if (this.resumeNetworkTracker) {
+          const retryNetwork = await this.resumeNetworkTracker.waitForNetworkResumeCandidateInfo(
+            customer,
+            NETWORK_RESUME_RETRY_WAIT_MS,
+            { minTs: retryContext.retryStartedAt },
+          );
+          if (retryNetwork?.candidateInfo?.resumeText) {
+            networkCandidateInfo = retryNetwork.candidateInfo;
+            acquisitionReason = 'dom_retry_network_recheck_hit';
+            domCandidateInfo = null;
+          }
+        }
+        if (!networkCandidateInfo) {
+          const retryDomCandidateInfo = await this.extractDomResumeCandidateInfo(customer);
+          if (retryDomCandidateInfo && isDomProfileConsistentWithCard(cardProfile, retryDomCandidateInfo)) {
+            domCandidateInfo = retryDomCandidateInfo;
+            acquisitionReason = 'dom_retry_hit';
+          } else {
+            domCandidateInfo = null;
+            acquisitionReason = 'dom_profile_mismatch_unresolved';
+          }
+        }
+      } catch (error) {
+        domCandidateInfo = null;
+        acquisitionReason = `dom_profile_retry_failed:${normalizeText(error?.message || error)}`;
+      }
+    }
+
+    return {
+      domCandidateInfo,
+      networkCandidateInfo,
+      acquisitionReason,
+    };
+  }
+
+  async acquireResumeAndEvaluate(customer, profile, artifactDir, baseResult) {
+    let modalOpened = false;
+    let capture = null;
+    let lastResumeError = null;
+    const timings = {
+      initialNetworkWaitMs: 0,
+      networkRetryMs: 0,
+      imageCaptureMs: 0,
+      imageModelMs: 0,
+      lateNetworkRetryMs: 0,
+      domFallbackMs: 0,
+      textModelMs: 0,
+    };
+    const cardProfile = this.buildCardProfile(customer);
+
+    await this.waitResumeOpenCooldown(this.resumeOpenCooldownMs + Math.floor(Math.random() * 200));
+    await this.checkpoint();
+    const acquisitionStartedAt = Date.now();
+    const openResult = await this.page.openOnlineResume();
+    let openDetected = openResult ? Boolean(openResult?.detectedOpen) : true;
+    this.lastResumeOpenAt = Date.now();
+    modalOpened = openDetected;
+    await this.interaction.sleepRange(600, 220);
+
+    const rateLimit =
+      typeof this.page.getResumeRateLimitWarning === 'function'
+        ? await this.page.getResumeRateLimitWarning()
+        : { hit: false, text: '' };
+    if (rateLimit?.hit) {
+      const backoffMs = 90000 + Math.floor(Math.random() * 30000);
+      this.setResumeOpenBlocked(backoffMs);
+      throw new Error(`RESUME_RATE_LIMIT_WARNING:${rateLimit.text}`);
+    }
+    if (openResult && !openDetected) {
+      let delayedDetected = false;
+      if (typeof this.page.getResumeModalState === 'function') {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const delayedState = await this.page.getResumeModalState();
+        delayedDetected =
+          Boolean(delayedState?.open) ||
+          Number(delayedState?.iframeCount || 0) > 0 ||
+          (Number(delayedState?.scopeCount || 0) > 0 && Number(delayedState?.closeCount || 0) > 0);
+      }
+      if (delayedDetected) {
+        openDetected = true;
+        modalOpened = true;
+        this.logger.log('在线简历首次检测未命中，1秒后复检已打开，继续处理。');
+      } else {
+        throw new Error('RESUME_MODAL_NOT_DETECTED_AFTER_SINGLE_DOM_CLICK');
+      }
+    }
+    if (!openDetected) {
+      throw new Error('RESUME_MODAL_NOT_DETECTED');
+    }
+
+    let networkResult = null;
+    if (this.resumeNetworkTracker) {
+      networkResult = await this.resumeNetworkTracker.waitForResumeNetworkByMode(customer, {
+        minTs: acquisitionStartedAt,
+      });
+      timings.initialNetworkWaitMs = Number(networkResult?.initialWaitMs || 0);
+      timings.networkRetryMs = Number(networkResult?.retryWaitMs || 0);
+    }
+
+    if (networkResult?.candidateInfo?.resumeText) {
+      await this.checkpoint();
+      const evaluationStartedAt = Date.now();
+      const evaluation = await this.llmClient.evaluateResume({
+        screeningCriteria: profile.screeningCriteria,
+        candidate: this.buildResumeCandidateContext(customer, networkResult.candidateInfo),
+      });
+      timings.textModelMs = Date.now() - evaluationStartedAt;
+      return {
+        modalOpened,
+        capture,
+        evaluation,
+        timings,
+        acquisitionMode: 'network',
+        acquisitionReason: networkResult.acquisitionReason || 'initial_network_hit',
+        sourceCandidateInfo: networkResult.candidateInfo,
+      };
+    }
+
+    try {
+      await this.checkpoint();
+      const captureStartedAt = Date.now();
+      capture = await this.resumeCaptureService.captureResume({
+        artifactDir,
+        waitResumeMs: 30000,
+        scrollSettleMs: 500,
+      });
+      timings.imageCaptureMs = Date.now() - captureStartedAt;
+      if (capture?.quality?.likelyBlank) {
+        const blankBackoffMs = 45000 + Math.floor(Math.random() * 20000);
+        this.setResumeOpenBlocked(blankBackoffMs);
+        throw new Error('RESUME_CAPTURE_LIKELY_BLANK');
+      }
+      const modelImagePaths = Array.isArray(capture.modelImagePaths)
+        ? capture.modelImagePaths.map((item) => String(item || '').trim()).filter(Boolean)
+        : [];
+      this.logger.log(`截图完成：chunks=${capture.chunkCount} | modelImages=${modelImagePaths.length}`);
+      baseResult.artifacts.chunkDir = capture.chunkDir;
+      baseResult.artifacts.metadataFile = capture.metadataFile;
+      baseResult.artifacts.stitchedImage = capture.stitchedImage;
+      baseResult.artifacts.chunkCount = capture.chunkCount;
+      baseResult.artifacts.modelImagePaths = modelImagePaths;
+
+      if (this.resumeNetworkTracker) {
+        this.resumeNetworkTracker.setResumeAcquisitionMode('image', 'image_capture_success');
+      }
+
+      await this.checkpoint();
+      const imageEvalStartedAt = Date.now();
+      const evaluation = await this.llmClient.evaluateResume({
+        screeningCriteria: profile.screeningCriteria,
+        candidate: this.buildResumeCandidateContext(customer, null),
+        imagePaths: modelImagePaths,
+      });
+      timings.imageModelMs = Date.now() - imageEvalStartedAt;
+      return {
+        modalOpened,
+        capture,
+        evaluation,
+        timings,
+        acquisitionMode: 'image_fallback',
+        acquisitionReason: 'image_capture_success',
+        sourceCandidateInfo: null,
+      };
+    } catch (imageError) {
+      lastResumeError = imageError;
+    }
+
+    let lateNetworkResult = null;
+    if (this.resumeNetworkTracker) {
+      lateNetworkResult = await this.resumeNetworkTracker.waitForLateNetworkResumeCandidateInfo(customer, {
+        minTs: acquisitionStartedAt,
+      });
+      timings.lateNetworkRetryMs = Number(lateNetworkResult?.lateRetryMs || 0);
+    }
+    if (lateNetworkResult?.candidateInfo?.resumeText) {
+      await this.checkpoint();
+      const evaluationStartedAt = Date.now();
+      const evaluation = await this.llmClient.evaluateResume({
+        screeningCriteria: profile.screeningCriteria,
+        candidate: this.buildResumeCandidateContext(customer, lateNetworkResult.candidateInfo),
+      });
+      timings.textModelMs = Date.now() - evaluationStartedAt;
+      return {
+        modalOpened,
+        capture,
+        evaluation,
+        timings,
+        acquisitionMode: 'network',
+        acquisitionReason: lateNetworkResult.acquisitionReason || 'late_network_hit',
+        sourceCandidateInfo: lateNetworkResult.candidateInfo,
+      };
+    }
+
+    const domStartedAt = Date.now();
+    const domFallback = await this.resolveDomResumeFallback(customer, cardProfile);
+    timings.domFallbackMs = Date.now() - domStartedAt;
+    if (domFallback?.networkCandidateInfo?.resumeText) {
+      await this.checkpoint();
+      const evaluationStartedAt = Date.now();
+      const evaluation = await this.llmClient.evaluateResume({
+        screeningCriteria: profile.screeningCriteria,
+        candidate: this.buildResumeCandidateContext(customer, domFallback.networkCandidateInfo),
+      });
+      timings.textModelMs = Date.now() - evaluationStartedAt;
+      return {
+        modalOpened,
+        capture,
+        evaluation,
+        timings,
+        acquisitionMode: 'network',
+        acquisitionReason: domFallback.acquisitionReason || 'dom_retry_network_recheck_hit',
+        sourceCandidateInfo: domFallback.networkCandidateInfo,
+      };
+    }
+    if (domFallback?.domCandidateInfo?.resumeText) {
+      await this.checkpoint();
+      const evaluationStartedAt = Date.now();
+      const evaluation = await this.llmClient.evaluateResume({
+        screeningCriteria: profile.screeningCriteria,
+        candidate: this.buildResumeCandidateContext(customer, domFallback.domCandidateInfo),
+      });
+      timings.textModelMs = Date.now() - evaluationStartedAt;
+      return {
+        modalOpened,
+        capture,
+        evaluation,
+        timings,
+        acquisitionMode: 'dom_fallback',
+        acquisitionReason: domFallback.acquisitionReason || 'dom_initial_hit',
+        sourceCandidateInfo: domFallback.domCandidateInfo,
+      };
+    }
+
+    throw lastResumeError || new Error('DOM_RESUME_FALLBACK_FAILED');
   }
 
   async restoreListContext(profile) {
@@ -744,165 +1055,71 @@ export class BossChatApp {
       const artifactDir = path.join(this.artifactRootDir, runId, candidateToken);
       await mkdir(artifactDir, { recursive: true });
 
-      let capture = null;
-      let lastResumeError = null;
-      let resumeProfile = null;
-      await this.waitResumeOpenCooldown(this.resumeOpenCooldownMs + Math.floor(Math.random() * 200));
-      await this.checkpoint();
-      const openResult = await this.page.openOnlineResume();
-      let openDetected = openResult ? Boolean(openResult?.detectedOpen) : true;
-      this.lastResumeOpenAt = Date.now();
-      modalOpened = openDetected;
-      await this.interaction.sleepRange(600, 220);
-      const rateLimit =
-        typeof this.page.getResumeRateLimitWarning === 'function'
-          ? await this.page.getResumeRateLimitWarning()
-          : { hit: false, text: '' };
-      if (rateLimit?.hit) {
-        const backoffMs = 90000 + Math.floor(Math.random() * 30000);
-        this.setResumeOpenBlocked(backoffMs);
-        this.logger.log(
-          `检测到简历查看频控提示：${rateLimit.text}，进入冷却 ${Math.round(backoffMs / 1000)}s，当前候选跳过。`,
-        );
-        lastResumeError = new Error(`RESUME_RATE_LIMIT_WARNING:${rateLimit.text}`);
-      } else if (openResult && !openDetected) {
-        let delayedDetected = false;
-        if (typeof this.page.getResumeModalState === 'function') {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          const delayedState = await this.page.getResumeModalState();
-          delayedDetected =
-            Boolean(delayedState?.open) ||
-            Number(delayedState?.iframeCount || 0) > 0 ||
-            (Number(delayedState?.scopeCount || 0) > 0 &&
-              Number(delayedState?.closeCount || 0) > 0);
-        }
-        if (delayedDetected) {
-          openDetected = true;
-          modalOpened = true;
-          this.logger.log('在线简历首次检测未命中，1秒后复检已打开，继续处理。');
-        } else {
-          lastResumeError = new Error('RESUME_MODAL_NOT_DETECTED_AFTER_SINGLE_DOM_CLICK');
-        }
-      }
-
-      if (!lastResumeError && openDetected) {
-        if (typeof this.page.getResumeProfileFromDom === 'function') {
-          resumeProfile = await this.page.getResumeProfileFromDom();
-          if (resumeProfile?.ok) {
-            this.logger.log(
-              `简历结构化信息：school=${resumeProfile.primarySchool || 'n/a'} | major=${resumeProfile.major || 'n/a'} | company=${resumeProfile.company || 'n/a'} | position=${resumeProfile.position || 'n/a'}`,
-            );
-            baseResult.artifacts.resumeProfile = {
-              primarySchool: resumeProfile.primarySchool || '',
-              schools: Array.isArray(resumeProfile.schools) ? resumeProfile.schools : [],
-              major: resumeProfile.major || '',
-              majors: Array.isArray(resumeProfile.majors) ? resumeProfile.majors : [],
-              company: resumeProfile.company || '',
-              position: resumeProfile.position || '',
-              resumeTextLength: String(resumeProfile.resumeText || '').length,
-              evidenceCorpusLength: String(resumeProfile.evidenceCorpus || '').length,
-            };
-          } else {
-            this.logger.log(`简历结构化提取未命中：${resumeProfile?.error || 'unknown'}`);
-          }
-        }
-        this.logger.log(
-          `在线简历点击完成：clicked=${Boolean(openResult?.clicked)} | detectedOpen=${openDetected} | by=${openResult?.by || 'unknown'}，开始截图探测与拼接。`,
-        );
-        this.logger.log(
-          `在线简历截图前状态：modalOpened=${modalOpened} | openDetected=${openDetected}`,
-        );
-        try {
-          await this.checkpoint();
-          capture = await this.resumeCaptureService.captureResume({
-            artifactDir,
-            waitResumeMs: 30000,
-            scrollSettleMs: 500,
-          });
-          if (capture?.quality?.likelyBlank) {
-            const blankBackoffMs = 45000 + Math.floor(Math.random() * 20000);
-            this.setResumeOpenBlocked(blankBackoffMs);
-            this.logger.log(
-              `检测到疑似空白简历截图（luma=${capture?.quality?.luma},std=${capture?.quality?.avgStd}），冷却 ${Math.round(blankBackoffMs / 1000)}s，当前候选跳过。`,
-            );
-            lastResumeError = new Error('RESUME_CAPTURE_LIKELY_BLANK');
-            capture = null;
-          }
-        } catch (error) {
-          lastResumeError = error;
-        }
-      } else if (!lastResumeError && !openDetected) {
-        lastResumeError = new Error('RESUME_MODAL_NOT_DETECTED');
-      }
-      if (!capture) {
-        throw lastResumeError || new Error('RESUME_CAPTURE_FAILED');
-      }
-      this.logger.log(
-        `截图完成：chunks=${capture.chunkCount} | image=${capture.stitchedImage}`,
+      const acquisition = await this.acquireResumeAndEvaluate(
+        customer,
+        profile,
+        artifactDir,
+        baseResult,
       );
-      baseResult.artifacts = {
-        chunkDir: capture.chunkDir,
-        metadataFile: capture.metadataFile,
-        stitchedImage: capture.stitchedImage,
-        chunkCount: capture.chunkCount,
-      };
-
-      await this.checkpoint();
-      const evaluation = await this.llmClient.evaluateResume({
-        screeningCriteria: profile.screeningCriteria,
-        candidate: {
-          name: customer.name || '',
-          sourceJob: customer.sourceJob || '',
-          resumeProfile: resumeProfile?.ok ? {
-            primarySchool: resumeProfile.primarySchool || '',
-            schools: Array.isArray(resumeProfile.schools) ? resumeProfile.schools : [],
-            major: resumeProfile.major || '',
-            majors: Array.isArray(resumeProfile.majors) ? resumeProfile.majors : [],
-            company: resumeProfile.company || '',
-            position: resumeProfile.position || '',
-          } : null,
-          resumeText: resumeProfile?.ok ? String(resumeProfile.resumeText || '') : '',
-          evidenceCorpus: resumeProfile?.ok ? String(resumeProfile.evidenceCorpus || '') : '',
-        },
-        imagePath: capture.stitchedImage,
-      });
-      const finalReason = sanitizeReasonWithResumeProfile(evaluation.reason, resumeProfile);
-      if (finalReason !== evaluation.reason) {
-        this.logger.log(
-          `评估理由学校字段已按主简历纠偏：rawReason=${evaluation.reason} | finalReason=${finalReason}`,
-        );
-      }
-      if (evaluation.evidenceGateDemoted === true) {
-        this.logger.log(
-          `证据闸门降级：rawPassed=${Boolean(evaluation.rawPassed)} | evidenceRawCount=${Number(evaluation.evidenceRawCount || 0)} | evidenceMatchedCount=${Number(evaluation.evidenceMatchedCount || 0)} | mode=${evaluation.evaluationMode || 'unknown'}`,
-        );
-      }
+      const evaluation = acquisition.evaluation;
+      const capture = acquisition.capture;
+      modalOpened = Boolean(acquisition.modalOpened);
+      const finalReason = evaluation.passed ? 'LLM判定通过' : 'LLM判定不通过';
       this.logger.log(
-        `LLM评估完成：passed=${evaluation.passed} | rawPassed=${Boolean(evaluation.rawPassed)} | mode=${evaluation.evaluationMode || 'unknown'} | reason=${finalReason}`,
+        `LLM评估完成：passed=${evaluation.passed} | source=${acquisition.acquisitionMode} | reason=${acquisition.acquisitionReason || 'n/a'} | mode=${evaluation.evaluationMode || 'unknown'} | imageCount=${Number(evaluation.imageCount || baseResult.artifacts.modelImagePaths?.length || 0)} | result=${normalizeText(evaluation.rawOutputText || '') || 'n/a'}`,
       );
 
       baseResult.reason = finalReason;
       baseResult.passed = evaluation.passed;
       baseResult.decision = evaluation.passed ? 'passed' : 'skipped';
-      baseResult.artifacts.rawPassed = Boolean(evaluation.rawPassed);
       baseResult.artifacts.finalPassed = Boolean(evaluation.passed);
-      baseResult.artifacts.evidenceRawCount = Number.isFinite(Number(evaluation.evidenceRawCount))
-        ? Number(evaluation.evidenceRawCount)
-        : 0;
-      baseResult.artifacts.evidenceMatchedCount = Number.isFinite(Number(evaluation.evidenceMatchedCount))
-        ? Number(evaluation.evidenceMatchedCount)
-        : 0;
-      baseResult.artifacts.evidenceGateDemoted = evaluation.evidenceGateDemoted === true;
       baseResult.artifacts.evaluationMode = String(evaluation.evaluationMode || '');
+      baseResult.artifacts.evaluationImageCount = Number.isFinite(Number(evaluation.imageCount))
+        ? Number(evaluation.imageCount)
+        : Array.isArray(baseResult.artifacts.modelImagePaths)
+        ? baseResult.artifacts.modelImagePaths.length
+        : 0;
       baseResult.artifacts.evaluationChunkIndex = Number.isFinite(Number(evaluation.chunkIndex))
         ? Number(evaluation.chunkIndex)
         : null;
       baseResult.artifacts.evaluationChunkTotal = Number.isFinite(Number(evaluation.chunkTotal))
         ? Number(evaluation.chunkTotal)
         : null;
-      baseResult.artifacts.evaluationEvidence = Array.isArray(evaluation.evidence)
-        ? evaluation.evidence.slice(0, 5).map((item) => String(item || '').trim()).filter(Boolean)
-        : [];
+      baseResult.artifacts.llmRawOutput = String(evaluation.rawOutputText || '');
+      baseResult.artifacts.resumeAcquisitionMode = String(acquisition.acquisitionMode || '');
+      baseResult.artifacts.resumeAcquisitionReason = String(acquisition.acquisitionReason || '');
+      baseResult.artifacts.initialNetworkWaitMs = Number(acquisition.timings?.initialNetworkWaitMs || 0);
+      baseResult.artifacts.networkRetryMs = Number(acquisition.timings?.networkRetryMs || 0);
+      baseResult.artifacts.imageCaptureMs = Number(acquisition.timings?.imageCaptureMs || 0);
+      baseResult.artifacts.imageModelMs = Number(acquisition.timings?.imageModelMs || 0);
+      baseResult.artifacts.lateNetworkRetryMs = Number(acquisition.timings?.lateNetworkRetryMs || 0);
+      baseResult.artifacts.domFallbackMs = Number(acquisition.timings?.domFallbackMs || 0);
+      baseResult.artifacts.textModelMs = Number(acquisition.timings?.textModelMs || 0);
+      if (acquisition.sourceCandidateInfo) {
+        baseResult.artifacts.resumeProfile = {
+          primarySchool: normalizeText(acquisition.sourceCandidateInfo.school || ''),
+          schools: Array.isArray(acquisition.sourceCandidateInfo.schools)
+            ? acquisition.sourceCandidateInfo.schools
+            : [],
+          major: normalizeText(acquisition.sourceCandidateInfo.major || ''),
+          majors: Array.isArray(acquisition.sourceCandidateInfo.majors)
+            ? acquisition.sourceCandidateInfo.majors
+            : [],
+          company: normalizeText(acquisition.sourceCandidateInfo.company || ''),
+          position: normalizeText(acquisition.sourceCandidateInfo.position || ''),
+          resumeTextLength: String(acquisition.sourceCandidateInfo.resumeText || '').length,
+          evidenceCorpusLength: String(
+            acquisition.sourceCandidateInfo.evidenceCorpus || acquisition.sourceCandidateInfo.resumeText || '',
+          ).length,
+        };
+      }
+      if (this.resumeNetworkTracker) {
+        baseResult.artifacts.resumeNetworkMode = this.resumeNetworkTracker.getResumeAcquisitionState().mode;
+        baseResult.artifacts.resumeNetworkModeReason =
+          this.resumeNetworkTracker.getResumeAcquisitionState().reason;
+        baseResult.artifacts.resumeNetworkDiagnostics =
+          this.resumeNetworkTracker.resumeNetworkDiagnostics.slice(-12);
+      }
 
       await this.checkpoint();
       const closeResult =
@@ -1069,7 +1286,7 @@ export class BossChatApp {
 
       const message = error.message || String(error);
       if (
-        /ONLINE_RESUME_UNAVAILABLE|ONLINE_RESUME_BUTTON_NOT_FOUND|OPEN_ONLINE_RESUME_FAILED|NO_RESUME_IFRAME|NO_SCROLL_CONTAINER|RESUME_MODAL_OPEN_TIMEOUT|Resume context probe timeout: reason=NO_RESUME_IFRAME|RESUME_RATE_LIMIT_WARNING|RESUME_CAPTURE_LIKELY_BLANK/i.test(
+        /ONLINE_RESUME_UNAVAILABLE|ONLINE_RESUME_BUTTON_NOT_FOUND|OPEN_ONLINE_RESUME_FAILED|NO_RESUME_IFRAME|NO_SCROLL_CONTAINER|RESUME_MODAL_OPEN_TIMEOUT|Resume context probe timeout: reason=NO_RESUME_IFRAME|RESUME_RATE_LIMIT_WARNING|RESUME_CAPTURE_LIKELY_BLANK|DOM_RESUME_FALLBACK_FAILED|RESUME_MODAL_NOT_DETECTED/i.test(
           message,
         )
       ) {

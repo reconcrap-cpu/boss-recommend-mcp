@@ -19,6 +19,13 @@ import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
 import { __testables as vendorCliTestables } from "../vendor/boss-chat-cli/src/cli.js";
 import { BossChatPage } from "../vendor/boss-chat-cli/src/browser/chat-page.js";
 import { LlmClient, parseLlmJson } from "../vendor/boss-chat-cli/src/services/llm.js";
+import { ReportStore } from "../vendor/boss-chat-cli/src/services/report-store.js";
+import {
+  NETWORK_RESUME_IMAGE_MODE_GRACE_MS,
+  NETWORK_RESUME_RETRY_WAIT_MS,
+  NETWORK_RESUME_WAIT_MS,
+  ResumeNetworkTracker,
+} from "../vendor/boss-chat-cli/src/services/resume-network.js";
 
 const { handleRequest } = indexTestables;
 
@@ -58,6 +65,8 @@ function createBossChatTestWorkspace() {
     baseUrl: "https://api.example.com/v1",
     apiKey: "sk-test-key",
     model: "gpt-4.1-mini",
+    llmTimeoutMs: 65000,
+    llmMaxRetries: 4,
     debugPort: 9666
   }, null, 2));
 
@@ -254,6 +263,8 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(stateAfterPrepare.last_prepare_args.baseurl, "https://api.example.com/v1");
     assert.equal(stateAfterPrepare.last_prepare_args.apikey, "sk-test-key");
     assert.equal(stateAfterPrepare.last_prepare_args.model, "gpt-4.1-mini");
+    assert.equal(stateAfterPrepare.last_prepare_args["llm-timeout-ms"], "65000");
+    assert.equal(stateAfterPrepare.last_prepare_args["llm-max-retries"], "4");
 
     const started = await startBossChatRun({
       workspaceRoot,
@@ -278,6 +289,8 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(stateAfterStart.last_start_args.apikey, "sk-test-key");
     assert.equal(stateAfterStart.last_start_args.model, "gpt-4.1-mini");
     assert.equal(stateAfterStart.last_start_args.port, "9666");
+    assert.equal(stateAfterStart.last_start_args["llm-timeout-ms"], "65000");
+    assert.equal(stateAfterStart.last_start_args["llm-max-retries"], "4");
 
     const startedAll = await startBossChatRun({
       workspaceRoot,
@@ -897,41 +910,43 @@ function testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig() {
   assert.equal(launchConfig.args[0], "-y");
 }
 
-function testBossChatLlmEvidenceGateShouldDemoteMissingEvidence() {
-  const parsed = parseLlmJson(
-    JSON.stringify({
-      passed: true,
-      reason: "命中标准",
-      summary: "命中",
-      evidence: [],
-    }),
-    {
-      evidenceCorpus: "南京大学 机器学习 项目经历",
-    },
-  );
-  assert.equal(parsed.rawPassed, true);
-  assert.equal(parsed.passed, false);
-  assert.equal(parsed.evidenceGateDemoted, true);
-  assert.equal(parsed.evidenceMatchedCount, 0);
+function testVendorBossChatCliShouldParseSharedLlmTransportArgs() {
+  const parsed = vendorCliTestables.parseArgs([
+    "start-run",
+    "--llm-timeout-ms",
+    "70000",
+    "--llm-max-retries",
+    "5",
+  ]);
+  assert.equal(parsed.command, "start-run");
+  assert.equal(parsed.overrides.llm.timeoutMs, 70000);
+  assert.equal(parsed.overrides.llm.maxRetries, 5);
 }
 
-function testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence() {
+function testBossChatLlmParserShouldAcceptMinimalDecisionJson() {
   const parsed = parseLlmJson(
     JSON.stringify({
       passed: true,
-      reason: "命中标准",
-      summary: "命中",
-      evidence: ["十年金融风控投研经验"],
     }),
-    {
-      evidenceCorpus: "南京大学 机器学习 项目经历",
-    },
   );
-  assert.equal(parsed.rawPassed, true);
+  assert.equal(parsed.passed, true);
+  assert.equal(parsed.rawOutputText.includes('"passed":true'), true);
+}
+
+function testBossChatLlmParserShouldAcceptPlainPassFailText() {
+  const passed = parseLlmJson("PASS");
+  assert.equal(passed.passed, true);
+  const failed = parseLlmJson("false");
+  assert.equal(failed.passed, false);
+}
+
+function testBossChatLlmParserShouldAcceptDecisionField() {
+  const parsed = parseLlmJson(
+    JSON.stringify({
+      decision: "fail",
+    }),
+  );
   assert.equal(parsed.passed, false);
-  assert.equal(parsed.evidenceGateDemoted, true);
-  assert.equal(parsed.evidenceRawCount, 1);
-  assert.equal(parsed.evidenceMatchedCount, 0);
 }
 
 async function testBossChatLlmTextChunkFallbackShouldWork() {
@@ -962,39 +977,21 @@ async function testBossChatLlmTextChunkFallbackShouldWork() {
           if (payload.chunkIndex === 2) {
             return {
               passed: true,
-              rawPassed: true,
-              reason: "命中分段证据",
-              summary: "命中",
-              evidence: ["PASS_MARKER_ABC"],
-              evidenceRawCount: 1,
-              evidenceMatchedCount: 1,
-              evidenceGateDemoted: false,
+              rawOutputText: '{"passed":true}',
               chunkIndex: payload.chunkIndex,
               chunkTotal: payload.chunkTotal,
             };
           }
           return {
             passed: false,
-            rawPassed: false,
-            reason: "本段证据不足",
-            summary: "不足",
-            evidence: [],
-            evidenceRawCount: 0,
-            evidenceMatchedCount: 0,
-            evidenceGateDemoted: false,
+            rawOutputText: '{"passed":false}',
             chunkIndex: payload.chunkIndex,
             chunkTotal: payload.chunkTotal,
           };
         }
         return {
           passed: false,
-          rawPassed: false,
-          reason: "unexpected",
-          summary: "unexpected",
-          evidence: [],
-          evidenceRawCount: 0,
-          evidenceMatchedCount: 0,
-          evidenceGateDemoted: false,
+          rawOutputText: '{"passed":false}',
           chunkIndex: 1,
           chunkTotal: 1,
         };
@@ -1113,6 +1110,70 @@ async function testBossChatLlmShouldApplyThinkingDefaultsAndOverrides() {
   });
   await responsesClient.requestResponses({ prompt: "prompt", evidenceCorpus: "resume" });
   assert.deepEqual(responsesPayload.reasoning, { effort: "low" });
+}
+
+async function testBossChatLlmShouldSendAllImageChunksInSingleRequest() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-image-chunks-"));
+  const firstImage = path.join(tempDir, "chunk-1.png");
+  const secondImage = path.join(tempDir, "chunk-2.png");
+  fs.writeFileSync(
+    firstImage,
+    Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN4QAAAAASUVORK5CYII=", "base64"),
+  );
+  fs.writeFileSync(
+    secondImage,
+    Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN4QAAAAASUVORK5CYII=", "base64"),
+  );
+
+  let completionPayload = null;
+  const client = new LlmClient({
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "sk-test",
+    model: "gpt-test",
+  }, {
+    fetchImpl: async (_url, options = {}) => {
+      completionPayload = JSON.parse(String(options.body || "{}"));
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                message: {
+                  content: "{\"passed\":true}",
+                },
+              },
+            ],
+          };
+        },
+      };
+    },
+  });
+
+  try {
+    const result = await client.evaluateResume({
+      screeningCriteria: "有 AI 项目经验",
+      candidate: {
+        name: "候选人A",
+        sourceJob: "算法工程师",
+        resumeText: "",
+        evidenceCorpus: "",
+      },
+      imagePaths: [firstImage, secondImage],
+    });
+
+    assert.equal(result.passed, true);
+    assert.equal(result.evaluationMode, "image-multi-chunk");
+    assert.equal(result.imageCount, 2);
+    assert.equal(Array.isArray(completionPayload.messages?.[0]?.content), true);
+    assert.equal(
+      completionPayload.messages[0].content.filter((item) => item.type === "image_url").length,
+      2,
+    );
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 async function testBossChatAppShouldResetPrimaryChatLabelBeforeInitialPrime() {
@@ -1599,6 +1660,431 @@ async function testBossChatAppShouldWaitForCandidateListBeforePriming() {
   assert.equal(summary.skipped, 1);
 }
 
+function createProcessCustomerHarness({
+  llmEvaluate,
+  captureResume,
+  tracker,
+  pageOverrides = {},
+} = {}) {
+  const recorded = [];
+  const page = {
+    async closeResumeModalDomOnce() {
+      recorded.push("closeResumeModalDomOnce");
+      return {
+        closed: true,
+        method: "dom",
+        finalState: { scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+      };
+    },
+    async waitForConversationReady() {
+      recorded.push("waitForConversationReady");
+      return {
+        hasOnlineResume: true,
+        hasAskResume: true,
+        hasAttachmentResume: false,
+        attachmentResumeEnabled: false,
+      };
+    },
+    async openOnlineResume() {
+      recorded.push("openOnlineResume");
+      return { clicked: true, detectedOpen: true, by: "dom" };
+    },
+    async getResumeRateLimitWarning() {
+      return { hit: false, text: "" };
+    },
+    async getResumeModalState() {
+      return { open: true, iframeCount: 1, scopeCount: 1, closeCount: 1 };
+    },
+    async waitForCandidateActivated() {
+      recorded.push("waitForCandidateActivated");
+      return { matched: true };
+    },
+    async activateCandidate() {
+      recorded.push("activateCandidate");
+      return { ok: true };
+    },
+    ...pageOverrides,
+  };
+  const llmCalls = [];
+  const llmClient = {
+    async evaluateResume(payload) {
+      llmCalls.push(payload);
+      return llmEvaluate(payload);
+    },
+  };
+  const resumeCaptureService = {
+    async captureResume(payload) {
+      recorded.push("captureResume");
+      return captureResume(payload);
+    },
+  };
+  const stateStore = {
+    async record(_key, result) {
+      recorded.push(`record:${result.decision}`);
+    },
+  };
+  const app = new BossChatApp({
+    page,
+    llmClient,
+    interaction: {
+      async sleepRange() {},
+      async clickRect() {},
+    },
+    resumeCaptureService,
+    resumeNetworkTracker: tracker || null,
+    stateStore,
+    reportStore: { async write() { return ""; } },
+    dryRun: true,
+    artifactRootDir: os.tmpdir(),
+    resumeOpenCooldownMs: 0,
+    logger: { log() {} },
+  });
+  app.waitResumeOpenCooldown = async () => {};
+  return { app, llmCalls, recorded };
+}
+
+async function testBossChatResumeTrackerShouldRetryInitialNetworkWait() {
+  const tracker = new ResumeNetworkTracker({
+    chromeClient: { Network: null },
+    logger: { log() {} },
+  });
+  const waits = [];
+  let callCount = 0;
+  tracker.waitForNetworkResumeCandidateInfo = async (_candidate, timeoutMs) => {
+    waits.push(timeoutMs);
+    callCount += 1;
+    if (callCount === 2) {
+      return {
+        candidateInfo: { resumeText: "network resume" },
+        source: "geek_id_map",
+        waitedMs: 80,
+      };
+    }
+    return null;
+  };
+  const result = await tracker.waitForResumeNetworkByMode({ customerId: "1001" });
+  assert.deepEqual(waits, [NETWORK_RESUME_WAIT_MS, NETWORK_RESUME_RETRY_WAIT_MS]);
+  assert.equal(result.acquisitionReason, "network_retry_hit");
+}
+
+async function testBossChatResumeTrackerShouldUseImageModeGraceWindow() {
+  const tracker = new ResumeNetworkTracker({
+    chromeClient: { Network: null },
+    logger: { log() {} },
+  });
+  tracker.setResumeAcquisitionMode("image", "previous_image_fallback");
+  const waits = [];
+  tracker.waitForNetworkResumeCandidateInfo = async (_candidate, timeoutMs) => {
+    waits.push(timeoutMs);
+    return null;
+  };
+  const result = await tracker.waitForResumeNetworkByMode({ customerId: "1002" });
+  assert.deepEqual(waits, [NETWORK_RESUME_IMAGE_MODE_GRACE_MS]);
+  assert.equal(result.initialWaitMs >= 0, true);
+  assert.equal(result.retryWaitMs, 0);
+}
+
+async function testBossChatAppShouldUseNetworkBeforeImageFallback() {
+  const tracker = {
+    resumeNetworkDiagnostics: [],
+    getResumeAcquisitionState() {
+      return { mode: "network", reason: "initial_network_hit" };
+    },
+    async waitForResumeNetworkByMode() {
+      return {
+        candidateInfo: {
+          name: "候选人A",
+          school: "清华大学",
+          major: "计算机",
+          company: "OpenAI",
+          position: "工程师",
+          resumeText: "清华大学 计算机 OpenAI",
+          evidenceCorpus: "清华大学 计算机 OpenAI",
+        },
+        acquisitionReason: "initial_network_hit",
+        initialWaitMs: 12,
+        retryWaitMs: 0,
+      };
+    },
+    async waitForLateNetworkResumeCandidateInfo() {
+      throw new Error("late network retry should not run");
+    },
+  };
+  const { app, llmCalls, recorded } = createProcessCustomerHarness({
+    tracker,
+    llmEvaluate: async () => ({
+      passed: true,
+      rawOutputText: '{"passed":true}',
+      evaluationMode: "text",
+      chunkIndex: 1,
+      chunkTotal: 1,
+    }),
+    captureResume: async () => {
+      throw new Error("image capture should not run");
+    },
+  });
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-network",
+      name: "候选人A",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "1001",
+      textSnippet: "",
+    },
+    { screeningCriteria: "有 AI 项目经验" },
+    "run-network",
+    { skipCardClick: true },
+  );
+
+  assert.equal(result.artifacts.resumeAcquisitionMode, "network");
+  assert.equal(result.artifacts.resumeAcquisitionReason, "initial_network_hit");
+  assert.equal(llmCalls.length, 1);
+  assert.equal(llmCalls[0].candidate.resumeText.includes("清华大学"), true);
+  assert.equal(Array.isArray(llmCalls[0].imagePaths), false);
+  assert.equal(recorded.includes("captureResume"), false);
+}
+
+async function testBossChatAppShouldFallbackToImageAfterNetworkMiss() {
+  const tracker = {
+    resumeNetworkDiagnostics: [],
+    setResumeAcquisitionMode(mode, reason) {
+      this.state = { mode, reason };
+    },
+    getResumeAcquisitionState() {
+      return this.state || { mode: "image", reason: "image_capture_success" };
+    },
+    async waitForResumeNetworkByMode() {
+      return {
+        candidateInfo: null,
+        acquisitionReason: "",
+        initialWaitMs: 10,
+        retryWaitMs: 20,
+      };
+    },
+    async waitForLateNetworkResumeCandidateInfo() {
+      return {
+        candidateInfo: null,
+        acquisitionReason: "",
+        lateRetryMs: 0,
+      };
+    },
+  };
+  const { app, llmCalls } = createProcessCustomerHarness({
+    tracker,
+    llmEvaluate: async () => ({
+      passed: false,
+      rawOutputText: '{"passed":false}',
+      evaluationMode: "image-multi-chunk",
+      imageCount: 2,
+      chunkIndex: 1,
+      chunkTotal: 1,
+    }),
+    captureResume: async ({ artifactDir }) => ({
+      metadataFile: path.join(artifactDir, "chunks.json"),
+      chunkDir: path.join(artifactDir, "chunks"),
+      chunkCount: 2,
+      modelImagePaths: [
+        path.join(artifactDir, "chunks", "chunk_000.png"),
+        path.join(artifactDir, "chunks", "chunk_001.png"),
+      ],
+      stitchedImage: "",
+      quality: { likelyBlank: false },
+    }),
+  });
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-image",
+      name: "候选人B",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "1002",
+      textSnippet: "",
+    },
+    { screeningCriteria: "有 AI 项目经验" },
+    "run-image",
+    { skipCardClick: true },
+  );
+
+  assert.equal(result.artifacts.resumeAcquisitionMode, "image_fallback");
+  assert.equal(result.artifacts.resumeAcquisitionReason, "image_capture_success");
+  assert.equal(Array.isArray(llmCalls[0].imagePaths), true);
+  assert.equal(llmCalls[0].imagePaths.length, 2);
+}
+
+async function testBossChatAppShouldRetryLateNetworkBeforeDomFallback() {
+  const tracker = {
+    resumeNetworkDiagnostics: [],
+    getResumeAcquisitionState() {
+      return { mode: "network", reason: "late_network_hit" };
+    },
+    setResumeAcquisitionMode() {},
+    async waitForResumeNetworkByMode() {
+      return {
+        candidateInfo: null,
+        acquisitionReason: "",
+        initialWaitMs: 10,
+        retryWaitMs: 20,
+      };
+    },
+    async waitForLateNetworkResumeCandidateInfo() {
+      return {
+        candidateInfo: {
+          name: "候选人C",
+          school: "上海交大",
+          major: "软件工程",
+          resumeText: "上海交大 软件工程",
+          evidenceCorpus: "上海交大 软件工程",
+        },
+        acquisitionReason: "late_network_hit",
+        lateRetryMs: 30,
+      };
+    },
+  };
+  let imageAttempt = 0;
+  const { app, llmCalls } = createProcessCustomerHarness({
+    tracker,
+    llmEvaluate: async (payload) => {
+      imageAttempt += 1;
+      if (Array.isArray(payload.imagePaths) && payload.imagePaths.length > 0) {
+        throw new Error("VISION_MODEL_FAILED");
+      }
+      return {
+        passed: true,
+        rawOutputText: '{"passed":true}',
+        evaluationMode: "text",
+        chunkIndex: 1,
+        chunkTotal: 1,
+      };
+    },
+    captureResume: async ({ artifactDir }) => ({
+      metadataFile: path.join(artifactDir, "chunks.json"),
+      chunkDir: path.join(artifactDir, "chunks"),
+      chunkCount: 1,
+      modelImagePaths: [path.join(artifactDir, "chunks", "chunk_000.png")],
+      stitchedImage: "",
+      quality: { likelyBlank: false },
+    }),
+  });
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-late-network",
+      name: "候选人C",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "1003",
+      textSnippet: "",
+    },
+    { screeningCriteria: "有 AI 项目经验" },
+    "run-late-network",
+    { skipCardClick: true },
+  );
+
+  assert.equal(imageAttempt >= 2, true);
+  assert.equal(result.artifacts.resumeAcquisitionMode, "network");
+  assert.equal(result.artifacts.resumeAcquisitionReason, "late_network_hit");
+  assert.equal(llmCalls[llmCalls.length - 1].candidate.resumeText.includes("上海交大"), true);
+}
+
+async function testBossChatAppShouldUseDomOnlyAfterHigherPriorityPathsFail() {
+  let domReadCount = 0;
+  const tracker = {
+    resumeNetworkDiagnostics: [],
+    getResumeAcquisitionState() {
+      return { mode: "image", reason: "image_capture_success" };
+    },
+    setResumeAcquisitionMode() {},
+    async waitForResumeNetworkByMode() {
+      return {
+        candidateInfo: null,
+        acquisitionReason: "",
+        initialWaitMs: 10,
+        retryWaitMs: 20,
+      };
+    },
+    async waitForLateNetworkResumeCandidateInfo() {
+      return {
+        candidateInfo: null,
+        acquisitionReason: "",
+        lateRetryMs: 15,
+      };
+    },
+    async waitForNetworkResumeCandidateInfo() {
+      return null;
+    },
+  };
+  const { app, recorded } = createProcessCustomerHarness({
+    tracker,
+    llmEvaluate: async (payload) => ({
+      passed: false,
+      rawOutputText: '{"passed":false}',
+      evaluationMode: "text",
+      chunkIndex: 1,
+      chunkTotal: 1,
+      imageCount: 0,
+    }),
+    captureResume: async () => {
+      throw new Error("IMAGE_CAPTURE_FAILED");
+    },
+    pageOverrides: {
+      async getResumeProfileFromDom() {
+        domReadCount += 1;
+        if (domReadCount === 1) {
+          return {
+            ok: true,
+            name: "李同学",
+            primarySchool: "北京大学",
+            schools: ["北京大学"],
+            major: "数学",
+            majors: ["数学"],
+            company: "",
+            position: "",
+            resumeText: "北京大学 数学",
+            evidenceCorpus: "北京大学 数学",
+          };
+        }
+        return {
+          ok: true,
+          name: "候选人D",
+          primarySchool: "浙江大学",
+          schools: ["浙江大学"],
+          major: "计算机",
+          majors: ["计算机"],
+          company: "",
+          position: "",
+          resumeText: "浙江大学 计算机",
+          evidenceCorpus: "浙江大学 计算机",
+        };
+      },
+    },
+  });
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-dom",
+      name: "候选人D",
+      school: "浙江大学",
+      major: "计算机",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "1004",
+      textSnippet: "",
+    },
+    { screeningCriteria: "有 AI 项目经验" },
+    "run-dom",
+    { skipCardClick: true },
+  );
+
+  assert.equal(result.artifacts.resumeAcquisitionMode, "dom_fallback");
+  assert.equal(result.artifacts.resumeAcquisitionReason, "dom_retry_hit");
+  assert.equal(domReadCount, 2);
+  assert.equal(recorded.includes("activateCandidate"), true);
+  assert.equal(recorded.includes("openOnlineResume"), true);
+}
+
 async function testBossChatAppShouldPersistEvidenceArtifacts() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-artifacts-"));
   await mkdir(tempDir, { recursive: true });
@@ -1646,14 +2132,9 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
     async evaluateResume() {
       return {
         passed: false,
-        rawPassed: true,
-        reason: "模型未给出可在简历原文中校验的证据，按安全策略判为不通过。",
-        summary: "降级",
-        evidence: [],
-        evidenceRawCount: 1,
-        evidenceMatchedCount: 0,
-        evidenceGateDemoted: true,
-        evaluationMode: "text",
+        rawOutputText: '{"passed":false}',
+        evaluationMode: "image-multi-chunk",
+        imageCount: 3,
         chunkIndex: 1,
         chunkTotal: 1,
       };
@@ -1666,10 +2147,15 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
   const resumeCaptureService = {
     async captureResume({ artifactDir }) {
       return {
-        stitchedImage: path.join(artifactDir, "resume.png"),
         metadataFile: path.join(artifactDir, "chunks.json"),
         chunkDir: path.join(artifactDir, "chunks"),
         chunkCount: 1,
+        modelImagePaths: [
+          path.join(artifactDir, "chunks", "chunk_000.png"),
+          path.join(artifactDir, "chunks", "chunk_001.png"),
+          path.join(artifactDir, "chunks", "chunk_002.png"),
+        ],
+        stitchedImage: "",
         quality: { likelyBlank: false },
       };
     },
@@ -1710,14 +2196,109 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
   );
 
   assert.equal(result.passed, false);
-  assert.equal(result.artifacts.rawPassed, true);
   assert.equal(result.artifacts.finalPassed, false);
-  assert.equal(result.artifacts.evidenceRawCount, 1);
-  assert.equal(result.artifacts.evidenceMatchedCount, 0);
-  assert.equal(result.artifacts.evidenceGateDemoted, true);
-  assert.equal(result.artifacts.evaluationMode, "text");
+  assert.equal(result.reason, "LLM判定不通过");
+  assert.equal(result.artifacts.evaluationMode, "image-multi-chunk");
+  assert.equal(result.artifacts.evaluationImageCount, 3);
+  assert.equal(result.artifacts.llmRawOutput, '{"passed":false}');
+  assert.equal(Array.isArray(result.artifacts.modelImagePaths), true);
+  assert.equal(result.artifacts.modelImagePaths.length, 3);
   assert.equal(Array.isArray(records), true);
   assert.equal(records.length, 1);
+}
+
+async function testBossChatReportStoreShouldWriteReadableMarkdownAndCsv() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-report-store-"));
+  const reportStore = new ReportStore(tempDir);
+  const summary = {
+    startedAt: "2026-04-17T10:00:00.000Z",
+    finishedAt: "2026-04-17T10:01:05.000Z",
+    dryRun: true,
+    profile: {
+      targetCount: 5,
+      screeningCriteria: "有 AI 项目经验",
+    },
+    inspected: 2,
+    passed: 1,
+    requested: 0,
+    skipped: 1,
+    errors: 0,
+    exhausted: false,
+    stopped: false,
+    stopReason: "",
+    results: [
+      {
+        name: "候选人A",
+        sourceJob: "算法工程师",
+        decision: "passed",
+        passed: true,
+        requested: false,
+        reason: "符合要求",
+        error: "",
+        artifacts: {
+          resumeAcquisitionMode: "network",
+          resumeAcquisitionReason: "initial_hit",
+          textModelMs: 18234,
+          initialNetworkWaitMs: 4200,
+          evaluationMode: "text",
+          llmRawOutput: '{"passed":true}',
+        },
+      },
+      {
+        name: "候选人B",
+        sourceJob: "大模型算法",
+        decision: "skipped",
+        passed: false,
+        requested: false,
+        reason: "LLM判定不通过",
+        error: "",
+        artifacts: {
+          resumeAcquisitionMode: "image_fallback",
+          resumeAcquisitionReason: "late_network_miss",
+          imageCaptureMs: 2300,
+          imageModelMs: 19500,
+          lateNetworkRetryMs: 3000,
+          evaluationMode: "image-multi-chunk",
+          evaluationImageCount: 3,
+          llmRawOutput: '{"passed":false}',
+        },
+      },
+    ],
+    reportPath: null,
+  };
+
+  const jsonPath = await reportStore.write(summary);
+  const markdownPath = summary.reportMarkdownPath;
+  const csvPath = summary.reportCsvPath;
+  const jsonContent = fs.readFileSync(jsonPath, "utf8");
+  const markdownContent = fs.readFileSync(markdownPath, "utf8");
+  const csvContent = fs.readFileSync(csvPath, "utf8");
+
+  assert.equal(path.extname(jsonPath), ".json");
+  assert.equal(path.extname(markdownPath), ".md");
+  assert.equal(path.extname(csvPath), ".csv");
+  assert.equal(summary.reportPath, jsonPath);
+  assert.equal(typeof summary.reportArtifacts, "object");
+  assert.equal(summary.reportArtifacts.markdownPath, markdownPath);
+  assert.equal(summary.reportArtifacts.csvPath, csvPath);
+
+  const parsedJson = JSON.parse(jsonContent);
+  assert.equal(parsedJson.reportPath, jsonPath);
+  assert.equal(parsedJson.reportMarkdownPath, markdownPath);
+  assert.equal(parsedJson.reportCsvPath, csvPath);
+
+  assert.match(markdownContent, /# Boss Chat 运行报告/);
+  assert.match(markdownContent, /Resume Acquisition 汇总/);
+  assert.match(markdownContent, /Timing 汇总/);
+  assert.match(markdownContent, /候选人A/);
+  assert.match(markdownContent, /image_fallback/);
+  assert.match(markdownContent, /图片模型 19500ms/);
+
+  assert.match(csvContent, /resume_acquisition_mode/);
+  assert.match(csvContent, /initial_network_wait_ms/);
+  assert.match(csvContent, /late_network_retry_ms/);
+  assert.match(csvContent, /候选人B/);
+  assert.match(csvContent, /image-multi-chunk/);
 }
 
 async function main() {
@@ -1731,15 +2312,25 @@ async function main() {
   await testVendorBossChatCliShouldWaitForHydratedChatShell();
   await testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile();
   testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig();
-  testBossChatLlmEvidenceGateShouldDemoteMissingEvidence();
-  testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence();
+  testVendorBossChatCliShouldParseSharedLlmTransportArgs();
+  testBossChatLlmParserShouldAcceptMinimalDecisionJson();
+  testBossChatLlmParserShouldAcceptPlainPassFailText();
+  testBossChatLlmParserShouldAcceptDecisionField();
   await testBossChatLlmTextChunkFallbackShouldWork();
   await testBossChatLlmShouldApplyThinkingDefaultsAndOverrides();
+  await testBossChatLlmShouldSendAllImageChunksInSingleRequest();
   await testBossChatAppShouldResetPrimaryChatLabelBeforeInitialPrime();
   await testBossChatAppShouldCloseCandidateDetailDuringRunCleanup();
   await testBossChatAppShouldRestoreListContextAfterRecovery();
   await testBossChatAppShouldWaitForCandidateListBeforePriming();
+  await testBossChatResumeTrackerShouldRetryInitialNetworkWait();
+  await testBossChatResumeTrackerShouldUseImageModeGraceWindow();
+  await testBossChatAppShouldUseNetworkBeforeImageFallback();
+  await testBossChatAppShouldFallbackToImageAfterNetworkMiss();
+  await testBossChatAppShouldRetryLateNetworkBeforeDomFallback();
+  await testBossChatAppShouldUseDomOnlyAfterHigherPriorityPathsFail();
   await testBossChatAppShouldPersistEvidenceArtifacts();
+  await testBossChatReportStoreShouldWriteReadableMarkdownAndCsv();
   console.log("boss-chat tests passed");
 }
 
