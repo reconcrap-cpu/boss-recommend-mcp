@@ -484,6 +484,106 @@ async function testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForComple
   );
 }
 
+async function testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail() {
+  const calls = [];
+  const mouseEvents = [];
+  let stateIndex = 0;
+  const states = [
+    {
+      open: true,
+      panelCount: 1,
+      closeCount: 1,
+      topPanelClass: "base-info-single-top-detail",
+      topPanelScore: 520,
+      panelRect: {
+        left: 940,
+        top: 60,
+        width: 360,
+        height: 720,
+        right: 1300,
+        bottom: 780
+      },
+      closeRect: {
+        left: 1274,
+        top: 12,
+        width: 30,
+        height: 30,
+        right: 1304,
+        bottom: 42
+      }
+    },
+    {
+      open: true,
+      panelCount: 1,
+      closeCount: 1,
+      topPanelClass: "base-info-single-top-detail",
+      topPanelScore: 520,
+      panelRect: {
+        left: 940,
+        top: 60,
+        width: 360,
+        height: 720,
+        right: 1300,
+        bottom: 780
+      },
+      closeRect: {
+        left: 1274,
+        top: 12,
+        width: 30,
+        height: 30,
+        right: 1304,
+        bottom: 42
+      }
+    },
+    {
+      open: false,
+      panelCount: 0,
+      closeCount: 0,
+      topPanelClass: "",
+      topPanelScore: 0,
+      panelRect: null,
+      closeRect: null
+    }
+  ];
+
+  const fakeChromeClient = {
+    Input: {
+      async dispatchMouseEvent(payload) {
+        mouseEvents.push(payload);
+      }
+    },
+    async pressEscape() {
+      calls.push("pressEscape");
+    },
+    async callFunction(fn) {
+      calls.push(fn.name);
+      if (fn.name === "browserIsCandidateDetailOpen") {
+        const value = states[Math.min(stateIndex, states.length - 1)];
+        stateIndex += 1;
+        return value;
+      }
+      if (fn.name === "browserCloseCandidateDetailDomOnce") {
+        return {
+          ok: true,
+          selector: ".close-btn",
+          method: "dom-click-once"
+        };
+      }
+      throw new Error(`unexpected function: ${fn.name}`);
+    }
+  };
+
+  const page = new BossChatPage(fakeChromeClient);
+  const result = await page.closeCandidateDetail({
+    maxAttempts: 1,
+    ensureDismiss: true
+  });
+
+  assert.equal(result.closed, true);
+  assert.equal(calls.includes("pressEscape"), true);
+  assert.equal(mouseEvents.length > 0, true);
+}
+
 async function testBossChatMcpToolsShouldValidateAndRoute() {
   await withBossChatWorkspace(async (workspaceRoot) => {
     const toolsResponse = await handleRequest({
@@ -1132,6 +1232,122 @@ async function testBossChatAppShouldResetPrimaryChatLabelBeforeInitialPrime() {
   assert.equal(summary.skipped, 1);
 }
 
+async function testBossChatAppShouldCloseCandidateDetailDuringRunCleanup() {
+  const calls = [];
+  const page = {
+    async ensureReady() {
+      calls.push("ensureReady");
+      return { hasListContainer: true, listItemCount: 1 };
+    },
+    async activatePrimaryChatLabel(label) {
+      calls.push(`activatePrimaryChatLabel:${label}`);
+      return { changed: false, verified: true, activeLabel: label };
+    },
+    async selectJob(jobSelection) {
+      calls.push(`selectJob:${jobSelection.label}`);
+      return jobSelection;
+    },
+    async activateUnreadFilter() {
+      calls.push("activateUnreadFilter");
+      return { changed: false, verified: true, activeLabel: "未读" };
+    },
+    async primeConversationByFirstCandidate() {
+      calls.push("primeConversationByFirstCandidate:1");
+      return {
+        candidate: {
+          customerId: "1008",
+          name: "候选人清理",
+          sourceJob: "算法工程师",
+          domIndex: 0
+        },
+        totalVisibleCandidates: 1,
+        readyState: {
+          hasOnlineResume: true,
+          hasAskResume: true,
+          hasAttachmentResume: false
+        }
+      };
+    },
+    async getLoadedCustomers() {
+      calls.push("getLoadedCustomers:1");
+      return [];
+    },
+    async closeResumeModalDomOnce() {
+      calls.push("closeResumeModalDomOnce");
+      return {
+        closed: true,
+        method: "already-closed",
+        finalState: { scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" }
+      };
+    },
+    async closeCandidateDetailDomOnce() {
+      calls.push("closeCandidateDetailDomOnce");
+      return {
+        closed: true,
+        method: "dom-close-once:.close-btn",
+        finalState: { panelCount: 0, closeCount: 0, topPanelClass: "" }
+      };
+    }
+  };
+  const stateStore = {
+    async load() {},
+    hasAny() {
+      return false;
+    },
+    async record() {}
+  };
+  const app = new BossChatApp({
+    page,
+    llmClient: {},
+    interaction: {
+      async sleepRange() {},
+      async maybeRest() {}
+    },
+    resumeCaptureService: {},
+    stateStore,
+    reportStore: {
+      async write() {
+        return "report.json";
+      }
+    },
+    logger: { log() {} },
+    dryRun: true,
+    artifactRootDir: os.tmpdir(),
+    resumeOpenCooldownMs: 0
+  });
+  app.waitForCandidateList = async ({ reason } = {}) => {
+    calls.push(`waitForCandidateList:${reason || "unknown"}`);
+    return {
+      ready: true,
+      waitedMs: 0,
+      attempts: 1,
+      listItemCount: 1,
+      lastError: ""
+    };
+  };
+  app.processCustomer = async () => ({
+    name: "候选人清理",
+    passed: false,
+    requested: false,
+    reason: "skip",
+    error: "",
+    artifacts: {}
+  });
+
+  const summary = await app.run({
+    screeningCriteria: "有 AI 项目经验",
+    targetCount: 1,
+    startFrom: "unread",
+    jobSelection: { label: "算法工程师", value: "job-1" },
+    chrome: { port: 9222 },
+    llm: { model: "gpt-test" }
+  });
+
+  assert.equal(summary.inspected, 1);
+  assert.equal(calls.includes("closeCandidateDetailDomOnce"), true);
+  assert.equal(calls.lastIndexOf("closeCandidateDetailDomOnce") > calls.indexOf("getLoadedCustomers:1"), true);
+}
+
 async function testBossChatAppShouldRestoreListContextAfterRecovery() {
   const calls = [];
   let primeCount = 0;
@@ -1509,6 +1725,7 @@ async function main() {
   await testBossChatPrepareShouldRetryWhenChatPageIsNotReady();
   await testBossChatPageShouldTreatBlankChatShellAsOnChatPage();
   await testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad();
+  await testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
   await testVendorBossChatCliShouldWaitForHydratedChatShell();
@@ -1519,6 +1736,7 @@ async function main() {
   await testBossChatLlmTextChunkFallbackShouldWork();
   await testBossChatLlmShouldApplyThinkingDefaultsAndOverrides();
   await testBossChatAppShouldResetPrimaryChatLabelBeforeInitialPrime();
+  await testBossChatAppShouldCloseCandidateDetailDuringRunCleanup();
   await testBossChatAppShouldRestoreListContextAfterRecovery();
   await testBossChatAppShouldWaitForCandidateListBeforePriming();
   await testBossChatAppShouldPersistEvidenceArtifacts();

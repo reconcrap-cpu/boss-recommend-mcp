@@ -214,6 +214,46 @@ export class BossChatApp {
     };
   }
 
+  async cleanupPanels({
+    resumeMaxAttempts = 6,
+    detailMaxAttempts = 4,
+    ensureDismiss = true,
+  } = {}) {
+    const resume =
+      typeof this.page.closeResumeModalDomOnce === 'function'
+        ? await this.page.closeResumeModalDomOnce()
+        : await this.page.closeResumeModal({
+          maxAttempts: resumeMaxAttempts,
+          ensureDismiss,
+        });
+
+    let detail = {
+      closed: true,
+      method: 'unsupported',
+      finalState: {
+        panelCount: 0,
+        closeCount: 0,
+        topPanelClass: '',
+      },
+    };
+    if (typeof this.page.closeCandidateDetailDomOnce === 'function') {
+      detail = await this.page.closeCandidateDetailDomOnce();
+      if (!detail.closed && typeof this.page.closeCandidateDetail === 'function') {
+        detail = await this.page.closeCandidateDetail({
+          maxAttempts: detailMaxAttempts,
+          ensureDismiss,
+        });
+      }
+    } else if (typeof this.page.closeCandidateDetail === 'function') {
+      detail = await this.page.closeCandidateDetail({
+        maxAttempts: detailMaxAttempts,
+        ensureDismiss,
+      });
+    }
+
+    return { resume, detail };
+  }
+
   async run(profile) {
     const startedAt = new Date().toISOString();
     const runId = runToken(new Date());
@@ -576,12 +616,13 @@ export class BossChatApp {
     }
 
     try {
-      const finalClose =
-        typeof this.page.closeResumeModalDomOnce === 'function'
-          ? await this.page.closeResumeModalDomOnce()
-          : await this.page.closeResumeModal({ maxAttempts: 6, ensureDismiss: true });
+      const finalClose = await this.cleanupPanels({
+        resumeMaxAttempts: 6,
+        detailMaxAttempts: 4,
+        ensureDismiss: true,
+      });
       this.logger.log(
-        `运行收尾关闭简历弹层：closed=${finalClose.closed} | method=${finalClose.method}`,
+        `运行收尾关闭弹层：resumeClosed=${finalClose.resume.closed} | resumeMethod=${finalClose.resume.method} | detailClosed=${finalClose.detail.closed} | detailMethod=${finalClose.detail.method}`,
       );
     } catch (cleanupError) {
       this.logger.log(`运行收尾清理告警：${cleanupError?.message || cleanupError}`);
@@ -614,13 +655,17 @@ export class BossChatApp {
     let modalOpened = false;
     try {
       this.logger.log(`候选人开始：${customer.name || '未知'} (${customer.customerKey})`);
-      const preClose =
-        typeof this.page.closeResumeModalDomOnce === 'function'
-          ? await this.page.closeResumeModalDomOnce()
-          : await this.page.closeResumeModal({ maxAttempts: 4, ensureDismiss: true });
-      if (preClose.method !== 'already-closed') {
+      const preClose = await this.cleanupPanels({
+        resumeMaxAttempts: 4,
+        detailMaxAttempts: 3,
+        ensureDismiss: true,
+      });
+      if (
+        preClose.resume.method !== 'already-closed' ||
+        preClose.detail.method !== 'already-closed'
+      ) {
         this.logger.log(
-          `候选人开始前清理残留弹层：closed=${preClose.closed} | method=${preClose.method}`,
+          `候选人开始前清理残留面板：resumeClosed=${preClose.resume.closed} | resumeMethod=${preClose.resume.method} | detailClosed=${preClose.detail.closed} | detailMethod=${preClose.detail.method}`,
         );
       }
       if (!skipCardClick) {
@@ -980,6 +1025,24 @@ export class BossChatApp {
         }
       }
 
+      const finalPanels = await this.cleanupPanels({
+        resumeMaxAttempts: 4,
+        detailMaxAttempts: 4,
+        ensureDismiss: true,
+      });
+      baseResult.artifacts.finalResumeCloseMethod = finalPanels.resume.method;
+      baseResult.artifacts.finalResumeClosed = finalPanels.resume.closed;
+      baseResult.artifacts.finalDetailCloseMethod = finalPanels.detail.method;
+      baseResult.artifacts.finalDetailClosed = finalPanels.detail.closed;
+      if (
+        finalPanels.resume.method !== 'already-closed' ||
+        finalPanels.detail.method !== 'already-closed'
+      ) {
+        this.logger.log(
+          `候选人收尾清理：resumeClosed=${finalPanels.resume.closed} | resumeMethod=${finalPanels.resume.method} | detailClosed=${finalPanels.detail.closed} | detailMethod=${finalPanels.detail.method}`,
+        );
+      }
+
       await this.stateStore.record(baseResult.customerKey, baseResult, baseAliases);
       return baseResult;
     } catch (error) {
@@ -987,16 +1050,19 @@ export class BossChatApp {
         throw error;
       }
 
-      if (modalOpened) {
+      if (modalOpened || typeof this.page.closeCandidateDetailDomOnce === 'function' || typeof this.page.closeCandidateDetail === 'function') {
         try {
-          const closeResult =
-            typeof this.page.closeResumeModalDomOnce === 'function'
-              ? await this.page.closeResumeModalDomOnce()
-              : await this.page.closeResumeModal({ maxAttempts: 6, ensureDismiss: true });
-          baseResult.artifacts.resumeCloseMethod = closeResult.method;
-          baseResult.artifacts.resumeClosed = closeResult.closed;
+          const closeResult = await this.cleanupPanels({
+            resumeMaxAttempts: 6,
+            detailMaxAttempts: 4,
+            ensureDismiss: true,
+          });
+          baseResult.artifacts.resumeCloseMethod = closeResult.resume.method;
+          baseResult.artifacts.resumeClosed = closeResult.resume.closed;
+          baseResult.artifacts.finalDetailCloseMethod = closeResult.detail.method;
+          baseResult.artifacts.finalDetailClosed = closeResult.detail.closed;
           this.logger.log(
-            `异常后关闭简历结果：closed=${closeResult.closed} | method=${closeResult.method} | scope=${closeResult?.finalState?.scopeCount ?? 'n/a'} | iframe=${closeResult?.finalState?.iframeCount ?? 'n/a'} | close=${closeResult?.finalState?.closeCount ?? 'n/a'} | class=${closeResult?.finalState?.topScopeClass || 'n/a'}`,
+            `异常后关闭面板结果：resumeClosed=${closeResult.resume.closed} | resumeMethod=${closeResult.resume.method} | resumeScope=${closeResult?.resume?.finalState?.scopeCount ?? 'n/a'} | resumeIframe=${closeResult?.resume?.finalState?.iframeCount ?? 'n/a'} | resumeClose=${closeResult?.resume?.finalState?.closeCount ?? 'n/a'} | resumeClass=${closeResult?.resume?.finalState?.topScopeClass || 'n/a'} | detailClosed=${closeResult.detail.closed} | detailMethod=${closeResult.detail.method} | detailPanels=${closeResult?.detail?.finalState?.panelCount ?? 'n/a'} | detailClose=${closeResult?.detail?.finalState?.closeCount ?? 'n/a'} | detailClass=${closeResult?.detail?.finalState?.topPanelClass || 'n/a'}`,
           );
         } catch {}
       }

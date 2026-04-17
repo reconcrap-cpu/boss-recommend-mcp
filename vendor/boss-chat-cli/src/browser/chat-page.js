@@ -1011,6 +1011,272 @@ function browserOpenOnlineResume(options = {}) {
   };
 }
 
+function browserIsCandidateDetailOpen() {
+  const collectSnapshot = () => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (el) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2;
+    };
+    const rectToJson = (rect) => ({
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      right: rect.right,
+      bottom: rect.bottom,
+    });
+    const panelSelectors = [
+      '.base-info-single-top-detail',
+      '.resume-detail-wrap',
+      '.geek-card-detail',
+      '.candidate-detail-wrap',
+      '.chat-detail-wrap',
+    ];
+    const closeButtons = Array.from(document.querySelectorAll('.close-btn')).filter(isVisible);
+    const panelEntries = [];
+    const seen = new Set();
+    const pushPanel = (node, source) => {
+      if (!(node instanceof HTMLElement) || !isVisible(node)) return;
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 240 || rect.height < 160) return;
+      const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}:${normalize(node.className || '')}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      panelEntries.push({ node, rect, source });
+    };
+
+    for (const selector of panelSelectors) {
+      for (const node of Array.from(document.querySelectorAll(selector))) {
+        pushPanel(node, `selector:${selector}`);
+      }
+    }
+
+    for (const closeButton of closeButtons) {
+      let current = closeButton.parentElement;
+      let depth = 0;
+      while (current instanceof HTMLElement && depth < 10) {
+        pushPanel(current, 'close-ancestor');
+        current = current.parentElement;
+        depth += 1;
+      }
+    }
+
+    const scoredPanels = panelEntries
+      .map((entry) => {
+        const classText = normalize(entry.node.className || '').toLowerCase();
+        const text = normalize(entry.node.textContent || '').slice(0, 240).toLowerCase();
+        const containsClose = closeButtons.some((button) => entry.node.contains(button));
+        const anchoredRight =
+          entry.rect.left >= window.innerWidth * 0.4 ||
+          entry.rect.right >= window.innerWidth * 0.72;
+        const hasKnownDetailClass =
+          classText.includes('base-info-single-top-detail') ||
+          classText.includes('resume-detail-wrap') ||
+          classText.includes('candidate-detail') ||
+          classText.includes('chat-detail') ||
+          classText.includes('geek-card-detail');
+        const hasDetailHint =
+          text.includes('在线简历') ||
+          text.includes('附件简历') ||
+          text.includes('牛人分析器') ||
+          text.includes('活跃');
+
+        let score = 0;
+        if (containsClose) score += 220;
+        if (anchoredRight) score += 140;
+        if (hasKnownDetailClass) score += 160;
+        if (hasDetailHint) score += 80;
+        if (entry.source === 'close-ancestor') score += 40;
+        score += Math.min(180, Math.floor((entry.rect.width * entry.rect.height) / 12000));
+
+        return {
+          ...entry,
+          score,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const topPanel = scoredPanels[0] || null;
+    const topPanelNode = topPanel?.node || null;
+    const closeButton =
+      closeButtons.find((button) => topPanelNode instanceof HTMLElement && topPanelNode.contains(button)) ||
+      closeButtons[0] ||
+      null;
+
+    return {
+      open: Boolean(topPanel || closeButton),
+      panelCount: scoredPanels.length,
+      closeCount: closeButtons.length,
+      topPanelClass: normalize(topPanelNode?.className || ''),
+      topPanelScore: Number(topPanel?.score || 0),
+      panelRect: topPanel ? rectToJson(topPanel.rect) : null,
+      closeRect: closeButton ? rectToJson(closeButton.getBoundingClientRect()) : null,
+    };
+  };
+
+  return collectSnapshot();
+}
+
+function browserCloseCandidateDetailDomOnce() {
+  const collectSnapshot = () => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (el) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 2 && rect.height > 2;
+    };
+    const rectToJson = (rect) => ({
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height,
+      right: rect.right,
+      bottom: rect.bottom,
+    });
+    const panelSelectors = [
+      '.base-info-single-top-detail',
+      '.resume-detail-wrap',
+      '.geek-card-detail',
+      '.candidate-detail-wrap',
+      '.chat-detail-wrap',
+    ];
+    const closeButtons = Array.from(document.querySelectorAll('.close-btn')).filter(isVisible);
+    const panelEntries = [];
+    const seen = new Set();
+    const pushPanel = (node, source) => {
+      if (!(node instanceof HTMLElement) || !isVisible(node)) return;
+      const rect = node.getBoundingClientRect();
+      if (rect.width < 240 || rect.height < 160) return;
+      const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}:${normalize(node.className || '')}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      panelEntries.push({ node, rect, source });
+    };
+
+    for (const selector of panelSelectors) {
+      for (const node of Array.from(document.querySelectorAll(selector))) {
+        pushPanel(node, `selector:${selector}`);
+      }
+    }
+
+    for (const closeButton of closeButtons) {
+      let current = closeButton.parentElement;
+      let depth = 0;
+      while (current instanceof HTMLElement && depth < 10) {
+        pushPanel(current, 'close-ancestor');
+        current = current.parentElement;
+        depth += 1;
+      }
+    }
+
+    const scoredPanels = panelEntries
+      .map((entry) => {
+        const classText = normalize(entry.node.className || '').toLowerCase();
+        const text = normalize(entry.node.textContent || '').slice(0, 240).toLowerCase();
+        const containsClose = closeButtons.some((button) => entry.node.contains(button));
+        const anchoredRight =
+          entry.rect.left >= window.innerWidth * 0.4 ||
+          entry.rect.right >= window.innerWidth * 0.72;
+        const hasKnownDetailClass =
+          classText.includes('base-info-single-top-detail') ||
+          classText.includes('resume-detail-wrap') ||
+          classText.includes('candidate-detail') ||
+          classText.includes('chat-detail') ||
+          classText.includes('geek-card-detail');
+        const hasDetailHint =
+          text.includes('在线简历') ||
+          text.includes('附件简历') ||
+          text.includes('牛人分析器') ||
+          text.includes('活跃');
+
+        let score = 0;
+        if (containsClose) score += 220;
+        if (anchoredRight) score += 140;
+        if (hasKnownDetailClass) score += 160;
+        if (hasDetailHint) score += 80;
+        if (entry.source === 'close-ancestor') score += 40;
+        score += Math.min(180, Math.floor((entry.rect.width * entry.rect.height) / 12000));
+
+        return {
+          ...entry,
+          score,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const topPanel = scoredPanels[0] || null;
+    const topPanelNode = topPanel?.node || null;
+    const closeButton =
+      closeButtons.find((button) => topPanelNode instanceof HTMLElement && topPanelNode.contains(button)) ||
+      closeButtons[0] ||
+      null;
+
+    return {
+      open: Boolean(topPanel || closeButton),
+      panelCount: scoredPanels.length,
+      closeCount: closeButtons.length,
+      topPanelClass: normalize(topPanelNode?.className || ''),
+      topPanelScore: Number(topPanel?.score || 0),
+      panelRect: topPanel ? rectToJson(topPanel.rect) : null,
+      closeRect: closeButton ? rectToJson(closeButton.getBoundingClientRect()) : null,
+      closeButton,
+    };
+  };
+  const serializeSnapshot = (snapshot = {}) => ({
+    open: Boolean(snapshot?.open),
+    panelCount: Number(snapshot?.panelCount || 0),
+    closeCount: Number(snapshot?.closeCount || 0),
+    topPanelClass: String(snapshot?.topPanelClass || ''),
+    topPanelScore: Number(snapshot?.topPanelScore || 0),
+    panelRect: snapshot?.panelRect || null,
+    closeRect: snapshot?.closeRect || null,
+  });
+
+  const snapshot = collectSnapshot();
+  if (!snapshot?.open || !(snapshot.closeButton instanceof HTMLElement)) {
+    return {
+      ok: false,
+      error: 'CANDIDATE_DETAIL_CLOSE_BUTTON_NOT_FOUND',
+      state: serializeSnapshot(snapshot),
+    };
+  }
+
+  try {
+    snapshot.closeButton.click();
+    const rect = snapshot.closeButton.getBoundingClientRect();
+    return {
+      ok: true,
+      selector: '.close-btn',
+      method: 'dom-click-once',
+      rect: {
+        left: rect.left,
+        top: rect.top,
+        width: rect.width,
+        height: rect.height,
+        right: rect.right,
+        bottom: rect.bottom,
+      },
+      state: serializeSnapshot(snapshot),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `CANDIDATE_DETAIL_DOM_CLOSE_FAILED:${error?.message || error}`,
+      state: serializeSnapshot(snapshot),
+    };
+  }
+}
+
 function browserCloseResumeModalDomOnce() {
   const isVisible = (el) => {
     if (!(el instanceof HTMLElement)) return false;
@@ -2593,6 +2859,160 @@ export class BossChatPage {
       closeCount: Number(result?.closeCount || 0),
       topScopeClass: String(result?.topScopeClass || ''),
       topScopeScore: Number(result?.topScopeScore || 0),
+    };
+  }
+
+  async isCandidateDetailOpen() {
+    const result = await this.chromeClient.callFunction(browserIsCandidateDetailOpen);
+    return Boolean(result?.open);
+  }
+
+  async getCandidateDetailState() {
+    const result = await this.chromeClient.callFunction(browserIsCandidateDetailOpen);
+    return {
+      open: Boolean(result?.open),
+      panelCount: Number(result?.panelCount || 0),
+      closeCount: Number(result?.closeCount || 0),
+      topPanelClass: String(result?.topPanelClass || ''),
+      topPanelScore: Number(result?.topPanelScore || 0),
+      panelRect: result?.panelRect || null,
+      closeRect: result?.closeRect || null,
+    };
+  }
+
+  async closeCandidateDetailDomOnce() {
+    const stateBefore = await this.getCandidateDetailState();
+    const drawerOpen = (state) =>
+      Boolean(state?.open) ||
+      Number(state?.panelCount || 0) > 0 ||
+      Number(state?.closeCount || 0) > 0;
+    const openBefore = drawerOpen(stateBefore);
+    if (!openBefore) {
+      return {
+        closed: true,
+        method: 'already-closed',
+        finalState: stateBefore,
+      };
+    }
+
+    const result = await this.chromeClient.callFunction(browserCloseCandidateDetailDomOnce);
+    if (!result?.ok) {
+      const finalState = await this.getCandidateDetailState();
+      return {
+        closed: false,
+        method: `dom-close-miss:${result?.error || 'unknown'}`,
+        finalState,
+      };
+    }
+
+    let finalState = await this.getCandidateDetailState();
+    let openAfter = drawerOpen(finalState);
+    for (let attempt = 0; openAfter && attempt < 8; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      finalState = await this.getCandidateDetailState();
+      openAfter = drawerOpen(finalState);
+    }
+    return {
+      closed: !openAfter,
+      method: `dom-close-once:${result.selector || '.close-btn'}`,
+      finalState,
+    };
+  }
+
+  async closeCandidateDetail({ maxAttempts = 4, ensureDismiss = false } = {}) {
+    const drawerOpen = (state) =>
+      Boolean(state?.open) ||
+      Number(state?.panelCount || 0) > 0 ||
+      Number(state?.closeCount || 0) > 0;
+    const methods = [];
+    for (let index = 0; index < maxAttempts; index += 1) {
+      const state = await this.getCandidateDetailState();
+      if (!drawerOpen(state) && !ensureDismiss) {
+        return {
+          closed: true,
+          method: methods.join('+') || 'already-closed',
+          finalState: state,
+        };
+      }
+
+      const selectorResult = await this.chromeClient.callFunction(browserCloseCandidateDetailDomOnce);
+      if (selectorResult?.ok) {
+        methods.push(`selector:${selectorResult.selector || '.close-btn'}`);
+      } else {
+        methods.push(`selector-miss:${selectorResult?.error || 'unknown'}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 220));
+
+      let midState = await this.getCandidateDetailState();
+      if (!drawerOpen(midState)) {
+        return {
+          closed: true,
+          method: methods.join('+'),
+          finalState: midState,
+        };
+      }
+
+      if (midState?.panelRect) {
+        await this.clickRect(midState.panelRect);
+        methods.push('focus-panel');
+        await new Promise((resolve) => setTimeout(resolve, 160));
+      } else if (midState?.closeRect) {
+        await this.clickRect(midState.closeRect);
+        methods.push('focus-close');
+        await new Promise((resolve) => setTimeout(resolve, 160));
+      }
+
+      await this.chromeClient.pressEscape();
+      methods.push('escape');
+      await new Promise((resolve) => setTimeout(resolve, 220));
+
+      midState = await this.getCandidateDetailState();
+      if (!drawerOpen(midState)) {
+        return {
+          closed: true,
+          method: methods.join('+'),
+          finalState: midState,
+        };
+      }
+
+      if (midState?.closeRect) {
+        await this.clickRect(midState.closeRect);
+        methods.push('rect-close');
+        await new Promise((resolve) => setTimeout(resolve, 220));
+        midState = await this.getCandidateDetailState();
+        if (!drawerOpen(midState)) {
+          return {
+            closed: true,
+            method: methods.join('+'),
+            finalState: midState,
+          };
+        }
+      }
+
+      if (ensureDismiss && index >= 1) {
+        const finalSweep = await this.getCandidateDetailState();
+        if (!drawerOpen(finalSweep)) {
+          return {
+            closed: true,
+            method: methods.join('+'),
+            finalState: finalSweep,
+          };
+        }
+      }
+    }
+
+    const finalState = await this.getCandidateDetailState();
+    if (!drawerOpen(finalState)) {
+      return {
+        closed: true,
+        method: methods.join('+') || 'fallback',
+        finalState,
+      };
+    }
+    return {
+      closed: false,
+      method: methods.join('+') || 'failed',
+      finalState,
     };
   }
 
