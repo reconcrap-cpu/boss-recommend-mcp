@@ -742,6 +742,70 @@ function ensureUserConfig(options = {}) {
   throw lastError || new Error("No writable target for screening-config.json");
 }
 
+function getBossChatDataDir(workspaceRoot) {
+  return path.join(path.resolve(String(workspaceRoot || process.cwd())), ".boss-chat");
+}
+
+function collectRuntimeDirectories(options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const stateHome = getStateHome();
+  const bossChatRoot = getBossChatDataDir(workspaceRoot);
+  const recommendRuntimeDirs = [
+    stateHome,
+    path.join(stateHome, "runs")
+  ];
+  const bossChatRuntimeDirs = [
+    bossChatRoot,
+    path.join(bossChatRoot, "logs"),
+    path.join(bossChatRoot, "runs"),
+    path.join(bossChatRoot, "profiles"),
+    path.join(bossChatRoot, "reports"),
+    path.join(bossChatRoot, "artifacts")
+  ];
+  return {
+    workspaceRoot,
+    stateHome,
+    bossChatRoot,
+    directories: dedupePaths([
+      ...recommendRuntimeDirs,
+      ...bossChatRuntimeDirs
+    ]).filter(Boolean)
+  };
+}
+
+function ensureRuntimeDirectories(options = {}) {
+  const { workspaceRoot, stateHome, bossChatRoot, directories } = collectRuntimeDirectories(options);
+  const created = [];
+  const existed = [];
+  const failed = [];
+
+  for (const directory of directories) {
+    try {
+      const existedBefore = fs.existsSync(directory);
+      ensureDir(directory);
+      if (existedBefore) {
+        existed.push(directory);
+      } else {
+        created.push(directory);
+      }
+    } catch (error) {
+      failed.push({
+        path: directory,
+        message: error?.message || String(error)
+      });
+    }
+  }
+
+  return {
+    workspaceRoot,
+    stateHome,
+    bossChatRoot,
+    created,
+    existed,
+    failed
+  };
+}
+
 function readJsonObjectFile(filePath) {
   const raw = fs.readFileSync(filePath, "utf8");
   const parsed = JSON.parse(raw);
@@ -1333,11 +1397,22 @@ function printMcpConfig(options = {}) {
 }
 
 function installAll(options = {}) {
+  const runtimeDirsResult = ensureRuntimeDirectories(options);
   const skillResults = installSkill();
   const configResult = ensureUserConfig(options);
   const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
   const externalMcpResult = installExternalMcpConfigs(options);
   const externalSkillResult = mirrorSkillToExternalDirs(options);
+  console.log(
+    `Runtime directories prepared: created=${runtimeDirsResult.created.length}, existing=${runtimeDirsResult.existed.length}, failed=${runtimeDirsResult.failed.length}`
+  );
+  console.log(`- recommend runtime: ${runtimeDirsResult.stateHome}`);
+  console.log(`- boss-chat runtime: ${runtimeDirsResult.bossChatRoot}`);
+  if (runtimeDirsResult.failed.length > 0) {
+    for (const item of runtimeDirsResult.failed) {
+      console.warn(`Runtime dir warning: ${item.path} -> ${item.message}`);
+    }
+  }
   console.log(`Bundled skills installed: ${skillResults.length}`);
   for (const item of skillResults) {
     console.log(`- ${item.skill}: ${item.targetDir}`);
@@ -1546,7 +1621,18 @@ export async function runCli(argv = process.argv) {
       }
       break;
     case "init-config": {
+      const runtimeDirsResult = ensureRuntimeDirectories(options);
       const result = ensureUserConfig(options);
+      console.log(
+        `Runtime directories prepared: created=${runtimeDirsResult.created.length}, existing=${runtimeDirsResult.existed.length}, failed=${runtimeDirsResult.failed.length}`
+      );
+      console.log(`- recommend runtime: ${runtimeDirsResult.stateHome}`);
+      console.log(`- boss-chat runtime: ${runtimeDirsResult.bossChatRoot}`);
+      if (runtimeDirsResult.failed.length > 0) {
+        for (const item of runtimeDirsResult.failed) {
+          console.warn(`Runtime dir warning: ${item.path} -> ${item.message}`);
+        }
+      }
       console.log(result.created ? `Config template created at: ${result.path}` : `Config already exists at: ${result.path}`);
       if (Array.isArray(result.patched_keys) && result.patched_keys.length > 0) {
         console.log(`Config patched missing defaults: ${result.patched_keys.join(", ")}`);
@@ -1635,6 +1721,7 @@ export const __testables = {
   getRunFollowUp,
   installSkill,
   isInstalledPackageRoot,
+  ensureRuntimeDirectories,
   runBossChatCliCommand,
   runPipelineOnce
 };

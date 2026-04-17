@@ -68,6 +68,7 @@ MCP 工具：
 - 在真正开始 search/screen 前，会进行最后一轮全参数总确认（岗位 + 全部筛选参数 + criteria + target_count + post_action + max_greet_count）
 - npm 全局安装后会自动执行 install：生成 skill、导出 MCP 模板，并自动尝试写入已检测到的外部 agent MCP 配置（含 Trae / trae-cn / Cursor / Claude / OpenClaw）
 - npm / npx 安装后会自动初始化 `screening-config.json` 模板（优先写入 workspace 的 `config/`，不可写时回退到用户目录）
+- npm 安装流程会预创建运行目录（跨平台）：`~/.boss-recommend-mcp`、`~/.boss-recommend-mcp/runs`、`<workspace>/.boss-chat` 及其 `logs/runs/profiles/reports/artifacts`
 - `post_action` 必须在每次完整运行开始时确认一次
 - `target_count` 会在每次运行开始时询问一次（可留空，不设上限）
 - 当 `post_action=greet` 时，必须在运行开始时确认 `max_greet_count`
