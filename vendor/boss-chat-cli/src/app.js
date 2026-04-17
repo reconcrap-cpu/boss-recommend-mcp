@@ -142,6 +142,16 @@ export class BossChatApp {
     } catch {}
   }
 
+  async restoreListContext(profile) {
+    if (typeof this.page.activatePrimaryChatLabel === 'function') {
+      await this.page.activatePrimaryChatLabel('全部');
+    }
+    await this.page.selectJob(profile.jobSelection);
+    return profile.startFrom === 'all'
+      ? this.page.activateAllFilter()
+      : this.page.activateUnreadFilter();
+  }
+
   async run(profile) {
     const startedAt = new Date().toISOString();
     const runId = runToken(new Date());
@@ -158,12 +168,7 @@ export class BossChatApp {
     } catch (error) {
       this.logger.log(`页面就绪检查告警：${error?.message || error}，将继续执行预热恢复流程。`);
     }
-    await this.page.selectJob(profile.jobSelection);
-
-    const filterResult =
-      startFrom === 'all'
-        ? await this.page.activateAllFilter()
-        : await this.page.activateUnreadFilter();
+    const filterResult = await this.restoreListContext(profile);
     await this.interaction.sleepRange(420, 160);
     this.logger.log('预热步骤：准备点击首位人选初始化聊天容器...');
     let primedCustomer = null;
@@ -270,6 +275,16 @@ export class BossChatApp {
                 `页面恢复：changed=${recover.changed} | href=${recover.href || 'unknown'}，准备重新预热并继续。`,
               );
               await this.interaction.sleepRange(900, 220);
+              const recoveredFilterResult = await this.restoreListContext(profile);
+              this.logger.log(
+                `恢复后列表上下文：岗位=${profile.jobSelection?.label || profile.jobSelection?.value || '未知'}；列表范围: ${filterLabel}${
+                  recoveredFilterResult.changed
+                    ? recoveredFilterResult.verified === false
+                      ? '（已尝试切换，未验证 active）'
+                      : '（已切换）'
+                    : '（已在目标筛选）'
+                }${recoveredFilterResult?.activeLabel ? ` | active=${recoveredFilterResult.activeLabel}` : ''}`,
+              );
               const prime = await this.page.primeConversationByFirstCandidate();
               const candidate = prime?.candidate || {};
               const candidateBase = {

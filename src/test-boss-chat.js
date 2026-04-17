@@ -1015,6 +1015,233 @@ async function testBossChatLlmShouldApplyThinkingDefaultsAndOverrides() {
   assert.deepEqual(responsesPayload.reasoning, { effort: "low" });
 }
 
+async function testBossChatAppShouldResetPrimaryChatLabelBeforeInitialPrime() {
+  const calls = [];
+  const page = {
+    async ensureReady() {
+      calls.push("ensureReady");
+      return { hasListContainer: true, listItemCount: 1 };
+    },
+    async activatePrimaryChatLabel(label) {
+      calls.push(`activatePrimaryChatLabel:${label}`);
+      return { changed: false, verified: true, activeLabel: label };
+    },
+    async selectJob(jobSelection) {
+      calls.push(`selectJob:${jobSelection.label}`);
+      return jobSelection;
+    },
+    async activateUnreadFilter() {
+      calls.push("activateUnreadFilter");
+      return { changed: false, verified: true, activeLabel: "未读" };
+    },
+    async primeConversationByFirstCandidate() {
+      calls.push("primeConversationByFirstCandidate:1");
+      return {
+        candidate: {
+          customerId: "1001",
+          name: "候选人A",
+          sourceJob: "算法工程师",
+          domIndex: 0,
+        },
+        totalVisibleCandidates: 1,
+        readyState: {
+          hasOnlineResume: true,
+          hasAskResume: true,
+          hasAttachmentResume: false,
+        },
+      };
+    },
+    async getLoadedCustomers() {
+      calls.push("getLoadedCustomers:1");
+      return [];
+    },
+    async closeResumeModalDomOnce() {
+      return {
+        closed: true,
+        method: "already-closed",
+        finalState: { scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+      };
+    },
+  };
+  const stateStore = {
+    async load() {},
+    hasAny() {
+      return false;
+    },
+    async record() {},
+  };
+  const app = new BossChatApp({
+    page,
+    llmClient: {},
+    interaction: {
+      async sleepRange() {},
+      async maybeRest() {},
+    },
+    resumeCaptureService: {},
+    stateStore,
+    reportStore: {
+      async write() {
+        return "report.json";
+      },
+    },
+    logger: { log() {} },
+    dryRun: true,
+    artifactRootDir: os.tmpdir(),
+    resumeOpenCooldownMs: 0,
+  });
+  app.processCustomer = async (_customer, _profile, _runId, options = {}) => {
+    calls.push(`processCustomer:${options.skipCardClick === true ? "skip" : "click"}`);
+    return {
+      name: "候选人A",
+      passed: false,
+      requested: false,
+      reason: "skip",
+      error: "",
+      artifacts: {},
+    };
+  };
+
+  const summary = await app.run({
+    screeningCriteria: "有 AI 项目经验",
+    targetCount: 1,
+    startFrom: "unread",
+    jobSelection: { label: "算法工程师", value: "job-1" },
+    chrome: { port: 9222 },
+    llm: { model: "gpt-test" },
+  });
+
+  assert.deepEqual(calls.slice(0, 5), [
+    "ensureReady",
+    "activatePrimaryChatLabel:全部",
+    "selectJob:算法工程师",
+    "activateUnreadFilter",
+    "primeConversationByFirstCandidate:1",
+  ]);
+  assert.equal(calls.includes("processCustomer:skip"), true);
+  assert.equal(summary.inspected, 1);
+  assert.equal(summary.skipped, 1);
+}
+
+async function testBossChatAppShouldRestoreListContextAfterRecovery() {
+  const calls = [];
+  let primeCount = 0;
+  let loadedCount = 0;
+  const page = {
+    async ensureReady() {
+      return { hasListContainer: true, listItemCount: 1 };
+    },
+    async activatePrimaryChatLabel(label) {
+      calls.push(`activatePrimaryChatLabel:${label}`);
+      return { changed: false, verified: true, activeLabel: label };
+    },
+    async selectJob(jobSelection) {
+      calls.push(`selectJob:${jobSelection.label}`);
+      return jobSelection;
+    },
+    async activateUnreadFilter() {
+      calls.push("activateUnreadFilter");
+      return { changed: false, verified: true, activeLabel: "未读" };
+    },
+    async primeConversationByFirstCandidate() {
+      primeCount += 1;
+      calls.push(`primeConversationByFirstCandidate:${primeCount}`);
+      if (primeCount === 1) {
+        throw new Error("NO_FIRST_CANDIDATE");
+      }
+      return {
+        candidate: {
+          customerId: "1002",
+          name: "候选人B",
+          sourceJob: "算法工程师",
+          domIndex: 0,
+        },
+        totalVisibleCandidates: 1,
+        readyState: {
+          hasOnlineResume: true,
+          hasAskResume: true,
+          hasAttachmentResume: false,
+        },
+      };
+    },
+    async getLoadedCustomers() {
+      loadedCount += 1;
+      calls.push(`getLoadedCustomers:${loadedCount}`);
+      if (loadedCount === 1) {
+        throw new Error("CHAT_CARD_LIST_NOT_FOUND");
+      }
+      return [];
+    },
+    async recoverToChatIndex() {
+      calls.push("recoverToChatIndex");
+      return { changed: true, href: "https://www.zhipin.com/web/chat/index" };
+    },
+    async closeResumeModalDomOnce() {
+      return {
+        closed: true,
+        method: "already-closed",
+        finalState: { scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+      };
+    },
+  };
+  const stateStore = {
+    async load() {},
+    hasAny() {
+      return false;
+    },
+    async record() {},
+  };
+  const app = new BossChatApp({
+    page,
+    llmClient: {},
+    interaction: {
+      async sleepRange() {},
+      async maybeRest() {},
+    },
+    resumeCaptureService: {},
+    stateStore,
+    reportStore: {
+      async write() {
+        return "report.json";
+      },
+    },
+    logger: { log() {} },
+    dryRun: true,
+    artifactRootDir: os.tmpdir(),
+    resumeOpenCooldownMs: 0,
+  });
+  app.processCustomer = async (_customer, _profile, _runId, options = {}) => {
+    calls.push(`processCustomer:${options.skipCardClick === true ? "skip" : "click"}`);
+    return {
+      name: "候选人B",
+      passed: false,
+      requested: false,
+      reason: "skip",
+      error: "",
+      artifacts: {},
+    };
+  };
+
+  const summary = await app.run({
+    screeningCriteria: "有 AI 项目经验",
+    targetCount: 1,
+    startFrom: "unread",
+    jobSelection: { label: "算法工程师", value: "job-1" },
+    chrome: { port: 9222 },
+    llm: { model: "gpt-test" },
+  });
+
+  assert.equal(calls.filter((item) => item === "activatePrimaryChatLabel:全部").length, 2);
+  const recoverIndex = calls.indexOf("recoverToChatIndex");
+  assert.equal(recoverIndex >= 0, true);
+  assert.equal(calls[recoverIndex + 1], "activatePrimaryChatLabel:全部");
+  assert.equal(calls[recoverIndex + 2], "selectJob:算法工程师");
+  assert.equal(calls[recoverIndex + 3], "activateUnreadFilter");
+  assert.equal(calls[recoverIndex + 4], "primeConversationByFirstCandidate:2");
+  assert.equal(calls.includes("processCustomer:skip"), true);
+  assert.equal(summary.inspected, 1);
+  assert.equal(summary.skipped, 1);
+}
+
 async function testBossChatAppShouldPersistEvidenceArtifacts() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-artifacts-"));
   await mkdir(tempDir, { recursive: true });
@@ -1150,6 +1377,8 @@ async function main() {
   testBossChatLlmEvidenceGateShouldDemoteUnmatchedEvidence();
   await testBossChatLlmTextChunkFallbackShouldWork();
   await testBossChatLlmShouldApplyThinkingDefaultsAndOverrides();
+  await testBossChatAppShouldResetPrimaryChatLabelBeforeInitialPrime();
+  await testBossChatAppShouldRestoreListContextAfterRecovery();
   await testBossChatAppShouldPersistEvidenceArtifacts();
   console.log("boss-chat tests passed");
 }

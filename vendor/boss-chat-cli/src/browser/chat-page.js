@@ -276,6 +276,63 @@ async function browserActivateFilterTab(label) {
   };
 }
 
+async function browserActivatePrimaryChatLabel(label) {
+  const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const isVisible = (node) => {
+    if (!(node instanceof HTMLElement)) return false;
+    const rect = node.getBoundingClientRect();
+    if (rect.width <= 2 || rect.height <= 2) return false;
+    const style = getComputedStyle(node);
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.01;
+  };
+  const matchesLabel = (node) => {
+    const text = normalize(node?.textContent || '');
+    return text === label || text.startsWith(`${label}(`);
+  };
+  const hasActiveState = (node) =>
+    node instanceof HTMLElement &&
+    (
+      node.classList.contains('active') ||
+      node.classList.contains('selected') ||
+      node.getAttribute('aria-selected') === 'true' ||
+      node.getAttribute('data-active') === 'true'
+    );
+  const getLabels = () =>
+    Array.from(document.querySelectorAll('.label-list .chat-label-item, .chat-label-item'))
+      .filter((node) => node instanceof HTMLElement && isVisible(node));
+  const getActiveLabel = () => {
+    const activeNode = getLabels().find((node) => hasActiveState(node));
+    return normalize(activeNode?.textContent || '');
+  };
+
+  const labels = getLabels();
+  const candidates = labels.filter((node) => matchesLabel(node));
+  if (candidates.length === 0) {
+    return { ok: false, error: `PRIMARY_CHAT_LABEL_NOT_FOUND:${label}` };
+  }
+
+  const activeLabelBefore = getActiveLabel();
+  if (candidates.some((node) => hasActiveState(node)) || matchesLabel({ textContent: activeLabelBefore })) {
+    return { ok: true, changed: false, verified: true, activeLabel: activeLabelBefore || label };
+  }
+
+  candidates[0].click();
+  await new Promise((resolve) => window.setTimeout(resolve, 420));
+
+  const refreshedCandidates = getLabels().filter((node) => matchesLabel(node));
+  const activeLabelAfter = getActiveLabel();
+  const verified =
+    matchesLabel({ textContent: activeLabelAfter }) ||
+    refreshedCandidates.some((node) => hasActiveState(node));
+
+  return {
+    ok: true,
+    changed: true,
+    verified,
+    activeLabel: activeLabelAfter || '',
+  };
+}
+
 function browserGetLoadedCustomers() {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const isScrollable = (el) =>
@@ -2313,6 +2370,14 @@ export class BossChatPage {
     const result = await this.chromeClient.callFunction(browserActivateFilterTab, '全部');
     if (!result?.ok) {
       throw new Error(result?.error || 'ACTIVATE_ALL_FILTER_FAILED');
+    }
+    return result;
+  }
+
+  async activatePrimaryChatLabel(label = '全部') {
+    const result = await this.chromeClient.callFunction(browserActivatePrimaryChatLabel, label);
+    if (!result?.ok) {
+      throw new Error(result?.error || `ACTIVATE_PRIMARY_CHAT_LABEL_FAILED:${label}`);
     }
     return result;
   }
