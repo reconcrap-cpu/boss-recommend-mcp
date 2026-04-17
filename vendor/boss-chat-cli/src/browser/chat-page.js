@@ -24,6 +24,7 @@ function browserGetPageState() {
 
   return {
     href: window.location.href,
+    readyState: document.readyState,
     hasListContainer: Boolean(listContainer),
     listItemCount: listItems.length,
   };
@@ -33,9 +34,10 @@ function browserGetCurrentHref() {
   return { href: window.location.href };
 }
 
-function browserNavigateToChatIndex() {
+function browserNavigateToChatIndex(options = {}) {
   const chatUrl = 'https://www.zhipin.com/web/chat/index';
-  if (!String(window.location.href || '').includes('/web/chat/index')) {
+  const force = options?.force === true;
+  if (force || !String(window.location.href || '').includes('/web/chat/index')) {
     window.location.assign(chatUrl);
     return { ok: true, changed: true, href: chatUrl };
   }
@@ -2236,11 +2238,20 @@ export class BossChatPage {
     return target?.type === 'page' && String(target.url || '').includes(CHAT_URL_TOKEN);
   }
 
-  async ensureReady() {
-    const pageState = await this.chromeClient.callFunction(browserGetPageState);
+  async getPageState() {
+    return this.chromeClient.callFunction(browserGetPageState);
+  }
+
+  async ensureOnChatPage() {
+    const pageState = await this.getPageState();
     if (!pageState?.href?.includes(CHAT_URL_TOKEN)) {
       throw new Error('ACTIVE_TAB_IS_NOT_BOSS_CHAT_PAGE');
     }
+    return pageState;
+  }
+
+  async ensureReady() {
+    const pageState = await this.ensureOnChatPage();
     if (!pageState.hasListContainer && Number(pageState.listItemCount || 0) <= 0) {
       throw new Error('CHAT_LIST_CONTAINER_NOT_FOUND');
     }
@@ -2250,16 +2261,20 @@ export class BossChatPage {
   async recoverToChatIndex(options = {}) {
     const maxAttempts = options.maxAttempts || 20;
     const delayMs = options.delayMs || 500;
+    const forceNavigate = options.forceNavigate === true;
+    const waitForReadyState = options.waitForReadyState || 'complete';
     const hrefResult = await this.chromeClient.callFunction(browserGetCurrentHref);
-    if (String(hrefResult?.href || '').includes(CHAT_URL_TOKEN)) {
+    if (!forceNavigate && String(hrefResult?.href || '').includes(CHAT_URL_TOKEN)) {
       return { changed: false, href: hrefResult?.href || '' };
     }
 
-    await this.chromeClient.callFunction(browserNavigateToChatIndex);
+    await this.chromeClient.callFunction(browserNavigateToChatIndex, { force: forceNavigate });
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
-      const state = await this.chromeClient.callFunction(browserGetPageState);
-      if (String(state?.href || '').includes(CHAT_URL_TOKEN)) {
+      const state = await this.getPageState();
+      const onChatPage = String(state?.href || '').includes(CHAT_URL_TOKEN);
+      const ready = !waitForReadyState || String(state?.readyState || '').toLowerCase() === String(waitForReadyState).toLowerCase();
+      if (onChatPage && ready) {
         return { changed: true, href: state.href };
       }
     }

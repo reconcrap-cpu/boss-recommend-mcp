@@ -44,6 +44,7 @@ const CLI_FILE_PATH = fileURLToPath(import.meta.url);
 const MINIMAL_TERMINAL_PATTERNS = [/^进度: /, /^候选人结果: /];
 const CHAT_INDEX_URL = 'https://www.zhipin.com/web/chat/index';
 const CHAT_START_REQUIRED_FIELDS = ['job', 'start_from', 'target_count', 'criteria'];
+const CHAT_PAGE_RENAVIGATE_MAX_ATTEMPTS = 3;
 
 function sanitizePathToken(value, fallback = 'run') {
   const token = String(value || '')
@@ -651,6 +652,8 @@ async function connectBossChatPage(chromeClient) {
     target?.type === 'page' && /zhipin\.com/i.test(String(target?.url || ''));
   let target = null;
   let recoveredToChatIndex = false;
+  let blankChatPage = false;
+  let renavigateAttempts = 0;
 
   try {
     target = await chromeClient.connect(BossChatPage.targetMatcher);
@@ -659,15 +662,41 @@ async function connectBossChatPage(chromeClient) {
   }
 
   const page = new BossChatPage(chromeClient);
-  try {
-    await page.ensureReady();
-  } catch {
-    await page.recoverToChatIndex();
-    recoveredToChatIndex = true;
-    await page.ensureReady();
+  for (let attempt = 1; attempt <= CHAT_PAGE_RENAVIGATE_MAX_ATTEMPTS + 1; attempt += 1) {
+    try {
+      await page.ensureReady();
+      return {
+        target,
+        page,
+        recoveredToChatIndex,
+        blankChatPage,
+        renavigateAttempts,
+      };
+    } catch (error) {
+      const message = String(error?.message || error || '');
+      const canRetry =
+        /ACTIVE_TAB_IS_NOT_BOSS_CHAT_PAGE|CHAT_LIST_CONTAINER_NOT_FOUND/.test(message)
+        && attempt <= CHAT_PAGE_RENAVIGATE_MAX_ATTEMPTS;
+
+      if (!canRetry) {
+        if (/CHAT_LIST_CONTAINER_NOT_FOUND/.test(message)) {
+          blankChatPage = true;
+          await page.ensureOnChatPage();
+          break;
+        }
+        throw error;
+      }
+
+      await page.recoverToChatIndex({
+        forceNavigate: true,
+        waitForReadyState: 'complete',
+      });
+      recoveredToChatIndex = true;
+      renavigateAttempts += 1;
+    }
   }
 
-  return { target, page, recoveredToChatIndex };
+  return { target, page, recoveredToChatIndex, blankChatPage, renavigateAttempts };
 }
 
 async function handlePrepareRunCommand(args, dataDir) {
@@ -704,7 +733,7 @@ async function handlePrepareRunCommand(args, dataDir) {
   let chromeClient = null;
   try {
     chromeClient = new ChromeClient(mergedProfile.chrome.port);
-    const { target, page, recoveredToChatIndex } = await connectBossChatPage(chromeClient);
+    const { target, page, recoveredToChatIndex, blankChatPage, renavigateAttempts } = await connectBossChatPage(chromeClient);
     const jobs = await page.listJobs();
     if (!Array.isArray(jobs) || jobs.length === 0) {
       return {
@@ -723,6 +752,8 @@ async function handlePrepareRunCommand(args, dataDir) {
       page_url: CHAT_INDEX_URL,
       connected_target: target?.url || '',
       recovered_to_chat_index: recoveredToChatIndex,
+      blank_chat_page: blankChatPage,
+      renavigate_attempts: renavigateAttempts,
       required_fields: CHAT_START_REQUIRED_FIELDS.slice(),
       defaults: {
         profile: String(args.profile || 'default').trim() || 'default',
@@ -1159,10 +1190,13 @@ async function executeRunCommand(args, dataDir) {
 
     chromeClient = new ChromeClient(persistentProfile.chrome.port);
 
-    const { target, page, recoveredToChatIndex } = await connectBossChatPage(chromeClient);
+    const { target, page, recoveredToChatIndex, blankChatPage, renavigateAttempts } = await connectBossChatPage(chromeClient);
     logger.log(`已连接 Chrome tab: ${target.title || target.url}`);
     if (recoveredToChatIndex) {
-      logger.log(`检测到当前标签不在聊天页，已自动跳转到 ${CHAT_INDEX_URL}`);
+      logger.log(`检测到页面不符合预期，已重新跳转到 ${CHAT_INDEX_URL} 并等待加载完成。attempts=${renavigateAttempts}`);
+    }
+    if (blankChatPage) {
+      logger.log('检测到聊天页处于空白未初始化状态，将继续通过岗位选择和首位候选人预热来恢复列表。');
     }
 
     const runProfile = await promptRunProfile({

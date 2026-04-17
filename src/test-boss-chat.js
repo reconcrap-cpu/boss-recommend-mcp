@@ -16,6 +16,7 @@ import {
 import { __testables as cliTestables } from "./cli.js";
 import { __testables as indexTestables } from "./index.js";
 import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
+import { BossChatPage } from "../vendor/boss-chat-cli/src/browser/chat-page.js";
 import { LlmClient, parseLlmJson } from "../vendor/boss-chat-cli/src/services/llm.js";
 
 const { handleRequest } = indexTestables;
@@ -396,6 +397,90 @@ async function testBossChatPrepareShouldRetryWhenChatPageIsNotReady() {
       }
     }
   });
+}
+
+async function testBossChatPageShouldTreatBlankChatShellAsOnChatPage() {
+  const fakeChromeClient = {
+    async callFunction() {
+      return {
+        href: "https://www.zhipin.com/web/chat/index",
+        readyState: "complete",
+        hasListContainer: false,
+        listItemCount: 0
+      };
+    }
+  };
+
+  const page = new BossChatPage(fakeChromeClient);
+  const pageState = await page.ensureOnChatPage();
+  assert.equal(pageState.href, "https://www.zhipin.com/web/chat/index");
+
+  await assert.rejects(
+    () => page.ensureReady(),
+    /CHAT_LIST_CONTAINER_NOT_FOUND/
+  );
+}
+
+async function testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad() {
+  const calls = [];
+  let stateIndex = 0;
+  const states = [
+    {
+      href: "https://www.zhipin.com/web/chat/index",
+      readyState: "loading",
+      hasListContainer: false,
+      listItemCount: 0
+    },
+    {
+      href: "https://www.zhipin.com/web/chat/index",
+      readyState: "interactive",
+      hasListContainer: false,
+      listItemCount: 0
+    },
+    {
+      href: "https://www.zhipin.com/web/chat/index",
+      readyState: "complete",
+      hasListContainer: false,
+      listItemCount: 0
+    }
+  ];
+
+  const fakeChromeClient = {
+    async callFunction(fn, arg) {
+      calls.push({ name: fn.name, arg });
+      if (fn.name === "browserGetCurrentHref") {
+        return { href: "https://www.zhipin.com/web/chat/index" };
+      }
+      if (fn.name === "browserNavigateToChatIndex") {
+        return { ok: true, changed: true, href: "https://www.zhipin.com/web/chat/index" };
+      }
+      if (fn.name === "browserGetPageState") {
+        const value = states[Math.min(stateIndex, states.length - 1)];
+        stateIndex += 1;
+        return value;
+      }
+      throw new Error(`unexpected function: ${fn.name}`);
+    }
+  };
+
+  const page = new BossChatPage(fakeChromeClient);
+  const result = await page.recoverToChatIndex({
+    forceNavigate: true,
+    waitForReadyState: "complete",
+    maxAttempts: 5,
+    delayMs: 0
+  });
+
+  assert.equal(result.changed, true);
+  assert.equal(result.href, "https://www.zhipin.com/web/chat/index");
+  assert.equal(
+    calls.some((entry) => entry.name === "browserNavigateToChatIndex" && entry.arg?.force === true),
+    true
+  );
+  assert.equal(
+    calls.filter((entry) => entry.name === "browserGetPageState").length >= 3,
+    true
+  );
 }
 
 async function testBossChatMcpToolsShouldValidateAndRoute() {
@@ -941,6 +1026,8 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
 async function main() {
   await testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli();
   await testBossChatPrepareShouldRetryWhenChatPageIsNotReady();
+  await testBossChatPageShouldTreatBlankChatShellAsOnChatPage();
+  await testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
   testBossChatLlmEvidenceGateShouldDemoteMissingEvidence();
