@@ -18,10 +18,12 @@ import {
 } from "./adapters.js";
 import {
   cancelBossChatRun,
+  ensureBossChatRuntimeReady,
   getBossChatHealthCheck,
   getBossChatRun,
   pauseBossChatRun,
   prepareBossChatRun,
+  resolveBossChatRuntimeLayout,
   resumeBossChatRun,
   startBossChatRun
 } from "./boss-chat.js";
@@ -742,30 +744,22 @@ function ensureUserConfig(options = {}) {
   throw lastError || new Error("No writable target for screening-config.json");
 }
 
-function getBossChatDataDir(workspaceRoot) {
-  return path.join(path.resolve(String(workspaceRoot || process.cwd())), ".boss-chat");
-}
-
 function collectRuntimeDirectories(options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
   const stateHome = getStateHome();
-  const bossChatRoot = getBossChatDataDir(workspaceRoot);
+  const runtime = resolveBossChatRuntimeLayout(workspaceRoot);
+  const bossChatRoot = runtime.data_dir;
   const recommendRuntimeDirs = [
     stateHome,
     path.join(stateHome, "runs")
   ];
-  const bossChatRuntimeDirs = [
-    bossChatRoot,
-    path.join(bossChatRoot, "logs"),
-    path.join(bossChatRoot, "runs"),
-    path.join(bossChatRoot, "profiles"),
-    path.join(bossChatRoot, "reports"),
-    path.join(bossChatRoot, "artifacts")
-  ];
+  const bossChatRuntimeDirs = runtime.directories || [bossChatRoot];
   return {
     workspaceRoot,
     stateHome,
     bossChatRoot,
+    legacyBossChatRoot: runtime.legacy_workspace_dir,
+    migrationPending: runtime.migration_pending,
     directories: dedupePaths([
       ...recommendRuntimeDirs,
       ...bossChatRuntimeDirs
@@ -774,19 +768,20 @@ function collectRuntimeDirectories(options = {}) {
 }
 
 function ensureRuntimeDirectories(options = {}) {
-  const { workspaceRoot, stateHome, bossChatRoot, directories } = collectRuntimeDirectories(options);
-  const created = [];
-  const existed = [];
-  const failed = [];
+  const { workspaceRoot, stateHome } = collectRuntimeDirectories(options);
+  const runtime = ensureBossChatRuntimeReady(workspaceRoot);
+  const recommendCreated = [];
+  const recommendExisted = [];
+  const failed = [...runtime.failed];
 
-  for (const directory of directories) {
+  for (const directory of [stateHome, path.join(stateHome, "runs")]) {
     try {
       const existedBefore = fs.existsSync(directory);
       ensureDir(directory);
       if (existedBefore) {
-        existed.push(directory);
+        recommendExisted.push(directory);
       } else {
-        created.push(directory);
+        recommendCreated.push(directory);
       }
     } catch (error) {
       failed.push({
@@ -799,9 +794,12 @@ function ensureRuntimeDirectories(options = {}) {
   return {
     workspaceRoot,
     stateHome,
-    bossChatRoot,
-    created,
-    existed,
+    bossChatRoot: runtime.data_dir,
+    legacyBossChatRoot: runtime.legacy_workspace_dir,
+    migrationPending: runtime.migration_pending,
+    migration: runtime.migration,
+    created: dedupePaths([...recommendCreated, ...runtime.created]),
+    existed: dedupePaths([...recommendExisted, ...runtime.existed]),
     failed
   };
 }
@@ -1343,10 +1341,13 @@ function printPaths() {
   const codexHome = getCodexHome();
   const stateHome = getStateHome();
   const calibrationResolution = getFeaturedCalibrationResolution(process.cwd());
+  const bossChatRuntime = resolveBossChatRuntimeLayout(getWorkspaceRoot({}));
   console.log(`package_root=${packageRoot}`);
   console.log(`skill_sources=${bundledSkillNames.map((name) => getSkillSourceDir(name)).join(" | ")}`);
   console.log(`codex_home=${codexHome}`);
   console.log(`state_home=${stateHome}`);
+  console.log(`boss_chat_runtime=${bossChatRuntime.data_dir}`);
+  console.log(`boss_chat_legacy_workspace_runtime=${bossChatRuntime.legacy_workspace_dir || ""}`);
   console.log(`skill_targets=${bundledSkillNames.map((name) => path.join(codexHome, "skills", name)).join(" | ")}`);
   console.log(`config_target=${getUserConfigPath()}`);
   console.log(`legacy_config_target=${getLegacyUserConfigPath()}`);
@@ -1408,6 +1409,9 @@ function installAll(options = {}) {
   );
   console.log(`- recommend runtime: ${runtimeDirsResult.stateHome}`);
   console.log(`- boss-chat runtime: ${runtimeDirsResult.bossChatRoot}`);
+  if (runtimeDirsResult.migration?.performed) {
+    console.log(`- boss-chat migration: ${runtimeDirsResult.migration.message}`);
+  }
   if (runtimeDirsResult.failed.length > 0) {
     for (const item of runtimeDirsResult.failed) {
       console.warn(`Runtime dir warning: ${item.path} -> ${item.message}`);
@@ -1628,6 +1632,9 @@ export async function runCli(argv = process.argv) {
       );
       console.log(`- recommend runtime: ${runtimeDirsResult.stateHome}`);
       console.log(`- boss-chat runtime: ${runtimeDirsResult.bossChatRoot}`);
+      if (runtimeDirsResult.migration?.performed) {
+        console.log(`- boss-chat migration: ${runtimeDirsResult.migration.message}`);
+      }
       if (runtimeDirsResult.failed.length > 0) {
         for (const item of runtimeDirsResult.failed) {
           console.warn(`Runtime dir warning: ${item.path} -> ${item.message}`);
@@ -1716,12 +1723,15 @@ export const __testables = {
   buildBossChatCliInput,
   buildDefaultMcpArgs,
   buildMcpLaunchConfig,
+  collectRuntimeDirectories,
+  ensureBossChatRuntimeReady,
+  ensureRuntimeDirectories,
   getBossChatCliRunTarget,
   getDefaultMcpPackageSpecifier,
   getRunFollowUp,
   installSkill,
   isInstalledPackageRoot,
-  ensureRuntimeDirectories,
+  resolveBossChatRuntimeLayout,
   runBossChatCliCommand,
   runPipelineOnce
 };

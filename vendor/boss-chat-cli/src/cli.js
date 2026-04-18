@@ -182,6 +182,7 @@ function parseArgs(argv) {
   const args = {
     command: 'run',
     profile: 'default',
+    dataDir: '',
     dryRun: false,
     noState: false,
     json: false,
@@ -216,6 +217,10 @@ function parseArgs(argv) {
     switch (name) {
       case 'profile':
         args.profile = value || args.profile;
+        break;
+      case 'data-dir':
+      case 'dataDir':
+        args.dataDir = String(value || '').trim();
         break;
       case 'dry-run':
         args.dryRun = true;
@@ -296,6 +301,14 @@ function parseArgs(argv) {
   return args;
 }
 
+function resolveDataDir(args = {}, env = process.env, cwd = process.cwd()) {
+  const explicit = String(args?.dataDir || '').trim();
+  if (explicit) return path.resolve(explicit);
+  const fromEnv = String(env?.BOSS_CHAT_HOME || '').trim();
+  if (fromEnv) return path.resolve(fromEnv);
+  return path.join(path.resolve(String(cwd || process.cwd())), '.boss-chat');
+}
+
 function printUsage() {
   console.log('Usage: boss-chat <command> [options]');
   console.log('');
@@ -310,6 +323,7 @@ function printUsage() {
   console.log('');
   console.log('Common options:');
   console.log('  --profile <name>                Profile name (default: default)');
+  console.log('  --data-dir <path>               Runtime data dir (default: $BOSS_CHAT_HOME or <cwd>/.boss-chat)');
   console.log('  --json                          JSON output for agent integration');
   console.log('  --run-id <id>                   Target async run_id (for get/pause/resume/cancel)');
   console.log('');
@@ -1513,7 +1527,7 @@ async function executeRunCommand(args, dataDir) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const dataDir = path.join(process.cwd(), '.boss-chat');
+  const dataDir = resolveDataDir(args);
   await mkdir(dataDir, { recursive: true });
 
   if (args.command === 'help') {
@@ -1560,6 +1574,7 @@ async function main() {
 
 export const __testables = {
   parseArgs,
+  resolveDataDir,
   connectBossChatPage,
   hasHydratedChatShell,
   promptRunProfile,

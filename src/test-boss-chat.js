@@ -6,14 +6,16 @@ import { mkdir } from "node:fs/promises";
 
 import {
   cancelBossChatRun,
+  ensureBossChatRuntimeReady,
   getBossChatHealthCheck,
   getBossChatRun,
   pauseBossChatRun,
   prepareBossChatRun,
+  resolveBossChatRuntimeLayout,
   resumeBossChatRun,
   startBossChatRun
 } from "./boss-chat.js";
-import { __testables as cliTestables } from "./cli.js";
+import { __testables as cliTestables, runCli } from "./cli.js";
 import { __testables as indexTestables } from "./index.js";
 import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
 import { __testables as vendorCliTestables } from "../vendor/boss-chat-cli/src/cli.js";
@@ -76,19 +78,6 @@ function createBossChatTestWorkspace() {
     "#!/usr/bin/env node",
     "const fs = require('node:fs');",
     "const path = require('node:path');",
-    "const cwd = process.cwd();",
-    "const statePath = path.join(cwd, '.boss-chat', 'stub-state.json');",
-    "fs.mkdirSync(path.dirname(statePath), { recursive: true });",
-    "const raw = fs.existsSync(statePath) ? fs.readFileSync(statePath, 'utf8') : '{}';",
-    "const state = JSON.parse(raw || '{}');",
-    "state.counter = Number.isInteger(state.counter) ? state.counter : 0;",
-    "state.prepare_calls = Number.isInteger(state.prepare_calls) ? state.prepare_calls : 0;",
-    "if (!Number.isInteger(state.prepare_fail_budget)) {",
-    "  const configured = Number.parseInt(process.env.BOSS_CHAT_STUB_PREPARE_FAILS || '0', 10);",
-    "  state.prepare_fail_budget = Number.isFinite(configured) && configured > 0 ? configured : 0;",
-    "}",
-    "state.runs = state.runs && typeof state.runs === 'object' ? state.runs : {};",
-    "state.get_calls = state.get_calls && typeof state.get_calls === 'object' ? state.get_calls : {};",
     "const argv = process.argv.slice(2);",
     "const command = String(argv[0] || '').trim();",
     "const options = {};",
@@ -104,6 +93,20 @@ function createBossChatTestWorkspace() {
     "    options[key] = true;",
     "  }",
     "}",
+    "const cwd = process.cwd();",
+    "const dataDir = String(options['data-dir'] || process.env.BOSS_CHAT_HOME || path.join(cwd, '.boss-chat'));",
+    "const statePath = path.join(dataDir, 'stub-state.json');",
+    "fs.mkdirSync(path.dirname(statePath), { recursive: true });",
+    "const raw = fs.existsSync(statePath) ? fs.readFileSync(statePath, 'utf8') : '{}';",
+    "const state = JSON.parse(raw || '{}');",
+    "state.counter = Number.isInteger(state.counter) ? state.counter : 0;",
+    "state.prepare_calls = Number.isInteger(state.prepare_calls) ? state.prepare_calls : 0;",
+    "if (!Number.isInteger(state.prepare_fail_budget)) {",
+    "  const configured = Number.parseInt(process.env.BOSS_CHAT_STUB_PREPARE_FAILS || '0', 10);",
+    "  state.prepare_fail_budget = Number.isFinite(configured) && configured > 0 ? configured : 0;",
+    "}",
+    "state.runs = state.runs && typeof state.runs === 'object' ? state.runs : {};",
+    "state.get_calls = state.get_calls && typeof state.get_calls === 'object' ? state.get_calls : {};",
     "function saveAndPrint(payload) {",
     "  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));",
     "  process.stdout.write(`${JSON.stringify(payload)}\\n`);",
@@ -189,15 +192,21 @@ function createBossChatTestWorkspace() {
   return workspaceRoot;
 }
 
+function getTestChatDataDir(workspaceRoot) {
+  return resolveBossChatRuntimeLayout(workspaceRoot).data_dir;
+}
+
 function readStubState(workspaceRoot) {
-  const statePath = path.join(workspaceRoot, ".boss-chat", "stub-state.json");
+  const statePath = path.join(getTestChatDataDir(workspaceRoot), "stub-state.json");
   return JSON.parse(fs.readFileSync(statePath, "utf8"));
 }
 
 async function withBossChatWorkspace(testFn) {
   const workspaceRoot = createBossChatTestWorkspace();
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+  const previousBossChatHome = process.env.BOSS_CHAT_HOME;
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = path.join(workspaceRoot, "config", "screening-config.json");
+  process.env.BOSS_CHAT_HOME = path.join(workspaceRoot, "user-boss-chat");
   try {
     await testFn(workspaceRoot);
   } finally {
@@ -205,6 +214,11 @@ async function withBossChatWorkspace(testFn) {
       delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
     } else {
       process.env.BOSS_RECOMMEND_SCREEN_CONFIG = previousScreenConfig;
+    }
+    if (previousBossChatHome === undefined) {
+      delete process.env.BOSS_CHAT_HOME;
+    } else {
+      process.env.BOSS_CHAT_HOME = previousBossChatHome;
     }
     fs.rmSync(workspaceRoot, { recursive: true, force: true });
   }
@@ -230,6 +244,9 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(health.status, "OK");
     assert.equal(health.shared_llm_config, true);
     assert.equal(health.debug_port, 9666);
+    assert.equal(health.data_dir, getTestChatDataDir(workspaceRoot));
+    assert.equal(health.legacy_workspace_dir, path.join(workspaceRoot, ".boss-chat"));
+    assert.equal(health.migration_pending, false);
 
     const prepared = await prepareBossChatRun({
       workspaceRoot,
@@ -261,6 +278,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
 
     const stateAfterPrepare = readStubState(workspaceRoot);
     assert.equal(stateAfterPrepare.last_prepare_args.profile, "default");
+    assert.equal(stateAfterPrepare.last_prepare_args["data-dir"], getTestChatDataDir(workspaceRoot));
     assert.equal(stateAfterPrepare.last_prepare_args.port, "9666");
     assert.equal(stateAfterPrepare.last_prepare_args.baseurl, "https://api.example.com/v1");
     assert.equal(stateAfterPrepare.last_prepare_args.apikey, "sk-test-key");
@@ -283,6 +301,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
 
     const stateAfterStart = readStubState(workspaceRoot);
     assert.equal(stateAfterStart.last_start_args.profile, "default");
+    assert.equal(stateAfterStart.last_start_args["data-dir"], getTestChatDataDir(workspaceRoot));
     assert.equal(stateAfterStart.last_start_args.job, "算法工程师");
     assert.equal(stateAfterStart.last_start_args["start-from"], "unread");
     assert.equal(stateAfterStart.last_start_args.criteria, "有 AI Agent 经验");
@@ -392,6 +411,94 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
   });
 }
 
+async function testBossChatRuntimeShouldMigrateLegacyWorkspaceDataOnce() {
+  await withBossChatWorkspace(async (workspaceRoot) => {
+    const legacyDir = path.join(workspaceRoot, ".boss-chat");
+    const legacyStatePath = path.join(legacyDir, "state", "default.json");
+    const legacyRunPath = path.join(legacyDir, "runs", "legacy-run.json");
+    fs.mkdirSync(path.dirname(legacyStatePath), { recursive: true });
+    fs.mkdirSync(path.dirname(legacyRunPath), { recursive: true });
+    fs.writeFileSync(legacyStatePath, JSON.stringify({ cursor: 7 }, null, 2));
+    fs.writeFileSync(legacyRunPath, JSON.stringify({ run_id: "legacy-run" }, null, 2));
+
+    const before = resolveBossChatRuntimeLayout(workspaceRoot);
+    assert.equal(before.data_dir, getTestChatDataDir(workspaceRoot));
+    assert.equal(before.legacy_workspace_dir, legacyDir);
+    assert.equal(before.migration_source_dir, legacyDir);
+    assert.equal(before.migration_pending, true);
+
+    const ready = ensureBossChatRuntimeReady(workspaceRoot);
+    assert.equal(ready.migration.attempted, true);
+    assert.equal(ready.migration.performed, true);
+    assert.equal(fs.existsSync(path.join(ready.data_dir, "state", "default.json")), true);
+    assert.equal(fs.existsSync(path.join(ready.data_dir, "runs", "legacy-run.json")), true);
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(ready.data_dir, "state", "default.json"), "utf8")),
+      { cursor: 7 }
+    );
+    assert.equal(fs.existsSync(legacyStatePath), true);
+
+    const after = resolveBossChatRuntimeLayout(workspaceRoot);
+    assert.equal(after.migration_pending, false);
+    assert.equal(after.migration_source_dir, null);
+
+    const secondReady = ensureBossChatRuntimeReady(workspaceRoot);
+    assert.equal(secondReady.migration.attempted, false);
+    assert.equal(secondReady.migration.performed, false);
+  });
+}
+
+function testBossChatRuntimeShouldResolveUserDirForRootWorkspace() {
+  const previousBossChatHome = process.env.BOSS_CHAT_HOME;
+  const previousRecommendHome = process.env.BOSS_RECOMMEND_HOME;
+  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-root-runtime-"));
+  try {
+    delete process.env.BOSS_CHAT_HOME;
+    process.env.BOSS_RECOMMEND_HOME = runtimeRoot;
+    const rootWorkspace = path.parse(process.cwd()).root;
+    const runtime = resolveBossChatRuntimeLayout(rootWorkspace);
+    assert.equal(runtime.data_dir, path.join(runtimeRoot, "boss-chat"));
+    assert.equal(runtime.legacy_workspace_dir, null);
+    assert.equal(runtime.migration_pending, false);
+
+    const ready = ensureBossChatRuntimeReady(rootWorkspace);
+    assert.equal(fs.existsSync(ready.data_dir), true);
+    assert.equal(fs.existsSync(path.join(ready.data_dir, "runs")), true);
+  } finally {
+    if (previousBossChatHome === undefined) {
+      delete process.env.BOSS_CHAT_HOME;
+    } else {
+      process.env.BOSS_CHAT_HOME = previousBossChatHome;
+    }
+    if (previousRecommendHome === undefined) {
+      delete process.env.BOSS_RECOMMEND_HOME;
+    } else {
+      process.env.BOSS_RECOMMEND_HOME = previousRecommendHome;
+    }
+    fs.rmSync(runtimeRoot, { recursive: true, force: true });
+  }
+}
+
+async function testBossChatWhereShouldPrintUserRuntimePath() {
+  await withBossChatWorkspace(async (workspaceRoot) => {
+    const previousWorkspaceRoot = process.env.BOSS_WORKSPACE_ROOT;
+    process.env.BOSS_WORKSPACE_ROOT = workspaceRoot;
+    try {
+      const logs = await captureConsoleLogs(async () => {
+        await runCli(["node", "src/cli.js", "where"]);
+      });
+      assert.equal(logs.some((line) => line.includes(`boss_chat_runtime=${getTestChatDataDir(workspaceRoot)}`)), true);
+      assert.equal(logs.some((line) => line.includes(`boss_chat_legacy_workspace_runtime=${path.join(workspaceRoot, ".boss-chat")}`)), true);
+    } finally {
+      if (previousWorkspaceRoot === undefined) {
+        delete process.env.BOSS_WORKSPACE_ROOT;
+      } else {
+        process.env.BOSS_WORKSPACE_ROOT = previousWorkspaceRoot;
+      }
+    }
+  });
+}
+
 async function testBossChatPrepareShouldRetryWhenChatPageIsNotReady() {
   await withBossChatWorkspace(async (workspaceRoot) => {
     const previousPrepareFails = process.env.BOSS_CHAT_STUB_PREPARE_FAILS;
@@ -413,6 +520,24 @@ async function testBossChatPrepareShouldRetryWhenChatPageIsNotReady() {
       }
     }
   });
+}
+
+function testVendorBossChatCliShouldResolveExplicitDataDir() {
+  const cwd = path.join(path.parse(process.cwd()).root, "workspace");
+  const args = vendorCliTestables.parseArgs(["start-run", "--data-dir", "/tmp/boss-chat-data"]);
+  assert.equal(args.dataDir, "/tmp/boss-chat-data");
+  assert.equal(
+    vendorCliTestables.resolveDataDir(args, { BOSS_CHAT_HOME: "/tmp/ignored" }, cwd),
+    path.resolve("/tmp/boss-chat-data")
+  );
+  assert.equal(
+    vendorCliTestables.resolveDataDir({}, { BOSS_CHAT_HOME: "/tmp/from-env" }, cwd),
+    path.resolve("/tmp/from-env")
+  );
+  assert.equal(
+    vendorCliTestables.resolveDataDir({}, {}, cwd),
+    path.join(path.resolve(cwd), ".boss-chat")
+  );
 }
 
 async function testBossChatPageShouldTreatBlankChatShellAsOnChatPage() {
@@ -2881,6 +3006,9 @@ async function testBossChatReportStoreShouldWriteReadableMarkdownAndCsv() {
 
 async function main() {
   await testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli();
+  await testBossChatRuntimeShouldMigrateLegacyWorkspaceDataOnce();
+  testBossChatRuntimeShouldResolveUserDirForRootWorkspace();
+  await testBossChatWhereShouldPrintUserRuntimePath();
   await testBossChatPrepareShouldRetryWhenChatPageIsNotReady();
   await testBossChatPageShouldTreatBlankChatShellAsOnChatPage();
   await testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad();
@@ -2890,6 +3018,7 @@ async function main() {
   await testBossChatPageShouldSurfaceCandidateDetailOverlayAndContentState();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
+  testVendorBossChatCliShouldResolveExplicitDataDir();
   await testVendorBossChatCliShouldWaitForHydratedChatShell();
   await testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile();
   testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig();
