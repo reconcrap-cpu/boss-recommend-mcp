@@ -1918,6 +1918,35 @@ function browserAnyPopupVisible() {
   return { visible: wrappers.length > 0, count: wrappers.length };
 }
 
+browserConversationReadyState.helpers = [
+  browserIsResumeModalOpen,
+  browserNormalizeVisibleText,
+  browserIsVisibleElement,
+  browserRectToJson,
+  browserCollectCandidateDetailSnapshot,
+];
+
+browserFindCandidateDetailOutsideClickPoint.helpers = [
+  browserNormalizeVisibleText,
+  browserIsVisibleElement,
+  browserRectToJson,
+  browserCollectCandidateDetailSnapshot,
+];
+
+browserIsCandidateDetailOpen.helpers = [
+  browserNormalizeVisibleText,
+  browserIsVisibleElement,
+  browserRectToJson,
+  browserCollectCandidateDetailSnapshot,
+];
+
+browserCloseCandidateDetailDomOnce.helpers = [
+  browserNormalizeVisibleText,
+  browserIsVisibleElement,
+  browserRectToJson,
+  browserCollectCandidateDetailSnapshot,
+];
+
 function browserSetEditorMessage(message) {
   const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const text = String(message || '').trim();

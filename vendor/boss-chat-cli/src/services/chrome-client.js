@@ -52,7 +52,11 @@ export class ChromeClient {
   }
 
   async callFunction(fn, arg = null) {
-    const expression = `(${fn.toString()})(${JSON.stringify(arg)})`;
+    const helpers = Array.isArray(fn?.helpers) ? fn.helpers : [];
+    const helperSource = helpers.map((helper) => helper.toString()).join(';\n');
+    const expression = helperSource
+      ? `(() => { ${helperSource}; return (${fn.toString()})(${JSON.stringify(arg)}); })()`
+      : `(${fn.toString()})(${JSON.stringify(arg)})`;
     return this.evaluate(expression);
   }
 

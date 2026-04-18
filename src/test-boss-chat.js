@@ -18,6 +18,7 @@ import { __testables as indexTestables } from "./index.js";
 import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
 import { __testables as vendorCliTestables } from "../vendor/boss-chat-cli/src/cli.js";
 import { BossChatPage } from "../vendor/boss-chat-cli/src/browser/chat-page.js";
+import { ChromeClient } from "../vendor/boss-chat-cli/src/services/chrome-client.js";
 import { LlmClient, parseLlmJson, __testables as llmTestables } from "../vendor/boss-chat-cli/src/services/llm.js";
 import { ReportStore } from "../vendor/boss-chat-cli/src/services/report-store.js";
 import {
@@ -607,6 +608,30 @@ async function testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail(
   assert.equal(calls.includes("pressEscape"), true);
   assert.equal(mouseEvents.length > 0, true);
   assert.equal(result.method.includes("outside-click:left-gap"), true);
+}
+
+async function testChromeClientShouldInjectBrowserHelpersIntoCallFunction() {
+  function helper(value) {
+    return Number(value || 0) + 1;
+  }
+  function target(value) {
+    return helper(value) * 2;
+  }
+  target.helpers = [helper];
+
+  const client = new ChromeClient(9222);
+  let capturedExpression = "";
+  client.evaluate = async (expression) => {
+    capturedExpression = String(expression || "");
+    return "ok";
+  };
+
+  const result = await client.callFunction(target, 2);
+
+  assert.equal(result, "ok");
+  assert.equal(capturedExpression.includes("function helper"), true);
+  assert.equal(capturedExpression.includes("function target"), true);
+  assert.equal(capturedExpression.includes("return (helper(value) * 2)") || capturedExpression.includes("return helper(value) * 2"), true);
 }
 
 async function testBossChatPageShouldWaitForPanelsClosedInStrictConversationReady() {
@@ -2860,6 +2885,7 @@ async function main() {
   await testBossChatPageShouldTreatBlankChatShellAsOnChatPage();
   await testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad();
   await testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail();
+  await testChromeClientShouldInjectBrowserHelpersIntoCallFunction();
   await testBossChatPageShouldWaitForPanelsClosedInStrictConversationReady();
   await testBossChatPageShouldSurfaceCandidateDetailOverlayAndContentState();
   await testBossChatMcpToolsShouldValidateAndRoute();
