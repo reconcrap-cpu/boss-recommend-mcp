@@ -219,6 +219,29 @@ function createArgs(tempDir) {
   };
 }
 
+async function withLongResumeChunkEnv(overrides, fn) {
+  const envKeys = [
+    "BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS",
+    "BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS",
+    "BOSS_RECOMMEND_TEXT_MAX_CHUNKS"
+  ];
+  const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(overrides || {})) {
+    process.env[key] = String(value);
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const key of envKeys) {
+      if (previous[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previous[key];
+      }
+    }
+  }
+}
+
 function testShouldAbortResumeProbeEarly() {
   const probe = {
     ok: false,
@@ -1088,13 +1111,19 @@ function testCheckpointPayloadShouldIncludeCandidateAudits() {
     raw_passed: true,
     final_passed: false,
     evidence_gate_demoted: true,
-    screening_reason: "模型未给出可校验证据"
+    screening_reason: "模型未给出可校验证据",
+    decision_mode: "text_chunk_aggregate",
+    chunk_count: 3,
+    aggregate_retry_used: true
   });
   const checkpoint = cli.buildCheckpointPayload();
   assert.equal(Array.isArray(checkpoint.candidate_audits), true);
   assert.equal(checkpoint.candidate_audits.length, 1);
   assert.equal(checkpoint.candidate_audits[0].candidate_key, "candidate-a");
   assert.equal(checkpoint.candidate_audits[0].evidence_gate_demoted, true);
+  assert.equal(checkpoint.candidate_audits[0].decision_mode, "text_chunk_aggregate");
+  assert.equal(checkpoint.candidate_audits[0].chunk_count, 3);
+  assert.equal(checkpoint.candidate_audits[0].aggregate_retry_used, true);
 }
 
 function testCheckpointShouldPersistAndRestoreInputSummary() {
@@ -1276,6 +1305,46 @@ async function testFeaturedPostActionFailureShouldStillRecordPassedCandidate() {
   assert.match(cli.passedCandidates[0].reason, /\[favorite失败]/);
 }
 
+async function testRunShouldRecordLongResumeDecisionObservability() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-decision-observability-"));
+  const args = createArgs(tempDir);
+  const candidate = { key: "aggregate-audit", geek_id: "aggregate-audit", name: "aggregate candidate" };
+  const cli = new FakeRecommendScreenCli(args, {
+    candidates: [candidate]
+  });
+  cli.waitForNetworkResumeCandidateInfo = async () => ({
+    name: "aggregate candidate",
+    school: "测试大学",
+    major: "人工智能",
+    company: "测试公司",
+    position: "算法工程师",
+    resumeText: "满足测试标准"
+  });
+  cli.callTextModel = async () => ({
+    passed: true,
+    rawPassed: true,
+    reason: "通过",
+    summary: "通过",
+    evidence: ["跨 chunk 证据"],
+    evidenceRawCount: 1,
+    evidenceMatchedCount: 1,
+    decisionMode: "text_chunk_aggregate",
+    chunkCount: 3,
+    aggregateRetryUsed: true,
+    chunkIndex: null,
+    chunkTotal: 3
+  });
+
+  const result = await cli.run();
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(cli.passedCandidates[0]?.decisionMode, "text_chunk_aggregate");
+  assert.equal(cli.passedCandidates[0]?.chunkCount, 3);
+  assert.equal(cli.passedCandidates[0]?.aggregateRetryUsed, true);
+  assert.equal(cli.candidateAudits[0]?.decision_mode, "text_chunk_aggregate");
+  assert.equal(cli.candidateAudits[0]?.chunk_count, 3);
+  assert.equal(cli.candidateAudits[0]?.aggregate_retry_used, true);
+}
+
 async function testStitchWithSharpShouldComposeExpectedImage() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-sharp-stitch-"));
   const chunkA = path.join(tempDir, "chunk_000.png");
@@ -1424,7 +1493,9 @@ async function testCallTextModelShouldNotTruncateLongResume() {
   const resumeText = `${"A".repeat(32000)}${marker}`;
   const originalFetch = global.fetch;
   let capturedUserContent = "";
+  let callCount = 0;
   global.fetch = async (_url, options = {}) => {
+    callCount += 1;
     const payload = JSON.parse(String(options.body || "{}"));
     capturedUserContent = String(payload?.messages?.[1]?.content || "");
     return {
@@ -1446,6 +1517,8 @@ async function testCallTextModelShouldNotTruncateLongResume() {
   try {
     const result = await cli.callTextModel(resumeText);
     assert.equal(result.passed, false);
+    assert.equal(result.decisionMode, "full_text");
+    assert.equal(callCount, 1);
     assert.equal(capturedUserContent.includes(marker), true);
   } finally {
     global.fetch = originalFetch;
@@ -1456,16 +1529,12 @@ async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-chunk-fallback-"));
   const cli = new RecommendScreenCli(createArgs(tempDir));
   const originalFetch = global.fetch;
-  const prevChunkSize = process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS;
-  const prevChunkOverlap = process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS;
-  const prevMaxChunks = process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS;
-  process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS = "80";
-  process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS = "0";
-  process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS = "6";
-
-  const passMarker = "PASS_MARKER_ABC";
-  const resumeText = `${"x".repeat(120)}${passMarker}${"y".repeat(120)}`;
+  const chunkOneMarker = "本科 2025 届，南京大学，研究方向为机器学习";
+  const chunkTwoMarker = "主导 AI 项目落地，并有 2 段相关工作经历";
+  const resumeText = `${chunkOneMarker}\n${"A".repeat(1300)}\n${chunkTwoMarker}\n${"B".repeat(300)}`;
+  const expectedChunkCount = __testables.splitTextByChunks(resumeText, 1000, 1, 6).length;
   let callCount = 0;
+  let aggregateUserContent = "";
   global.fetch = async (_url, options = {}) => {
     callCount += 1;
     if (callCount === 1) {
@@ -1480,10 +1549,45 @@ async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
 
     const payload = JSON.parse(String(options.body || "{}"));
     const userContent = String(payload?.messages?.[1]?.content || "");
-    const passed = userContent.includes(passMarker);
-    const response = passed
-      ? "{\"passed\": true, \"reason\": \"命中证据\", \"summary\": \"命中\", \"evidence\": [\"PASS_MARKER_ABC\"]}"
-      : "{\"passed\": false, \"reason\": \"本段证据不足\", \"summary\": \"不足\", \"evidence\": []}";
+    const chunkMatch = userContent.match(/当前分段:\s*(\d+)\/(\d+)/);
+    if (chunkMatch) {
+      const chunkIndex = Number(chunkMatch[1]);
+      const chunkTotal = Number(chunkMatch[2]);
+      const isFirstChunk = chunkIndex === 1;
+      const isLastChunk = chunkIndex === chunkTotal;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    chunk_passed: false,
+                    chunk_summary: isFirstChunk
+                      ? "教育背景满足应届要求"
+                      : (isLastChunk ? "项目和工作经历满足相关经验要求" : "中间分段主要是补充描述"),
+                    hard_evidence: isFirstChunk
+                      ? ["本科 2025 届", "南京大学"]
+                      : (isLastChunk ? ["AI 项目落地", "2 段相关工作经历"] : []),
+                    soft_evidence: [],
+                    hard_blockers: [],
+                    missing_or_uncertain: isLastChunk ? [] : ["项目经历细节需要结合后续分段"],
+                    quoted_spans: isFirstChunk
+                      ? ["本科 2025 届", "南京大学"]
+                      : (isLastChunk ? ["AI 项目落地", "2 段相关工作经历"] : []),
+                    chunk_index: chunkIndex,
+                    chunk_total: chunkTotal
+                  })
+                }
+              }
+            ]
+          };
+        }
+      };
+    }
+    aggregateUserContent = userContent;
     return {
       ok: true,
       status: 200,
@@ -1492,7 +1596,12 @@ async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
           choices: [
             {
               message: {
-                content: response
+                content: JSON.stringify({
+                  passed: true,
+                  reason: "综合全部分段后，教育背景与 AI 项目/工作经历共同满足筛选条件。",
+                  summary: "跨 chunk 证据成立",
+                  evidence: ["本科 2025 届", "AI 项目落地", "2 段相关工作经历"]
+                })
               }
             }
           ]
@@ -1501,27 +1610,312 @@ async function testCallTextModelShouldFallbackToChunkModeOnContextLimit() {
     };
   };
   try {
-    const result = await cli.callTextModel(resumeText);
-    assert.equal(result.passed, true);
-    assert.equal(callCount >= 2, true);
-    assert.equal(Array.isArray(result.evidence), true);
+    await withLongResumeChunkEnv(
+      {
+        BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS: "1000",
+        BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS: "1",
+        BOSS_RECOMMEND_TEXT_MAX_CHUNKS: "6"
+      },
+      async () => {
+        const result = await cli.callTextModel(resumeText);
+        assert.equal(result.passed, true);
+        assert.equal(result.decisionMode, "text_chunk_aggregate");
+        assert.equal(result.chunkCount, expectedChunkCount);
+        assert.equal(result.aggregateRetryUsed, false);
+        assert.equal(callCount, expectedChunkCount + 2);
+        assert.equal(aggregateUserContent.includes(`"chunk_count": ${expectedChunkCount}`), true);
+        assert.equal(aggregateUserContent.includes("本科 2025 届"), true);
+        assert.equal(aggregateUserContent.includes("AI 项目落地"), true);
+      }
+    );
   } finally {
     global.fetch = originalFetch;
-    if (prevChunkSize === undefined) {
-      delete process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS;
-    } else {
-      process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS = prevChunkSize;
+  }
+}
+
+async function testCallTextModelShouldNotUseAnyPassShortcutWhenAggregateRejects() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-chunk-aggregate-reject-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const originalFetch = global.fetch;
+  const resumeText = `${"A".repeat(1050)}\n局部命中关键词但是整体不满足\n${"B".repeat(1050)}`;
+  let aggregateCalled = false;
+  global.fetch = async (_url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const userContent = String(payload?.messages?.[1]?.content || "");
+    if (userContent.includes("简历内容:")) {
+      return {
+        ok: false,
+        status: 400,
+        async text() {
+          return "maximum context length exceeded";
+        }
+      };
     }
-    if (prevChunkOverlap === undefined) {
-      delete process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS;
-    } else {
-      process.env.BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS = prevChunkOverlap;
+    if (userContent.includes("当前分段: 1/3")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [{ message: { content: JSON.stringify({
+              chunk_passed: true,
+              chunk_summary: "本段有局部关键词命中",
+              hard_evidence: ["局部命中关键词"],
+              soft_evidence: [],
+              hard_blockers: [],
+              missing_or_uncertain: ["缺少完整项目与工作链路"],
+              quoted_spans: ["局部命中关键词"],
+              chunk_index: 1,
+              chunk_total: 3
+            }) } }]
+          };
+        }
+      };
     }
-    if (prevMaxChunks === undefined) {
-      delete process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS;
-    } else {
-      process.env.BOSS_RECOMMEND_TEXT_MAX_CHUNKS = prevMaxChunks;
+    if (userContent.includes("当前分段: 2/3") || userContent.includes("当前分段: 3/3")) {
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [{ message: { content: JSON.stringify({
+              chunk_passed: false,
+              chunk_summary: "其他分段未补足必需证据",
+              hard_evidence: [],
+              soft_evidence: [],
+              hard_blockers: ["缺少连续工作/项目证据"],
+              missing_or_uncertain: ["完整时间线不足"],
+              quoted_spans: ["缺少连续工作/项目证据"],
+              chunk_index: userContent.includes("当前分段: 2/3") ? 2 : 3,
+              chunk_total: 3
+            }) } }]
+          };
+        }
+      };
     }
+    aggregateCalled = true;
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  passed: false,
+                  reason: "综合全部分段后仍缺少完整项目与工作链路，不能通过。",
+                  summary: "聚合后不通过",
+                  evidence: ["缺少连续工作/项目证据"]
+                })
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    await withLongResumeChunkEnv(
+      {
+        BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS: "1000",
+        BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS: "1",
+        BOSS_RECOMMEND_TEXT_MAX_CHUNKS: "6"
+      },
+      async () => {
+        const result = await cli.callTextModel(resumeText);
+        assert.equal(result.passed, false);
+        assert.equal(result.decisionMode, "text_chunk_aggregate");
+        assert.equal(aggregateCalled, true);
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testCallTextModelShouldRetryAggregateWithCompressedEvidenceOnce() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-chunk-aggregate-retry-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const originalFetch = global.fetch;
+  const resumeText = `${"第一段证据 ".repeat(160)}\n${"第二段证据 ".repeat(160)}`;
+  const aggregateBodies = [];
+  global.fetch = async (_url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const userContent = String(payload?.messages?.[1]?.content || "");
+    if (userContent.includes("简历内容:")) {
+      return {
+        ok: false,
+        status: 400,
+        async text() {
+          return "maximum context length exceeded";
+        }
+      };
+    }
+    if (userContent.includes("当前分段:")) {
+      const chunkIndex = userContent.includes("当前分段: 1/2") ? 1 : 2;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    chunk_passed: false,
+                    chunk_summary: `分段 ${chunkIndex} 提取到多条证据`,
+                    hard_evidence: [
+                      `关键证据 ${chunkIndex}-1`,
+                      `关键证据 ${chunkIndex}-2`,
+                      `关键证据 ${chunkIndex}-3`,
+                      `关键证据 ${chunkIndex}-4`
+                    ],
+                    soft_evidence: [`补充证据 ${chunkIndex}-1`, `补充证据 ${chunkIndex}-2`],
+                    hard_blockers: [],
+                    missing_or_uncertain: [`待确认信息 ${chunkIndex}-1`, `待确认信息 ${chunkIndex}-2`],
+                    quoted_spans: [`原文片段 ${chunkIndex}-1`, `原文片段 ${chunkIndex}-2`],
+                    chunk_index: chunkIndex,
+                    chunk_total: 2
+                  })
+                }
+              }
+            ]
+          };
+        }
+      };
+    }
+    aggregateBodies.push(userContent);
+    if (aggregateBodies.length === 1) {
+      return {
+        ok: false,
+        status: 400,
+        async text() {
+          return "maximum context length exceeded";
+        }
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  passed: false,
+                  reason: "压缩后综合判断仍不通过。",
+                  summary: "压缩重试完成",
+                  evidence: ["关键证据 1-1"]
+                })
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    await withLongResumeChunkEnv(
+      {
+        BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS: "1000",
+        BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS: "1",
+        BOSS_RECOMMEND_TEXT_MAX_CHUNKS: "6"
+      },
+      async () => {
+        const result = await cli.callTextModel(resumeText);
+        assert.equal(result.passed, false);
+        assert.equal(result.aggregateRetryUsed, true);
+        assert.equal(aggregateBodies.length, 2);
+        assert.equal(aggregateBodies[1].length < aggregateBodies[0].length, true);
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+}
+
+async function testCallTextModelShouldFailWhenAggregateResponseMissingPassed() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-text-chunk-aggregate-invalid-"));
+  const cli = new RecommendScreenCli(createArgs(tempDir));
+  const originalFetch = global.fetch;
+  const resumeText = `${"A".repeat(900)}\n${"B".repeat(900)}`;
+  global.fetch = async (_url, options = {}) => {
+    const payload = JSON.parse(String(options.body || "{}"));
+    const userContent = String(payload?.messages?.[1]?.content || "");
+    if (userContent.includes("简历内容:")) {
+      return {
+        ok: false,
+        status: 400,
+        async text() {
+          return "maximum context length exceeded";
+        }
+      };
+    }
+    if (userContent.includes("当前分段:")) {
+      const chunkIndex = userContent.includes("当前分段: 1/2") ? 1 : 2;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return {
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    chunk_passed: false,
+                    chunk_summary: `分段 ${chunkIndex} 证据不足`,
+                    hard_evidence: [],
+                    soft_evidence: [],
+                    hard_blockers: [],
+                    missing_or_uncertain: ["缺少关键经历"],
+                    quoted_spans: [],
+                    chunk_index: chunkIndex,
+                    chunk_total: 2
+                  })
+                }
+              }
+            ]
+          };
+        }
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  reason: "missing passed field",
+                  summary: "invalid"
+                })
+              }
+            }
+          ]
+        };
+      }
+    };
+  };
+  try {
+    await withLongResumeChunkEnv(
+      {
+        BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS: "1000",
+        BOSS_RECOMMEND_TEXT_CHUNK_OVERLAP_CHARS: "1",
+        BOSS_RECOMMEND_TEXT_MAX_CHUNKS: "6"
+      },
+      async () => {
+        await assert.rejects(
+          () => cli.callTextModel(resumeText),
+          (error) => error?.code === "TEXT_MODEL_FAILED"
+        );
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
   }
 }
 
@@ -1867,6 +2261,7 @@ async function main() {
   testSaveCsvShouldIncludeAllCandidateOutcomes();
   await testGetCenteredCandidateClickPointShouldSupportLatestSelector();
   await testFeaturedPostActionFailureShouldStillRecordPassedCandidate();
+  await testRunShouldRecordLongResumeDecisionObservability();
   await testStitchWithSharpShouldComposeExpectedImage();
   testStitchWithAvailablePythonShouldFallbackToPython();
   testStitchWithAvailablePythonShouldFailWhenScriptMissing();
@@ -1875,6 +2270,9 @@ async function main() {
   testParseArgsShouldSupportInputSummaryJson();
   await testCallTextModelShouldNotTruncateLongResume();
   await testCallTextModelShouldFallbackToChunkModeOnContextLimit();
+  await testCallTextModelShouldNotUseAnyPassShortcutWhenAggregateRejects();
+  await testCallTextModelShouldRetryAggregateWithCompressedEvidenceOnce();
+  await testCallTextModelShouldFailWhenAggregateResponseMissingPassed();
   await testTextModelShouldDefaultThinkingLowForVolcengine();
   await testTextModelShouldSupportLowThinkingForVolcengine();
   await testPrepareVisionImageSegmentsShouldSplitLongImage();

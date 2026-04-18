@@ -502,53 +502,51 @@ async function testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail(
   const calls = [];
   const mouseEvents = [];
   let stateIndex = 0;
+  const openState = {
+    open: true,
+    panelCount: 1,
+    closeCount: 1,
+    topPanelClass: "new-resume-online-main-ui",
+    topPanelScore: 520,
+    panelRect: {
+      left: 980,
+      top: 0,
+      width: 330,
+      height: 760,
+      right: 1310,
+      bottom: 760
+    },
+    closeRect: {
+      left: 1274,
+      top: 12,
+      width: 30,
+      height: 30,
+      right: 1304,
+      bottom: 42
+    },
+    overlayClass: "dialog-wrap active",
+    overlayRect: {
+      left: 0,
+      top: 0,
+      width: 1440,
+      height: 773,
+      right: 1440,
+      bottom: 773
+    },
+    contentClass: "new-resume-online-main-ui resume-recommend resume-common-wrap",
+    contentRect: {
+      left: 980,
+      top: 0,
+      width: 330,
+      height: 760,
+      right: 1310,
+      bottom: 760
+    }
+  };
   const states = [
-    {
-      open: true,
-      panelCount: 1,
-      closeCount: 1,
-      topPanelClass: "base-info-single-top-detail",
-      topPanelScore: 520,
-      panelRect: {
-        left: 940,
-        top: 60,
-        width: 360,
-        height: 720,
-        right: 1300,
-        bottom: 780
-      },
-      closeRect: {
-        left: 1274,
-        top: 12,
-        width: 30,
-        height: 30,
-        right: 1304,
-        bottom: 42
-      }
-    },
-    {
-      open: true,
-      panelCount: 1,
-      closeCount: 1,
-      topPanelClass: "base-info-single-top-detail",
-      topPanelScore: 520,
-      panelRect: {
-        left: 940,
-        top: 60,
-        width: 360,
-        height: 720,
-        right: 1300,
-        bottom: 780
-      },
-      closeRect: {
-        left: 1274,
-        top: 12,
-        width: 30,
-        height: 30,
-        right: 1304,
-        bottom: 42
-      }
-    },
+    openState,
+    openState,
+    openState,
     {
       open: false,
       panelCount: 0,
@@ -556,7 +554,11 @@ async function testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail(
       topPanelClass: "",
       topPanelScore: 0,
       panelRect: null,
-      closeRect: null
+      closeRect: null,
+      overlayClass: "",
+      overlayRect: null,
+      contentClass: "",
+      contentRect: null
     }
   ];
 
@@ -583,6 +585,14 @@ async function testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail(
           method: "dom-click-once"
         };
       }
+      if (fn.name === "browserFindCandidateDetailOutsideClickPoint") {
+        return {
+          ok: true,
+          strategy: "left-gap",
+          point: { x: 72, y: 260 },
+          state: openState
+        };
+      }
       throw new Error(`unexpected function: ${fn.name}`);
     }
   };
@@ -596,6 +606,120 @@ async function testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail(
   assert.equal(result.closed, true);
   assert.equal(calls.includes("pressEscape"), true);
   assert.equal(mouseEvents.length > 0, true);
+  assert.equal(result.method.includes("outside-click:left-gap"), true);
+}
+
+async function testBossChatPageShouldWaitForPanelsClosedInStrictConversationReady() {
+  const calls = [];
+  let stateIndex = 0;
+  const states = [
+    {
+      hasOnlineResume: true,
+      hasAskResume: true,
+      hasAttachmentResume: false,
+      attachmentResumeEnabled: false,
+      resumeModalOpen: false,
+      candidateDetailOpen: true,
+      panelsClosed: false,
+      editorVisible: true,
+      activeSubmit: true,
+      hasAnySubmit: true,
+      messageInputReady: true,
+    },
+    {
+      hasOnlineResume: true,
+      hasAskResume: true,
+      hasAttachmentResume: false,
+      attachmentResumeEnabled: false,
+      resumeModalOpen: false,
+      candidateDetailOpen: false,
+      panelsClosed: true,
+      editorVisible: true,
+      activeSubmit: true,
+      hasAnySubmit: true,
+      messageInputReady: true,
+    }
+  ];
+  const fakeChromeClient = {
+    async callFunction(fn) {
+      calls.push(fn.name);
+      if (fn.name === "browserConversationReadyState") {
+        const value = states[Math.min(stateIndex, states.length - 1)];
+        stateIndex += 1;
+        return value;
+      }
+      throw new Error(`unexpected function: ${fn.name}`);
+    }
+  };
+
+  const page = new BossChatPage(fakeChromeClient);
+  const result = await page.waitForConversationReady({
+    requirePanelsClosed: true,
+    maxAttempts: 3,
+    delayMs: 0
+  });
+
+  assert.equal(result.panelsClosed, true);
+  assert.equal(calls.filter((name) => name === "browserConversationReadyState").length, 2);
+}
+
+async function testBossChatPageShouldSurfaceCandidateDetailOverlayAndContentState() {
+  const fakeChromeClient = {
+    async callFunction(fn) {
+      if (fn.name === "browserIsCandidateDetailOpen") {
+        return {
+          open: true,
+          panelCount: 1,
+          closeCount: 1,
+          topPanelClass: "new-resume-online-main-ui resume-recommend resume-common-wrap",
+          topPanelScore: 620,
+          panelRect: {
+            left: 980,
+            top: 0,
+            width: 330,
+            height: 760,
+            right: 1310,
+            bottom: 760
+          },
+          closeRect: {
+            left: 1274,
+            top: 12,
+            width: 30,
+            height: 30,
+            right: 1304,
+            bottom: 42
+          },
+          overlayClass: "dialog-wrap active",
+          overlayRect: {
+            left: 0,
+            top: 0,
+            width: 1440,
+            height: 773,
+            right: 1440,
+            bottom: 773
+          },
+          contentClass: "new-resume-online-main-ui resume-recommend resume-common-wrap",
+          contentRect: {
+            left: 980,
+            top: 0,
+            width: 330,
+            height: 760,
+            right: 1310,
+            bottom: 760
+          }
+        };
+      }
+      throw new Error(`unexpected function: ${fn.name}`);
+    }
+  };
+
+  const page = new BossChatPage(fakeChromeClient);
+  const result = await page.getCandidateDetailState();
+
+  assert.equal(result.overlayClass, "dialog-wrap active");
+  assert.equal(result.contentClass.includes("new-resume-online-main-ui"), true);
+  assert.equal(result.panelRect.left, result.contentRect.left);
+  assert.equal(result.overlayRect.width > result.contentRect.width, true);
 }
 
 async function testBossChatMcpToolsShouldValidateAndRoute() {
@@ -1014,31 +1138,39 @@ async function testBossChatLlmTextChunkFallbackShouldWork() {
 
       async requestByPreference(payload) {
         this.calls.push(payload);
-        if (payload.chunkTotal === 1 && !payload.imageDataUrl) {
+        const prompt = String(payload?.prompt || "");
+        if (prompt.includes("简历文本:") && !prompt.includes("当前分段：")) {
           const error = new Error("maximum context length exceeded");
           throw error;
         }
-        if (payload.chunkTotal > 1) {
-          if (payload.chunkIndex === 2) {
-            return {
-              passed: true,
-              rawOutputText: '{"passed":true}',
-              chunkIndex: payload.chunkIndex,
-              chunkTotal: payload.chunkTotal,
-            };
-          }
+        if (prompt.includes("当前分段：")) {
           return {
-            passed: false,
-            rawOutputText: '{"passed":false}',
+            rawOutputText: JSON.stringify({
+              chunk_passed: Number(payload.chunkIndex) === 2,
+              chunk_summary: Number(payload.chunkIndex) === 2 ? "命中核心 AI 项目经历" : "当前分段证据不足",
+              hard_evidence: Number(payload.chunkIndex) === 2 ? ["PASS_MARKER_DEF"] : ["PASS_MARKER_ABC"],
+              soft_evidence: [],
+              hard_blockers: [],
+              missing_or_uncertain: Number(payload.chunkIndex) === 2 ? [] : ["需结合后续分段"],
+              quoted_spans: Number(payload.chunkIndex) === 2 ? ["PASS_MARKER_DEF"] : ["PASS_MARKER_ABC"],
+              chunk_index: payload.chunkIndex,
+              chunk_total: payload.chunkTotal,
+            }),
+            chunk_passed: Number(payload.chunkIndex) === 2,
             chunkIndex: payload.chunkIndex,
             chunkTotal: payload.chunkTotal,
           };
         }
         return {
-          passed: false,
-          rawOutputText: '{"passed":false}',
-          chunkIndex: 1,
-          chunkTotal: 1,
+          passed: true,
+          rawOutputText: JSON.stringify({
+            passed: true,
+            reason: "综合全部分段后，候选人具备目标 AI 项目证据。",
+            summary: "长简历聚合后通过",
+            evidence: ["PASS_MARKER_DEF"],
+          }),
+          chunkIndex: null,
+          chunkTotal: payload?.aggregateInput?.chunk_count || null,
         };
       }
     }
@@ -1056,8 +1188,8 @@ async function testBossChatLlmTextChunkFallbackShouldWork() {
       imagePath: null,
     });
     assert.equal(result.passed, true);
-    assert.equal(result.evaluationMode, "text");
-    assert.equal(result.chunkIndex, 2);
+    assert.equal(result.evaluationMode, "text-chunk-aggregate");
+    assert.equal(result.chunkIndex, null);
     assert.equal(Number(result.chunkTotal) > 1, true);
   } finally {
     if (originalChunkSize === undefined) delete process.env.BOSS_CHAT_TEXT_CHUNK_SIZE_CHARS;
@@ -1710,6 +1842,7 @@ function createProcessCustomerHarness({
   captureResume,
   tracker,
   pageOverrides = {},
+  dryRun = true,
 } = {}) {
   const recorded = [];
   const page = {
@@ -1721,13 +1854,58 @@ function createProcessCustomerHarness({
         finalState: { scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
       };
     },
-    async waitForConversationReady() {
-      recorded.push("waitForConversationReady");
+    async closeResumeModal() {
+      recorded.push("closeResumeModal");
+      return {
+        closed: true,
+        method: "closeResumeModal",
+        finalState: { open: false, scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+      };
+    },
+    async closeCandidateDetailDomOnce() {
+      recorded.push("closeCandidateDetailDomOnce");
+      return {
+        closed: true,
+        method: "already-closed",
+        finalState: {
+          open: false,
+          panelCount: 0,
+          closeCount: 0,
+          topPanelClass: "",
+          overlayClass: "",
+          contentClass: "",
+        },
+      };
+    },
+    async closeCandidateDetail() {
+      recorded.push("closeCandidateDetail");
+      return {
+        closed: true,
+        method: "closeCandidateDetail",
+        finalState: {
+          open: false,
+          panelCount: 0,
+          closeCount: 0,
+          topPanelClass: "",
+          overlayClass: "",
+          contentClass: "",
+        },
+      };
+    },
+    async waitForConversationReady(options = {}) {
+      recorded.push(options.requirePanelsClosed ? "waitForConversationReady:strict" : "waitForConversationReady");
       return {
         hasOnlineResume: true,
         hasAskResume: true,
         hasAttachmentResume: false,
         attachmentResumeEnabled: false,
+        resumeModalOpen: false,
+        candidateDetailOpen: false,
+        panelsClosed: true,
+        editorVisible: true,
+        activeSubmit: true,
+        hasAnySubmit: true,
+        messageInputReady: true,
       };
     },
     async openOnlineResume() {
@@ -1740,6 +1918,20 @@ function createProcessCustomerHarness({
     async getResumeModalState() {
       return { open: true, iframeCount: 1, scopeCount: 1, closeCount: 1 };
     },
+    async getCandidateDetailState() {
+      return {
+        open: false,
+        panelCount: 0,
+        closeCount: 0,
+        topPanelClass: "",
+        overlayClass: "",
+        contentClass: "",
+        panelRect: null,
+        overlayRect: null,
+        contentRect: null,
+        closeRect: null,
+      };
+    },
     async waitForCandidateActivated() {
       recorded.push("waitForCandidateActivated");
       return { matched: true };
@@ -1747,6 +1939,44 @@ function createProcessCustomerHarness({
     async activateCandidate() {
       recorded.push("activateCandidate");
       return { ok: true };
+    },
+    async setEditorMessage(message) {
+      recorded.push("setEditorMessage");
+      return { value: message, activeSubmit: true };
+    },
+    async sendMessage() {
+      recorded.push("sendMessage");
+      return { sent: true, method: "dom-submit", cleared: true, editorAfter: "" };
+    },
+    async clickAskResume() {
+      recorded.push("clickAskResume");
+      return { ok: true, alreadyRequested: false };
+    },
+    async clickConfirmRequestResume() {
+      recorded.push("clickConfirmRequestResume");
+      return {
+        ok: true,
+        confirmed: true,
+        requestedVerified: true,
+        assumedRequested: false,
+        uiState: { hasDisabledOperateAsk: true },
+      };
+    },
+    async getResumeRequestMessageState() {
+      recorded.push("getResumeRequestMessageState");
+      return { ok: true, count: 0, lastText: "", recent: [] };
+    },
+    async waitForResumeRequestMessage() {
+      recorded.push("waitForResumeRequestMessage");
+      return {
+        observed: true,
+        state: {
+          ok: true,
+          count: 1,
+          lastText: "简历请求已发送",
+          recent: ["简历请求已发送"],
+        },
+      };
     },
     ...pageOverrides,
   };
@@ -1779,7 +2009,7 @@ function createProcessCustomerHarness({
     resumeNetworkTracker: tracker || null,
     stateStore,
     reportStore: { async write() { return ""; } },
-    dryRun: true,
+    dryRun,
     artifactRootDir: os.tmpdir(),
     resumeOpenCooldownMs: 0,
     logger: { log() {} },
@@ -2130,6 +2360,261 @@ async function testBossChatAppShouldUseDomOnlyAfterHigherPriorityPathsFail() {
   assert.equal(recorded.includes("openOnlineResume"), true);
 }
 
+async function testBossChatAppShouldGateOutreachUntilPanelsClosed() {
+  let resumeModalOpen = true;
+  let detailOpen = true;
+  const { app, recorded } = createProcessCustomerHarness({
+    dryRun: false,
+    llmEvaluate: async () => ({
+      passed: true,
+      rawOutputText: '{"passed":true}',
+      evaluationMode: "image-multi-chunk",
+      imageCount: 1,
+      chunkIndex: 1,
+      chunkTotal: 1,
+    }),
+    captureResume: async ({ artifactDir }) => ({
+      metadataFile: path.join(artifactDir, "chunks.json"),
+      chunkDir: path.join(artifactDir, "chunks"),
+      chunkCount: 1,
+      modelImagePaths: [path.join(artifactDir, "chunks", "chunk_000.png")],
+      stitchedImage: "",
+      quality: { likelyBlank: false },
+    }),
+    pageOverrides: {
+      async closeResumeModalDomOnce() {
+        recorded.push("closeResumeModalDomOnce");
+        resumeModalOpen = false;
+        return {
+          closed: true,
+          method: "dom-close-once:.boss-popup__close",
+          finalState: { open: false, scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+        };
+      },
+      async getResumeModalState() {
+        return {
+          open: resumeModalOpen,
+          iframeCount: resumeModalOpen ? 1 : 0,
+          scopeCount: resumeModalOpen ? 1 : 0,
+          closeCount: resumeModalOpen ? 1 : 0,
+          topScopeClass: resumeModalOpen ? "resume-modal" : "",
+        };
+      },
+      async closeCandidateDetailDomOnce() {
+        recorded.push("closeCandidateDetailDomOnce");
+        detailOpen = false;
+        return {
+          closed: true,
+          method: "dom-close-once:.close-btn",
+          finalState: {
+            open: false,
+            panelCount: 0,
+            closeCount: 0,
+            topPanelClass: "",
+            overlayClass: "",
+            contentClass: "",
+          },
+        };
+      },
+      async getCandidateDetailState() {
+        return {
+          open: detailOpen,
+          panelCount: detailOpen ? 1 : 0,
+          closeCount: detailOpen ? 1 : 0,
+          topPanelClass: detailOpen ? "new-resume-online-main-ui" : "",
+          overlayClass: detailOpen ? "dialog-wrap active" : "",
+          contentClass: detailOpen ? "new-resume-online-main-ui resume-recommend resume-common-wrap" : "",
+          panelRect: detailOpen ? { left: 980, top: 0, width: 330, height: 760, right: 1310, bottom: 760 } : null,
+          overlayRect: detailOpen ? { left: 0, top: 0, width: 1440, height: 773, right: 1440, bottom: 773 } : null,
+          contentRect: detailOpen ? { left: 980, top: 0, width: 330, height: 760, right: 1310, bottom: 760 } : null,
+          closeRect: detailOpen ? { left: 1274, top: 12, width: 30, height: 30, right: 1304, bottom: 42 } : null,
+        };
+      },
+      async waitForConversationReady(options = {}) {
+        recorded.push(options.requirePanelsClosed ? "waitForConversationReady:strict" : "waitForConversationReady");
+        if (options.requirePanelsClosed && (resumeModalOpen || detailOpen)) {
+          throw new Error("CONVERSATION_PANEL_NOT_READY_OR_BLOCKED");
+        }
+        return {
+          hasOnlineResume: true,
+          hasAskResume: true,
+          hasAttachmentResume: false,
+          attachmentResumeEnabled: false,
+          resumeModalOpen,
+          candidateDetailOpen: detailOpen,
+          panelsClosed: !resumeModalOpen && !detailOpen,
+          editorVisible: true,
+          activeSubmit: true,
+          hasAnySubmit: true,
+          messageInputReady: true,
+        };
+      },
+    },
+  });
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-gated",
+      name: "候选人G",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "2001",
+      textSnippet: "",
+    },
+    { screeningCriteria: "有 AI 项目经验" },
+    "run-gated",
+    { skipCardClick: true },
+  );
+
+  const captureIndex = recorded.indexOf("captureResume");
+  const closeResumeIndex = recorded.findIndex((item, index) => index > captureIndex && item === "closeResumeModalDomOnce");
+  const closeDetailIndex = recorded.findIndex((item, index) => index > closeResumeIndex && item === "closeCandidateDetailDomOnce");
+  const strictReadyIndex = recorded.findIndex((item, index) => index > closeDetailIndex && item === "waitForConversationReady:strict");
+  const setEditorIndex = recorded.findIndex((item, index) => index > strictReadyIndex && item === "setEditorMessage");
+  const sendMessageIndex = recorded.findIndex((item, index) => index > setEditorIndex && item === "sendMessage");
+  const askResumeIndex = recorded.findIndex((item, index) => index > sendMessageIndex && item === "clickAskResume");
+
+  assert.equal(result.decision, "passed");
+  assert.equal(result.requested, true);
+  assert.equal(result.artifacts.preActionResumeClosed, true);
+  assert.equal(result.artifacts.preActionDetailClosed, true);
+  assert.equal(closeResumeIndex > captureIndex, true);
+  assert.equal(closeDetailIndex > closeResumeIndex, true);
+  assert.equal(strictReadyIndex > closeDetailIndex, true);
+  assert.equal(setEditorIndex > strictReadyIndex, true);
+  assert.equal(sendMessageIndex > setEditorIndex, true);
+  assert.equal(askResumeIndex > sendMessageIndex, true);
+}
+
+async function testBossChatAppShouldSkipOutreachWhenDetailStillOpenAfterRetry() {
+  let resumeModalOpen = true;
+  const { app, recorded } = createProcessCustomerHarness({
+    dryRun: false,
+    llmEvaluate: async () => ({
+      passed: true,
+      rawOutputText: '{"passed":true}',
+      evaluationMode: "image-multi-chunk",
+      imageCount: 1,
+      chunkIndex: 1,
+      chunkTotal: 1,
+    }),
+    captureResume: async ({ artifactDir }) => ({
+      metadataFile: path.join(artifactDir, "chunks.json"),
+      chunkDir: path.join(artifactDir, "chunks"),
+      chunkCount: 1,
+      modelImagePaths: [path.join(artifactDir, "chunks", "chunk_000.png")],
+      stitchedImage: "",
+      quality: { likelyBlank: false },
+    }),
+    pageOverrides: {
+      async closeResumeModalDomOnce() {
+        recorded.push("closeResumeModalDomOnce");
+        resumeModalOpen = false;
+        return {
+          closed: true,
+          method: "dom-close-once:.boss-popup__close",
+          finalState: { open: false, scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: "" },
+        };
+      },
+      async getResumeModalState() {
+        return {
+          open: resumeModalOpen,
+          iframeCount: resumeModalOpen ? 1 : 0,
+          scopeCount: resumeModalOpen ? 1 : 0,
+          closeCount: resumeModalOpen ? 1 : 0,
+          topScopeClass: resumeModalOpen ? "resume-modal" : "",
+        };
+      },
+      async closeCandidateDetailDomOnce() {
+        recorded.push("closeCandidateDetailDomOnce");
+        return {
+          closed: false,
+          method: "dom-close-miss:.close-btn",
+          finalState: {
+            open: true,
+            panelCount: 1,
+            closeCount: 1,
+            topPanelClass: "new-resume-online-main-ui",
+            overlayClass: "dialog-wrap active",
+            contentClass: "new-resume-online-main-ui resume-recommend resume-common-wrap",
+          },
+        };
+      },
+      async closeCandidateDetail() {
+        recorded.push("closeCandidateDetail");
+        return {
+          closed: false,
+          method: "selector:.close-btn+escape+outside-click:left-gap",
+          finalState: {
+            open: true,
+            panelCount: 1,
+            closeCount: 1,
+            topPanelClass: "new-resume-online-main-ui",
+            overlayClass: "dialog-wrap active",
+            contentClass: "new-resume-online-main-ui resume-recommend resume-common-wrap",
+          },
+        };
+      },
+      async getCandidateDetailState() {
+        return {
+          open: true,
+          panelCount: 1,
+          closeCount: 1,
+          topPanelClass: "new-resume-online-main-ui",
+          overlayClass: "dialog-wrap active",
+          contentClass: "new-resume-online-main-ui resume-recommend resume-common-wrap",
+          panelRect: { left: 980, top: 0, width: 330, height: 760, right: 1310, bottom: 760 },
+          overlayRect: { left: 0, top: 0, width: 1440, height: 773, right: 1440, bottom: 773 },
+          contentRect: { left: 980, top: 0, width: 330, height: 760, right: 1310, bottom: 760 },
+          closeRect: { left: 1274, top: 12, width: 30, height: 30, right: 1304, bottom: 42 },
+        };
+      },
+      async waitForConversationReady(options = {}) {
+        recorded.push(options.requirePanelsClosed ? "waitForConversationReady:strict" : "waitForConversationReady");
+        return {
+          hasOnlineResume: true,
+          hasAskResume: true,
+          hasAttachmentResume: false,
+          attachmentResumeEnabled: false,
+          resumeModalOpen: false,
+          candidateDetailOpen: true,
+          panelsClosed: false,
+          editorVisible: true,
+          activeSubmit: true,
+          hasAnySubmit: true,
+          messageInputReady: true,
+        };
+      },
+    },
+  });
+
+  const result = await app.processCustomer(
+    {
+      customerKey: "candidate-skip-outreach",
+      name: "候选人H",
+      sourceJob: "算法工程师",
+      domIndex: 0,
+      customerId: "2002",
+      textSnippet: "",
+    },
+    { screeningCriteria: "有 AI 项目经验" },
+    "run-skip-outreach",
+    { skipCardClick: true },
+  );
+
+  assert.equal(result.decision, "skipped");
+  assert.equal(result.passed, false);
+  assert.equal(result.artifacts.finalPassed, true);
+  assert.equal(result.artifacts.preActionResumeClosed, true);
+  assert.equal(result.artifacts.preActionDetailClosed, false);
+  assert.equal(result.artifacts.preActionCleanupRetried, true);
+  assert.equal(result.artifacts.preActionCleanupFailureReason.includes("candidate-detail-still-open"), true);
+  assert.equal(result.artifacts.finalDetailClosed, false);
+  assert.equal(recorded.includes("setEditorMessage"), false);
+  assert.equal(recorded.includes("sendMessage"), false);
+  assert.equal(recorded.includes("clickAskResume"), false);
+}
+
 async function testBossChatAppShouldPersistEvidenceArtifacts() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-artifacts-"));
   await mkdir(tempDir, { recursive: true });
@@ -2375,6 +2860,8 @@ async function main() {
   await testBossChatPageShouldTreatBlankChatShellAsOnChatPage();
   await testBossChatRecoverToChatIndexShouldForceNavigateAndWaitForCompleteLoad();
   await testBossChatPageShouldFallbackToEscapeWhenClosingCandidateDetail();
+  await testBossChatPageShouldWaitForPanelsClosedInStrictConversationReady();
+  await testBossChatPageShouldSurfaceCandidateDetailOverlayAndContentState();
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
   await testVendorBossChatCliShouldWaitForHydratedChatShell();
@@ -2399,6 +2886,8 @@ async function main() {
   await testBossChatAppShouldFallbackToImageAfterNetworkMiss();
   await testBossChatAppShouldRetryLateNetworkBeforeDomFallback();
   await testBossChatAppShouldUseDomOnlyAfterHigherPriorityPathsFail();
+  await testBossChatAppShouldGateOutreachUntilPanelsClosed();
+  await testBossChatAppShouldSkipOutreachWhenDetailStillOpenAfterRetry();
   await testBossChatAppShouldPersistEvidenceArtifacts();
   await testBossChatReportStoreShouldWriteReadableMarkdownAndCsv();
   console.log("boss-chat tests passed");

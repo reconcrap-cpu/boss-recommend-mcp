@@ -58,6 +58,24 @@ const DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS = 1200;
 const DEFAULT_TEXT_MODEL_MAX_CHUNKS = 12;
 const DEFAULT_LLM_TIMEOUT_MS = 60000;
 const DEFAULT_LLM_MAX_RETRIES = 3;
+const LONG_RESUME_AGGREGATE_LIMITS_STANDARD = {
+  summaryMaxLength: 180,
+  evidenceMaxItems: 3,
+  blockerMaxItems: 3,
+  uncertaintyMaxItems: 2,
+  quoteMaxItems: 2,
+  itemMaxLength: 160,
+  quoteMaxLength: 120
+};
+const LONG_RESUME_AGGREGATE_LIMITS_COMPACT = {
+  summaryMaxLength: 120,
+  evidenceMaxItems: 2,
+  blockerMaxItems: 2,
+  uncertaintyMaxItems: 1,
+  quoteMaxItems: 1,
+  itemMaxLength: 96,
+  quoteMaxLength: 80
+};
 const MAX_EVIDENCE_TOKENS = 12;
 let visionSharpFactory = null;
 const PAGE_SCOPE_TAB_STATUS = {
@@ -477,6 +495,21 @@ function toStringArray(value, maxItems = 8) {
   return normalized;
 }
 
+function dedupeNormalizedList(value, maxItems = 8, maxLength = 160) {
+  const source = Array.isArray(value) ? value : [];
+  const normalized = [];
+  const seen = new Set();
+  for (const item of source) {
+    const text = truncateText(item, maxLength);
+    const key = toLowerSafe(text);
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(text);
+    if (normalized.length >= maxItems) break;
+  }
+  return normalized;
+}
+
 function toLowerSafe(text) {
   return String(text || "").toLowerCase();
 }
@@ -543,6 +576,162 @@ function truncateText(value, maxLength = 96) {
   const text = normalizeText(value);
   if (text.length <= maxLength) return text;
   return `${text.slice(0, Math.max(12, maxLength - 1))}…`;
+}
+
+function filterEvidenceListAgainstText(value, sourceText, maxItems = 8, maxLength = 160) {
+  const rawSource = String(sourceText || "");
+  const normalizedSource = normalizeText(rawSource);
+  const normalizedSourceLower = toLowerSafe(normalizedSource);
+  const result = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value) ? value : []) {
+    const text = truncateText(item, maxLength);
+    if (!text) continue;
+    const match = matchEvidenceAgainstResume(text, rawSource, normalizedSource, normalizedSourceLower);
+    if (!match.matched) continue;
+    const key = toLowerSafe(text);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function filterQuotedSpansAgainstText(value, sourceText, maxItems = 6, maxLength = 120) {
+  const rawSource = String(sourceText || "");
+  const normalizedSource = normalizeText(rawSource);
+  const result = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value) ? value : []) {
+    const text = truncateText(item, maxLength);
+    if (!text) continue;
+    const normalized = normalizeText(text);
+    if (!normalized) continue;
+    const matched = rawSource.includes(text) || normalizedSource.includes(normalized);
+    if (!matched) continue;
+    const key = toLowerSafe(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function buildCandidateProfileFallback(candidateProfile = {}, compact = false) {
+  if (!candidateProfile || typeof candidateProfile !== "object" || Array.isArray(candidateProfile)) {
+    return null;
+  }
+  const maxLength = compact ? 80 : 120;
+  const normalized = {};
+  for (const [key, value] of Object.entries({
+    name: candidateProfile.name,
+    school: candidateProfile.school,
+    major: candidateProfile.major,
+    company: candidateProfile.company,
+    position: candidateProfile.position
+  })) {
+    const text = truncateText(value, maxLength);
+    if (text) normalized[key] = text;
+  }
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function normalizeChunkAnalysisResult(parsed, resumeText, options = {}) {
+  const rawResumeText = String(resumeText || "");
+  const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
+  const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
+  const chunkPassed = parsePassedDecision(parsed?.chunk_passed);
+  const fallbackPassed = chunkPassed !== null ? chunkPassed : parsePassedDecision(parsed?.passed);
+  if (fallbackPassed === null) {
+    throw new Error("Text chunk analysis response missing boolean chunk_passed decision.");
+  }
+  const hardEvidence = filterEvidenceListAgainstText(parsed?.hard_evidence, rawResumeText, 4, 180);
+  const softEvidence = filterEvidenceListAgainstText(parsed?.soft_evidence, rawResumeText, 3, 180);
+  const hardBlockers = filterEvidenceListAgainstText(parsed?.hard_blockers, rawResumeText, 3, 180);
+  const quotedSpans = filterQuotedSpansAgainstText(parsed?.quoted_spans, rawResumeText, 4, 140);
+  const missingOrUncertain = dedupeNormalizedList(parsed?.missing_or_uncertain, 3, 140);
+  const chunkSummary = truncateText(
+    parsed?.chunk_summary
+      || parsed?.summary
+      || (fallbackPassed ? "当前分段命中筛选条件相关证据。" : "当前分段未发现充分证据。"),
+    220
+  );
+  return {
+    chunk_passed: fallbackPassed,
+    chunk_summary: chunkSummary,
+    hard_evidence: hardEvidence,
+    soft_evidence: softEvidence,
+    hard_blockers: hardBlockers,
+    missing_or_uncertain: missingOrUncertain,
+    quoted_spans: quotedSpans,
+    chunk_index: chunkIndex,
+    chunk_total: chunkTotal
+  };
+}
+
+function buildLongResumeAggregateInput(chunkAnalyses = [], candidateProfile = null, options = {}) {
+  const compact = options?.compact === true;
+  const limits = compact ? LONG_RESUME_AGGREGATE_LIMITS_COMPACT : LONG_RESUME_AGGREGATE_LIMITS_STANDARD;
+  const seenByBucket = {
+    hard_evidence: new Set(),
+    soft_evidence: new Set(),
+    hard_blockers: new Set(),
+    missing_or_uncertain: new Set(),
+    quoted_spans: new Set()
+  };
+  const normalizedChunks = (Array.isArray(chunkAnalyses) ? chunkAnalyses : [])
+    .filter((item) => item && typeof item === "object")
+    .map((item, index) => ({
+      chunk_passed: item.chunk_passed === true,
+      chunk_summary: truncateText(
+        item.chunk_summary || (item.chunk_passed ? "当前分段命中相关证据。" : "当前分段证据不足。"),
+        limits.summaryMaxLength
+      ),
+      hard_evidence: dedupeNormalizedList(item.hard_evidence, limits.evidenceMaxItems * 2, limits.itemMaxLength),
+      soft_evidence: dedupeNormalizedList(item.soft_evidence, limits.evidenceMaxItems * 2, limits.itemMaxLength),
+      hard_blockers: dedupeNormalizedList(item.hard_blockers, limits.blockerMaxItems * 2, limits.itemMaxLength),
+      missing_or_uncertain: dedupeNormalizedList(item.missing_or_uncertain, limits.uncertaintyMaxItems * 2, limits.itemMaxLength),
+      quoted_spans: dedupeNormalizedList(item.quoted_spans, limits.quoteMaxItems * 2, limits.quoteMaxLength),
+      chunk_index: Number.isFinite(Number(item.chunk_index)) ? Number(item.chunk_index) : index + 1,
+      chunk_total: Number.isFinite(Number(item.chunk_total)) ? Number(item.chunk_total) : null
+    }))
+    .sort((left, right) => left.chunk_index - right.chunk_index)
+    .map((item) => {
+      const chunk = {
+        chunk_index: item.chunk_index,
+        chunk_total: item.chunk_total,
+        chunk_passed: item.chunk_passed,
+        chunk_summary: item.chunk_summary
+      };
+      for (const [field, maxItems] of [
+        ["hard_evidence", limits.evidenceMaxItems],
+        ["soft_evidence", limits.evidenceMaxItems],
+        ["hard_blockers", limits.blockerMaxItems],
+        ["missing_or_uncertain", limits.uncertaintyMaxItems],
+        ["quoted_spans", limits.quoteMaxItems]
+      ]) {
+        const bucket = [];
+        for (const entry of item[field]) {
+          const key = toLowerSafe(entry);
+          if (!entry || seenByBucket[field].has(key)) continue;
+          seenByBucket[field].add(key);
+          bucket.push(entry);
+          if (bucket.length >= maxItems) break;
+        }
+        if (bucket.length > 0) {
+          chunk[field] = bucket;
+        }
+      }
+      return chunk;
+    });
+  return {
+    compression_mode: compact ? "compact" : "standard",
+    chunk_count: normalizedChunks.length,
+    candidate_profile: buildCandidateProfileFallback(candidateProfile, compact),
+    chunks: normalizedChunks
+  };
 }
 
 function isMaskedName(value) {
@@ -3429,7 +3618,10 @@ class RecommendScreenCli {
         geekId: item?.geekId || "",
         summary: item?.summary || "",
         imagePath: item?.imagePath || "",
-        resumeSource: item?.resumeSource || ""
+        resumeSource: item?.resumeSource || "",
+        decisionMode: item?.decisionMode || "",
+        chunkCount: Number.isFinite(Number(item?.chunkCount)) ? Number(item.chunkCount) : null,
+        aggregateRetryUsed: item?.aggregateRetryUsed === true
       })),
       candidate_audits: this.candidateAudits.map((item) => ({
         ts: item?.ts || null,
@@ -3452,6 +3644,9 @@ class RecommendScreenCli {
         action_taken: item?.action_taken || "",
         error_code: item?.error_code || "",
         error_message: item?.error_message || "",
+        decision_mode: item?.decision_mode || "",
+        chunk_count: Number.isFinite(Number(item?.chunk_count)) ? Number(item.chunk_count) : null,
+        aggregate_retry_used: item?.aggregate_retry_used === true,
         chunk_index: Number.isFinite(Number(item?.chunk_index)) ? Number(item.chunk_index) : null,
         chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null,
         timing_ms: sanitizeTimingBreakdown(item?.timing_ms)
@@ -3620,6 +3815,9 @@ class RecommendScreenCli {
       action_taken: normalizeText(entry?.action_taken || "") || "",
       error_code: normalizeText(entry?.error_code || "") || "",
       error_message: normalizeText(entry?.error_message || "") || "",
+      decision_mode: normalizeText(entry?.decision_mode || "") || "",
+      chunk_count: Number.isFinite(Number(entry?.chunk_count)) ? Number(entry.chunk_count) : null,
+      aggregate_retry_used: entry?.aggregate_retry_used === true,
       chunk_index: Number.isFinite(Number(entry?.chunk_index)) ? Number(entry.chunk_index) : null,
       chunk_total: Number.isFinite(Number(entry?.chunk_total)) ? Number(entry.chunk_total) : null,
       timing_ms: sanitizeTimingBreakdown(entry?.timing_ms)
@@ -4211,7 +4409,10 @@ class RecommendScreenCli {
           geekId: item?.geekId || "",
           summary: item?.summary || "",
           imagePath: item?.imagePath || "",
-          resumeSource: item?.resumeSource || ""
+          resumeSource: item?.resumeSource || "",
+          decisionMode: normalizeText(item?.decisionMode || "") || "",
+          chunkCount: Number.isFinite(Number(item?.chunkCount)) ? Number(item.chunkCount) : null,
+          aggregateRetryUsed: item?.aggregateRetryUsed === true
         }))
       : [];
     this.candidateAudits = Array.isArray(parsed.candidate_audits)
@@ -4236,6 +4437,9 @@ class RecommendScreenCli {
           action_taken: normalizeText(item?.action_taken || "") || "",
           error_code: normalizeText(item?.error_code || "") || "",
           error_message: normalizeText(item?.error_message || "") || "",
+          decision_mode: normalizeText(item?.decision_mode || "") || "",
+          chunk_count: Number.isFinite(Number(item?.chunk_count)) ? Number(item.chunk_count) : null,
+          aggregate_retry_used: item?.aggregate_retry_used === true,
           chunk_index: Number.isFinite(Number(item?.chunk_index)) ? Number(item.chunk_index) : null,
           chunk_total: Number.isFinite(Number(item?.chunk_total)) ? Number(item.chunk_total) : null,
           timing_ms: sanitizeTimingBreakdown(item?.timing_ms)
@@ -5020,7 +5224,10 @@ class RecommendScreenCli {
       evidence: parsedEvidence,
       evidenceRawCount,
       evidenceMatchedCount,
-      evidenceGateDemoted: false
+      evidenceGateDemoted: false,
+      decisionMode: "vision",
+      chunkCount: null,
+      aggregateRetryUsed: false
     };
   }
 
@@ -5326,13 +5533,13 @@ class RecommendScreenCli {
     };
   }
 
-  async callTextModel(resumeText) {
+  async callTextModel(resumeText, options = {}) {
     const fullResumeText = String(resumeText || "");
     if (!normalizeText(fullResumeText)) {
       throw this.buildError("TEXT_MODEL_FAILED", "Resume text is empty.");
     }
     try {
-      return await this.requestTextModel(fullResumeText, {
+      return await this.requestTextModelDecision(fullResumeText, {
         chunkIndex: 1,
         chunkTotal: 1
       });
@@ -5340,7 +5547,7 @@ class RecommendScreenCli {
       if (!isTextContextLimitMessage(error?.message || "")) {
         throw error;
       }
-      log("[TEXT_MODEL] 检测到上下文长度限制，启用分段筛选模式。");
+      log("[TEXT_MODEL] 检测到上下文长度限制，启用长简历两阶段汇总模式。");
     }
 
     const chunkSize = parsePositiveInteger(process.env.BOSS_RECOMMEND_TEXT_CHUNK_SIZE_CHARS) || DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS;
@@ -5351,55 +5558,40 @@ class RecommendScreenCli {
       throw this.buildError("TEXT_MODEL_FAILED", "Resume text is empty after chunk split.");
     }
 
-    const chunkResults = [];
+    const chunkAnalyses = [];
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index];
-      const result = await this.requestTextModel(chunk.text, {
+      const analysis = await this.requestTextChunkAnalysis(chunk.text, {
         chunkIndex: index + 1,
         chunkTotal: chunks.length
       });
-      chunkResults.push(result);
+      chunkAnalyses.push(analysis);
     }
 
-    const passedChunks = chunkResults.filter((item) => item?.passed === true);
-    if (passedChunks.length > 0) {
-      const best = passedChunks[0];
-      return {
-        passed: true,
-        rawPassed: best?.rawPassed === true || best?.passed === true,
-        reason: best.reason || `分段筛选命中（${best.chunkIndex}/${chunks.length}）。`,
-        summary: best.summary || best.reason || "分段筛选命中",
-        evidence: Array.isArray(best.evidence) ? best.evidence : [],
-        evidenceRawCount: Number.isFinite(Number(best?.evidenceRawCount)) ? Number(best.evidenceRawCount) : null,
-        evidenceMatchedCount: Number.isFinite(Number(best?.evidenceMatchedCount)) ? Number(best.evidenceMatchedCount) : null,
-        evidenceGateDemoted: best?.evidenceGateDemoted === true,
-        chunkIndex: best?.chunkIndex || null,
-        chunkTotal: best?.chunkTotal || chunks.length
-      };
+    let aggregateInput = buildLongResumeAggregateInput(chunkAnalyses, options?.candidateProfile || null);
+    try {
+      return await this.requestLongResumeAggregateDecision(this.args.criteria, aggregateInput, {
+        aggregateRetryUsed: false
+      });
+    } catch (error) {
+      if (!isTextContextLimitMessage(error?.message || "")) {
+        throw error;
+      }
+      log("[TEXT_MODEL] 长简历聚合输入再次触发上下文限制，压缩证据后重试一次。");
     }
 
-    const firstReason = chunkResults.map((item) => normalizeText(item?.reason)).find(Boolean);
-    return {
-      passed: false,
-      rawPassed: chunkResults.some((item) => item?.rawPassed === true),
-      reason: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
-      summary: firstReason || `分段筛选未找到满足标准的证据（共 ${chunks.length} 段）。`,
-      evidence: [],
-      evidenceRawCount: chunkResults.reduce((acc, item) => acc + (Number.isFinite(Number(item?.evidenceRawCount)) ? Number(item.evidenceRawCount) : 0), 0),
-      evidenceMatchedCount: chunkResults.reduce((acc, item) => acc + (Number.isFinite(Number(item?.evidenceMatchedCount)) ? Number(item.evidenceMatchedCount) : 0), 0),
-      evidenceGateDemoted: chunkResults.some((item) => item?.evidenceGateDemoted === true),
-      chunkIndex: null,
-      chunkTotal: chunks.length
-    };
+    aggregateInput = buildLongResumeAggregateInput(chunkAnalyses, options?.candidateProfile || null, {
+      compact: true
+    });
+    return await this.requestLongResumeAggregateDecision(this.args.criteria, aggregateInput, {
+      aggregateRetryUsed: true
+    });
   }
 
-  async requestTextModel(resumeText, options = {}) {
+  async requestTextModelDecision(resumeText, options = {}) {
     const safeResumeText = String(resumeText || "");
     const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
     const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
-    const chunkHint = chunkTotal > 1
-      ? `\n\n当前输入是简历分段 ${chunkIndex}/${chunkTotal}。请严格基于本分段文本判断；如果本分段证据不足，必须返回 passed=false。`
-      : "";
     const rawBaseUrl = this.args.baseUrl;
     log(`[callTextModel] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
     const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
@@ -5417,7 +5609,7 @@ class RecommendScreenCli {
           role: "user",
           content:
             `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${this.args.criteria}\n\n` +
-            `简历内容:\n${safeResumeText}${chunkHint}\n\n` +
+            `简历内容:\n${safeResumeText}\n\n` +
             "要求：\n" +
             "1) 必须完整阅读上面的全部简历文本。\n" +
             "2) 只能依据简历中真实出现的信息判断，严禁编造不存在的经历/项目/学历/公司。\n" +
@@ -5494,8 +5686,183 @@ class RecommendScreenCli {
       evidenceRawCount: parsedEvidence.length,
       evidenceMatchedCount: evidence.length,
       evidenceGateDemoted: false,
+      decisionMode: "full_text",
+      chunkCount: chunkTotal,
+      aggregateRetryUsed: false,
       chunkIndex,
       chunkTotal
+    };
+  }
+
+  async requestTextChunkAnalysis(resumeText, options = {}) {
+    const safeResumeText = String(resumeText || "");
+    const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
+    const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
+    const rawBaseUrl = this.args.baseUrl;
+    log(`[requestTextChunkAnalysis] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
+    const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
+    const payload = {
+      model: this.args.model,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是一位严谨的招聘筛选助手。你的任务是对长简历的单个文本分段抽取结构化证据。" +
+            "必须严格基于当前分段文本，不得假设其他分段存在额外证据。只能返回 JSON。"
+        },
+        {
+          role: "user",
+          content:
+            `请分析候选人长简历的当前文本分段，并为后续整份简历综合判断提取结构化证据。\n\n` +
+            `筛选标准:\n${this.args.criteria}\n\n` +
+            `当前分段: ${chunkIndex}/${chunkTotal}\n\n` +
+            `分段文本:\n${safeResumeText}\n\n` +
+            "要求：\n" +
+            "1) 只能依据当前分段文本提取证据，不能臆造其他分段的信息。\n" +
+            "2) hard_evidence / soft_evidence / hard_blockers / quoted_spans 中的每一项都必须来自当前分段原文。\n" +
+            "3) 若当前分段单独不足以支持通过，chunk_passed 必须为 false。\n" +
+            "4) quoted_spans 应尽量是当前分段中的短原文摘录。\n" +
+            "5) missing_or_uncertain 用于记录当前还缺失或无法判断的信息。\n\n" +
+            "请返回严格 JSON: " +
+            "{\"chunk_passed\": true/false, \"chunk_summary\": \"\", \"hard_evidence\": [], \"soft_evidence\": [], \"hard_blockers\": [], \"missing_or_uncertain\": [], \"quoted_spans\": [], \"chunk_index\": 1, \"chunk_total\": 1}"
+        }
+      ]
+    };
+    applyChatCompletionThinking(payload, {
+      baseUrl,
+      model: this.args.model,
+      thinkingLevel: this.args.thinkingLevel
+    });
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.args.apiKey}`
+    };
+    if (this.args.openaiOrganization) headers["OpenAI-Organization"] = this.args.openaiOrganization;
+    if (this.args.openaiProject) headers["OpenAI-Project"] = this.args.openaiProject;
+
+    const response = await this.fetchWithLlmRetries("TEXT_MODEL_FAILED", `${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw this.buildError("TEXT_MODEL_FAILED", `Text chunk analysis request failed: ${response.status} ${body.slice(0, 400)}`);
+    }
+    const json = await response.json();
+    const choice = json?.choices?.[0] || {};
+    const content = flattenChatMessageContent(choice?.message?.content);
+    const parsed = tryExtractJsonObject(content);
+    try {
+      return normalizeChunkAnalysisResult(parsed, safeResumeText, {
+        chunkIndex,
+        chunkTotal
+      });
+    } catch (error) {
+      throw this.buildError(
+        "TEXT_MODEL_FAILED",
+        `Text chunk analysis response invalid. content=${truncateText(content, 180)} error=${normalizeText(error?.message || error)}`
+      );
+    }
+  }
+
+  async requestLongResumeAggregateDecision(criteria, aggregateInput, options = {}) {
+    const normalizedCriteria = normalizeText(criteria || this.args.criteria);
+    const chunkCount = Number.isFinite(Number(aggregateInput?.chunk_count))
+      ? Number(aggregateInput.chunk_count)
+      : (Array.isArray(aggregateInput?.chunks) ? aggregateInput.chunks.length : 0);
+    if (!normalizedCriteria) {
+      throw this.buildError("TEXT_MODEL_FAILED", "Long resume aggregate decision missing criteria.");
+    }
+    if (!Array.isArray(aggregateInput?.chunks) || aggregateInput.chunks.length <= 0) {
+      throw this.buildError("TEXT_MODEL_FAILED", "Long resume aggregate decision missing chunk analyses.");
+    }
+    const rawBaseUrl = this.args.baseUrl;
+    log(`[requestLongResumeAggregateDecision] baseUrl 原始值类型=${typeof rawBaseUrl}, 长度=${rawBaseUrl != null ? String(rawBaseUrl).length : "null/undefined"}, JSON编码=${JSON.stringify(rawBaseUrl)}`);
+    const baseUrl = String(rawBaseUrl || "").replace(/\/$/, "");
+    const payload = {
+      model: this.args.model,
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是一位严谨的招聘筛选助手。你的任务是基于多个简历分段的结构化证据做整份长简历的最终综合判断。" +
+            "必须综合全部分段后再判断，允许跨分段拼接教育、项目、工作经历证据。只能返回 JSON。"
+        },
+        {
+          role: "user",
+          content:
+            `请基于以下长简历分段分析结果，判断候选人是否最终通过筛选。\n\n` +
+            `筛选标准:\n${normalizedCriteria}\n\n` +
+            "要求：\n" +
+            "1) 必须综合全部 chunk 的信息后再给出最终判断。\n" +
+            "2) 允许跨 chunk 拼接证据；如果单个 chunk 不足，但合并后成立，可以判定通过。\n" +
+            "3) 如果结构化证据仍不足以支撑结论，必须返回 passed=false。\n" +
+            "4) evidence 中每条证据都必须能在输入的结构化证据里找到依据。\n\n" +
+            `长简历结构化输入:\n${JSON.stringify(aggregateInput, null, 2)}\n\n` +
+            "请返回严格 JSON: " +
+            "{\"passed\": true/false, \"reason\": \"\", \"summary\": \"\", \"evidence\": []}"
+        }
+      ]
+    };
+    applyChatCompletionThinking(payload, {
+      baseUrl,
+      model: this.args.model,
+      thinkingLevel: this.args.thinkingLevel
+    });
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.args.apiKey}`
+    };
+    if (this.args.openaiOrganization) headers["OpenAI-Organization"] = this.args.openaiOrganization;
+    if (this.args.openaiProject) headers["OpenAI-Project"] = this.args.openaiProject;
+
+    const response = await this.fetchWithLlmRetries("TEXT_MODEL_FAILED", `${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw this.buildError("TEXT_MODEL_FAILED", `Long resume aggregate request failed: ${response.status} ${body.slice(0, 400)}`);
+    }
+    const json = await response.json();
+    const choice = json?.choices?.[0] || {};
+    const content = flattenChatMessageContent(choice?.message?.content);
+    const parsed = tryExtractJsonObject(content);
+    const parsedPassed = parsePassedDecision(parsed?.passed);
+    const fallbackPassed = parsePassedDecisionFromContent(content);
+    const rawPassed = parsedPassed !== null ? parsedPassed : fallbackPassed;
+    if (rawPassed === null) {
+      throw this.buildError(
+        "TEXT_MODEL_FAILED",
+        `Long resume aggregate response missing boolean passed decision. content=${truncateText(content, 180)}`
+      );
+    }
+    const aggregateSourceText = JSON.stringify(aggregateInput);
+    const parsedEvidence = toStringArray(parsed?.evidence);
+    const evidence = filterEvidenceListAgainstText(parsedEvidence, aggregateSourceText, 8, 160);
+    const reason = normalizeText(parsed?.reason || parsed?.summary || "") || (rawPassed
+      ? "综合全部分段后，模型判定候选人符合筛选标准。"
+      : "综合全部分段后，模型判定候选人不符合筛选标准。");
+    const summary = normalizeText(parsed?.summary || reason) || reason;
+    return {
+      passed: rawPassed,
+      rawPassed,
+      cot: reason,
+      reason,
+      summary,
+      evidence,
+      evidenceRawCount: parsedEvidence.length,
+      evidenceMatchedCount: evidence.length,
+      evidenceGateDemoted: false,
+      decisionMode: "text_chunk_aggregate",
+      chunkCount,
+      aggregateRetryUsed: options?.aggregateRetryUsed === true,
+      chunkIndex: null,
+      chunkTotal: chunkCount
     };
   }
 
@@ -5804,6 +6171,9 @@ class RecommendScreenCli {
           evidence_raw_count: null,
           evidence_matched_count: null,
           evidence_gate_demoted: false,
+          decision_mode: item?.decisionMode || "",
+          chunk_count: Number.isFinite(Number(item?.chunkCount)) ? Number(item.chunkCount) : null,
+          aggregate_retry_used: item?.aggregateRetryUsed === true,
           error_code: "",
           error_message: ""
         }));
@@ -6074,13 +6444,6 @@ class RecommendScreenCli {
 
           if (networkCandidateInfo?.resumeText) {
             networkCandidateInfo = enrichCandidateInfoWithCardProfile(networkCandidateInfo, cardProfile || null);
-            screening = await timeCandidateStage(
-              "text_model_ms",
-              () => this.callTextModel(networkCandidateInfo.resumeText)
-            );
-            resumeSource = "network";
-            resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
-            this.resumeSourceStats.network += 1;
             candidateProfile = mergeCandidateProfiles(
               networkCandidateInfo || null,
               cardProfile || null,
@@ -6092,6 +6455,13 @@ class RecommendScreenCli {
                 position: nextCandidate.last_position || ""
               }
             );
+            screening = await timeCandidateStage(
+              "text_model_ms",
+              () => this.callTextModel(networkCandidateInfo.resumeText, { candidateProfile })
+            );
+            resumeSource = "network";
+            resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
+            this.resumeSourceStats.network += 1;
           } else {
             try {
               resumeSource = "image_fallback";
@@ -6117,13 +6487,6 @@ class RecommendScreenCli {
                   lateNetworkCandidateInfo,
                   cardProfile || null
                 );
-                screening = await timeCandidateStage(
-                  "text_model_ms",
-                  () => this.callTextModel(networkCandidateInfo.resumeText)
-                );
-                resumeSource = "network";
-                resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
-                this.resumeSourceStats.network += 1;
                 candidateProfile = mergeCandidateProfiles(
                   networkCandidateInfo || null,
                   cardProfile || null,
@@ -6135,6 +6498,13 @@ class RecommendScreenCli {
                     position: nextCandidate.last_position || ""
                   }
                 );
+                screening = await timeCandidateStage(
+                  "text_model_ms",
+                  () => this.callTextModel(networkCandidateInfo.resumeText, { candidateProfile })
+                );
+                resumeSource = "network";
+                resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
+                this.resumeSourceStats.network += 1;
               } else {
                 const domFallback = await timeCandidateStage(
                   "dom_fallback_ms",
@@ -6145,13 +6515,6 @@ class RecommendScreenCli {
                     domFallback.networkCandidateInfo,
                     cardProfile || null
                   );
-                  screening = await timeCandidateStage(
-                    "text_model_ms",
-                    () => this.callTextModel(networkCandidateInfo.resumeText)
-                  );
-                  resumeSource = "network";
-                  resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
-                  this.resumeSourceStats.network += 1;
                   candidateProfile = mergeCandidateProfiles(
                     networkCandidateInfo || null,
                     cardProfile || null,
@@ -6163,18 +6526,18 @@ class RecommendScreenCli {
                       position: nextCandidate.last_position || ""
                     }
                   );
+                  screening = await timeCandidateStage(
+                    "text_model_ms",
+                    () => this.callTextModel(networkCandidateInfo.resumeText, { candidateProfile })
+                  );
+                  resumeSource = "network";
+                  resumeTextLength = normalizeText(networkCandidateInfo.resumeText).length;
+                  this.resumeSourceStats.network += 1;
                 } else if (domFallback?.domCandidateInfo?.resumeText) {
                   domCandidateInfo = enrichCandidateInfoWithCardProfile(
                     domFallback.domCandidateInfo,
                     cardProfile || null
                   );
-                  screening = await timeCandidateStage(
-                    "text_model_ms",
-                    () => this.callTextModel(domCandidateInfo.resumeText)
-                  );
-                  resumeSource = "dom_fallback";
-                  resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
-                  this.resumeSourceStats.dom_fallback += 1;
                   candidateProfile = mergeCandidateProfiles(
                     domCandidateInfo || null,
                     cardProfile || null,
@@ -6186,6 +6549,13 @@ class RecommendScreenCli {
                       position: nextCandidate.last_position || ""
                     }
                   );
+                  screening = await timeCandidateStage(
+                    "text_model_ms",
+                    () => this.callTextModel(domCandidateInfo.resumeText, { candidateProfile })
+                  );
+                  resumeSource = "dom_fallback";
+                  resumeTextLength = normalizeText(domCandidateInfo.resumeText).length;
+                  this.resumeSourceStats.dom_fallback += 1;
                 } else {
                   throw imageFallbackError;
                 }
@@ -6251,7 +6621,10 @@ class RecommendScreenCli {
               geekId: nextCandidate.geek_id,
               summary: screening.summary,
               imagePath: capture?.stitchedImage || capture?.modelImagePaths?.[0] || capture?.chunkFiles?.[0] || "",
-              resumeSource
+              resumeSource,
+              decisionMode: screening?.decisionMode || "",
+              chunkCount: Number.isFinite(Number(screening?.chunkCount)) ? Number(screening.chunkCount) : null,
+              aggregateRetryUsed: screening?.aggregateRetryUsed === true
             });
             this.recordCandidateAudit({
               candidate_key: nextCandidate.key || nextCandidate.geek_id || "",
@@ -6275,6 +6648,9 @@ class RecommendScreenCli {
               evidence_gate_demoted: screening?.evidenceGateDemoted === true,
               screening_reason: screeningReason,
               action_taken: actionResult.actionTaken || "none",
+              decision_mode: screening?.decisionMode || "",
+              chunk_count: Number.isFinite(Number(screening?.chunkCount)) ? Number(screening.chunkCount) : null,
+              aggregate_retry_used: screening?.aggregateRetryUsed === true,
               chunk_index: Number.isFinite(Number(screening?.chunkIndex)) ? Number(screening.chunkIndex) : null,
               chunk_total: Number.isFinite(Number(screening?.chunkTotal)) ? Number(screening.chunkTotal) : null
             });
@@ -6301,6 +6677,9 @@ class RecommendScreenCli {
                 : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
               evidence_gate_demoted: screening?.evidenceGateDemoted === true,
               screening_reason: normalizeText(screening?.reason || screening?.summary || "模型判定不通过"),
+              decision_mode: screening?.decisionMode || "",
+              chunk_count: Number.isFinite(Number(screening?.chunkCount)) ? Number(screening.chunkCount) : null,
+              aggregate_retry_used: screening?.aggregateRetryUsed === true,
               chunk_index: Number.isFinite(Number(screening?.chunkIndex)) ? Number(screening.chunkIndex) : null,
               chunk_total: Number.isFinite(Number(screening?.chunkTotal)) ? Number(screening.chunkTotal) : null
             });
@@ -6328,6 +6707,9 @@ class RecommendScreenCli {
               : (Array.isArray(screening?.evidence) ? screening.evidence.length : null),
             evidence_gate_demoted: screening?.evidenceGateDemoted === true,
             screening_reason: normalizeText(screening?.reason || screening?.summary || ""),
+            decision_mode: screening?.decisionMode || "",
+            chunk_count: Number.isFinite(Number(screening?.chunkCount)) ? Number(screening.chunkCount) : null,
+            aggregate_retry_used: screening?.aggregateRetryUsed === true,
             error_code: error?.code || "CANDIDATE_PROCESS_FAILED",
             error_message: normalizeText(error?.message || error)
           });
@@ -6532,6 +6914,12 @@ if (require.main === module) {
       formatResumeApiData,
       buildCardProfileFallbackText,
       enrichCandidateInfoWithCardProfile,
+      splitTextByChunks,
+      buildLongResumeAggregateInput,
+      normalizeChunkAnalysisResult,
+      dedupeNormalizedList,
+      filterEvidenceListAgainstText,
+      filterQuotedSpansAgainstText,
       extractEvidenceTokens,
       matchEvidenceAgainstResume
     }

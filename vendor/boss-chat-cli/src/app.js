@@ -577,6 +577,145 @@ export class BossChatApp {
     return { resume, detail };
   }
 
+  isResumeModalVisible(state = {}) {
+    return (
+      Boolean(state?.open) ||
+      Number(state?.iframeCount || 0) > 0 ||
+      Number(state?.scopeCount || 0) > 0
+    );
+  }
+
+  isCandidateDetailVisible(state = {}) {
+    return (
+      Boolean(state?.open) ||
+      Number(state?.panelCount || 0) > 0 ||
+      Number(state?.closeCount || 0) > 0
+    );
+  }
+
+  async ensurePanelsClosedBeforeOutreach({ initialResumeCloseResult = null } = {}) {
+    const runResumeLightClose = async () => {
+      if (initialResumeCloseResult) {
+        return initialResumeCloseResult;
+      }
+      if (typeof this.page.closeResumeModalDomOnce === 'function') {
+        return this.page.closeResumeModalDomOnce();
+      }
+      if (typeof this.page.closeResumeModal === 'function') {
+        return this.page.closeResumeModal({ maxAttempts: 6, ensureDismiss: true });
+      }
+      return {
+        closed: true,
+        method: 'unsupported',
+        finalState: { open: false, scopeCount: 0, iframeCount: 0, closeCount: 0, topScopeClass: '' },
+      };
+    };
+    const runDetailLightClose = async () => {
+      if (typeof this.page.closeCandidateDetailDomOnce === 'function') {
+        return this.page.closeCandidateDetailDomOnce();
+      }
+      if (typeof this.page.closeCandidateDetail === 'function') {
+        return this.page.closeCandidateDetail({ maxAttempts: 1, ensureDismiss: false });
+      }
+      return {
+        closed: true,
+        method: 'unsupported',
+        finalState: {
+          open: false,
+          panelCount: 0,
+          closeCount: 0,
+          topPanelClass: '',
+          overlayClass: '',
+          contentClass: '',
+        },
+      };
+    };
+    const methodParts = [];
+    let retried = false;
+    let readyState = null;
+
+    let resumeResult = await runResumeLightClose();
+    let detailResult = await runDetailLightClose();
+    methodParts.push(`resume:${resumeResult?.method || 'unknown'}`);
+    methodParts.push(`detail:${detailResult?.method || 'unknown'}`);
+    this.logger.log(
+      `发送前首次关闭结果：resumeClosed=${Boolean(resumeResult?.closed)} | resumeMethod=${resumeResult?.method || 'unknown'} | detailClosed=${Boolean(detailResult?.closed)} | detailMethod=${detailResult?.method || 'unknown'}`,
+    );
+
+    let resumeClosed = Boolean(resumeResult?.closed);
+    let detailClosed = Boolean(detailResult?.closed);
+
+    if (!resumeClosed && typeof this.page.closeResumeModal === 'function') {
+      retried = true;
+      resumeResult = await this.page.closeResumeModal({ maxAttempts: 6, ensureDismiss: true });
+      methodParts.push(`resume-retry:${resumeResult?.method || 'unknown'}`);
+      resumeClosed = Boolean(resumeResult?.closed);
+    }
+
+    if (!detailClosed && typeof this.page.closeCandidateDetail === 'function') {
+      retried = true;
+      detailResult = await this.page.closeCandidateDetail({ maxAttempts: 4, ensureDismiss: true });
+      methodParts.push(`detail-retry:${detailResult?.method || 'unknown'}`);
+      detailClosed = Boolean(detailResult?.closed);
+    }
+
+    let resumeState = resumeResult?.finalState || null;
+    let detailState = detailResult?.finalState || null;
+
+    if (typeof this.page.getResumeModalState === 'function') {
+      resumeState = await this.page.getResumeModalState();
+      resumeClosed = !this.isResumeModalVisible(resumeState);
+    }
+    if (typeof this.page.getCandidateDetailState === 'function') {
+      detailState = await this.page.getCandidateDetailState();
+      detailClosed = !this.isCandidateDetailVisible(detailState);
+    }
+
+    if (retried) {
+      this.logger.log(
+        `发送前重试关闭结果：resumeClosed=${resumeClosed} | resumeMethod=${resumeResult?.method || 'unknown'} | detailClosed=${detailClosed} | detailMethod=${detailResult?.method || 'unknown'}`,
+      );
+    }
+
+    let failureReason = '';
+    if (resumeClosed && detailClosed) {
+      try {
+        readyState = await this.page.waitForConversationReady({
+          maxAttempts: 12,
+          delayMs: 220,
+          requirePanelsClosed: true,
+        });
+        methodParts.push('ready:strict');
+      } catch (error) {
+        failureReason = `strict-ready-check-failed:${error?.message || error}`;
+        methodParts.push(failureReason);
+      }
+    } else {
+      failureReason = [
+        !resumeClosed ? 'resume-modal-still-open' : '',
+        !detailClosed ? 'candidate-detail-still-open' : '',
+      ].filter(Boolean).join('+');
+    }
+
+    const diagnostics = {
+      preActionResumeClosed: resumeClosed,
+      preActionDetailClosed: detailClosed,
+      preActionCleanupMethod: methodParts.join('|'),
+      preActionCleanupRetried: retried,
+      preActionCleanupFailureReason: failureReason,
+    };
+
+    return {
+      ok: resumeClosed && detailClosed && Boolean(readyState?.panelsClosed),
+      readyState,
+      diagnostics,
+      resumeResult,
+      detailResult,
+      resumeState,
+      detailState,
+    };
+  }
+
   async run(profile) {
     const startedAt = new Date().toISOString();
     const runId = runToken(new Date());
@@ -1099,6 +1238,7 @@ export class BossChatApp {
       baseResult.artifacts.evaluationChunkTotal = Number.isFinite(Number(evaluation.chunkTotal))
         ? Number(evaluation.chunkTotal)
         : null;
+      baseResult.artifacts.evaluationAggregateRetryUsed = evaluation.aggregateRetryUsed === true;
       baseResult.artifacts.llmReason = normalizeText(evaluation.reason || '');
       baseResult.artifacts.llmSummary = normalizeText(evaluation.summary || '');
       baseResult.artifacts.llmCot = normalizeText(evaluation.cot || '');
@@ -1156,6 +1296,33 @@ export class BossChatApp {
       }
 
       if (evaluation.passed && !this.dryRun) {
+        await this.checkpoint();
+        const preAction = await this.ensurePanelsClosedBeforeOutreach({
+          initialResumeCloseResult: closeResult,
+        });
+        Object.assign(baseResult.artifacts, preAction.diagnostics);
+        if (!preAction.ok) {
+          baseResult.decision = 'skipped';
+          baseResult.passed = false;
+          baseResult.requested = false;
+          baseResult.reason =
+            '发送前未能安全关闭简历/详情面板，已跳过避免触发风控';
+          this.logger.log(
+            `候选人跳过：name=${customer.name || '未知'} | key=${customer.customerKey} | reason=${baseResult.reason} | cleanupFailure=${preAction.diagnostics.preActionCleanupFailureReason || 'unknown'}`,
+          );
+          const finalPanels = await this.cleanupPanels({
+            resumeMaxAttempts: 4,
+            detailMaxAttempts: 4,
+            ensureDismiss: true,
+          });
+          baseResult.artifacts.finalResumeCloseMethod = finalPanels.resume.method;
+          baseResult.artifacts.finalResumeClosed = finalPanels.resume.closed;
+          baseResult.artifacts.finalDetailCloseMethod = finalPanels.detail.method;
+          baseResult.artifacts.finalDetailClosed = finalPanels.detail.closed;
+          await this.stateStore.record(baseResult.customerKey, baseResult, baseAliases);
+          return baseResult;
+        }
+
         const greetingText = 'Hi同学，能麻烦发下简历吗？';
         this.logger.log(`候选人通过，先发送消息：${greetingText}`);
         await this.checkpoint();

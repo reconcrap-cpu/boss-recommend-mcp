@@ -921,6 +921,21 @@ function browserConversationReadyState() {
   const askResume = Array.from(document.querySelectorAll('span.operate-btn, button, a, span')).find(
     (el) => isVisible(el) && isAskResumeText(el.textContent || ''),
   );
+  const editor = document.querySelector(
+    '#boss-chat-editor-input, .conversation-editor #boss-chat-editor-input, .conversation-editor .boss-chat-editor-input',
+  );
+  const activeSubmit = Array.from(
+    document.querySelectorAll(
+      '.conversation-editor .submit.active, .conversation-editor .submit-content .submit.active, .submit.active',
+    ),
+  ).find((node) => isVisible(node));
+  const anySubmit = Array.from(
+    document.querySelectorAll(
+      '.conversation-editor .submit-content .submit, .conversation-editor .submit, .submit-content .submit, .submit',
+    ),
+  ).find((node) => isVisible(node) && normalize(node.textContent || '').includes('发送'));
+  const resumeState = browserIsResumeModalOpen();
+  const detailState = browserCollectCandidateDetailSnapshot();
   const attachmentResumeEnabled = Boolean(attachmentResume) && !isDisabledDeep(attachmentResume);
   return {
     hasOnlineResume: Boolean(onlineResume),
@@ -929,6 +944,345 @@ function browserConversationReadyState() {
     hasAttachmentResume: Boolean(attachmentResume),
     attachmentResumeEnabled,
     attachmentResumeClass: String(attachmentResume?.className || ''),
+    resumeModalOpen:
+      Boolean(resumeState?.open) ||
+      Number(resumeState?.iframeCount || 0) > 0 ||
+      Number(resumeState?.scopeCount || 0) > 0,
+    candidateDetailOpen:
+      Boolean(detailState?.open) ||
+      Number(detailState?.panelCount || 0) > 0 ||
+      Number(detailState?.closeCount || 0) > 0,
+    panelsClosed:
+      !(
+        Boolean(resumeState?.open) ||
+        Number(resumeState?.iframeCount || 0) > 0 ||
+        Number(resumeState?.scopeCount || 0) > 0 ||
+        Boolean(detailState?.open) ||
+        Number(detailState?.panelCount || 0) > 0 ||
+        Number(detailState?.closeCount || 0) > 0
+      ),
+    editorVisible: editor instanceof HTMLElement && isVisible(editor),
+    activeSubmit: Boolean(activeSubmit),
+    hasAnySubmit: Boolean(anySubmit),
+    messageInputReady:
+      editor instanceof HTMLElement &&
+      isVisible(editor) &&
+      (Boolean(activeSubmit) || Boolean(anySubmit)),
+  };
+}
+
+function browserNormalizeVisibleText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function browserIsVisibleElement(el, minimum = 2) {
+  if (!(el instanceof HTMLElement)) return false;
+  const style = getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
+    return false;
+  }
+  const rect = el.getBoundingClientRect();
+  return rect.width > minimum && rect.height > minimum;
+}
+
+function browserRectToJson(rect) {
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+    right: rect.right,
+    bottom: rect.bottom,
+  };
+}
+
+function browserCollectCandidateDetailSnapshot() {
+  const normalize = browserNormalizeVisibleText;
+  const isVisible = browserIsVisibleElement;
+  const rectToJson = browserRectToJson;
+  const viewportWidth = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0);
+  const viewportHeight = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0);
+  const panelSelectors = [
+    '.base-info-single-top-detail',
+    '.resume-detail-wrap',
+    '.geek-card-detail',
+    '.candidate-detail-wrap',
+    '.chat-detail-wrap',
+    '.new-resume-online-main-ui',
+    '.resume-recommend.resume-common-wrap',
+    '.resume-recommend',
+    '.boss-dialog__body',
+  ];
+  const overlaySelectors = [
+    '.dialog-wrap.active',
+    '.dialog-wrap',
+    '.boss-dialog.active',
+    '.boss-dialog',
+    '.boss-popup__wrapper',
+    '.v-modal',
+    '.modal-mask',
+    '.geek-detail-modal',
+    '.modal',
+  ];
+  const closeButtons = Array.from(document.querySelectorAll('.close-btn')).filter((el) => isVisible(el));
+  const contentEntries = [];
+  const overlayEntries = [];
+  const contentSeen = new Set();
+  const overlaySeen = new Set();
+
+  const pushEntry = (entries, seen, node, source, { minWidth = 240, minHeight = 160 } = {}) => {
+    if (!(node instanceof HTMLElement) || !isVisible(node)) return;
+    const rect = node.getBoundingClientRect();
+    if (rect.width < minWidth || rect.height < minHeight) return;
+    const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}:${normalize(node.className || '')}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    entries.push({ node, rect, source });
+  };
+
+  const hasContentHint = (node, rect, source = '') => {
+    const classText = normalize(node.className || '').toLowerCase();
+    const text = normalize(node.textContent || '').slice(0, 240).toLowerCase();
+    const containsClose = closeButtons.some((button) => node.contains(button));
+    const anchoredRight =
+      rect.left >= viewportWidth * 0.35 ||
+      rect.right >= viewportWidth * 0.68;
+    const hasKnownContentClass =
+      classText.includes('base-info-single-top-detail') ||
+      classText.includes('resume-detail-wrap') ||
+      classText.includes('candidate-detail') ||
+      classText.includes('chat-detail') ||
+      classText.includes('geek-card-detail') ||
+      classText.includes('new-resume-online-main-ui') ||
+      classText.includes('resume-common-wrap') ||
+      classText.includes('boss-dialog__body');
+    const hasDetailHint =
+      text.includes('在线简历') ||
+      text.includes('附件简历') ||
+      text.includes('牛人分析器') ||
+      text.includes('活跃');
+    const notFullScreen =
+      rect.width < viewportWidth * 0.96 ||
+      rect.height < viewportHeight * 0.96;
+    return (
+      containsClose ||
+      hasKnownContentClass ||
+      hasDetailHint ||
+      (source === 'close-ancestor' && (anchoredRight || notFullScreen))
+    );
+  };
+
+  const hasOverlayHint = (node, rect) => {
+    const classText = normalize(node.className || '').toLowerCase();
+    const hasOverlayClass =
+      classText.includes('dialog-wrap') ||
+      classText.includes('boss-dialog') ||
+      classText.includes('popup') ||
+      classText.includes('modal') ||
+      classText.includes('mask') ||
+      classText.includes('overlay');
+    const coversViewport =
+      rect.left <= 8 &&
+      rect.top <= 8 &&
+      rect.width >= viewportWidth * 0.85 &&
+      rect.height >= viewportHeight * 0.85;
+    return hasOverlayClass || coversViewport;
+  };
+
+  for (const selector of panelSelectors) {
+    for (const node of Array.from(document.querySelectorAll(selector))) {
+      pushEntry(contentEntries, contentSeen, node, `selector:${selector}`);
+    }
+  }
+
+  for (const selector of overlaySelectors) {
+    for (const node of Array.from(document.querySelectorAll(selector))) {
+      pushEntry(overlayEntries, overlaySeen, node, `selector:${selector}`, {
+        minWidth: 180,
+        minHeight: 120,
+      });
+    }
+  }
+
+  for (const closeButton of closeButtons) {
+    let current = closeButton.parentElement;
+    let depth = 0;
+    while (current instanceof HTMLElement && depth < 12) {
+      const rect = current.getBoundingClientRect();
+      if (hasContentHint(current, rect, 'close-ancestor')) {
+        pushEntry(contentEntries, contentSeen, current, 'close-ancestor');
+      }
+      if (hasOverlayHint(current, rect)) {
+        pushEntry(overlayEntries, overlaySeen, current, 'close-ancestor', {
+          minWidth: 180,
+          minHeight: 120,
+        });
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+  }
+
+  const scoredContent = contentEntries
+    .map((entry) => {
+      const classText = normalize(entry.node.className || '').toLowerCase();
+      const text = normalize(entry.node.textContent || '').slice(0, 240).toLowerCase();
+      const containsClose = closeButtons.some((button) => entry.node.contains(button));
+      const anchoredRight =
+        entry.rect.left >= viewportWidth * 0.35 ||
+        entry.rect.right >= viewportWidth * 0.68;
+      const hasKnownContentClass =
+        classText.includes('base-info-single-top-detail') ||
+        classText.includes('resume-detail-wrap') ||
+        classText.includes('candidate-detail') ||
+        classText.includes('chat-detail') ||
+        classText.includes('geek-card-detail') ||
+        classText.includes('new-resume-online-main-ui') ||
+        classText.includes('resume-common-wrap') ||
+        classText.includes('boss-dialog__body');
+      const hasDetailHint =
+        text.includes('在线简历') ||
+        text.includes('附件简历') ||
+        text.includes('牛人分析器') ||
+        text.includes('活跃');
+      const resemblesFullscreen =
+        entry.rect.left <= 8 &&
+        entry.rect.top <= 8 &&
+        entry.rect.width >= viewportWidth * 0.92 &&
+        entry.rect.height >= viewportHeight * 0.92;
+
+      let score = 0;
+      if (containsClose) score += 220;
+      if (anchoredRight) score += 150;
+      if (hasKnownContentClass) score += 200;
+      if (hasDetailHint) score += 80;
+      if (entry.source === 'close-ancestor') score += 40;
+      if (entry.rect.width <= viewportWidth * 0.82) score += 70;
+      if (entry.rect.height <= viewportHeight * 0.98) score += 20;
+      if (resemblesFullscreen) score -= 220;
+      score += Math.min(140, Math.floor((entry.rect.width * entry.rect.height) / 18000));
+
+      return {
+        ...entry,
+        score,
+      };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const scoredOverlay = overlayEntries
+    .map((entry) => {
+      const classText = normalize(entry.node.className || '').toLowerCase();
+      const coversViewport =
+        entry.rect.left <= 8 &&
+        entry.rect.top <= 8 &&
+        entry.rect.width >= viewportWidth * 0.85 &&
+        entry.rect.height >= viewportHeight * 0.85;
+      let score = 0;
+      if (classText.includes('dialog-wrap')) score += 160;
+      if (classText.includes('boss-dialog')) score += 120;
+      if (classText.includes('modal') || classText.includes('overlay') || classText.includes('mask')) {
+        score += 80;
+      }
+      if (coversViewport) score += 180;
+      if (entry.source === 'close-ancestor') score += 20;
+      return {
+        ...entry,
+        score,
+      };
+    })
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const topContent = scoredContent[0] || null;
+  const topOverlay = scoredOverlay[0] || null;
+  const topContentNode = topContent?.node || null;
+  const topOverlayNode = topOverlay?.node || null;
+  const closeButton =
+    closeButtons.find((button) => topContentNode instanceof HTMLElement && topContentNode.contains(button)) ||
+    closeButtons[0] ||
+    null;
+  const topPanel = topContent || topOverlay;
+  const topPanelNode = topPanel?.node || null;
+
+  return {
+    open: Boolean(topContent || topOverlay || closeButton),
+    panelCount: scoredContent.length,
+    closeCount: closeButtons.length,
+    topPanelClass: normalize(topPanelNode?.className || ''),
+    topPanelScore: Number(topPanel?.score || 0),
+    panelRect: topContent ? rectToJson(topContent.rect) : topOverlay ? rectToJson(topOverlay.rect) : null,
+    closeRect: closeButton ? rectToJson(closeButton.getBoundingClientRect()) : null,
+    overlayClass: normalize(topOverlayNode?.className || ''),
+    overlayRect: topOverlay ? rectToJson(topOverlay.rect) : null,
+    contentClass: normalize(topContentNode?.className || ''),
+    contentRect: topContent ? rectToJson(topContent.rect) : null,
+    closeButton,
+  };
+}
+
+function browserFindCandidateDetailOutsideClickPoint() {
+  const state = browserCollectCandidateDetailSnapshot();
+  const viewportWidth = Math.max(document.documentElement?.clientWidth || 0, window.innerWidth || 0);
+  const viewportHeight = Math.max(document.documentElement?.clientHeight || 0, window.innerHeight || 0);
+  const contentRect = state?.contentRect;
+  if (!state?.open || !contentRect) {
+    return {
+      ok: false,
+      error: 'CANDIDATE_DETAIL_OUTSIDE_POINT_NOT_FOUND',
+      state,
+    };
+  }
+
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+  const candidates = [];
+  const safeMidY = clamp(contentRect.top + contentRect.height / 2, 18, viewportHeight - 18);
+  const safeMidX = clamp(contentRect.left + contentRect.width / 2, 18, viewportWidth - 18);
+
+  if (contentRect.left >= 32) {
+    candidates.push({
+      strategy: 'left-gap',
+      x: clamp(Math.min(contentRect.left - 18, contentRect.left / 2), 18, viewportWidth - 18),
+      y: safeMidY,
+    });
+  }
+  if (viewportWidth - contentRect.right >= 32) {
+    candidates.push({
+      strategy: 'right-gap',
+      x: clamp(Math.max(contentRect.right + 18, contentRect.right + (viewportWidth - contentRect.right) / 2), 18, viewportWidth - 18),
+      y: safeMidY,
+    });
+  }
+  if (contentRect.top >= 32) {
+    candidates.push({
+      strategy: 'top-gap',
+      x: safeMidX,
+      y: clamp(Math.min(contentRect.top - 18, contentRect.top / 2), 18, viewportHeight - 18),
+    });
+  }
+
+  const point = candidates.find((candidate) => {
+    const outsideHorizontally = candidate.x < contentRect.left - 6 || candidate.x > contentRect.right + 6;
+    const outsideVertically = candidate.y < contentRect.top - 6 || candidate.y > contentRect.bottom + 6;
+    return outsideHorizontally || outsideVertically;
+  });
+
+  if (!point) {
+    return {
+      ok: false,
+      error: 'CANDIDATE_DETAIL_OUTSIDE_POINT_NOT_FOUND',
+      state,
+    };
+  }
+
+  return {
+    ok: true,
+    strategy: point.strategy,
+    point: {
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+    },
+    state,
   };
 }
 
@@ -1012,226 +1366,10 @@ function browserOpenOnlineResume(options = {}) {
 }
 
 function browserIsCandidateDetailOpen() {
-  const collectSnapshot = () => {
-    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const isVisible = (el) => {
-      if (!(el instanceof HTMLElement)) return false;
-      const style = getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
-        return false;
-      }
-      const rect = el.getBoundingClientRect();
-      return rect.width > 2 && rect.height > 2;
-    };
-    const rectToJson = (rect) => ({
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height,
-      right: rect.right,
-      bottom: rect.bottom,
-    });
-    const panelSelectors = [
-      '.base-info-single-top-detail',
-      '.resume-detail-wrap',
-      '.geek-card-detail',
-      '.candidate-detail-wrap',
-      '.chat-detail-wrap',
-    ];
-    const closeButtons = Array.from(document.querySelectorAll('.close-btn')).filter(isVisible);
-    const panelEntries = [];
-    const seen = new Set();
-    const pushPanel = (node, source) => {
-      if (!(node instanceof HTMLElement) || !isVisible(node)) return;
-      const rect = node.getBoundingClientRect();
-      if (rect.width < 240 || rect.height < 160) return;
-      const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}:${normalize(node.className || '')}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      panelEntries.push({ node, rect, source });
-    };
-
-    for (const selector of panelSelectors) {
-      for (const node of Array.from(document.querySelectorAll(selector))) {
-        pushPanel(node, `selector:${selector}`);
-      }
-    }
-
-    for (const closeButton of closeButtons) {
-      let current = closeButton.parentElement;
-      let depth = 0;
-      while (current instanceof HTMLElement && depth < 10) {
-        pushPanel(current, 'close-ancestor');
-        current = current.parentElement;
-        depth += 1;
-      }
-    }
-
-    const scoredPanels = panelEntries
-      .map((entry) => {
-        const classText = normalize(entry.node.className || '').toLowerCase();
-        const text = normalize(entry.node.textContent || '').slice(0, 240).toLowerCase();
-        const containsClose = closeButtons.some((button) => entry.node.contains(button));
-        const anchoredRight =
-          entry.rect.left >= window.innerWidth * 0.4 ||
-          entry.rect.right >= window.innerWidth * 0.72;
-        const hasKnownDetailClass =
-          classText.includes('base-info-single-top-detail') ||
-          classText.includes('resume-detail-wrap') ||
-          classText.includes('candidate-detail') ||
-          classText.includes('chat-detail') ||
-          classText.includes('geek-card-detail');
-        const hasDetailHint =
-          text.includes('在线简历') ||
-          text.includes('附件简历') ||
-          text.includes('牛人分析器') ||
-          text.includes('活跃');
-
-        let score = 0;
-        if (containsClose) score += 220;
-        if (anchoredRight) score += 140;
-        if (hasKnownDetailClass) score += 160;
-        if (hasDetailHint) score += 80;
-        if (entry.source === 'close-ancestor') score += 40;
-        score += Math.min(180, Math.floor((entry.rect.width * entry.rect.height) / 12000));
-
-        return {
-          ...entry,
-          score,
-        };
-      })
-      .sort((a, b) => b.score - a.score);
-
-    const topPanel = scoredPanels[0] || null;
-    const topPanelNode = topPanel?.node || null;
-    const closeButton =
-      closeButtons.find((button) => topPanelNode instanceof HTMLElement && topPanelNode.contains(button)) ||
-      closeButtons[0] ||
-      null;
-
-    return {
-      open: Boolean(topPanel || closeButton),
-      panelCount: scoredPanels.length,
-      closeCount: closeButtons.length,
-      topPanelClass: normalize(topPanelNode?.className || ''),
-      topPanelScore: Number(topPanel?.score || 0),
-      panelRect: topPanel ? rectToJson(topPanel.rect) : null,
-      closeRect: closeButton ? rectToJson(closeButton.getBoundingClientRect()) : null,
-    };
-  };
-
-  return collectSnapshot();
+  return browserCollectCandidateDetailSnapshot();
 }
 
 function browserCloseCandidateDetailDomOnce() {
-  const collectSnapshot = () => {
-    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-    const isVisible = (el) => {
-      if (!(el instanceof HTMLElement)) return false;
-      const style = getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') < 0.01) {
-        return false;
-      }
-      const rect = el.getBoundingClientRect();
-      return rect.width > 2 && rect.height > 2;
-    };
-    const rectToJson = (rect) => ({
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height,
-      right: rect.right,
-      bottom: rect.bottom,
-    });
-    const panelSelectors = [
-      '.base-info-single-top-detail',
-      '.resume-detail-wrap',
-      '.geek-card-detail',
-      '.candidate-detail-wrap',
-      '.chat-detail-wrap',
-    ];
-    const closeButtons = Array.from(document.querySelectorAll('.close-btn')).filter(isVisible);
-    const panelEntries = [];
-    const seen = new Set();
-    const pushPanel = (node, source) => {
-      if (!(node instanceof HTMLElement) || !isVisible(node)) return;
-      const rect = node.getBoundingClientRect();
-      if (rect.width < 240 || rect.height < 160) return;
-      const key = `${Math.round(rect.left)}:${Math.round(rect.top)}:${Math.round(rect.width)}:${Math.round(rect.height)}:${normalize(node.className || '')}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      panelEntries.push({ node, rect, source });
-    };
-
-    for (const selector of panelSelectors) {
-      for (const node of Array.from(document.querySelectorAll(selector))) {
-        pushPanel(node, `selector:${selector}`);
-      }
-    }
-
-    for (const closeButton of closeButtons) {
-      let current = closeButton.parentElement;
-      let depth = 0;
-      while (current instanceof HTMLElement && depth < 10) {
-        pushPanel(current, 'close-ancestor');
-        current = current.parentElement;
-        depth += 1;
-      }
-    }
-
-    const scoredPanels = panelEntries
-      .map((entry) => {
-        const classText = normalize(entry.node.className || '').toLowerCase();
-        const text = normalize(entry.node.textContent || '').slice(0, 240).toLowerCase();
-        const containsClose = closeButtons.some((button) => entry.node.contains(button));
-        const anchoredRight =
-          entry.rect.left >= window.innerWidth * 0.4 ||
-          entry.rect.right >= window.innerWidth * 0.72;
-        const hasKnownDetailClass =
-          classText.includes('base-info-single-top-detail') ||
-          classText.includes('resume-detail-wrap') ||
-          classText.includes('candidate-detail') ||
-          classText.includes('chat-detail') ||
-          classText.includes('geek-card-detail');
-        const hasDetailHint =
-          text.includes('在线简历') ||
-          text.includes('附件简历') ||
-          text.includes('牛人分析器') ||
-          text.includes('活跃');
-
-        let score = 0;
-        if (containsClose) score += 220;
-        if (anchoredRight) score += 140;
-        if (hasKnownDetailClass) score += 160;
-        if (hasDetailHint) score += 80;
-        if (entry.source === 'close-ancestor') score += 40;
-        score += Math.min(180, Math.floor((entry.rect.width * entry.rect.height) / 12000));
-
-        return {
-          ...entry,
-          score,
-        };
-      })
-      .sort((a, b) => b.score - a.score);
-
-    const topPanel = scoredPanels[0] || null;
-    const topPanelNode = topPanel?.node || null;
-    const closeButton =
-      closeButtons.find((button) => topPanelNode instanceof HTMLElement && topPanelNode.contains(button)) ||
-      closeButtons[0] ||
-      null;
-
-    return {
-      open: Boolean(topPanel || closeButton),
-      panelCount: scoredPanels.length,
-      closeCount: closeButtons.length,
-      topPanelClass: normalize(topPanelNode?.className || ''),
-      topPanelScore: Number(topPanel?.score || 0),
-      panelRect: topPanel ? rectToJson(topPanel.rect) : null,
-      closeRect: closeButton ? rectToJson(closeButton.getBoundingClientRect()) : null,
-      closeButton,
-    };
-  };
   const serializeSnapshot = (snapshot = {}) => ({
     open: Boolean(snapshot?.open),
     panelCount: Number(snapshot?.panelCount || 0),
@@ -1240,9 +1378,13 @@ function browserCloseCandidateDetailDomOnce() {
     topPanelScore: Number(snapshot?.topPanelScore || 0),
     panelRect: snapshot?.panelRect || null,
     closeRect: snapshot?.closeRect || null,
+    overlayClass: String(snapshot?.overlayClass || ''),
+    overlayRect: snapshot?.overlayRect || null,
+    contentClass: String(snapshot?.contentClass || ''),
+    contentRect: snapshot?.contentRect || null,
   });
 
-  const snapshot = collectSnapshot();
+  const snapshot = browserCollectCandidateDetailSnapshot();
   if (!snapshot?.open || !(snapshot.closeButton instanceof HTMLElement)) {
     return {
       ok: false,
@@ -2699,15 +2841,24 @@ export class BossChatPage {
   async waitForConversationReady(options = {}) {
     const maxAttempts = options.maxAttempts || 12;
     const delayMs = options.delayMs || 260;
+    const requirePanelsClosed = options.requirePanelsClosed === true;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const state = await this.chromeClient.callFunction(browserConversationReadyState);
-      if (state?.hasOnlineResume || state?.hasAskResume || state?.hasAttachmentResume) {
+      const hasActionControls =
+        Boolean(state?.hasOnlineResume) ||
+        Boolean(state?.hasAskResume) ||
+        Boolean(state?.hasAttachmentResume);
+      const panelsReady = requirePanelsClosed ? Boolean(state?.panelsClosed) : true;
+      const editorReady = requirePanelsClosed
+        ? Boolean(state?.editorVisible) && (Boolean(state?.activeSubmit) || Boolean(state?.hasAnySubmit))
+        : true;
+      if (hasActionControls && panelsReady && editorReady) {
         return state;
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
-    throw new Error('CONVERSATION_PANEL_NOT_READY');
+    throw new Error(requirePanelsClosed ? 'CONVERSATION_PANEL_NOT_READY_OR_BLOCKED' : 'CONVERSATION_PANEL_NOT_READY');
   }
 
   async waitForCandidateActivated(customer, options = {}) {
@@ -2877,6 +3028,10 @@ export class BossChatPage {
       topPanelScore: Number(result?.topPanelScore || 0),
       panelRect: result?.panelRect || null,
       closeRect: result?.closeRect || null,
+      overlayClass: String(result?.overlayClass || ''),
+      overlayRect: result?.overlayRect || null,
+      contentClass: String(result?.contentClass || ''),
+      contentRect: result?.contentRect || null,
     };
   }
 
@@ -2919,6 +3074,34 @@ export class BossChatPage {
     };
   }
 
+  async clickCandidateDetailOutside() {
+    const result = await this.chromeClient.callFunction(browserFindCandidateDetailOutsideClickPoint);
+    if (!result?.ok || !result?.point) {
+      const finalState = await this.getCandidateDetailState();
+      return {
+        clicked: false,
+        method: `outside-click-miss:${result?.error || 'unknown'}`,
+        finalState,
+      };
+    }
+
+    const point = result.point;
+    const rect = {
+      left: Math.max(0, Number(point.x || 0) - 3),
+      top: Math.max(0, Number(point.y || 0) - 3),
+      width: 6,
+      height: 6,
+    };
+    await this.clickRect(rect);
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    const finalState = await this.getCandidateDetailState();
+    return {
+      clicked: true,
+      method: `outside-click:${result?.strategy || 'unknown'}`,
+      finalState,
+    };
+  }
+
   async closeCandidateDetail({ maxAttempts = 4, ensureDismiss = false } = {}) {
     const drawerOpen = (state) =>
       Boolean(state?.open) ||
@@ -2952,16 +3135,6 @@ export class BossChatPage {
         };
       }
 
-      if (midState?.panelRect) {
-        await this.clickRect(midState.panelRect);
-        methods.push('focus-panel');
-        await new Promise((resolve) => setTimeout(resolve, 160));
-      } else if (midState?.closeRect) {
-        await this.clickRect(midState.closeRect);
-        methods.push('focus-close');
-        await new Promise((resolve) => setTimeout(resolve, 160));
-      }
-
       await this.chromeClient.pressEscape();
       methods.push('escape');
       await new Promise((resolve) => setTimeout(resolve, 220));
@@ -2975,18 +3148,15 @@ export class BossChatPage {
         };
       }
 
-      if (midState?.closeRect) {
-        await this.clickRect(midState.closeRect);
-        methods.push('rect-close');
-        await new Promise((resolve) => setTimeout(resolve, 220));
-        midState = await this.getCandidateDetailState();
-        if (!drawerOpen(midState)) {
-          return {
-            closed: true,
-            method: methods.join('+'),
-            finalState: midState,
-          };
-        }
+      const outsideResult = await this.clickCandidateDetailOutside();
+      methods.push(outsideResult.method || 'outside-click:unknown');
+      midState = outsideResult.finalState || await this.getCandidateDetailState();
+      if (!drawerOpen(midState)) {
+        return {
+          closed: true,
+          method: methods.join('+'),
+          finalState: midState,
+        };
       }
 
       if (ensureDismiss && index >= 1) {

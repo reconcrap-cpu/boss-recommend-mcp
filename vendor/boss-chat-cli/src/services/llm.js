@@ -3,6 +3,24 @@ import { readFile } from 'node:fs/promises';
 const DEFAULT_TEXT_MODEL_CHUNK_SIZE_CHARS = 24000;
 const DEFAULT_TEXT_MODEL_CHUNK_OVERLAP_CHARS = 1200;
 const DEFAULT_TEXT_MODEL_MAX_CHUNKS = 12;
+const LONG_RESUME_AGGREGATE_LIMITS_STANDARD = {
+  summaryMaxLength: 180,
+  evidenceMaxItems: 3,
+  blockerMaxItems: 3,
+  uncertaintyMaxItems: 2,
+  quoteMaxItems: 2,
+  itemMaxLength: 160,
+  quoteMaxLength: 120,
+};
+const LONG_RESUME_AGGREGATE_LIMITS_COMPACT = {
+  summaryMaxLength: 120,
+  evidenceMaxItems: 2,
+  blockerMaxItems: 2,
+  uncertaintyMaxItems: 1,
+  quoteMaxItems: 1,
+  itemMaxLength: 96,
+  quoteMaxLength: 80,
+};
 const MAX_EVIDENCE_TOKENS = 12;
 const LLM_THINKING_ENV_KEYS = [
   'BOSS_CHAT_LLM_THINKING_LEVEL',
@@ -13,6 +31,12 @@ const LLM_THINKING_ENV_KEYS = [
 
 function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function truncateText(value, maxLength = 96) {
+  const text = normalizeText(value);
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, Math.max(12, maxLength - 1))}…`;
 }
 
 function toLowerSafe(text) {
@@ -179,6 +203,21 @@ function toStringArray(value, maxItems = 8) {
   return normalized;
 }
 
+function dedupeNormalizedList(value, maxItems = 8, maxLength = 160) {
+  const source = Array.isArray(value) ? value : [];
+  const normalized = [];
+  const seen = new Set();
+  for (const item of source) {
+    const text = truncateText(item, maxLength);
+    const key = toLowerSafe(text);
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(text);
+    if (normalized.length >= maxItems) break;
+  }
+  return normalized;
+}
+
 function collectNestedText(value, out = [], depth = 0) {
   if (depth > 6 || value === null || value === undefined) return out;
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
@@ -331,6 +370,47 @@ function matchEvidenceAgainstResume(evidenceText, rawResumeText, normalizedResum
   };
 }
 
+function filterEvidenceListAgainstText(value, sourceText, maxItems = 8, maxLength = 160) {
+  const rawSource = String(sourceText || '');
+  const normalizedSource = normalizeText(rawSource);
+  const normalizedSourceLower = toLowerSafe(normalizedSource);
+  const result = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value) ? value : []) {
+    const text = truncateText(item, maxLength);
+    if (!text) continue;
+    const match = matchEvidenceAgainstResume(text, rawSource, normalizedSource, normalizedSourceLower);
+    if (!match.matched) continue;
+    const key = toLowerSafe(text);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function filterQuotedSpansAgainstText(value, sourceText, maxItems = 6, maxLength = 120) {
+  const rawSource = String(sourceText || '');
+  const normalizedSource = normalizeText(rawSource);
+  const result = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value) ? value : []) {
+    const text = truncateText(item, maxLength);
+    if (!text) continue;
+    const normalized = normalizeText(text);
+    if (!normalized) continue;
+    const matched = rawSource.includes(text) || normalizedSource.includes(normalized);
+    if (!matched) continue;
+    const key = toLowerSafe(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(text);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
 function splitTextByChunks(text, chunkSize, overlap, maxChunks) {
   const source = String(text || '');
   if (!source) return [];
@@ -400,6 +480,30 @@ function buildProfileContext(candidate) {
   return profileContext;
 }
 
+function buildAggregateCandidateProfile(candidate, compact = false) {
+  const maxLength = compact ? 80 : 120;
+  const schools = Array.isArray(candidate?.resumeProfile?.schools)
+    ? dedupeNormalizedList(candidate.resumeProfile.schools, compact ? 2 : 3, maxLength)
+    : [];
+  const majors = Array.isArray(candidate?.resumeProfile?.majors)
+    ? dedupeNormalizedList(candidate.resumeProfile.majors, compact ? 2 : 3, maxLength)
+    : [];
+  const profile = {
+    name: truncateText(candidate?.name || '', maxLength),
+    sourceJob: truncateText(candidate?.sourceJob || '', maxLength),
+    primarySchool: truncateText(candidate?.resumeProfile?.primarySchool || '', maxLength),
+    primaryMajor: truncateText(candidate?.resumeProfile?.major || '', maxLength),
+    company: truncateText(candidate?.resumeProfile?.company || '', maxLength),
+    position: truncateText(candidate?.resumeProfile?.position || '', maxLength),
+    schools,
+    majors,
+  };
+  return Object.fromEntries(Object.entries(profile).filter(([, value]) => {
+    if (Array.isArray(value)) return value.length > 0;
+    return Boolean(normalizeText(value));
+  }));
+}
+
 function buildImagePrompt({ screeningCriteria, candidate }) {
   const profileContext = buildProfileContext(candidate);
   return [
@@ -451,12 +555,86 @@ function buildTextPrompt({ screeningCriteria, candidate, resumeText, chunkIndex 
   ].join('\n');
 }
 
+function buildChunkAnalysisPrompt({ screeningCriteria, candidate, resumeText, chunkIndex = 1, chunkTotal = 1 }) {
+  const profileContext = buildProfileContext(candidate);
+  return [
+    '你是招聘筛选助手，请对长简历的当前文本分段提取结构化筛选证据。',
+    '只能依据当前分段文本中可见信息判断，不得臆测其他分段内容。',
+    '只采信当前候选人的主简历内容（教育经历/工作经历/项目经历/专业技能）。',
+    '必须忽略推荐模块与匿名卡片信息（例如“其他名企大厂经历牛人”“相似牛人”“推荐牛人”）。',
+    '若无法在教育经历模块确认学校名称，不要编造学校名；按信息不足处理。',
+    '必须且只能返回 JSON，不要输出 Markdown。',
+    'hard_evidence / soft_evidence / hard_blockers / quoted_spans 中每项都必须来自当前分段原文。',
+    '如果当前分段单独不足以支持通过，chunk_passed 必须为 false。',
+    '',
+    `筛选标准：${screeningCriteria}`,
+    '',
+    '候选人上下文（仅供辅助，不可覆盖简历事实）：',
+    `姓名：${candidate.name || '未知'}`,
+    `投递职位：${candidate.sourceJob || '未知'}`,
+    ...(profileContext.length > 0 ? ['', ...profileContext] : []),
+    '',
+    `当前分段：${chunkIndex}/${chunkTotal}`,
+    '',
+    `分段文本:\n${String(resumeText || '')}`,
+    '',
+    '请返回严格 JSON：{"chunk_passed":true/false,"chunk_summary":"","hard_evidence":[],"soft_evidence":[],"hard_blockers":[],"missing_or_uncertain":[],"quoted_spans":[],"chunk_index":1,"chunk_total":1}',
+  ].join('\n');
+}
+
+function buildLongResumeAggregatePrompt({ screeningCriteria, candidate, aggregateInput }) {
+  return [
+    '你是招聘筛选助手，请基于长简历各分段的结构化分析结果，对整份简历做最终综合判断。',
+    '必须综合全部 chunk 的信息后再判断，允许跨 chunk 拼接教育、项目、工作经历证据。',
+    '只采信当前候选人的主简历内容（教育经历/工作经历/项目经历/专业技能）。',
+    '必须忽略推荐模块与匿名卡片信息（例如“其他名企大厂经历牛人”“相似牛人”“推荐牛人”）。',
+    '若结构化证据仍不足以支持通过，返回 {"passed":false}。',
+    '必须且只能返回 JSON，不要输出 Markdown。',
+    '返回格式：{"passed":true/false,"reason":"","summary":"","evidence":[]}。',
+    '',
+    `筛选标准：${screeningCriteria}`,
+    '',
+    '候选人上下文（仅供辅助，不可覆盖结构化证据事实）：',
+    `姓名：${candidate?.name || '未知'}`,
+    `投递职位：${candidate?.sourceJob || '未知'}`,
+    '',
+    `长简历结构化输入:\n${JSON.stringify(aggregateInput, null, 2)}`,
+  ].join('\n');
+}
+
 function pickFirstText(...values) {
   for (const value of values) {
     const normalized = normalizeText(value);
     if (normalized) return normalized;
   }
   return '';
+}
+
+function parsePassedDecision(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (['true', '1', 'yes', 'y', 'pass', 'passed', 'match', 'matched'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'n', 'fail', 'failed', 'unmatched'].includes(normalized)) return false;
+  return null;
+}
+
+function extractJsonPayload(text) {
+  const raw = String(text || '').trim();
+  if (!raw) {
+    throw new Error('LLM returned empty content');
+  }
+  const codeFenceMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = codeFenceMatch ? codeFenceMatch[1] : raw;
+  const jsonMatch = candidate.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error('LLM response did not contain JSON');
+  }
+  return {
+    text: raw,
+    parsed: JSON.parse(jsonMatch[0]),
+  };
 }
 
 export function parseLlmJson(content, options = {}) {
@@ -497,14 +675,7 @@ export function parseLlmJson(content, options = {}) {
     };
   }
 
-  const codeFenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = codeFenceMatch ? codeFenceMatch[1] : text;
-  const jsonMatch = candidate.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error('LLM response did not contain JSON');
-  }
-
-  const parsed = JSON.parse(jsonMatch[0]);
+  const { parsed } = extractJsonPayload(text);
   const parsedPassed =
     typeof parsed.passed === 'boolean'
       ? parsed.passed
@@ -540,7 +711,103 @@ export function parseLlmJson(content, options = {}) {
     summary: parsedSummary || parsedReason || parsedCot,
     evidence: parsedEvidence,
     chunkIndex,
-    chunkTotal,
+      chunkTotal,
+    };
+}
+
+function normalizeChunkAnalysisResult(content, options = {}) {
+  const { text, parsed } = extractJsonPayload(content);
+  const chunkIndex = Number.isInteger(options.chunkIndex) && options.chunkIndex > 0 ? options.chunkIndex : 1;
+  const chunkTotal = Number.isInteger(options.chunkTotal) && options.chunkTotal > 0 ? options.chunkTotal : 1;
+  const resumeText = String(options.resumeText || '');
+  const chunkPassed =
+    parsePassedDecision(parsed?.chunk_passed) !== null
+      ? parsePassedDecision(parsed?.chunk_passed)
+      : parsePassedDecision(parsed?.passed);
+  if (chunkPassed === null) {
+    throw new Error('LLM chunk analysis response missing boolean "chunk_passed"');
+  }
+  return {
+    rawOutputText: text,
+    chunk_passed: chunkPassed,
+    chunk_summary: truncateText(
+      parsed?.chunk_summary || parsed?.summary || (chunkPassed ? '当前分段命中相关证据。' : '当前分段证据不足。'),
+      220,
+    ),
+    hard_evidence: filterEvidenceListAgainstText(parsed?.hard_evidence, resumeText, 4, 180),
+    soft_evidence: filterEvidenceListAgainstText(parsed?.soft_evidence, resumeText, 3, 180),
+    hard_blockers: filterEvidenceListAgainstText(parsed?.hard_blockers, resumeText, 3, 180),
+    missing_or_uncertain: dedupeNormalizedList(parsed?.missing_or_uncertain, 3, 140),
+    quoted_spans: filterQuotedSpansAgainstText(parsed?.quoted_spans, resumeText, 4, 140),
+    chunk_index: chunkIndex,
+    chunk_total: chunkTotal,
+  };
+}
+
+function buildLongResumeAggregateInput(chunkAnalyses = [], candidate = {}, options = {}) {
+  const compact = options?.compact === true;
+  const limits = compact ? LONG_RESUME_AGGREGATE_LIMITS_COMPACT : LONG_RESUME_AGGREGATE_LIMITS_STANDARD;
+  const seenByBucket = {
+    hard_evidence: new Set(),
+    soft_evidence: new Set(),
+    hard_blockers: new Set(),
+    missing_or_uncertain: new Set(),
+    quoted_spans: new Set(),
+  };
+  const normalizedChunks = (Array.isArray(chunkAnalyses) ? chunkAnalyses : [])
+    .filter((item) => item && typeof item === 'object')
+    .map((item, index) => ({
+      chunk_passed: item.chunk_passed === true,
+      chunk_summary: truncateText(
+        item.chunk_summary || (item.chunk_passed ? '当前分段命中相关证据。' : '当前分段证据不足。'),
+        limits.summaryMaxLength,
+      ),
+      hard_evidence: dedupeNormalizedList(item.hard_evidence, limits.evidenceMaxItems * 2, limits.itemMaxLength),
+      soft_evidence: dedupeNormalizedList(item.soft_evidence, limits.evidenceMaxItems * 2, limits.itemMaxLength),
+      hard_blockers: dedupeNormalizedList(item.hard_blockers, limits.blockerMaxItems * 2, limits.itemMaxLength),
+      missing_or_uncertain: dedupeNormalizedList(
+        item.missing_or_uncertain,
+        limits.uncertaintyMaxItems * 2,
+        limits.itemMaxLength,
+      ),
+      quoted_spans: dedupeNormalizedList(item.quoted_spans, limits.quoteMaxItems * 2, limits.quoteMaxLength),
+      chunk_index: Number.isFinite(Number(item.chunk_index)) ? Number(item.chunk_index) : index + 1,
+      chunk_total: Number.isFinite(Number(item.chunk_total)) ? Number(item.chunk_total) : null,
+    }))
+    .sort((left, right) => left.chunk_index - right.chunk_index)
+    .map((item) => {
+      const chunk = {
+        chunk_index: item.chunk_index,
+        chunk_total: item.chunk_total,
+        chunk_passed: item.chunk_passed,
+        chunk_summary: item.chunk_summary,
+      };
+      for (const [field, maxItems] of [
+        ['hard_evidence', limits.evidenceMaxItems],
+        ['soft_evidence', limits.evidenceMaxItems],
+        ['hard_blockers', limits.blockerMaxItems],
+        ['missing_or_uncertain', limits.uncertaintyMaxItems],
+        ['quoted_spans', limits.quoteMaxItems],
+      ]) {
+        const bucket = [];
+        for (const entry of item[field]) {
+          const key = toLowerSafe(entry);
+          if (!entry || seenByBucket[field].has(key)) continue;
+          seenByBucket[field].add(key);
+          bucket.push(entry);
+          if (bucket.length >= maxItems) break;
+        }
+        if (bucket.length > 0) {
+          chunk[field] = bucket;
+        }
+      }
+      return chunk;
+    });
+  return {
+    compression_mode: compact ? 'compact' : 'standard',
+    chunk_count: normalizedChunks.length,
+    candidate_profile: buildAggregateCandidateProfile(candidate, compact),
+    chunks: normalizedChunks,
   };
 }
 
@@ -623,7 +890,15 @@ export class LlmClient {
     throw lastError || new Error(`${label} evaluation failed`);
   }
 
-  async requestResponses({ prompt, imageDataUrl = null, imageDataUrls = [], evidenceCorpus = '', chunkIndex = 1, chunkTotal = 1 }) {
+  async requestResponses({
+    prompt,
+    imageDataUrl = null,
+    imageDataUrls = [],
+    evidenceCorpus = '',
+    chunkIndex = 1,
+    chunkTotal = 1,
+    parser = parseLlmJson,
+  }) {
     const content = [{ type: 'input_text', text: prompt }];
     const normalizedImageDataUrls = Array.isArray(imageDataUrls)
       ? imageDataUrls.map((item) => String(item || '').trim()).filter(Boolean)
@@ -691,7 +966,7 @@ export class LlmClient {
     }
 
     try {
-      return parseLlmJson(outputContent, {
+      return parser(outputContent, {
         evidenceCorpus,
         reasoningText,
         chunkIndex,
@@ -706,7 +981,15 @@ export class LlmClient {
     }
   }
 
-  async requestCompletions({ prompt, imageDataUrl = null, imageDataUrls = [], evidenceCorpus = '', chunkIndex = 1, chunkTotal = 1 }) {
+  async requestCompletions({
+    prompt,
+    imageDataUrl = null,
+    imageDataUrls = [],
+    evidenceCorpus = '',
+    chunkIndex = 1,
+    chunkTotal = 1,
+    parser = parseLlmJson,
+  }) {
     const content = [{ type: 'text', text: prompt }];
     const normalizedImageDataUrls = Array.isArray(imageDataUrls)
       ? imageDataUrls.map((item) => String(item || '').trim()).filter(Boolean)
@@ -765,7 +1048,7 @@ export class LlmClient {
     }
 
     try {
-      return parseLlmJson(outputContent, {
+      return parser(outputContent, {
         evidenceCorpus,
         reasoningText,
         chunkIndex,
@@ -832,6 +1115,59 @@ export class LlmClient {
     };
   }
 
+  async requestTextChunkAnalysis({ screeningCriteria, candidate, resumeText, chunkIndex = 1, chunkTotal = 1 }) {
+    return this.requestByPreference({
+      prompt: buildChunkAnalysisPrompt({
+        screeningCriteria,
+        candidate,
+        resumeText,
+        chunkIndex,
+        chunkTotal,
+      }),
+      imageDataUrl: null,
+      evidenceCorpus: resumeText,
+      chunkIndex,
+      chunkTotal,
+      parser: (content, parserOptions) =>
+        normalizeChunkAnalysisResult(content, {
+          resumeText,
+          chunkIndex,
+          chunkTotal,
+          ...parserOptions,
+        }),
+    });
+  }
+
+  async requestLongResumeAggregateDecision({
+    screeningCriteria,
+    candidate,
+    aggregateInput,
+    aggregateRetryUsed = false,
+  }) {
+    const result = await this.requestByPreference({
+      prompt: buildLongResumeAggregatePrompt({
+        screeningCriteria,
+        candidate,
+        aggregateInput,
+      }),
+      imageDataUrl: null,
+      evidenceCorpus: JSON.stringify(aggregateInput),
+      chunkIndex: 1,
+      chunkTotal: Number.isFinite(Number(aggregateInput?.chunk_count))
+        ? Number(aggregateInput.chunk_count)
+        : 1,
+    });
+    return {
+      ...result,
+      evaluationMode: 'text-chunk-aggregate',
+      aggregateRetryUsed,
+      chunkIndex: null,
+      chunkTotal: Number.isFinite(Number(aggregateInput?.chunk_count))
+        ? Number(aggregateInput.chunk_count)
+        : result.chunkTotal,
+    };
+  }
+
   async evaluateTextResume({ screeningCriteria, candidate }) {
     const fullResumeText = String(candidate?.resumeText || '');
     const normalizedResumeText = normalizeText(fullResumeText);
@@ -860,6 +1196,7 @@ export class LlmClient {
       return {
         ...single,
         evaluationMode: 'text',
+        aggregateRetryUsed: false,
       };
     } catch (error) {
       if (!isTextContextLimitMessage(error?.message || '')) {
@@ -878,45 +1215,37 @@ export class LlmClient {
     const chunkResults = [];
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index];
-      const result = await this.requestByPreference({
-        prompt: buildTextPrompt({
-          screeningCriteria,
-          candidate,
-          resumeText: chunk.text,
-          chunkIndex: index + 1,
-          chunkTotal: chunks.length,
-        }),
-        imageDataUrl: null,
-        evidenceCorpus: chunk.text,
+      const result = await this.requestTextChunkAnalysis({
+        screeningCriteria,
+        candidate,
+        resumeText: chunk.text,
         chunkIndex: index + 1,
         chunkTotal: chunks.length,
       });
       chunkResults.push(result);
     }
 
-    const passedChunks = chunkResults.filter((item) => item?.passed === true);
-    if (passedChunks.length > 0) {
-      const best = passedChunks[0];
-      return {
-        ...best,
-        evaluationMode: 'text',
-      };
+    let aggregateInput = buildLongResumeAggregateInput(chunkResults, candidate);
+    try {
+      return await this.requestLongResumeAggregateDecision({
+        screeningCriteria,
+        candidate,
+        aggregateInput,
+        aggregateRetryUsed: false,
+      });
+    } catch (error) {
+      if (!isTextContextLimitMessage(error?.message || '')) {
+        throw error;
+      }
     }
 
-    return {
-      passed: false,
-      rawOutputText:
-        chunkResults.map((item) => normalizeText(item?.rawOutputText)).find(Boolean) ||
-        `{"passed":false,"mode":"text-chunk-fallback","chunks":${chunks.length}}`,
-      rawReasoningText: chunkResults.map((item) => normalizeText(item?.rawReasoningText)).find(Boolean) || '',
-      cot: chunkResults.map((item) => normalizeText(item?.cot)).find(Boolean) || '',
-      reason: chunkResults.map((item) => normalizeText(item?.reason)).find(Boolean) || '',
-      summary: chunkResults.map((item) => normalizeText(item?.summary)).find(Boolean) || '',
-      evidence: [],
-      chunkIndex: null,
-      chunkTotal: chunks.length,
-      evaluationMode: 'text',
-    };
+    aggregateInput = buildLongResumeAggregateInput(chunkResults, candidate, { compact: true });
+    return this.requestLongResumeAggregateDecision({
+      screeningCriteria,
+      candidate,
+      aggregateInput,
+      aggregateRetryUsed: true,
+    });
   }
 
   async evaluateResume({ screeningCriteria, candidate, imagePath, imagePaths = [] }) {
@@ -953,4 +1282,11 @@ export const __testables = {
   matchEvidenceAgainstResume,
   splitTextByChunks,
   isTextContextLimitMessage,
+  buildChunkAnalysisPrompt,
+  buildLongResumeAggregatePrompt,
+  normalizeChunkAnalysisResult,
+  buildLongResumeAggregateInput,
+  dedupeNormalizedList,
+  filterEvidenceListAgainstText,
+  filterQuotedSpansAgainstText,
 };
