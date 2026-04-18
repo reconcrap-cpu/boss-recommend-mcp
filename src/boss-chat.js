@@ -97,11 +97,30 @@ function isSafeBossChatLegacyWorkspaceRoot(workspaceRoot) {
   );
 }
 
-export function getBossChatDataDir() {
+function isUnsafeBossChatDataDir(targetPath) {
+  const resolved = path.resolve(String(targetPath || ""));
+  return isRootDirectory(resolved) || isSystemDirectoryWorkspaceRoot(resolved);
+}
+
+function resolveBossChatDataDir() {
   if (process.env.BOSS_CHAT_HOME) {
-    return path.resolve(process.env.BOSS_CHAT_HOME);
+    return {
+      data_dir: path.resolve(process.env.BOSS_CHAT_HOME),
+      data_dir_source: "env:BOSS_CHAT_HOME"
+    };
   }
-  return path.join(getStateHome(), BOSS_CHAT_RUNTIME_SUBDIR);
+  const stateHome = getStateHome();
+  const source = process.env.BOSS_RECOMMEND_HOME
+    ? "default:env:BOSS_RECOMMEND_HOME"
+    : "default:user_home";
+  return {
+    data_dir: path.join(stateHome, BOSS_CHAT_RUNTIME_SUBDIR),
+    data_dir_source: source
+  };
+}
+
+export function getBossChatDataDir() {
+  return resolveBossChatDataDir().data_dir;
 }
 
 export function getLegacyBossChatWorkspaceDataDir(workspaceRoot) {
@@ -110,7 +129,8 @@ export function getLegacyBossChatWorkspaceDataDir(workspaceRoot) {
 }
 
 export function resolveBossChatRuntimeLayout(workspaceRoot) {
-  const dataDir = getBossChatDataDir();
+  const resolvedDataDir = resolveBossChatDataDir();
+  const dataDir = resolvedDataDir.data_dir;
   const legacyWorkspaceDir = getLegacyBossChatWorkspaceDataDir(workspaceRoot);
   const migrationSourceDir =
     legacyWorkspaceDir && pathExists(legacyWorkspaceDir) && !pathExists(dataDir)
@@ -119,6 +139,7 @@ export function resolveBossChatRuntimeLayout(workspaceRoot) {
   return {
     workspace_root: workspaceRoot ? path.resolve(String(workspaceRoot)) : null,
     data_dir: dataDir,
+    data_dir_source: resolvedDataDir.data_dir_source,
     legacy_workspace_dir: legacyWorkspaceDir,
     migration_source_dir: migrationSourceDir,
     migration_pending: Boolean(migrationSourceDir),
@@ -143,6 +164,22 @@ export function ensureBossChatRuntimeReady(workspaceRoot) {
       ? `Pending legacy boss-chat migration from ${runtime.migration_source_dir}`
       : ""
   };
+
+  if (isUnsafeBossChatDataDir(runtime.data_dir)) {
+    return {
+      ...runtime,
+      created,
+      existed,
+      failed: [
+        {
+          path: runtime.data_dir,
+          message: `Refusing unsafe boss-chat runtime path: ${runtime.data_dir}. Please use BOSS_CHAT_HOME in a writable user directory.`
+        }
+      ],
+      migration,
+      blocked_reason: "UNSAFE_DATA_DIR"
+    };
+  }
 
   if (runtime.migration_source_dir) {
     try {
@@ -701,7 +738,17 @@ function buildBossChatCliArgs(command, input, resolvedConfig, runtimeLayout = nu
   return args;
 }
 
+function withRuntimeDiagnostics(payload, runtimeLayout) {
+  if (!payload || typeof payload !== "object") return payload;
+  return {
+    ...payload,
+    data_dir: runtimeLayout?.data_dir || null,
+    data_dir_source: runtimeLayout?.data_dir_source || null
+  };
+}
+
 async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
+  const runtimeLayout = ensureBossChatRuntimeReady(workspaceRoot);
   const cliPath = resolveBossChatCliPath(workspaceRoot);
   if (!cliPath) {
     return {
@@ -714,12 +761,13 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
         error: {
           code: "BOSS_CHAT_CLI_MISSING",
           message: "未找到 vendored boss-chat CLI。"
-        }
+        },
+        data_dir: runtimeLayout?.data_dir || null,
+        data_dir_source: runtimeLayout?.data_dir_source || null
       }
     };
   }
 
-  const runtimeLayout = ensureBossChatRuntimeReady(workspaceRoot);
   const runtimeInitFailed = runtimeLayout.failed.some((item) => item.path === runtimeLayout.data_dir)
     && !pathExists(runtimeLayout.data_dir);
   if (runtimeInitFailed) {
@@ -738,6 +786,7 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
             .join("; ") || "无法初始化 boss-chat runtime 目录。"
         },
         data_dir: runtimeLayout.data_dir,
+        data_dir_source: runtimeLayout.data_dir_source,
         migration: runtimeLayout.migration
       }
     };
@@ -756,7 +805,9 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
           status: "FAILED",
           error: configResolution.error,
           config_path: configResolution.config_path,
-          config_dir: configResolution.config_dir
+          config_dir: configResolution.config_dir,
+          data_dir: runtimeLayout.data_dir,
+          data_dir_source: runtimeLayout.data_dir_source
         }
       };
     }
@@ -767,7 +818,10 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, args, {
       cwd,
-      env: process.env,
+      env: {
+        ...process.env,
+        BOSS_CHAT_HOME: runtimeLayout.data_dir
+      },
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"]
     });
@@ -791,7 +845,9 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
           error: {
             code: "BOSS_CHAT_CLI_SPAWN_FAILED",
             message: error?.message || "无法启动 vendored boss-chat CLI。"
-          }
+          },
+          data_dir: runtimeLayout.data_dir,
+          data_dir_source: runtimeLayout.data_dir_source
         }
       });
     });
@@ -803,7 +859,7 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
           exitCode: Number.isInteger(code) ? code : 1,
           stdout,
           stderr,
-          payload: parsed
+          payload: withRuntimeDiagnostics(parsed, runtimeLayout)
         });
         return;
       }
@@ -812,18 +868,21 @@ async function spawnBossChatCli({ workspaceRoot, command, input = {} }) {
         exitCode: Number.isInteger(code) ? code : 1,
         stdout,
         stderr,
-        payload: Number(code) === 0
-          ? {
-              status: "OK",
-              message: normalizeText(stdout) || `${command} 执行成功。`
-            }
-          : {
-              status: "FAILED",
-              error: {
-                code: "BOSS_CHAT_CLI_EXECUTION_FAILED",
-                message: normalizeText(stderr || stdout) || `${command} 执行失败。`
+        payload: withRuntimeDiagnostics(
+          Number(code) === 0
+            ? {
+                status: "OK",
+                message: normalizeText(stdout) || `${command} 执行成功。`
               }
-            }
+            : {
+                status: "FAILED",
+                error: {
+                  code: "BOSS_CHAT_CLI_EXECUTION_FAILED",
+                  message: normalizeText(stderr || stdout) || `${command} 执行失败。`
+                }
+              },
+          runtimeLayout
+        )
       });
     });
   });
@@ -844,6 +903,7 @@ export function getBossChatHealthCheck(workspaceRoot, input = {}) {
         message: "未找到 vendored boss-chat CLI。"
       },
       data_dir: runtimeLayout.data_dir,
+      data_dir_source: runtimeLayout.data_dir_source,
       legacy_workspace_dir: runtimeLayout.legacy_workspace_dir,
       migration_pending: runtimeLayout.migration_pending
     };
@@ -857,6 +917,7 @@ export function getBossChatHealthCheck(workspaceRoot, input = {}) {
       cli_dir: cliDir,
       cli_path: cliPath,
       data_dir: runtimeLayout.data_dir,
+      data_dir_source: runtimeLayout.data_dir_source,
       legacy_workspace_dir: runtimeLayout.legacy_workspace_dir,
       migration_pending: runtimeLayout.migration_pending
     };
@@ -870,6 +931,7 @@ export function getBossChatHealthCheck(workspaceRoot, input = {}) {
     debug_port: resolvedPort,
     shared_llm_config: true,
     data_dir: runtimeLayout.data_dir,
+    data_dir_source: runtimeLayout.data_dir_source,
     legacy_workspace_dir: runtimeLayout.legacy_workspace_dir,
     migration_source_dir: runtimeLayout.migration_source_dir,
     migration_pending: runtimeLayout.migration_pending

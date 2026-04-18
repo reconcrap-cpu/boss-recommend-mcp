@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { appendFile, mkdir } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import * as readlineCore from 'node:readline';
@@ -301,12 +302,82 @@ function parseArgs(argv) {
   return args;
 }
 
-function resolveDataDir(args = {}, env = process.env, cwd = process.cwd()) {
+function isRootDirectory(targetPath) {
+  const resolved = path.resolve(String(targetPath || ''));
+  const parsed = path.parse(resolved);
+  return resolved.toLowerCase() === String(parsed.root || '').toLowerCase();
+}
+
+function isSystemDirectoryPath(targetPath) {
+  const resolved = path.resolve(String(targetPath || ''));
+  const normalized = resolved.replace(/\\/g, '/').toLowerCase();
+  if (process.platform === 'win32') {
+    return (
+      normalized.endsWith('/windows')
+      || normalized.endsWith('/windows/system32')
+      || normalized.endsWith('/windows/syswow64')
+      || normalized.endsWith('/program files')
+      || normalized.endsWith('/program files (x86)')
+    );
+  }
+  return (
+    normalized === '/system'
+    || normalized.startsWith('/system/')
+    || normalized === '/usr'
+    || normalized.startsWith('/usr/')
+    || normalized === '/bin'
+    || normalized.startsWith('/bin/')
+    || normalized === '/sbin'
+    || normalized.startsWith('/sbin/')
+  );
+}
+
+function resolveDefaultDataDir(env = process.env) {
+  const stateHomeRaw = String(env?.BOSS_RECOMMEND_HOME || '').trim();
+  const stateHome = stateHomeRaw
+    ? path.resolve(stateHomeRaw)
+    : path.join(os.homedir(), '.boss-recommend-mcp');
+  const source = stateHomeRaw
+    ? 'default:env:BOSS_RECOMMEND_HOME'
+    : 'default:user_home';
+  return {
+    path: path.join(stateHome, 'boss-chat'),
+    source,
+  };
+}
+
+function resolveDataDirDetails(args = {}, env = process.env, cwd = process.cwd()) {
   const explicit = String(args?.dataDir || '').trim();
-  if (explicit) return path.resolve(explicit);
+  if (explicit) {
+    return {
+      path: path.resolve(explicit),
+      source: 'arg:data-dir',
+    };
+  }
   const fromEnv = String(env?.BOSS_CHAT_HOME || '').trim();
-  if (fromEnv) return path.resolve(fromEnv);
-  return path.join(path.resolve(String(cwd || process.cwd())), '.boss-chat');
+  if (fromEnv) {
+    return {
+      path: path.resolve(fromEnv),
+      source: 'env:BOSS_CHAT_HOME',
+    };
+  }
+  return resolveDefaultDataDir(env);
+}
+
+function resolveDataDir(args = {}, env = process.env, cwd = process.cwd()) {
+  return resolveDataDirDetails(args, env, cwd).path;
+}
+
+function validateDataDir(targetPath) {
+  const resolved = path.resolve(String(targetPath || ''));
+  if (isRootDirectory(resolved) || isSystemDirectoryPath(resolved)) {
+    return {
+      ok: false,
+      code: 'UNSAFE_DATA_DIR',
+      message: `Refusing unsafe boss-chat data dir: ${resolved}. Please use --data-dir or BOSS_CHAT_HOME to a writable user directory.`,
+    };
+  }
+  return { ok: true };
 }
 
 function printUsage() {
@@ -323,7 +394,7 @@ function printUsage() {
   console.log('');
   console.log('Common options:');
   console.log('  --profile <name>                Profile name (default: default)');
-  console.log('  --data-dir <path>               Runtime data dir (default: $BOSS_CHAT_HOME or <cwd>/.boss-chat)');
+  console.log('  --data-dir <path>               Runtime data dir (default: $BOSS_CHAT_HOME or ~/.boss-recommend-mcp/boss-chat)');
   console.log('  --json                          JSON output for agent integration');
   console.log('  --run-id <id>                   Target async run_id (for get/pause/resume/cancel)');
   console.log('');
@@ -1527,7 +1598,27 @@ async function executeRunCommand(args, dataDir) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const dataDir = resolveDataDir(args);
+  const resolvedDataDir = resolveDataDirDetails(args);
+  const dataDir = resolvedDataDir.path;
+  const dataDirValidation = validateDataDir(dataDir);
+  if (!dataDirValidation.ok) {
+    const failedPayload = {
+      status: 'FAILED',
+      error: {
+        code: dataDirValidation.code,
+        message: dataDirValidation.message,
+      },
+      data_dir: dataDir,
+      data_dir_source: resolvedDataDir.source,
+    };
+    if (args.json) {
+      console.log(JSON.stringify(failedPayload));
+    } else {
+      console.error(failedPayload.error.message);
+    }
+    process.exitCode = 1;
+    return;
+  }
   await mkdir(dataDir, { recursive: true });
 
   if (args.command === 'help') {
@@ -1566,6 +1657,13 @@ async function main() {
       return;
   }
 
+  if (payload && typeof payload === 'object') {
+    payload = {
+      ...payload,
+      data_dir: dataDir,
+      data_dir_source: resolvedDataDir.source,
+    };
+  }
   outputCommandResult(args, payload);
   if (payload?.status === 'FAILED') {
     process.exitCode = 1;
@@ -1574,7 +1672,9 @@ async function main() {
 
 export const __testables = {
   parseArgs,
+  resolveDataDirDetails,
   resolveDataDir,
+  validateDataDir,
   connectBossChatPage,
   hasHydratedChatShell,
   promptRunProfile,

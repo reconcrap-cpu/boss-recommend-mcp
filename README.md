@@ -239,7 +239,9 @@ node src/cli.js chat run --job "算法工程师" --start-from unread --criteria 
 - `pause_boss_chat_run`
 - `resume_boss_chat_run`
 - `cancel_boss_chat_run`
-- vendored `boss-chat` CLI 还支持 `--data-dir <path>` 与 `BOSS_CHAT_HOME`，优先级高于兼容旧行为的 `<cwd>/.boss-chat`
+- vendored `boss-chat` CLI 还支持 `--data-dir <path>` 与 `BOSS_CHAT_HOME`，默认目录为 `~/.boss-recommend-mcp/boss-chat`（若设置 `BOSS_RECOMMEND_HOME`，则默认 `<BOSS_RECOMMEND_HOME>/boss-chat`）
+- 对 `/.boss-chat`、系统目录等危险运行目录会主动拒绝启动并返回 `UNSAFE_DATA_DIR`，避免在 harness 丢参时误写根目录
+- `boss_chat_health_check` 与 chat run 返回结果会包含 `data_dir` 与 `data_dir_source`，便于定位是参数/环境变量/默认路径生效
 
 chat-only 交互建议：
 

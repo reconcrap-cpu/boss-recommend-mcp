@@ -244,6 +244,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(health.status, "OK");
     assert.equal(health.shared_llm_config, true);
     assert.equal(health.debug_port, 9666);
+    assert.equal(health.data_dir_source, "env:BOSS_CHAT_HOME");
     assert.equal(health.data_dir, getTestChatDataDir(workspaceRoot));
     assert.equal(health.legacy_workspace_dir, path.join(workspaceRoot, ".boss-chat"));
     assert.equal(health.migration_pending, false);
@@ -526,18 +527,45 @@ function testVendorBossChatCliShouldResolveExplicitDataDir() {
   const cwd = path.join(path.parse(process.cwd()).root, "workspace");
   const args = vendorCliTestables.parseArgs(["start-run", "--data-dir", "/tmp/boss-chat-data"]);
   assert.equal(args.dataDir, "/tmp/boss-chat-data");
+  const explicitResolved = vendorCliTestables.resolveDataDirDetails(args, { BOSS_CHAT_HOME: "/tmp/ignored" }, cwd);
+  assert.equal(explicitResolved.source, "arg:data-dir");
+  assert.equal(explicitResolved.path, path.resolve("/tmp/boss-chat-data"));
   assert.equal(
     vendorCliTestables.resolveDataDir(args, { BOSS_CHAT_HOME: "/tmp/ignored" }, cwd),
     path.resolve("/tmp/boss-chat-data")
   );
+  const envResolved = vendorCliTestables.resolveDataDirDetails({}, { BOSS_CHAT_HOME: "/tmp/from-env" }, cwd);
+  assert.equal(envResolved.source, "env:BOSS_CHAT_HOME");
+  assert.equal(envResolved.path, path.resolve("/tmp/from-env"));
   assert.equal(
     vendorCliTestables.resolveDataDir({}, { BOSS_CHAT_HOME: "/tmp/from-env" }, cwd),
     path.resolve("/tmp/from-env")
   );
+  const defaultResolved = vendorCliTestables.resolveDataDirDetails({}, {}, cwd);
+  assert.equal(defaultResolved.source, "default:user_home");
+  assert.equal(defaultResolved.path, path.join(os.homedir(), ".boss-recommend-mcp", "boss-chat"));
   assert.equal(
     vendorCliTestables.resolveDataDir({}, {}, cwd),
-    path.join(path.resolve(cwd), ".boss-chat")
+    path.join(os.homedir(), ".boss-recommend-mcp", "boss-chat")
   );
+
+  const unsafeRoot = vendorCliTestables.validateDataDir(path.parse(process.cwd()).root);
+  assert.equal(unsafeRoot.ok, false);
+  assert.equal(unsafeRoot.code, "UNSAFE_DATA_DIR");
+  assert.equal(unsafeRoot.message.includes("Refusing unsafe boss-chat data dir"), true);
+
+  const safePath = vendorCliTestables.validateDataDir(path.join(os.homedir(), ".boss-recommend-mcp", "boss-chat"));
+  assert.equal(safePath.ok, true);
+}
+
+function testVendorBossChatCliShouldUseRecommendHomeForDefaultDataDir() {
+  const resolved = vendorCliTestables.resolveDataDirDetails(
+    {},
+    { BOSS_RECOMMEND_HOME: "/tmp/recommend-home" },
+    path.join(path.parse(process.cwd()).root, "workspace")
+  );
+  assert.equal(resolved.source, "default:env:BOSS_RECOMMEND_HOME");
+  assert.equal(resolved.path, path.resolve("/tmp/recommend-home/boss-chat"));
 }
 
 async function testBossChatPageShouldTreatBlankChatShellAsOnChatPage() {
@@ -3019,6 +3047,7 @@ async function main() {
   await testBossChatMcpToolsShouldValidateAndRoute();
   await testBossChatCliShouldSupportRunAndFollowUpParsing();
   testVendorBossChatCliShouldResolveExplicitDataDir();
+  testVendorBossChatCliShouldUseRecommendHomeForDefaultDataDir();
   await testVendorBossChatCliShouldWaitForHydratedChatShell();
   await testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile();
   testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig();
