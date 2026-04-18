@@ -31,7 +31,12 @@ const CSV_HEADER = [
   'text_model_ms',
   'timing_summary',
   'reason',
+  'llm_summary',
+  'llm_cot',
+  'llm_evidence',
+  'llm_raw_reasoning',
   'error_message',
+  'llm_raw_output',
   'llm_raw_output_preview',
 ];
 
@@ -100,6 +105,24 @@ function getTimingValue(result, key) {
   return normalizeMs(getArtifacts(result)[key]);
 }
 
+function getLlmSummary(result) {
+  return normalizeText(getArtifacts(result).llmSummary);
+}
+
+function getLlmCot(result) {
+  return normalizeText(getArtifacts(result).llmCot);
+}
+
+function getLlmEvidence(result) {
+  const evidence = getArtifacts(result).llmEvidence;
+  if (!Array.isArray(evidence)) return '';
+  return evidence.map((item) => normalizeText(item)).filter(Boolean).join(' | ');
+}
+
+function getLlmRawReasoning(result) {
+  return normalizeText(getArtifacts(result).llmRawReasoning);
+}
+
 function formatTimingSummary(result) {
   const parts = [];
   for (const [key, label] of TIMING_BUCKETS) {
@@ -113,10 +136,16 @@ function formatTimingSummary(result) {
 function formatResultNotes(result) {
   const parts = [];
   const reason = previewText(result?.reason, 120);
+  const summary = previewText(getLlmSummary(result), 120);
+  const cot = previewText(getLlmCot(result), 180);
   const errorMessage = previewText(result?.error, 120);
+  const llmRawReasoning = previewText(getLlmRawReasoning(result), 180);
   const llmRawOutput = previewText(getArtifacts(result).llmRawOutput, 180);
   if (reason) parts.push(`原因: ${reason}`);
+  if (summary) parts.push(`摘要: ${summary}`);
+  if (cot) parts.push(`CoT: ${cot}`);
   if (errorMessage) parts.push(`错误: ${errorMessage}`);
+  if (llmRawReasoning) parts.push(`Reasoning: ${llmRawReasoning}`);
   if (llmRawOutput) parts.push(`LLM: ${llmRawOutput}`);
   return parts.length > 0 ? parts.join(' | ') : '-';
 }
@@ -243,7 +272,12 @@ function buildCsvSummary(summary) {
       csvEscape(getTimingValue(result, 'textModelMs') ?? ''),
       csvEscape(formatTimingSummary(result)),
       csvEscape(result?.reason || ''),
+      csvEscape(getLlmSummary(result)),
+      csvEscape(getLlmCot(result)),
+      csvEscape(getLlmEvidence(result)),
+      csvEscape(getLlmRawReasoning(result)),
       csvEscape(result?.error || ''),
+      csvEscape(artifacts.llmRawOutput || ''),
       csvEscape(previewText(artifacts.llmRawOutput, 500)),
     ].join(','));
   });

@@ -43,6 +43,22 @@ function getCompletionContent(data) {
   return '';
 }
 
+function flattenChatMessageContent(content) {
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          return item.text || item.content || item.reasoning_content || '';
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  return String(content || '');
+}
+
 function getResponsesContent(data) {
   if (typeof data?.output_text === 'string' && data.output_text.trim()) {
     return data.output_text;
@@ -161,6 +177,100 @@ function toStringArray(value, maxItems = 8) {
     if (normalized.length >= maxItems) break;
   }
   return normalized;
+}
+
+function collectNestedText(value, out = [], depth = 0) {
+  if (depth > 6 || value === null || value === undefined) return out;
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    const normalized = normalizeText(String(value));
+    if (normalized) out.push(normalized);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNestedText(item, out, depth + 1);
+    }
+    return out;
+  }
+  if (typeof value === 'object') {
+    const priorityKeys = ['text', 'reasoning_content', 'summary_text', 'summary', 'content', 'cot', 'reason'];
+    const seen = new Set();
+    for (const key of priorityKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        seen.add(key);
+        collectNestedText(value[key], out, depth + 1);
+      }
+    }
+    for (const [key, nested] of Object.entries(value)) {
+      if (seen.has(key)) continue;
+      collectNestedText(nested, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+function dedupeTextFragments(fragments = []) {
+  const deduped = [];
+  const seen = new Set();
+  for (const item of fragments) {
+    const normalized = normalizeText(item);
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(normalized);
+  }
+  return deduped;
+}
+
+function joinTextFragments(fragments = []) {
+  return dedupeTextFragments(fragments).join('\n');
+}
+
+function extractCompletionReasoningText(data) {
+  const choice = data?.choices?.[0] || {};
+  const fragments = [];
+  const content = choice?.message?.content;
+  if (Array.isArray(content)) {
+    for (const part of content) {
+      const partType = normalizeText(part?.type || '').toLowerCase();
+      if (partType.includes('reason') || partType.includes('summary')) {
+        collectNestedText(part, fragments);
+      }
+    }
+  }
+  const candidates = [
+    choice?.message?.reasoning_content,
+    choice?.message?.reasoning,
+    choice?.reasoning_content,
+    choice?.reasoning,
+  ];
+  for (const candidate of candidates) {
+    collectNestedText(candidate, fragments);
+  }
+  return joinTextFragments(fragments);
+}
+
+function extractResponsesReasoningText(data) {
+  const fragments = [];
+  collectNestedText(data?.reasoning, fragments);
+  collectNestedText(data?.reasoning_content, fragments);
+
+  const output = Array.isArray(data?.output) ? data.output : [];
+  for (const item of output) {
+    const itemType = normalizeText(item?.type || '').toLowerCase();
+    if (itemType.includes('reason') || itemType.includes('summary')) {
+      collectNestedText(item, fragments);
+    }
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const chunk of content) {
+      const chunkType = normalizeText(chunk?.type || '').toLowerCase();
+      if (chunkType.includes('reason') || chunkType.includes('summary')) {
+        collectNestedText(chunk, fragments);
+      }
+    }
+  }
+
+  return joinTextFragments(fragments);
 }
 
 function extractEvidenceTokens(text, maxItems = MAX_EVIDENCE_TOKENS) {
@@ -341,6 +451,14 @@ function buildTextPrompt({ screeningCriteria, candidate, resumeText, chunkIndex 
   ].join('\n');
 }
 
+function pickFirstText(...values) {
+  for (const value of values) {
+    const normalized = normalizeText(value);
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
 export function parseLlmJson(content, options = {}) {
   const text = String(content || '').trim();
   if (!text) {
@@ -355,6 +473,11 @@ export function parseLlmJson(content, options = {}) {
     return {
       passed: true,
       rawOutputText: text,
+      rawReasoningText: normalizeText(options.reasoningText || ''),
+      cot: normalizeText(options.reasoningText || ''),
+      reason: '',
+      summary: '',
+      evidence: [],
       chunkIndex,
       chunkTotal,
     };
@@ -364,6 +487,11 @@ export function parseLlmJson(content, options = {}) {
     return {
       passed: false,
       rawOutputText: text,
+      rawReasoningText: normalizeText(options.reasoningText || ''),
+      cot: normalizeText(options.reasoningText || ''),
+      reason: '',
+      summary: '',
+      evidence: [],
       chunkIndex,
       chunkTotal,
     };
@@ -391,9 +519,26 @@ export function parseLlmJson(content, options = {}) {
     throw new Error('LLM response missing boolean "passed"');
   }
 
+  const parsedReason = pickFirstText(parsed?.reason, parsed?.summary, parsed?.summary_text);
+  const parsedSummary = pickFirstText(parsed?.summary, parsed?.summary_text, parsed?.reason);
+  const parsedCot = pickFirstText(
+    options.reasoningText,
+    parsed?.cot,
+    parsed?.reasoning_content,
+    parsed?.reasoning,
+    parsedReason,
+    parsedSummary,
+  );
+  const parsedEvidence = toStringArray(parsed?.evidence);
+
   return {
     passed: parsedPassed,
     rawOutputText: text,
+    rawReasoningText: normalizeText(options.reasoningText || ''),
+    cot: parsedCot,
+    reason: parsedReason || parsedCot,
+    summary: parsedSummary || parsedReason || parsedCot,
+    evidence: parsedEvidence,
     chunkIndex,
     chunkTotal,
   };
@@ -525,6 +670,7 @@ export class LlmClient {
     }
 
     const outputContent = getResponsesContent(data);
+    const reasoningText = extractResponsesReasoningText(data);
     if (!outputContent) {
       const incompleteReason = String(data?.incomplete_details?.reason || '').trim();
       const outputTypes = Array.isArray(data?.output)
@@ -547,6 +693,7 @@ export class LlmClient {
     try {
       return parseLlmJson(outputContent, {
         evidenceCorpus,
+        reasoningText,
         chunkIndex,
         chunkTotal,
       });
@@ -610,6 +757,7 @@ export class LlmClient {
     }
 
     const outputContent = getCompletionContent(data);
+    const reasoningText = extractCompletionReasoningText(data);
     if (!String(outputContent || '').trim()) {
       const emptyError = new Error('Completions API empty textual content');
       emptyError.code = 'COMPLETIONS_EMPTY_CONTENT';
@@ -619,6 +767,7 @@ export class LlmClient {
     try {
       return parseLlmJson(outputContent, {
         evidenceCorpus,
+        reasoningText,
         chunkIndex,
         chunkTotal,
       });
@@ -759,6 +908,11 @@ export class LlmClient {
       rawOutputText:
         chunkResults.map((item) => normalizeText(item?.rawOutputText)).find(Boolean) ||
         `{"passed":false,"mode":"text-chunk-fallback","chunks":${chunks.length}}`,
+      rawReasoningText: chunkResults.map((item) => normalizeText(item?.rawReasoningText)).find(Boolean) || '',
+      cot: chunkResults.map((item) => normalizeText(item?.cot)).find(Boolean) || '',
+      reason: chunkResults.map((item) => normalizeText(item?.reason)).find(Boolean) || '',
+      summary: chunkResults.map((item) => normalizeText(item?.summary)).find(Boolean) || '',
+      evidence: [],
       chunkIndex: null,
       chunkTotal: chunks.length,
       evaluationMode: 'text',
@@ -791,6 +945,10 @@ export class LlmClient {
 }
 
 export const __testables = {
+  flattenChatMessageContent,
+  collectNestedText,
+  extractCompletionReasoningText,
+  extractResponsesReasoningText,
   extractEvidenceTokens,
   matchEvidenceAgainstResume,
   splitTextByChunks,

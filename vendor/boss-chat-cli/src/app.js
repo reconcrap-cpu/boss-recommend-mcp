@@ -18,6 +18,18 @@ function normalizeText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+function toStringArray(value, maxItems = 8) {
+  if (!Array.isArray(value)) return [];
+  const normalized = [];
+  for (const item of value) {
+    const text = normalizeText(item);
+    if (!text) continue;
+    normalized.push(text);
+    if (normalized.length >= maxItems) break;
+  }
+  return normalized;
+}
+
 function shouldContinue(summary, targetCount) {
   if (!targetCount || !Number.isFinite(targetCount) || targetCount <= 0) {
     return true;
@@ -1064,7 +1076,9 @@ export class BossChatApp {
       const evaluation = acquisition.evaluation;
       const capture = acquisition.capture;
       modalOpened = Boolean(acquisition.modalOpened);
-      const finalReason = evaluation.passed ? 'LLM判定通过' : 'LLM判定不通过';
+      const finalReason =
+        normalizeText(evaluation.reason || evaluation.summary || evaluation.cot) ||
+        (evaluation.passed ? 'LLM判定通过' : 'LLM判定不通过');
       this.logger.log(
         `LLM评估完成：passed=${evaluation.passed} | source=${acquisition.acquisitionMode} | reason=${acquisition.acquisitionReason || 'n/a'} | mode=${evaluation.evaluationMode || 'unknown'} | imageCount=${Number(evaluation.imageCount || baseResult.artifacts.modelImagePaths?.length || 0)} | result=${normalizeText(evaluation.rawOutputText || '') || 'n/a'}`,
       );
@@ -1085,6 +1099,11 @@ export class BossChatApp {
       baseResult.artifacts.evaluationChunkTotal = Number.isFinite(Number(evaluation.chunkTotal))
         ? Number(evaluation.chunkTotal)
         : null;
+      baseResult.artifacts.llmReason = normalizeText(evaluation.reason || '');
+      baseResult.artifacts.llmSummary = normalizeText(evaluation.summary || '');
+      baseResult.artifacts.llmCot = normalizeText(evaluation.cot || '');
+      baseResult.artifacts.llmEvidence = toStringArray(evaluation.evidence);
+      baseResult.artifacts.llmRawReasoning = String(evaluation.rawReasoningText || '');
       baseResult.artifacts.llmRawOutput = String(evaluation.rawOutputText || '');
       baseResult.artifacts.resumeAcquisitionMode = String(acquisition.acquisitionMode || '');
       baseResult.artifacts.resumeAcquisitionReason = String(acquisition.acquisitionReason || '');

@@ -18,7 +18,7 @@ import { __testables as indexTestables } from "./index.js";
 import { BossChatApp } from "../vendor/boss-chat-cli/src/app.js";
 import { __testables as vendorCliTestables } from "../vendor/boss-chat-cli/src/cli.js";
 import { BossChatPage } from "../vendor/boss-chat-cli/src/browser/chat-page.js";
-import { LlmClient, parseLlmJson } from "../vendor/boss-chat-cli/src/services/llm.js";
+import { LlmClient, parseLlmJson, __testables as llmTestables } from "../vendor/boss-chat-cli/src/services/llm.js";
 import { ReportStore } from "../vendor/boss-chat-cli/src/services/report-store.js";
 import {
   NETWORK_RESUME_IMAGE_MODE_GRACE_MS,
@@ -36,6 +36,7 @@ const TOOL_BOSS_CHAT_GET_RUN = "get_boss_chat_run";
 const TOOL_BOSS_CHAT_PAUSE_RUN = "pause_boss_chat_run";
 const TOOL_BOSS_CHAT_RESUME_RUN = "resume_boss_chat_run";
 const TOOL_BOSS_CHAT_CANCEL_RUN = "cancel_boss_chat_run";
+const { extractCompletionReasoningText, extractResponsesReasoningText } = llmTestables;
 
 function makeToolCall(id, name, args = {}) {
   return {
@@ -947,6 +948,50 @@ function testBossChatLlmParserShouldAcceptDecisionField() {
     }),
   );
   assert.equal(parsed.passed, false);
+}
+
+function testBossChatLlmParserShouldPreserveReasoningFields() {
+  const parsed = parseLlmJson(
+    JSON.stringify({
+      passed: true,
+      reason: "候选人具备 2 段 AI Agent 项目经验",
+      summary: "符合筛选要求",
+      evidence: ["AI Agent", "MCP"],
+    }),
+    {
+      reasoningText: "先检查项目经历，再核对技能栈，结论为通过。",
+    },
+  );
+  assert.equal(parsed.passed, true);
+  assert.equal(parsed.reason, "候选人具备 2 段 AI Agent 项目经验");
+  assert.equal(parsed.summary, "符合筛选要求");
+  assert.equal(parsed.cot, "先检查项目经历，再核对技能栈，结论为通过。");
+  assert.deepEqual(parsed.evidence, ["AI Agent", "MCP"]);
+  assert.equal(parsed.rawReasoningText, "先检查项目经历，再核对技能栈，结论为通过。");
+}
+
+function testBossChatLlmExtractorsShouldReadProviderReasoningFields() {
+  const completionReasoning = extractCompletionReasoningText({
+    choices: [
+      {
+        message: {
+          content: [{ type: "text", text: "{\"passed\":true}" }],
+          reasoning_content: [{ text: "先核对教育背景，再核对项目经历。" }],
+        },
+      },
+    ],
+  });
+  assert.equal(completionReasoning.includes("教育背景"), true);
+
+  const responsesReasoning = extractResponsesReasoningText({
+    output: [
+      {
+        type: "reasoning",
+        summary: [{ text: "根据项目经历与技能关键词判断为通过。" }],
+      },
+    ],
+  });
+  assert.equal(responsesReasoning.includes("技能关键词"), true);
 }
 
 async function testBossChatLlmTextChunkFallbackShouldWork() {
@@ -2133,6 +2178,11 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
       return {
         passed: false,
         rawOutputText: '{"passed":false}',
+        rawReasoningText: "先看项目经验，再看技能，结论不通过。",
+        cot: "先看项目经验，再看技能，结论不通过。",
+        reason: "项目经验与岗位要求不符",
+        summary: "不符合要求",
+        evidence: ["Python"],
         evaluationMode: "image-multi-chunk",
         imageCount: 3,
         chunkIndex: 1,
@@ -2197,9 +2247,14 @@ async function testBossChatAppShouldPersistEvidenceArtifacts() {
 
   assert.equal(result.passed, false);
   assert.equal(result.artifacts.finalPassed, false);
-  assert.equal(result.reason, "LLM判定不通过");
+  assert.equal(result.reason, "项目经验与岗位要求不符");
   assert.equal(result.artifacts.evaluationMode, "image-multi-chunk");
   assert.equal(result.artifacts.evaluationImageCount, 3);
+  assert.equal(result.artifacts.llmReason, "项目经验与岗位要求不符");
+  assert.equal(result.artifacts.llmSummary, "不符合要求");
+  assert.equal(result.artifacts.llmCot, "先看项目经验，再看技能，结论不通过。");
+  assert.deepEqual(result.artifacts.llmEvidence, ["Python"]);
+  assert.equal(result.artifacts.llmRawReasoning, "先看项目经验，再看技能，结论不通过。");
   assert.equal(result.artifacts.llmRawOutput, '{"passed":false}');
   assert.equal(Array.isArray(result.artifacts.modelImagePaths), true);
   assert.equal(result.artifacts.modelImagePaths.length, 3);
@@ -2241,6 +2296,10 @@ async function testBossChatReportStoreShouldWriteReadableMarkdownAndCsv() {
           textModelMs: 18234,
           initialNetworkWaitMs: 4200,
           evaluationMode: "text",
+          llmSummary: "教育与项目经历匹配",
+          llmCot: "先看教育背景，再看项目经历，结论通过。",
+          llmEvidence: ["AI Agent", "MCP"],
+          llmRawReasoning: "先看教育背景，再看项目经历，结论通过。",
           llmRawOutput: '{"passed":true}',
         },
       },
@@ -2260,6 +2319,10 @@ async function testBossChatReportStoreShouldWriteReadableMarkdownAndCsv() {
           lateNetworkRetryMs: 3000,
           evaluationMode: "image-multi-chunk",
           evaluationImageCount: 3,
+          llmSummary: "项目经历不足",
+          llmCot: "先看项目经历，再看实习时长，结论不通过。",
+          llmEvidence: ["数据分析"],
+          llmRawReasoning: "先看项目经历，再看实习时长，结论不通过。",
           llmRawOutput: '{"passed":false}',
         },
       },
@@ -2297,8 +2360,13 @@ async function testBossChatReportStoreShouldWriteReadableMarkdownAndCsv() {
   assert.match(csvContent, /resume_acquisition_mode/);
   assert.match(csvContent, /initial_network_wait_ms/);
   assert.match(csvContent, /late_network_retry_ms/);
+  assert.match(csvContent, /llm_summary/);
+  assert.match(csvContent, /llm_cot/);
+  assert.match(csvContent, /llm_raw_reasoning/);
+  assert.match(csvContent, /llm_raw_output/);
   assert.match(csvContent, /候选人B/);
   assert.match(csvContent, /image-multi-chunk/);
+  assert.match(csvContent, /先看项目经历，再看实习时长/);
 }
 
 async function main() {
@@ -2316,6 +2384,8 @@ async function main() {
   testBossChatLlmParserShouldAcceptMinimalDecisionJson();
   testBossChatLlmParserShouldAcceptPlainPassFailText();
   testBossChatLlmParserShouldAcceptDecisionField();
+  testBossChatLlmParserShouldPreserveReasoningFields();
+  testBossChatLlmExtractorsShouldReadProviderReasoningFields();
   await testBossChatLlmTextChunkFallbackShouldWork();
   await testBossChatLlmShouldApplyThinkingDefaultsAndOverrides();
   await testBossChatLlmShouldSendAllImageChunksInSingleRequest();
