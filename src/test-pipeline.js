@@ -2183,8 +2183,9 @@ async function testFollowUpChatMissingFieldsShouldExposeRecommendDefaults() {
   const targetCountQuestion = result.pending_questions.find((item) => item.field === "follow_up.chat.target_count");
   assert.equal(criteriaQuestion?.value, "默认沿用 recommend 的筛选条件");
   assert.equal(startFromQuestion?.value, "unread");
-  assert.equal(targetCountQuestion?.value, 18);
-  assert.equal(targetCountQuestion?.recommended_argument_patch?.follow_up?.chat?.target_count, "all");
+  assert.equal(targetCountQuestion?.value, "通过筛选数");
+  assert.equal(targetCountQuestion?.recommended_argument_patch?.follow_up?.chat?.target_count, "通过筛选数");
+  assert.equal(targetCountQuestion?.options?.some((item) => item.label.includes("通过筛选数（推荐）")), true);
   assert.equal(targetCountQuestion?.options?.some((item) => item.label.includes('follow_up.chat.target_count="all"')), true);
 }
 
@@ -2225,7 +2226,9 @@ async function testFollowUpChatMissingTargetCountShouldNeedInput() {
   assert.equal(result.missing_fields.includes("follow_up.chat.target_count"), true);
   const targetQuestion = result.pending_questions.find((item) => item.field === "follow_up.chat.target_count");
   assert.equal(Boolean(targetQuestion), true);
-  assert.equal(targetQuestion.recommended_argument_patch?.follow_up?.chat?.target_count, "all");
+  assert.equal(targetQuestion.recommended_argument_patch?.follow_up?.chat?.target_count, "通过筛选数");
+  assert.equal(targetQuestion.options?.some((item) => item.value === "通过筛选数"), true);
+  assert.equal(targetQuestion.options?.some((item) => item.value === "all"), true);
 }
 
 async function testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics() {
@@ -2248,7 +2251,8 @@ async function testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics(
   assert.equal(targetQuestion?.received_target_count, "not a target");
   assert.equal(Boolean(targetQuestion?.target_count_parse_error), true);
   assert.equal(targetQuestion?.accepted_examples.includes("all"), true);
-  assert.equal(targetQuestion?.recommended_argument_patch?.follow_up?.chat?.target_count, "all");
+  assert.equal(targetQuestion?.accepted_examples.includes("通过筛选数"), true);
+  assert.equal(targetQuestion?.recommended_argument_patch?.follow_up?.chat?.target_count, "通过筛选数");
 }
 
 async function testFollowUpChatAllTargetCountShouldLaunchUnlimited() {
@@ -2315,6 +2319,63 @@ async function testFollowUpChatAllTargetCountShouldLaunchUnlimited() {
   assert.equal(result.status, "COMPLETED");
   assert.equal(capturedChatInput.target_count, "all");
   assert.equal(result.follow_up?.chat?.target_count, "all");
+}
+
+async function testFollowUpChatPassedTargetCountShouldLaunchWithPassedCount() {
+  let capturedChatInput = null;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      followUp: createFollowUpChat({ target_count: "通过筛选数" })
+    },
+    {
+      parseRecommendInstruction: () => createParsed(),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9555 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => ({
+        ok: true,
+        summary: {
+          candidate_count: 6,
+          applied_filters: {},
+          page_state: {}
+        }
+      }),
+      runRecommendScreenCli: async () => ({
+        ok: true,
+        summary: {
+          processed_count: 6,
+          passed_count: 2,
+          skipped_count: 0
+        }
+      }),
+      startBossChatRun: async ({ input }) => {
+        capturedChatInput = input;
+        return {
+          status: "ACCEPTED",
+          run_id: "chat-run-pass-count",
+          message: "chat started"
+        };
+      },
+      getBossChatRun: async () => ({
+        status: "COMPLETED",
+        run: {
+          runId: "chat-run-pass-count",
+          state: "completed",
+          lastMessage: "chat completed",
+          progress: { processed: 2, matched: 2 }
+        }
+      })
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(capturedChatInput?.target_count, 2);
+  assert.equal(result.follow_up?.chat?.input?.target_count, 2);
+  assert.equal(result.follow_up?.chat?.input?.target_count_requested, "passed_count");
 }
 
 async function testFinalReviewShouldIncludeFollowUpChatSummary() {
@@ -2576,6 +2637,7 @@ async function main() {
   await testFinalReviewShouldIncludeFollowUpChatSummary();
   await testCompletedPipelineShouldRunChatFollowUp();
   await testFollowUpChatAllTargetCountShouldLaunchUnlimited();
+  await testFollowUpChatPassedTargetCountShouldLaunchWithPassedCount();
   await testCompletedPipelineShouldFailWhenChatLaunchFails();
   await testCompletedPipelineShouldFailWhenChatRunFails();
   console.log("pipeline tests passed");

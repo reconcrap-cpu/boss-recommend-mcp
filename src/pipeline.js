@@ -30,6 +30,15 @@ const SEARCH_NO_IFRAME_RETRY_DELAY_MS = 1200;
 const MAX_SEARCH_FILTER_AUTO_RETRY_ATTEMPTS = 2;
 const SEARCH_FILTER_AUTO_RETRY_DELAY_MS = 1200;
 const BOSS_CHAT_FOLLOW_UP_POLL_MS = 1500;
+const FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN = "passed_count";
+const FOLLOW_UP_TARGET_COUNT_PASSED_LABEL = "通过筛选数";
+const FOLLOW_UP_TARGET_COUNT_PASSED_ALIASES = new Set([
+  FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN,
+  "passed",
+  "通过筛选数",
+  "筛选通过数",
+  "通过数"
+]);
 const SEARCH_FILTER_RETRY_TOKENS = [
   "FILTER_CONFIRM_FAILED",
   "FILTER_DOM_CLASS_VERIFY_FAILED",
@@ -70,6 +79,75 @@ function parsePositiveIntegerValue(value) {
 
 function normalizePipelineTargetCountValue(value) {
   return normalizeTargetCountInput(value).publicValue;
+}
+
+function isFollowUpPassedTargetCountToken(value) {
+  const normalized = normalizeText(value).toLowerCase().replace(/\s+/g, "");
+  if (!normalized) return false;
+  return FOLLOW_UP_TARGET_COUNT_PASSED_ALIASES.has(normalized);
+}
+
+function normalizeFollowUpTargetCountInput(value) {
+  const normalized = normalizeTargetCountInput(value);
+  if (normalized.provided) {
+    return {
+      ...normalized,
+      launchValue: normalized.publicValue,
+      passedCountMode: false
+    };
+  }
+  if (isFollowUpPassedTargetCountToken(value)) {
+    return {
+      provided: true,
+      targetCount: null,
+      cliArg: null,
+      publicValue: FOLLOW_UP_TARGET_COUNT_PASSED_LABEL,
+      rawValue: value,
+      parseError: null,
+      launchValue: FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN,
+      passedCountMode: true
+    };
+  }
+  return {
+    ...normalized,
+    launchValue: null,
+    passedCountMode: false
+  };
+}
+
+function resolveFollowUpChatTargetCountForLaunch(targetCount, recommendSummary = null) {
+  if (isFollowUpPassedTargetCountToken(targetCount)) {
+    const passedCount = parsePositiveIntegerValue(recommendSummary?.passed_count);
+    if (passedCount) {
+      return {
+        ok: true,
+        target_count: passedCount,
+        resolved_from: FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN,
+        passed_count: recommendSummary?.passed_count ?? null
+      };
+    }
+    return {
+      ok: false,
+      code: "FOLLOW_UP_TARGET_COUNT_PASSED_UNAVAILABLE",
+      message: "boss-chat follow-up 选择了“通过筛选数”，但本次通过人数为空或 0。请改为正整数，或填写 all（扫到底）。",
+      passed_count: recommendSummary?.passed_count ?? null
+    };
+  }
+  const normalized = normalizeTargetCountInput(targetCount);
+  if (normalized.provided) {
+    return {
+      ok: true,
+      target_count: normalized.publicValue,
+      resolved_from: "explicit",
+      passed_count: recommendSummary?.passed_count ?? null
+    };
+  }
+  return {
+    ok: false,
+    code: "FOLLOW_UP_TARGET_COUNT_INVALID",
+    message: normalized.parseError || "boss-chat follow-up target_count 无效。",
+    passed_count: recommendSummary?.passed_count ?? null
+  };
 }
 
 function sleep(ms) {
@@ -394,13 +472,12 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
   const defaultCriteria = normalizeText(defaults?.criteria || "");
   const defaultStartFromRaw = normalizeText(defaults?.start_from || "").toLowerCase();
   const defaultStartFrom = defaultStartFromRaw === "all" ? "all" : "unread";
-  const defaultTargetCount = normalizePipelineTargetCountValue(defaults?.target_count);
 
   const explicitCriteria = normalizeText(raw.criteria);
   const explicitStartFromRaw = normalizeText(raw.start_from).toLowerCase();
   const explicitStartFrom = explicitStartFromRaw === "all" ? "all" : explicitStartFromRaw === "unread" ? "unread" : "";
-  const explicitTarget = normalizeTargetCountInput(raw.target_count);
-  const explicitTargetCount = explicitTarget.publicValue;
+  const explicitTarget = normalizeFollowUpTargetCountInput(raw.target_count);
+  const explicitTargetCount = explicitTarget.launchValue;
 
   const hasExplicitCriteria = Boolean(explicitCriteria);
   const hasExplicitStartFrom = Boolean(explicitStartFrom);
@@ -408,14 +485,15 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
 
   const criteria = explicitCriteria || defaultCriteria;
   const startFrom = explicitStartFrom || defaultStartFrom;
-  const targetCount = explicitTargetCount || defaultTargetCount;
+  const targetCount = explicitTargetCount || FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN;
+  const targetCountSummaryValue = explicitTarget.publicValue || FOLLOW_UP_TARGET_COUNT_PASSED_LABEL;
 
   const profile = normalizeText(raw.profile) || "default";
   const summary = {
     profile,
     criteria: criteria || null,
     start_from: startFrom || null,
-    target_count: targetCount,
+    target_count: targetCountSummaryValue,
     dry_run: raw.dry_run === true,
     no_state: raw.no_state === true,
     safe_pacing: typeof raw.safe_pacing === "boolean" ? raw.safe_pacing : null,
@@ -446,21 +524,39 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
     });
   }
   if (!hasExplicitTargetCount) {
-    const targetCountHints = buildTargetCountCompatibilityHints({
-      argumentName: "follow_up.chat.target_count",
-      recommendedArgumentPatch: {
-        follow_up: {
-          chat: {
-            target_count: "all"
-          }
+    const recommendedTargetCountPatch = {
+      follow_up: {
+        chat: {
+          target_count: FOLLOW_UP_TARGET_COUNT_PASSED_LABEL
         }
       }
+    };
+    const targetCountHints = buildTargetCountCompatibilityHints({
+      argumentName: "follow_up.chat.target_count",
+      recommendedArgumentPatch: recommendedTargetCountPatch
     });
     missing_fields.push("follow_up.chat.target_count");
     pending_questions.push({
       ...targetCountHints,
+      answer_format: `follow_up.chat.target_count = "${FOLLOW_UP_TARGET_COUNT_PASSED_LABEL}" | 正整数 | "all"`,
+      recommended_value: FOLLOW_UP_TARGET_COUNT_PASSED_LABEL,
+      recommended_argument_patch: recommendedTargetCountPatch,
+      canonical_passed_count_value: FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN,
+      accepted_examples: [
+        FOLLOW_UP_TARGET_COUNT_PASSED_LABEL,
+        ...targetCountHints.accepted_examples
+      ],
+      options: [
+        {
+          label: `通过筛选数（推荐）`,
+          value: FOLLOW_UP_TARGET_COUNT_PASSED_LABEL,
+          canonical_value: FOLLOW_UP_TARGET_COUNT_PASSED_TOKEN,
+          argument_patch: recommendedTargetCountPatch
+        },
+        ...(Array.isArray(targetCountHints.options) ? targetCountHints.options : [])
+      ],
       field: "follow_up.chat.target_count",
-      question: "请填写 boss-chat follow-up 本次处理人数上限。若扫到底，请在 follow_up.chat.target_count 里字面填写 \"all\"。",
+      question: "请填写 boss-chat follow-up 目标人数。默认建议填写“通过筛选数”；若要扫到底，请在 follow_up.chat.target_count 里字面填写 \"all\"。",
       value: summary.target_count,
       ...(explicitTarget.rawValue !== undefined ? { received_target_count: explicitTarget.rawValue } : {}),
       ...(explicitTarget.parseError ? { target_count_parse_error: explicitTarget.parseError } : {})
@@ -857,10 +953,32 @@ async function runBossChatFollowUpPhase({
   cancelChatRun
 }) {
   const recommendSummary = recommendResult?.result || null;
-  const resolvedChatInput = buildResolvedFollowUpChatInput(followUpChat, {
+  const requestedChatInput = buildResolvedFollowUpChatInput(followUpChat, {
     selectedJob,
     debugPort
   });
+  const targetCountResolution = resolveFollowUpChatTargetCountForLaunch(
+    requestedChatInput.target_count,
+    recommendSummary
+  );
+  if (!targetCountResolution.ok) {
+    return buildFollowUpFailedResponse(
+      targetCountResolution.code || "BOSS_CHAT_FOLLOW_UP_TARGET_COUNT_INVALID",
+      targetCountResolution.message || "boss-chat follow-up target_count 无法解析。",
+      recommendResult,
+      {
+        enabled: true,
+        input: requestedChatInput,
+        target_count_resolution: targetCountResolution
+      }
+    );
+  }
+  const resolvedChatInput = {
+    ...requestedChatInput,
+    target_count: targetCountResolution.target_count,
+    target_count_source: targetCountResolution.resolved_from,
+    target_count_requested: requestedChatInput.target_count
+  };
   let chatRunId = normalizeText(resume?.chat_run_id || "");
   const resumeFromChatPhase = resume?.resume === true && normalizeText(resume?.follow_up_phase) === "chat_followup";
   let pauseRequested = false;
