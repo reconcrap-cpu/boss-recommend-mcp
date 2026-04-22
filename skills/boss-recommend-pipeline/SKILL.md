@@ -72,8 +72,10 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - `start_from`: `unread|all`
   - `target_count`
 - `follow_up.chat` 可选：
+  - `greeting_text`（兼容 `greetingText`，自定义首条打招呼消息）
   - `profile`（默认 `default`）
   - `dry_run/no_state/safe_pacing/batch_rest_enabled`
+- `greeting_text` 未传时，boss-chat 会自动按默认优先级回退：本次显式值 > profile 历史值 > 内置默认招呼语
 - `job` / `port` 继承 recommend run 上下文；不要单独向用户再要一份
 - LLM 配置固定复用 recommend 的 `screening-config.json`；不要单独向用户再要 `baseUrl/apiKey/model`
 - 缺少 `follow_up.chat` 必填项时，按 `pending_questions` 补缺口；不要额外发起一轮独立的 chat 确认流程

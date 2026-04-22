@@ -188,7 +188,7 @@ node src/cli.js launch-chrome --port 9222
 node src/cli.js run --instruction-file request.txt --confirmation-file confirmation.json --overrides-file overrides.json
 node src/cli.js run --instruction-file request.txt --confirmation-file confirmation.json --overrides-file overrides.json --follow-up-file follow-up.json
 node src/cli.js chat health-check
-node src/cli.js chat run --job "算法工程师" --start-from unread --criteria "有 AI Agent 经验" --targetCount 20
+node src/cli.js chat run --job "算法工程师" --start-from unread --criteria "有 AI Agent 经验" --targetCount 20 --greeting-text "您好，方便发下简历吗？"
 ```
 
 ## Recommend + Chat Follow-up
@@ -201,6 +201,7 @@ node src/cli.js chat run --job "算法工程师" --start-from unread --criteria 
     "chat": {
       "criteria": "候选人需要继续在聊天页过滤有 AI Agent 经验的人选",
       "start_from": "unread",
+      "greeting_text": "您好，方便发下简历吗？",
       "target_count": 20,
       "profile": "default",
       "dry_run": false,
@@ -215,9 +216,11 @@ node src/cli.js chat run --job "算法工程师" --start-from unread --criteria 
 说明：
 
 - `criteria` / `start_from` / `target_count` 为必填
+- `greeting_text` 可选（兼容 `greetingText`）
 - `profile` 可选，默认 `default`
 - `job` 与 `port` 继承 recommend run 已选岗位和调试端口
 - `baseUrl` / `apiKey` / `model` 不再单独传入，固定复用 recommend 的 `screening-config.json`
+- `greeting_text` 默认优先级：本次显式值 > profile 历史值 > 内置默认招呼语（`Hi同学，能麻烦发下简历吗？`）
 - 若缺少 `follow_up.chat` 必填项，pipeline 会返回 `NEED_INPUT`
 - recommend 成功后，父 run 继续存活并进入 `chat_followup`；chat 结束后父 run 才会进入最终终态
 - `boss-chat` 子任务状态统一写入 `~/.boss-recommend-mcp/boss-chat`（或 `BOSS_CHAT_HOME` 指定目录），不再依赖工作区 `cwd`
@@ -229,7 +232,7 @@ node src/cli.js chat run --job "算法工程师" --start-from unread --criteria 
 - CLI：
   - `boss-recommend-mcp chat health-check`
   - `boss-recommend-mcp chat prepare-run`
-  - `boss-recommend-mcp chat run --job "算法工程师" --start-from unread --targetCount 20 --criteria "有 AI Agent 经验"`（后台启动，不自动轮询）
+  - `boss-recommend-mcp chat run --job "算法工程师" --start-from unread --targetCount 20 --criteria "有 AI Agent 经验" [--greeting-text "您好，方便发下简历吗？"]`（后台启动，不自动轮询）
   - `boss-recommend-mcp chat start-run|get-run|pause-run|resume-run|cancel-run`
 - MCP：
   - `boss_chat_health_check`
@@ -247,6 +250,7 @@ chat-only 交互建议：
 
 - 先调用一次 `prepare_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
 - 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count`、`criteria` 后调用 `start_boss_chat_run` 启动任务。
+- `greeting_text` 可选；未传时会自动沿用 profile 上次输入，若无历史值则使用默认招呼语（`Hi同学，能麻烦发下简历吗？`）。
 - `target_count` 支持正整数、`all`、`-1`；若用户给出 `全部候选人` / `所有候选人`，会自动按不限（扫到底）处理。
 
 Trae-CN / 长对话防循环建议：

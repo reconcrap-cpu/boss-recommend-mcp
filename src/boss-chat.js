@@ -579,6 +579,7 @@ function normalizeBossChatStartInput(input = {}) {
   const startFromRaw = normalizeText(input.startFrom || input.start_from).toLowerCase();
   const startFrom = startFromRaw === "all" ? "all" : startFromRaw === "unread" ? "unread" : "";
   const criteria = normalizeText(input.criteria);
+  const greetingText = normalizeText(input.greeting_text || input.greetingText || input.greeting);
   const parsedTarget = normalizeTargetCountInput(getBossChatTargetCountValue(input));
   const port = parsePositiveInteger(input.port);
   return {
@@ -586,6 +587,7 @@ function normalizeBossChatStartInput(input = {}) {
     job,
     startFrom,
     criteria,
+    greetingText,
     targetCount: parsedTarget.targetCount,
     targetCountArg: parsedTarget.cliArg,
     targetCountProvided: parsedTarget.provided,
@@ -646,6 +648,7 @@ function buildNextCallExample(input = {}, missingFields = []) {
   if (normalized.job) sample.job = normalized.job;
   if (normalized.startFrom) sample.start_from = normalized.startFrom;
   if (normalized.criteria) sample.criteria = normalized.criteria;
+  if (normalized.greetingText) sample.greeting_text = normalized.greetingText;
   if (normalized.targetCountProvided) {
     sample.target_count = normalized.targetCountPublicValue || (normalized.targetCountArg === "-1" ? "all" : normalized.targetCount);
   } else if (missingFields.includes("target_count")) {
@@ -680,6 +683,7 @@ function buildBossChatCliArgs(command, input, resolvedConfig, runtimeLayout = nu
     if (normalized.job) args.push("--job", normalized.job);
     if (normalized.startFrom) args.push("--start-from", normalized.startFrom);
     if (normalized.criteria) args.push("--criteria", normalized.criteria);
+    if (normalized.greetingText) args.push("--greeting", normalized.greetingText);
     if (normalized.targetCountArg) args.push("--targetCount", normalized.targetCountArg);
     args.push("--port", String(normalized.port || resolvedConfig.debugPort || 9222));
     args.push("--baseurl", resolvedConfig.baseUrl);
@@ -705,6 +709,7 @@ function buildBossChatCliArgs(command, input, resolvedConfig, runtimeLayout = nu
     args.push("--job", normalized.job);
     args.push("--start-from", normalized.startFrom);
     args.push("--criteria", normalized.criteria);
+    if (normalized.greetingText) args.push("--greeting", normalized.greetingText);
     if (normalized.targetCountArg) {
       args.push("--targetCount", normalized.targetCountArg);
     }

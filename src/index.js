@@ -437,6 +437,14 @@ function createRunInputSchema() {
                 type: "string",
                 enum: ["unread", "all"]
               },
+              greeting_text: {
+                type: "string",
+                description: "可选，首条打招呼消息；未传时按 profile 历史值/默认值自动回退"
+              },
+              greetingText: {
+                type: "string",
+                description: "兼容字段；优先使用 greeting_text。可选首条打招呼消息"
+              },
               target_count: createTargetCountInputSchema("boss-chat follow-up 本次处理人数上限；支持正整数、all 或 -1（扫到底）"),
               dry_run: { type: "boolean" },
               no_state: { type: "boolean" },
@@ -474,6 +482,14 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       criteria: {
         type: "string",
         description: "boss-chat 的筛选 criteria"
+      },
+      greeting_text: {
+        type: "string",
+        description: "可选，首条打招呼消息；未传时按 profile 历史值/默认值自动回退"
+      },
+      greetingText: {
+        type: "string",
+        description: "兼容字段；优先使用 greeting_text。可选首条打招呼消息"
       },
       target_count: createTargetCountInputSchema("本次处理人数上限；支持正整数、all 或 -1（扫到底），也兼容 { value: \"all\" } 等包装对象"),
       targetCount: createTargetCountInputSchema("兼容字段；优先使用 target_count。本次处理人数上限，支持正整数、all 或 -1（扫到底）"),
@@ -772,6 +788,18 @@ function validateBossChatStartArgs(args) {
     if (typeof args.criteria !== "string" || !normalizeText(args.criteria)) {
       return "criteria must be a non-empty string when provided";
     }
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(args, "greeting_text")
+    && typeof args.greeting_text !== "string"
+  ) {
+    return "greeting_text must be a string when provided";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(args, "greetingText")
+    && typeof args.greetingText !== "string"
+  ) {
+    return "greetingText must be a string when provided";
   }
   if (
     Object.prototype.hasOwnProperty.call(args, "target_count")

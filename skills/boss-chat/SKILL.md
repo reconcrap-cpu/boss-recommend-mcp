@@ -31,11 +31,18 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 可选：
 
 - `profile`（默认 `default`）
+- `greeting_text`（兼容 `greetingText`，可选自定义首条打招呼消息）
 - `port`
 - `dry_run`
 - `no_state`
 - `safe_pacing`
 - `batch_rest_enabled`
+
+`greeting_text` 默认规则：
+
+- 本次显式传入 `greeting_text`：使用本次值
+- 本次未传，但当前 `profile` 有历史输入：使用历史值
+- 两者都没有：使用内置默认招呼语（`Hi同学，能麻烦发下简历吗？`）
 
 `target_count` 填写规则（关键）：
 
@@ -55,6 +62,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。
 - 参数名必须写 `target_count`（不要写“目标数量”等中文键名）。
 - 当用户选择“扫到底/全部候选人/所有候选人”时，调用参数优先写：`"target_count": "all"`；`-1` 只作为兼容输入和内部 CLI 表示。
+- `greeting_text` 是可选项，不能因为缺少它阻塞启动或追加必填追问。
 - 若工具或提问选项里出现“扫到底（必须传 `target_count=\"all\"`）”之类字样，下一次工具调用时必须直接照抄这个字面量，不要只保留“扫到底”语义。
 - 禁止 agent 自行补全 `job/start_from/criteria` 并直接执行，必须由用户明确给出或确认。
 - chat-only 启动流程必须先进入聊天页并拉取岗位列表，再让用户从列表中选择 `job`。

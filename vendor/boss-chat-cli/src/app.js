@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 
 import { isDomProfileConsistentWithCard, NETWORK_RESUME_RETRY_WAIT_MS } from './services/resume-network.js';
+import { DEFAULT_GREETING_TEXT } from './services/profile-store.js';
 import { createCustomerAliases, createCustomerKey } from './utils/customer-key.js';
 
 function runToken(date = new Date()) {
@@ -42,6 +43,10 @@ function hasResumeRequestSentMessage(state = {}) {
   const recent = Array.isArray(state?.recent) ? state.recent : [];
   if (lastText.includes('简历请求已发送')) return true;
   return recent.some((item) => normalizeText(item).includes('简历请求已发送'));
+}
+
+function resolveGreetingText(profile = {}) {
+  return normalizeText(profile?.greetingText || '') || DEFAULT_GREETING_TEXT;
 }
 
 const CANDIDATE_LIST_WAIT_AFTER_CONTEXT_MS = 5000;
@@ -1323,11 +1328,11 @@ export class BossChatApp {
           return baseResult;
         }
 
-        const greetingText = 'Hi同学，能麻烦发下简历吗？';
+        const greetingText = resolveGreetingText(profile);
         this.logger.log(`候选人通过，先发送消息：${greetingText}`);
         await this.checkpoint();
         const editorState = await this.page.setEditorMessage(greetingText);
-        if (!String(editorState?.value || '').includes('Hi同学')) {
+        if (!normalizeText(editorState?.value || '').includes(normalizeText(greetingText))) {
           throw new Error('CHAT_EDITOR_MESSAGE_MISMATCH');
         }
         this.logger.log(

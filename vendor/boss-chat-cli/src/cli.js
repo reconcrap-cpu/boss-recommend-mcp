@@ -193,6 +193,7 @@ function parseArgs(argv) {
       startFrom: undefined,
       targetCount: undefined,
       screeningCriteria: undefined,
+      greetingText: undefined,
       jobSelection: undefined,
       llm: {},
       chrome: {},
@@ -249,6 +250,11 @@ function parseArgs(argv) {
       case 'criteria':
       case 'screeningCriteria':
         args.overrides.screeningCriteria = String(value || '').trim();
+        break;
+      case 'greeting':
+      case 'greeting-text':
+      case 'greetingText':
+        args.overrides.greetingText = String(value || '').trim();
         break;
       case 'job':
       case 'jobSelection':
@@ -403,6 +409,7 @@ function printUsage() {
   console.log('  --no-state                      Disable in-run candidate deduplication');
   console.log('  --job <text|value|index>        Select job by label/value/index');
   console.log('  --criteria <text>               Screening criteria for resume evaluation');
+  console.log('  --greeting <text>               Optional greeting message sent before asking for resume');
   console.log('  --start-from <unread|all>       Start from unread or all list');
   console.log('  --targetCount <n|all>           Maximum candidates to process; all means unlimited');
   console.log('  --baseurl <url>                 Override LLM base URL');
@@ -618,6 +625,7 @@ async function promptRunProfile({ page, persistentProfile, overrides }) {
   let startFrom = overrides.startFrom;
   let screeningCriteria = overrides.screeningCriteria;
   let targetCount = overrides.targetCount;
+  let greetingText = String(overrides.greetingText || '').trim() || String(persistentProfile?.greetingText || '').trim();
 
   if (process.stdin.isTTY) {
     const rl = readline.createInterface({
@@ -674,6 +682,7 @@ async function promptRunProfile({ page, persistentProfile, overrides }) {
     startFrom,
     screeningCriteria,
     targetCount: targetCount ?? null,
+    greetingText,
   });
 }
 
@@ -970,6 +979,7 @@ async function handlePrepareRunCommand(args, dataDir) {
       defaults: {
         profile: String(args.profile || 'default').trim() || 'default',
         start_from: 'unread',
+        greeting_text: String(args.overrides.greetingText || '').trim() || String(mergedProfile.greetingText || '').trim(),
       },
       job_options: jobs.map((job, index) => ({
         index: index + 1,
@@ -1003,6 +1013,9 @@ function buildDetachedRunArgs(args, runId) {
   workerArgs.push('--job', String(args.overrides.jobSelection));
   workerArgs.push('--start-from', String(args.overrides.startFrom));
   workerArgs.push('--criteria', String(args.overrides.screeningCriteria));
+  if (String(args.overrides.greetingText || '').trim()) {
+    workerArgs.push('--greeting', String(args.overrides.greetingText));
+  }
 
   if (args.dryRun) workerArgs.push('--dry-run');
   if (args.noState) workerArgs.push('--no-state');
@@ -1088,6 +1101,10 @@ async function handleStartRunCommand(args, dataDir) {
         startFrom: String(args.overrides.startFrom || ''),
         criteria: String(args.overrides.screeningCriteria || ''),
         targetCount: args.overrides.targetCount ?? null,
+        greetingText:
+          String(args.overrides.greetingText || '').trim()
+          || String(mergedProfile.greetingText || '').trim()
+          || null,
       },
     },
   });
@@ -1427,6 +1444,7 @@ async function executeRunCommand(args, dataDir) {
       value: appliedJob.value || runProfile.jobSelection.value,
       label: appliedJob.label || runProfile.jobSelection.label,
     };
+    await profileStore.save(args.profile, toPersistentProfile(runProfile));
 
     if (asyncMode) {
       updateRunState(dataDir, runId, {

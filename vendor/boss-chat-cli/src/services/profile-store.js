@@ -1,10 +1,13 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+export const DEFAULT_GREETING_TEXT = 'Hi同学，能麻烦发下简历吗？';
+
 const DEFAULT_PROFILE = {
   screeningCriteria: '',
   targetCount: null,
   startFrom: 'unread',
+  greetingText: DEFAULT_GREETING_TEXT,
   jobSelection: null,
   llm: {
     baseUrl: '',
@@ -77,6 +80,7 @@ function normalizeJobSelection(jobSelection) {
 export function toPersistentProfile(profile = {}) {
   const normalized = normalizeProfile(profile);
   return {
+    greetingText: normalized.greetingText,
     llm: {
       baseUrl: normalized.llm.baseUrl,
       apiKey: normalized.llm.apiKey,
@@ -100,6 +104,7 @@ export function normalizeProfile(profile = {}) {
   merged.screeningCriteria = String(merged.screeningCriteria || '').trim();
   merged.startFrom = String(merged.startFrom || '').trim().toLowerCase() === 'all' ? 'all' : 'unread';
   merged.targetCount = normalizeOptionalPositiveNumber(merged.targetCount, null);
+  merged.greetingText = String(merged.greetingText || '').trim() || DEFAULT_GREETING_TEXT;
   merged.jobSelection = normalizeJobSelection(merged.jobSelection);
   merged.chrome.port = normalizeNumber(merged.chrome.port, DEFAULT_PROFILE.chrome.port);
   merged.llm.baseUrl = String(merged.llm.baseUrl || '').trim().replace(/\/+$/, '');

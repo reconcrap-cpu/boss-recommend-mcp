@@ -294,6 +294,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
         job: "算法工程师",
         start_from: "unread",
         criteria: "有 AI Agent 经验",
+        greeting_text: "你好，方便发下简历吗？",
         target_count: 2
       }
     });
@@ -306,6 +307,7 @@ async function testBossChatAdapterShouldResolveSharedConfigAndInvokeLocalCli() {
     assert.equal(stateAfterStart.last_start_args.job, "算法工程师");
     assert.equal(stateAfterStart.last_start_args["start-from"], "unread");
     assert.equal(stateAfterStart.last_start_args.criteria, "有 AI Agent 经验");
+    assert.equal(stateAfterStart.last_start_args.greeting, "你好，方便发下简历吗？");
     assert.equal(stateAfterStart.last_start_args.targetCount, "2");
     assert.equal(stateAfterStart.last_start_args.baseurl, "https://api.example.com/v1");
     assert.equal(stateAfterStart.last_start_args.apikey, "sk-test-key");
@@ -909,14 +911,19 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
       params: {}
     }, workspaceRoot);
     const tools = toolsResponse.result.tools;
+    const runToolSchema = tools.find((item) => item.name === "start_recommend_pipeline_run").inputSchema;
     const prepareToolSchema = tools.find((item) => item.name === TOOL_BOSS_CHAT_PREPARE_RUN).inputSchema;
     const startToolSchema = tools.find((item) => item.name === TOOL_BOSS_CHAT_START_RUN).inputSchema;
     assert.equal(prepareToolSchema.required, undefined);
     assert.deepEqual(startToolSchema.required, ["job", "start_from", "criteria"]);
+    assert.equal(typeof startToolSchema.properties.greeting_text, "object");
+    assert.equal(typeof startToolSchema.properties.greetingText, "object");
     assert.equal(startToolSchema.anyOf.some((item) => item.required?.includes("target_count")), true);
     assert.equal(startToolSchema.anyOf.some((item) => item.required?.includes("targetCount")), true);
     assert.equal(startToolSchema.properties.target_count.examples.includes("all"), true);
     assert.equal(startToolSchema.examples.some((item) => item.target_count === "all"), true);
+    assert.equal(typeof runToolSchema.properties.follow_up.properties.chat.properties.greeting_text, "object");
+    assert.equal(typeof runToolSchema.properties.follow_up.properties.chat.properties.greetingText, "object");
 
     const prepared = await callTool(workspaceRoot, TOOL_BOSS_CHAT_PREPARE_RUN, {}, 101);
     assert.equal(prepared.status, "NEED_INPUT");
@@ -967,6 +974,13 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
       workspaceRoot
     );
     assert.equal(invalidStartResponse.error.code, -32602);
+    const invalidGreetingResponse = await handleRequest(
+      makeToolCall(1112, TOOL_BOSS_CHAT_START_RUN, {
+        greeting_text: 123
+      }),
+      workspaceRoot
+    );
+    assert.equal(invalidGreetingResponse.error.code, -32602);
 
     const invalidGetResponse = await handleRequest(
       makeToolCall(12, TOOL_BOSS_CHAT_GET_RUN, {}),
@@ -981,9 +995,11 @@ async function testBossChatMcpToolsShouldValidateAndRoute() {
       job: "算法工程师",
       start_from: "unread",
       criteria: "有 AI Agent 经验",
+      greeting_text: "您好，方便投递一份简历吗？",
       target_count: 2
     }, 14);
     assert.equal(started.status, "ACCEPTED");
+    assert.equal(readStubState(workspaceRoot).last_start_args.greeting, "您好，方便投递一份简历吗？");
 
     const startedAll = await callTool(workspaceRoot, TOOL_BOSS_CHAT_START_RUN, {
       job: "算法工程师",
@@ -1036,11 +1052,13 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
       chat: {
         criteria: "有 AI Agent 经验",
         start_from: "unread",
+        greeting_text: "您好，方便发下简历吗？",
         target_count: 2
       }
     })
   });
   assert.equal(followUpJson.chat.criteria, "有 AI Agent 经验");
+  assert.equal(followUpJson.chat.greeting_text, "您好，方便发下简历吗？");
   assert.equal(followUpJson.chat.target_count, 2);
 
   const tempFile = path.join(os.tmpdir(), `boss-recommend-follow-up-${Date.now()}.json`);
@@ -1077,6 +1095,7 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
         job: "算法工程师",
         "start-from": "unread",
         criteria: "有 AI Agent 经验",
+        "greeting-text": "您好，方便发下简历吗？",
         targetCount: "2"
       });
     });
@@ -1085,6 +1104,7 @@ async function testBossChatCliShouldSupportRunAndFollowUpParsing() {
     assert.equal(payload.status, "ACCEPTED");
     assert.equal(typeof payload.run_id, "string");
     const state = readStubState(workspaceRoot);
+    assert.equal(state.last_start_args.greeting, "您好，方便发下简历吗？");
     assert.equal(state.get_calls[payload.run_id] || 0, 0);
 
     await captureConsoleLogs(async () => {
@@ -1180,12 +1200,104 @@ async function testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile() {
       jobSelection: "AI应用开发工程师（2026） _ 杭州",
       startFrom: "unread",
       screeningCriteria: "小样本联通性验证",
+      greetingText: "你好，方便发下简历吗？",
       targetCount: 1,
     },
   });
   assert.equal(profile.jobSelection.label, "AI应用开发工程师（2026） _ 杭州");
   assert.equal(profile.startFrom, "unread");
+  assert.equal(profile.greetingText, "你好，方便发下简历吗？");
   assert.equal(profile.targetCount, 1);
+}
+
+async function testVendorBossChatCliShouldUseGreetingFallbacksInPromptRunProfile() {
+  const page = {
+    async ensureOnChatPage() {
+      return {
+        href: "https://www.zhipin.com/web/chat/index",
+        hasListContainer: true,
+        listItemCount: 8,
+      };
+    },
+    async listJobs() {
+      return [
+        {
+          value: "job-1",
+          label: "算法工程师 _ 杭州",
+          active: true,
+        },
+      ];
+    },
+  };
+
+  const fromLastProfile = await vendorCliTestables.promptRunProfile({
+    page,
+    persistentProfile: {
+      greetingText: "上次招呼语",
+      llm: {
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk-test-key",
+        model: "gpt-4.1-mini",
+      },
+      chrome: {
+        port: 9222,
+      },
+      runtime: {},
+    },
+    overrides: {
+      jobSelection: "算法工程师 _ 杭州",
+      startFrom: "unread",
+      screeningCriteria: "有 AI Agent 经验",
+      targetCount: 1,
+    },
+  });
+  assert.equal(fromLastProfile.greetingText, "上次招呼语");
+
+  const fromExplicitOverride = await vendorCliTestables.promptRunProfile({
+    page,
+    persistentProfile: {
+      greetingText: "上次招呼语",
+      llm: {
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk-test-key",
+        model: "gpt-4.1-mini",
+      },
+      chrome: {
+        port: 9222,
+      },
+      runtime: {},
+    },
+    overrides: {
+      jobSelection: "算法工程师 _ 杭州",
+      startFrom: "unread",
+      screeningCriteria: "有 AI Agent 经验",
+      greetingText: "本次新招呼语",
+      targetCount: 1,
+    },
+  });
+  assert.equal(fromExplicitOverride.greetingText, "本次新招呼语");
+
+  const fromBuiltInDefault = await vendorCliTestables.promptRunProfile({
+    page,
+    persistentProfile: {
+      llm: {
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk-test-key",
+        model: "gpt-4.1-mini",
+      },
+      chrome: {
+        port: 9222,
+      },
+      runtime: {},
+    },
+    overrides: {
+      jobSelection: "算法工程师 _ 杭州",
+      startFrom: "unread",
+      screeningCriteria: "有 AI Agent 经验",
+      targetCount: 1,
+    },
+  });
+  assert.equal(fromBuiltInDefault.greetingText, "Hi同学，能麻烦发下简历吗？");
 }
 
 function testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig() {
@@ -1220,10 +1332,13 @@ function testVendorBossChatCliShouldParseSharedLlmTransportArgs() {
     "70000",
     "--llm-max-retries",
     "5",
+    "--greeting",
+    "您好，方便发下简历吗？",
   ]);
   assert.equal(parsed.command, "start-run");
   assert.equal(parsed.overrides.llm.timeoutMs, 70000);
   assert.equal(parsed.overrides.llm.maxRetries, 5);
+  assert.equal(parsed.overrides.greetingText, "您好，方便发下简历吗？");
 }
 
 function testBossChatLlmParserShouldAcceptMinimalDecisionJson() {
@@ -3050,6 +3165,7 @@ async function main() {
   testVendorBossChatCliShouldUseRecommendHomeForDefaultDataDir();
   await testVendorBossChatCliShouldWaitForHydratedChatShell();
   await testVendorBossChatCliShouldRetryJobListDuringPromptRunProfile();
+  await testVendorBossChatCliShouldUseGreetingFallbacksInPromptRunProfile();
   testCliShouldPinInstalledPackageVersionInGeneratedMcpConfig();
   testVendorBossChatCliShouldParseSharedLlmTransportArgs();
   testBossChatLlmParserShouldAcceptMinimalDecisionJson();

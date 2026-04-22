@@ -1377,7 +1377,7 @@ function printHelp() {
   console.log("");
   console.log("Run command:");
   console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}'] [--follow-up-json '{...}']");
-  console.log("  boss-recommend-mcp chat run --job \"算法工程师\" --start-from unread --criteria \"有 AI Agent 经验\" --targetCount 20    # 后台启动，不自动轮询");
+  console.log("  boss-recommend-mcp chat run --job \"算法工程师\" --start-from unread --criteria \"有 AI Agent 经验\" --targetCount 20 [--greeting-text \"你好，方便发下简历吗？\"]    # 后台启动，不自动轮询");
   console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
   console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");
@@ -1481,11 +1481,18 @@ async function runPipelineOnce(options) {
 }
 
 function buildBossChatCliInput(options = {}) {
+  const greetingTextRaw =
+    options["greeting-text"]
+    ?? options.greeting_text
+    ?? options.greetingText
+    ?? options.greeting;
+  const greetingText = typeof greetingTextRaw === "string" ? greetingTextRaw.trim() : undefined;
   return {
     profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
     job: typeof options.job === "string" ? options.job.trim() : undefined,
     start_from: String(options["start-from"] || options.start_from || "").trim().toLowerCase() || undefined,
     criteria: typeof options.criteria === "string" ? options.criteria.trim() : undefined,
+    greeting_text: greetingText || undefined,
     target_count: parseBossChatTargetCountOption(options.targetCount || options["target-count"] || options.target_count),
     port: parsePositivePort(options.port),
     dry_run: options["dry-run"] === true || options.dryRun === true,

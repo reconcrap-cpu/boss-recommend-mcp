@@ -476,6 +476,7 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
   const explicitCriteria = normalizeText(raw.criteria);
   const explicitStartFromRaw = normalizeText(raw.start_from).toLowerCase();
   const explicitStartFrom = explicitStartFromRaw === "all" ? "all" : explicitStartFromRaw === "unread" ? "unread" : "";
+  const explicitGreetingText = normalizeText(raw.greeting_text || raw.greetingText);
   const explicitTarget = normalizeFollowUpTargetCountInput(raw.target_count);
   const explicitTargetCount = explicitTarget.launchValue;
 
@@ -493,6 +494,7 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
     profile,
     criteria: criteria || null,
     start_from: startFrom || null,
+    greeting_text: explicitGreetingText || null,
     target_count: targetCountSummaryValue,
     dry_run: raw.dry_run === true,
     no_state: raw.no_state === true,
@@ -572,6 +574,7 @@ function normalizeFollowUpChatInput(followUp = null, defaults = null) {
       profile,
       criteria: criteria || null,
       start_from: startFrom || null,
+      greeting_text: explicitGreetingText || undefined,
       target_count: targetCount,
       dry_run: raw.dry_run === true,
       no_state: raw.no_state === true,
@@ -619,6 +622,7 @@ function buildResolvedFollowUpChatInput(followUpChat, { selectedJob, debugPort }
     job: selectedJob?.title || selectedJob?.label || selectedJob?.value || null,
     start_from: followUpChat?.input?.start_from || null,
     criteria: followUpChat?.input?.criteria || null,
+    greeting_text: followUpChat?.input?.greeting_text || null,
     target_count: followUpChat?.input?.target_count || null,
     port: Number.isFinite(debugPort) ? debugPort : null,
     dry_run: followUpChat?.input?.dry_run === true,
@@ -639,6 +643,7 @@ function buildBossChatFollowUpStatus({ payload, runId, fallbackInput = null, sta
     job: normalizeText(fallbackInput?.job) || null,
     start_from: normalizeText(fallbackInput?.start_from) || null,
     criteria: normalizeText(fallbackInput?.criteria) || null,
+    greeting_text: normalizeText(fallbackInput?.greeting_text) || null,
     target_count: normalizePipelineTargetCountValue(fallbackInput?.target_count),
     port: parsePositiveIntegerValue(fallbackInput?.port),
     progress: {
@@ -995,6 +1000,7 @@ async function runBossChatFollowUpPhase({
     profile: resolvedChatInput.profile,
     job: resolvedChatInput.job,
     start_from: resolvedChatInput.start_from,
+    greeting_text: resolvedChatInput.greeting_text,
     target_count: resolvedChatInput.target_count
   });
 
@@ -1006,6 +1012,7 @@ async function runBossChatFollowUpPhase({
         job: resolvedChatInput.job,
         start_from: resolvedChatInput.start_from,
         criteria: resolvedChatInput.criteria,
+        greeting_text: resolvedChatInput.greeting_text,
         target_count: resolvedChatInput.target_count,
         port: resolvedChatInput.port,
         dry_run: resolvedChatInput.dry_run,

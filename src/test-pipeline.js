@@ -2404,6 +2404,62 @@ async function testFinalReviewShouldIncludeFollowUpChatSummary() {
   assert.equal(finalReview?.value?.follow_up?.chat?.target_count, 5);
 }
 
+async function testFollowUpChatGreetingTextShouldPassThroughWhenProvided() {
+  let capturedChatInput = null;
+  const result = await runRecommendPipeline(
+    {
+      workspaceRoot: process.cwd(),
+      instruction: "test",
+      confirmation: createJobConfirmedConfirmation(),
+      overrides: {},
+      followUp: createFollowUpChat({ greeting_text: "您好，方便发下简历吗？" })
+    },
+    {
+      parseRecommendInstruction: () => createParsed(),
+      runPipelinePreflight: () => ({ ok: true, checks: [], debug_port: 9555 }),
+      ensureBossRecommendPageReady: async () => ({ ok: true, state: "RECOMMEND_READY", page_state: {} }),
+      listRecommendJobs: async () => createJobListResult(),
+      runRecommendSearchCli: async () => ({
+        ok: true,
+        summary: {
+          candidate_count: 6,
+          applied_filters: {},
+          page_state: {}
+        }
+      }),
+      runRecommendScreenCli: async () => ({
+        ok: true,
+        summary: {
+          processed_count: 6,
+          passed_count: 2,
+          skipped_count: 0
+        }
+      }),
+      startBossChatRun: async ({ input }) => {
+        capturedChatInput = input;
+        return {
+          status: "ACCEPTED",
+          run_id: "chat-run-greeting",
+          message: "chat started"
+        };
+      },
+      getBossChatRun: async () => ({
+        status: "COMPLETED",
+        run: {
+          runId: "chat-run-greeting",
+          state: "completed",
+          lastMessage: "chat completed",
+          progress: { processed: 2, matched: 2 }
+        }
+      })
+    }
+  );
+
+  assert.equal(result.status, "COMPLETED");
+  assert.equal(capturedChatInput?.greeting_text, "您好，方便发下简历吗？");
+  assert.equal(result.follow_up?.chat?.input?.greeting_text, "您好，方便发下简历吗？");
+}
+
 async function testCompletedPipelineShouldRunChatFollowUp() {
   let getChatRunCalls = 0;
   const result = await runRecommendPipeline(
@@ -2635,6 +2691,7 @@ async function main() {
   await testFollowUpChatMissingTargetCountShouldNeedInput();
   await testFollowUpChatInvalidTargetCountShouldNeedInputWithDiagnostics();
   await testFinalReviewShouldIncludeFollowUpChatSummary();
+  await testFollowUpChatGreetingTextShouldPassThroughWhenProvided();
   await testCompletedPipelineShouldRunChatFollowUp();
   await testFollowUpChatAllTargetCountShouldLaunchUnlimited();
   await testFollowUpChatPassedTargetCountShouldLaunchWithPassedCount();
