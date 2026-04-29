@@ -85,6 +85,9 @@ const PAGE_SCOPE_TAB_STATUS = {
 };
 const BOTTOM_HINT_KEYWORDS = ["没有更多", "已显示全部", "已经到底", "暂无更多", "推荐完了", "没有更多人选"];
 const LOAD_MORE_HINT_KEYWORDS = ["滚动加载更多", "下滑加载更多", "继续下滑", "继续滑动", "滑动加载", "正在加载", "加载中"];
+const VIEWPORT_COLLAPSE_RATIO_THRESHOLD = 0.6;
+const VIEWPORT_COLLAPSE_MIN_EXPECTED_WIDTH = 1000;
+const VIEWPORT_COLLAPSE_NEAR_FULLSCREEN_RATIO = 0.85;
 
 function getHealingRulesPath() {
   const fromEnv = normalizeText(process.env.BOSS_RECOMMEND_HEALING_RULES_FILE || "");
@@ -2473,6 +2476,17 @@ const jsGetListState = `(() => {
       width: (doc.defaultView && Number.isFinite(doc.defaultView.innerWidth)) ? doc.defaultView.innerWidth : 0,
       height: (doc.defaultView && Number.isFinite(doc.defaultView.innerHeight)) ? doc.defaultView.innerHeight : 0
     },
+    topViewport: {
+      innerWidth: Number.isFinite(window.innerWidth) ? window.innerWidth : 0,
+      innerHeight: Number.isFinite(window.innerHeight) ? window.innerHeight : 0,
+      outerWidth: Number.isFinite(window.outerWidth) ? window.outerWidth : 0,
+      outerHeight: Number.isFinite(window.outerHeight) ? window.outerHeight : 0,
+      visualWidth: (window.visualViewport && Number.isFinite(window.visualViewport.width)) ? window.visualViewport.width : 0,
+      visualHeight: (window.visualViewport && Number.isFinite(window.visualViewport.height)) ? window.visualViewport.height : 0,
+      screenAvailWidth: (window.screen && Number.isFinite(window.screen.availWidth)) ? window.screen.availWidth : 0,
+      screenAvailHeight: (window.screen && Number.isFinite(window.screen.availHeight)) ? window.screen.availHeight : 0,
+      devicePixelRatio: Number.isFinite(window.devicePixelRatio) ? window.devicePixelRatio : 0
+    },
     candidateCount: effectiveCount,
     recommendCandidateCount: candidateCards.length,
     featuredCandidateCount: featuredCandidates.length,
@@ -4657,6 +4671,7 @@ class RecommendScreenCli {
       if (activeStatus) {
         this.lastActiveTabStatus = activeStatus;
       }
+      state.viewportDiagnostics = await this.getViewportHealthDiagnostics(state);
       return state;
     }
     return { ok: false, error: "INVALID_LIST_STATE" };
@@ -4664,6 +4679,7 @@ class RecommendScreenCli {
 
   isListViewportCollapsed(state) {
     if (!state?.ok) return false;
+    if (state.viewportDiagnostics?.relativeCollapsed === true) return true;
     const clientHeight = Number(state.clientHeight || 0);
     const clientWidth = Number(state.clientWidth || 0);
     const frameWidth = Number(state.frameRect?.width || 0);
@@ -4681,17 +4697,141 @@ class RecommendScreenCli {
     );
   }
 
-  async getCurrentWindowState() {
+  getPositiveNumber(...values) {
+    for (const value of values) {
+      const number = Number(value);
+      if (Number.isFinite(number) && number > 0) return number;
+    }
+    return 0;
+  }
+
+  async getWindowBoundsInfo() {
     if (!this.Browser || !this.windowId || typeof this.Browser.getWindowBounds !== "function") {
       return null;
     }
     try {
       const info = await this.Browser.getWindowBounds({ windowId: this.windowId });
-      const state = String(info?.bounds?.windowState || "").toLowerCase();
-      return state || null;
+      return info && typeof info === "object" ? info : null;
     } catch {
       return null;
     }
+  }
+
+  async getPageLayoutMetrics() {
+    if (!this.Page || typeof this.Page.getLayoutMetrics !== "function") {
+      return null;
+    }
+    try {
+      const metrics = await this.Page.getLayoutMetrics();
+      return metrics && typeof metrics === "object" ? metrics : null;
+    } catch {
+      return null;
+    }
+  }
+
+  buildViewportHealthDiagnostics(state, windowInfo = null, layoutMetrics = null) {
+    const topViewport = state?.topViewport || {};
+    const bounds = windowInfo?.bounds || null;
+    const windowState = normalizeText(bounds?.windowState || "").toLowerCase() || null;
+    const windowWidth = this.getPositiveNumber(bounds?.width);
+    const screenAvailWidth = this.getPositiveNumber(topViewport.screenAvailWidth);
+    const topOuterWidth = this.getPositiveNumber(topViewport.outerWidth);
+    const actualWidth = this.getPositiveNumber(
+      layoutMetrics?.cssVisualViewport?.clientWidth,
+      layoutMetrics?.cssLayoutViewport?.clientWidth,
+      topViewport.visualWidth,
+      topViewport.innerWidth,
+      state?.viewport?.width,
+      state?.clientWidth,
+      state?.frameRect?.width
+    );
+    const actualHeight = this.getPositiveNumber(
+      layoutMetrics?.cssVisualViewport?.clientHeight,
+      layoutMetrics?.cssLayoutViewport?.clientHeight,
+      topViewport.visualHeight,
+      topViewport.innerHeight,
+      state?.viewport?.height,
+      state?.clientHeight,
+      state?.frameRect?.height
+    );
+    const nearFullscreen = (
+      windowState === "maximized"
+      || (
+        windowWidth > 0
+        && screenAvailWidth > 0
+        && windowWidth >= screenAvailWidth * VIEWPORT_COLLAPSE_NEAR_FULLSCREEN_RATIO
+      )
+      || (
+        topOuterWidth > 0
+        && screenAvailWidth > 0
+        && topOuterWidth >= screenAvailWidth * VIEWPORT_COLLAPSE_NEAR_FULLSCREEN_RATIO
+      )
+    );
+    let expectedWidth = 0;
+    if (windowState === "maximized" && screenAvailWidth > 0) {
+      expectedWidth = screenAvailWidth;
+    } else if (windowWidth > 0) {
+      expectedWidth = screenAvailWidth > 0 && windowWidth >= screenAvailWidth * VIEWPORT_COLLAPSE_NEAR_FULLSCREEN_RATIO
+        ? Math.min(windowWidth, screenAvailWidth)
+        : windowWidth;
+    } else if (topOuterWidth > 0) {
+      expectedWidth = screenAvailWidth > 0 && topOuterWidth >= screenAvailWidth * VIEWPORT_COLLAPSE_NEAR_FULLSCREEN_RATIO
+        ? Math.min(topOuterWidth, screenAvailWidth)
+        : topOuterWidth;
+    }
+    const widthRatio = actualWidth > 0 && expectedWidth > 0 ? actualWidth / expectedWidth : null;
+    const relativeCollapsed = Boolean(
+      nearFullscreen
+      && expectedWidth >= VIEWPORT_COLLAPSE_MIN_EXPECTED_WIDTH
+      && actualWidth > 0
+      && widthRatio !== null
+      && widthRatio <= VIEWPORT_COLLAPSE_RATIO_THRESHOLD
+    );
+    return {
+      relativeCollapsed,
+      threshold: VIEWPORT_COLLAPSE_RATIO_THRESHOLD,
+      minExpectedWidth: VIEWPORT_COLLAPSE_MIN_EXPECTED_WIDTH,
+      nearFullscreen,
+      windowState,
+      actualWidth,
+      actualHeight,
+      expectedWidth,
+      widthRatio,
+      windowBounds: bounds ? {
+        left: bounds.left ?? null,
+        top: bounds.top ?? null,
+        width: bounds.width ?? null,
+        height: bounds.height ?? null,
+        windowState: bounds.windowState ?? null
+      } : null,
+      cssLayoutViewport: layoutMetrics?.cssLayoutViewport || null,
+      cssVisualViewport: layoutMetrics?.cssVisualViewport || null,
+      topViewport: {
+        innerWidth: topViewport.innerWidth || 0,
+        innerHeight: topViewport.innerHeight || 0,
+        outerWidth: topViewport.outerWidth || 0,
+        outerHeight: topViewport.outerHeight || 0,
+        visualWidth: topViewport.visualWidth || 0,
+        visualHeight: topViewport.visualHeight || 0,
+        screenAvailWidth: topViewport.screenAvailWidth || 0,
+        screenAvailHeight: topViewport.screenAvailHeight || 0,
+        devicePixelRatio: topViewport.devicePixelRatio || 0
+      }
+    };
+  }
+
+  async getViewportHealthDiagnostics(state) {
+    const [windowInfo, layoutMetrics] = await Promise.all([
+      this.getWindowBoundsInfo(),
+      this.getPageLayoutMetrics()
+    ]);
+    return this.buildViewportHealthDiagnostics(state, windowInfo, layoutMetrics);
+  }
+
+  async getCurrentWindowState() {
+    const info = await this.getWindowBoundsInfo();
+    const state = String(info?.bounds?.windowState || "").toLowerCase();
+    return state || null;
   }
 
   async setWindowStateIfPossible(windowState, reason = "unknown") {
@@ -4740,7 +4880,11 @@ class RecommendScreenCli {
       return { ok: true, recovered: false, state };
     }
 
-    log(`[视口恢复] 检测到推荐列表视口异常缩小，尝试自动恢复。原因: ${reason}`);
+    const diagnostics = state?.viewportDiagnostics || null;
+    const ratioText = Number.isFinite(diagnostics?.widthRatio)
+      ? `，宽度比例: ${diagnostics.widthRatio.toFixed(3)}`
+      : "";
+    log(`[视口恢复] 检测到推荐列表视口异常缩小，尝试自动恢复。原因: ${reason}${ratioText}`);
     await this.toggleWindowStateForViewportRecovery(reason);
     await sleep(humanDelay(900, 130));
     state = await this.getListState();
@@ -4751,7 +4895,8 @@ class RecommendScreenCli {
     return {
       ok: false,
       recovered: false,
-      state
+      state,
+      diagnostics: state?.viewportDiagnostics || diagnostics || null
     };
   }
 

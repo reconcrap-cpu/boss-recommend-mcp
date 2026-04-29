@@ -185,6 +185,62 @@ function createResumeCaptureError(message = "Resume canvas not found") {
   return error;
 }
 
+function createViewportState(cli, {
+  actualWidth,
+  actualHeight = 585,
+  screenAvailWidth = 1440,
+  windowState = "maximized",
+  windowWidth = 1454
+}) {
+  const state = {
+    ok: true,
+    clientWidth: actualWidth,
+    clientHeight: actualHeight,
+    frameRect: {
+      width: actualWidth,
+      height: actualHeight
+    },
+    viewport: {
+      width: actualWidth,
+      height: actualHeight
+    },
+    topViewport: {
+      innerWidth: actualWidth,
+      innerHeight: actualHeight,
+      outerWidth: actualWidth,
+      outerHeight: actualHeight,
+      visualWidth: actualWidth,
+      visualHeight: actualHeight,
+      screenAvailWidth,
+      screenAvailHeight: 860,
+      devicePixelRatio: 2
+    }
+  };
+  state.viewportDiagnostics = cli.buildViewportHealthDiagnostics(
+    state,
+    {
+      bounds: {
+        left: -7,
+        top: -7,
+        width: windowWidth,
+        height: 874,
+        windowState
+      }
+    },
+    {
+      cssVisualViewport: {
+        clientWidth: actualWidth,
+        clientHeight: actualHeight
+      },
+      cssLayoutViewport: {
+        clientWidth: actualWidth,
+        clientHeight: actualHeight
+      }
+    }
+  );
+  return state;
+}
+
 function createArgs(tempDir) {
   return {
     baseUrl: "https://example.invalid/v1",
@@ -217,6 +273,75 @@ function createArgs(tempDir) {
       postActionConfirmed: true
     }
   };
+}
+
+function testViewportCollapseRiskShouldUseRelativeWidth() {
+  const cli = new RecommendScreenCli(createArgs(os.tmpdir()));
+  const state = createViewportState(cli, {
+    actualWidth: 785,
+    screenAvailWidth: 1440,
+    windowState: "maximized",
+    windowWidth: 1454
+  });
+  assert.equal(state.viewportDiagnostics.relativeCollapsed, true);
+  assert.equal(cli.isListViewportCollapsed(state), true);
+  assert.equal(Math.round(state.viewportDiagnostics.widthRatio * 1000), 545);
+}
+
+function testNormalMaximizedViewportShouldNotCollapse() {
+  const cli = new RecommendScreenCli(createArgs(os.tmpdir()));
+  const state = createViewportState(cli, {
+    actualWidth: 1280,
+    screenAvailWidth: 1440,
+    windowState: "maximized",
+    windowWidth: 1454
+  });
+  assert.equal(state.viewportDiagnostics.relativeCollapsed, false);
+  assert.equal(cli.isListViewportCollapsed(state), false);
+}
+
+function testSmallNormalWindowShouldNotUseScreenWidthRatio() {
+  const cli = new RecommendScreenCli(createArgs(os.tmpdir()));
+  const state = createViewportState(cli, {
+    actualWidth: 785,
+    screenAvailWidth: 1440,
+    windowState: "normal",
+    windowWidth: 800
+  });
+  assert.equal(state.viewportDiagnostics.nearFullscreen, false);
+  assert.equal(state.viewportDiagnostics.relativeCollapsed, false);
+  assert.equal(cli.isListViewportCollapsed(state), false);
+}
+
+async function testViewportCollapseRiskShouldTriggerRecovery() {
+  const cli = new RecommendScreenCli(createArgs(os.tmpdir()));
+  const collapsedState = createViewportState(cli, {
+    actualWidth: 785,
+    screenAvailWidth: 1440,
+    windowState: "maximized",
+    windowWidth: 1454
+  });
+  const healthyState = createViewportState(cli, {
+    actualWidth: 1280,
+    screenAvailWidth: 1440,
+    windowState: "maximized",
+    windowWidth: 1454
+  });
+  let listStateCalls = 0;
+  let recoveryCalled = false;
+  cli.getListState = async () => {
+    listStateCalls += 1;
+    return listStateCalls === 1 ? collapsedState : healthyState;
+  };
+  cli.toggleWindowStateForViewportRecovery = async () => {
+    recoveryCalled = true;
+    return true;
+  };
+  const result = await cli.ensureHealthyListViewport("test_relative_viewport");
+  assert.equal(recoveryCalled, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.recovered, true);
+  assert.equal(result.state, healthyState);
 }
 
 async function withLongResumeChunkEnv(overrides, fn) {
@@ -2225,6 +2350,10 @@ async function testVisionModelShouldSendAllOrderedChunks() {
 async function main() {
   testShouldAbortResumeProbeEarly();
   testResumeViewportStabilityRequiresSettledScrollAndClip();
+  testViewportCollapseRiskShouldUseRelativeWidth();
+  testNormalMaximizedViewportShouldNotCollapse();
+  testSmallNormalWindowShouldNotUseScreenWidthRatio();
+  await testViewportCollapseRiskShouldTriggerRecovery();
   await testSingleResumeCaptureFailureIsSkipped();
   await testConsecutiveResumeCaptureFailuresStillAbort();
   await testPageExhaustedBeforeTargetShouldRaiseRecoverableError();
