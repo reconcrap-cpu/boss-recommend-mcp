@@ -572,7 +572,7 @@ function createRunInputSchema() {
       },
       llm_image_detail: {
         type: "string",
-        description: "可选，图片输入 detail，默认 high"
+        description: "可选，图片输入 detail，默认 low"
       },
       delay_ms: {
         type: "integer",
@@ -746,7 +746,7 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       },
       llm_image_detail: {
         type: "string",
-        description: "可选，图片输入 detail，默认 high"
+        description: "可选，图片输入 detail，默认 low"
       },
       online_resume_button_timeout_ms: {
         type: "integer",

@@ -863,9 +863,17 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
     llmConfig: resolvedConfig.ok ? {
       ...resolvedConfig.config
     } : null,
-    llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
-    llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
-    llmImageDetail: normalizeText(args.llm_image_detail) || "high",
+    llmTimeoutMs: parsePositiveInteger(
+      args.llm_timeout_ms,
+      parsePositiveInteger(resolvedConfig.config?.llmTimeoutMs || resolvedConfig.config?.timeoutMs, slowLive ? 180000 : 120000)
+    ),
+    llmImageLimit: parsePositiveInteger(
+      args.llm_image_limit,
+      parsePositiveInteger(resolvedConfig.config?.llmImageLimit || resolvedConfig.config?.imageLimit, 8)
+    ),
+    llmImageDetail: normalizeText(
+      args.llm_image_detail || resolvedConfig.config?.llmImageDetail || resolvedConfig.config?.imageDetail
+    ) || "low",
     screeningMode: normalizeScreeningModeArg(args),
     listMaxScrolls: parsePositiveInteger(args.list_max_scrolls, 200),
     listStableSignatureLimit: parsePositiveInteger(args.list_stable_signature_limit, 2),

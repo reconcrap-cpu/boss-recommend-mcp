@@ -1045,9 +1045,17 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
     llmConfig: normalized.screeningMode === "llm" && configResolution?.ok ? {
       ...configResolution.config
     } : null,
-    llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
-    llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
-    llmImageDetail: normalizeText(args.llm_image_detail) || "high",
+    llmTimeoutMs: parsePositiveInteger(
+      args.llm_timeout_ms,
+      parsePositiveInteger(configResolution?.config?.llmTimeoutMs || configResolution?.config?.timeoutMs, slowLive ? 180000 : 120000)
+    ),
+    llmImageLimit: parsePositiveInteger(
+      args.llm_image_limit,
+      parsePositiveInteger(configResolution?.config?.llmImageLimit || configResolution?.config?.imageLimit, 8)
+    ),
+    llmImageDetail: normalizeText(
+      args.llm_image_detail || configResolution?.config?.llmImageDetail || configResolution?.config?.imageDetail
+    ) || "low",
     imageOutputDir: resolveBossConfiguredOutputDir("", getRunsDir()),
     name: "mcp-recommend-pipeline-run",
     parsed

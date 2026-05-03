@@ -752,8 +752,11 @@ export async function runChatWorkflow({
                 resumeNetworkEvents
               ),
               targetUrl,
-              closeResume: false
+              closeResume: false,
+              networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
+              networkParseIntervalMs: 250
             });
+            addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
             parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
             if (parsedNetworkProfileCount > 0) {
               contentWait = {
@@ -789,8 +792,11 @@ export async function runChatWorkflow({
                 resumeNetworkEvents
               ),
               targetUrl,
-              closeResume: false
+              closeResume: false,
+              networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
+              networkParseIntervalMs: 250
             });
+            addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
             parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
           }
 
@@ -808,12 +814,20 @@ export async function runChatWorkflow({
                   imageOutputDir,
                   domain: "chat",
                   runId: runControl?.runId,
-                  index
+                  index,
+                  extension: "jpg"
                 }),
+                format: "jpeg",
+                quality: 72,
+                optimize: true,
+                resizeMaxWidth: 1100,
+                captureViewport: true,
                 padding: 8,
                 maxScreenshots: maxImagePages,
                 wheelDeltaY: imageWheelDeltaY,
-                settleMs: 1200,
+                settleMs: 350,
+                duplicateStopCount: 1,
+                skipDuplicateScreenshots: true,
                 metadata: {
                   domain: "chat",
                   capture_mode: "scroll_sequence",

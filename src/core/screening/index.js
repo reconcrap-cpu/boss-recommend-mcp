@@ -289,6 +289,72 @@ function tryExtractJsonObject(text) {
   return null;
 }
 
+function extractBalancedJsonAt(text = "", startIndex = 0) {
+  const source = String(text || "");
+  const start = source.indexOf("{", Math.max(0, Number(startIndex) || 0));
+  if (start < 0) return "";
+  let depth = 0;
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        inString = false;
+        quote = "";
+      }
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      inString = true;
+      quote = char;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  return "";
+}
+
+function tryParseEmbeddedJsonObjects(text = "") {
+  const source = decodeHtmlEntities(String(text || ""));
+  const objects = [];
+  const anchors = [
+    "__INITIAL_STATE__",
+    "__NEXT_DATA__",
+    "geekDetailInfo",
+    "geekDetail",
+    "geekBaseInfo",
+    "geekEduExpList",
+    "geekWorkExpList",
+    "resume"
+  ];
+  for (const anchor of anchors) {
+    let searchIndex = 0;
+    while (searchIndex >= 0 && searchIndex < source.length) {
+      const anchorIndex = source.indexOf(anchor, searchIndex);
+      if (anchorIndex < 0) break;
+      const windowStart = Math.max(0, anchorIndex - 4000);
+      const braceIndex = source.lastIndexOf("{", anchorIndex);
+      if (braceIndex >= windowStart) {
+        const jsonText = extractBalancedJsonAt(source, braceIndex);
+        const parsed = tryParseJson(jsonText);
+        if (parsed && typeof parsed === "object") objects.push(parsed);
+      }
+      searchIndex = anchorIndex + anchor.length;
+    }
+  }
+  return objects;
+}
+
 function flattenChatMessageContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -392,6 +458,65 @@ function pickFirst(...values) {
   return "";
 }
 
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isBossGeekDetailShape(value) {
+  if (!isPlainObject(value)) return false;
+  return Boolean(
+    isPlainObject(value.geekBaseInfo)
+    || value.geekName
+    || value.geekAdvantage
+    || Array.isArray(value.geekEduExpList)
+    || Array.isArray(value.geekEducationList)
+    || Array.isArray(value.geekWorkExpList)
+    || Array.isArray(value.geekProjExpList)
+    || Array.isArray(value.geekCertificationList)
+    || Array.isArray(value.geekSkillList)
+    || isPlainObject(value.highestEduExp)
+  );
+}
+
+function isBossChatProfileShape(value) {
+  if (!isPlainObject(value)) return false;
+  return Boolean(
+    (value.name || value.encryptGeekId || value.uid)
+    && (
+      Array.isArray(value.eduExpList)
+      || Array.isArray(value.workExpList)
+      || value.school
+      || value.major
+      || value.lastCompany
+      || value.positionName
+    )
+  );
+}
+
+function collectObjects(root, {
+  maxObjects = 500,
+  maxDepth = 8
+} = {}) {
+  if (!root || typeof root !== "object") return [];
+  const queue = [{ value: root, depth: 0 }];
+  const seen = new WeakSet();
+  const objects = [];
+  while (queue.length && objects.length < maxObjects) {
+    const { value, depth } = queue.shift();
+    if (!value || typeof value !== "object" || seen.has(value)) continue;
+    seen.add(value);
+    if (isPlainObject(value)) objects.push(value);
+    if (depth >= maxDepth) continue;
+    const children = Array.isArray(value) ? value : Object.values(value);
+    for (const child of children) {
+      if (child && typeof child === "object") {
+        queue.push({ value: child, depth: depth + 1 });
+      }
+    }
+  }
+  return objects;
+}
+
 function joinRange(start, end, fallback = "") {
   const left = parseDateLike(start);
   const right = parseDateLike(end);
@@ -461,8 +586,8 @@ function formatEducation(item = {}, index = 0) {
   ];
   return [
     `${index + 1}. ${[
-      pickFirst(item.school),
-      pickFirst(item.major),
+      pickFirst(item.school, item.schoolName),
+      pickFirst(item.major, item.majorName),
       pickFirst(item.degreeName, item.degree),
       period
     ].filter(Boolean).join(" / ")}`,
@@ -507,16 +632,28 @@ function resolveBossGeekDetail(payload = {}) {
   const candidates = [
     { sourceKey: "geekDetailInfo", detail: payload?.zpData?.geekDetailInfo },
     { sourceKey: "geekDetail", detail: payload?.zpData?.geekDetail },
+    { sourceKey: "geekDetailInfo", detail: payload?.zpData?.data?.geekDetailInfo },
+    { sourceKey: "geekDetail", detail: payload?.zpData?.data?.geekDetail },
+    { sourceKey: "geekDetailInfo", detail: payload?.zpData?.data?.detailInfo },
+    { sourceKey: "geekDetailInfo", detail: payload?.zpData?.data?.resumeDetail },
+    { sourceKey: "geekDetailInfo", detail: payload?.zpData?.data },
+    { sourceKey: "geekDetailInfo", detail: payload?.data?.geekDetailInfo },
+    { sourceKey: "geekDetail", detail: payload?.data?.geekDetail },
+    { sourceKey: "geekDetailInfo", detail: payload?.data?.detailInfo },
+    { sourceKey: "geekDetailInfo", detail: payload?.data?.resumeDetail },
+    { sourceKey: "geekDetailInfo", detail: payload?.data },
     { sourceKey: "geekDetailInfo", detail: payload?.geekDetailInfo },
-    { sourceKey: "geekDetail", detail: payload?.geekDetail }
+    { sourceKey: "geekDetail", detail: payload?.geekDetail },
+    { sourceKey: "geekDetailInfo", detail: payload }
   ];
-  const found = candidates.find((item) => item.detail && typeof item.detail === "object");
+  const found = candidates.find((item) => isBossGeekDetailShape(item.detail));
   return found || { sourceKey: "", detail: null };
 }
 
 function extractBossChatGeekInfo(payload = {}) {
-  const data = payload?.zpData?.data;
+  const data = payload?.zpData?.data || payload?.data || payload?.zpData?.geekInfo || payload?.geekInfo;
   if (!data || typeof data !== "object") return null;
+  if (!isBossChatProfileShape(data)) return null;
   const educationList = normalizeList(data.eduExpList);
   const workList = normalizeList(data.workExpList);
   const firstEducation = educationList[0] || {};
@@ -585,7 +722,13 @@ function extractBossChatGeekInfo(payload = {}) {
 }
 
 function extractBossChatHistoryResume(payload = {}) {
-  const messages = normalizeList(payload?.zpData?.messages);
+  const messages = normalizeList(payload?.zpData?.messages).length
+    ? normalizeList(payload?.zpData?.messages)
+    : normalizeList(payload?.messages).length
+      ? normalizeList(payload?.messages)
+      : normalizeList(payload?.data?.messages).length
+        ? normalizeList(payload?.data?.messages)
+        : normalizeList(payload?.zpData?.data?.messages);
   const resumes = messages
     .map((message) => message?.body?.resume)
     .filter((resume) => resume && typeof resume === "object");
@@ -647,12 +790,56 @@ function extractBossChatHistoryResume(payload = {}) {
   };
 }
 
+function extractBossProfileRecursively(payload = {}) {
+  for (const object of collectObjects(payload)) {
+    if (isBossGeekDetailShape(object)) {
+      const profile = extractBossGeekDetailInfo({ geekDetailInfo: object });
+      if (profile?.text || profile?.identity?.name) {
+        return {
+          ...profile,
+          source_keys: {
+            ...(profile.source_keys || {}),
+            recursive_profile_match: true
+          }
+        };
+      }
+    }
+    if (isBossChatProfileShape(object)) {
+      const profile = extractBossChatGeekInfo({ zpData: { data: object } });
+      if (profile?.text || profile?.identity?.name) {
+        return {
+          ...profile,
+          source_keys: {
+            ...(profile.source_keys || {}),
+            recursive_profile_match: true
+          }
+        };
+      }
+    }
+    if (isPlainObject(object.resume)) {
+      const profile = extractBossChatHistoryResume({ zpData: { messages: [{ body: { resume: object.resume } }] } });
+      if (profile?.text || profile?.identity?.name) {
+        return {
+          ...profile,
+          source_keys: {
+            ...(profile.source_keys || {}),
+            recursive_profile_match: true
+          }
+        };
+      }
+    }
+  }
+  return null;
+}
+
 function extractBossGeekDetailInfo(payload = {}) {
   const { sourceKey, detail } = resolveBossGeekDetail(payload);
   if (!detail || typeof detail !== "object") return null;
 
-  const base = detail.geekBaseInfo || {};
-  const educationList = normalizeList(detail.geekEduExpList);
+  const base = detail.geekBaseInfo || detail.baseInfo || detail.base || {};
+  const educationList = normalizeList(detail.geekEduExpList).length
+    ? normalizeList(detail.geekEduExpList)
+    : normalizeList(detail.geekEducationList);
   const firstEducation = educationList[0] || detail.highestEduExp || {};
   const workList = normalizeList(detail.geekWorkExpList);
   const firstWork = workList[0] || {};
@@ -666,6 +853,8 @@ function extractBossGeekDetailInfo(payload = {}) {
   const normalizedExpectationList = expectationList.length ? expectationList : expectationFallback;
   const certifications = normalizeList(detail.geekCertificationList);
   const skillTags = [
+    ...normalizeTagList(detail.geekSkillList),
+    ...normalizeTagList(detail.skillList),
     ...normalizeTagList(detail.blueGeekSkills),
     ...normalizeTagList(base.userHighlightList),
     ...normalizeTagList(base.userDescHighlightList),
@@ -674,6 +863,7 @@ function extractBossGeekDetailInfo(payload = {}) {
     ...normalizeTagList(detail.professionalSkill)
   ];
   const summaryParts = [
+    pickFirst(detail.geekAdvantage),
     pickFirst(base.userDescription),
     pickFirst(base.userDesc),
     pickFirst(base.workEduDesc),
@@ -681,7 +871,7 @@ function extractBossGeekDetailInfo(payload = {}) {
   ].filter(Boolean);
   const sections = {
     base: [
-      base.name ? `姓名：${normalizeText(base.name)}` : "",
+      pickFirst(base.name, detail.geekName, detail.name) ? `姓名：${pickFirst(base.name, detail.geekName, detail.name)}` : "",
       normalizeGenderValue(base.gender) ? `性别：${normalizeGenderValue(base.gender)}` : "",
       pickFirst(base.ageDesc, base.age) ? `年龄：${pickFirst(base.ageDesc, base.age)}` : "",
       pickFirst(base.degreeCategory) ? `最高学历：${pickFirst(base.degreeCategory)}` : "",
@@ -710,11 +900,11 @@ function extractBossGeekDetailInfo(payload = {}) {
 
   return {
     identity: {
-      name: pickFirst(base.name),
+      name: pickFirst(base.name, detail.geekName, detail.name),
       current_position: pickFirst(firstWork.positionName, firstWork.positionTitle, firstWork.position),
-      current_company: pickFirst(firstWork.formattedCompany, firstWork.company),
-      school: pickFirst(firstEducation.school),
-      major: pickFirst(firstEducation.major),
+      current_company: pickFirst(firstWork.formattedCompany, firstWork.company, firstWork.brandName),
+      school: pickFirst(firstEducation.school, firstEducation.schoolName),
+      major: pickFirst(firstEducation.major, firstEducation.majorName),
       degree: pickFirst(base.degreeCategory, firstEducation.degreeName, firstEducation.degree),
       years_experience: parseYearsExperience(pickFirst(base.workYearDesc, base.workYearsDesc)) ?? null,
       age: parseAge(pickFirst(base.ageDesc, base.age)) ?? null,
@@ -744,24 +934,68 @@ function extractBossGeekDetailInfo(payload = {}) {
 
 export function extractBossProfileFromNetworkBody(networkBody = {}) {
   const text = parseNetworkBodyText(networkBody);
-  const parsed = tryParseJson(text);
-  if (!parsed) {
+  const parsedObjects = [
+    tryParseJson(text),
+    ...tryParseEmbeddedJsonObjects(text)
+  ].filter((item) => item && typeof item === "object");
+  if (!parsedObjects.length) {
+    const htmlText = /<html|<body|<div|<section|<script/i.test(text) ? htmlToText(text) : "";
+    if (htmlText && htmlText.length > 80) {
+      const candidate = normalizeCandidateProfile({
+        domain: "recommend",
+        source: "network-html-fallback",
+        text: htmlText
+      });
+      return {
+        ok: true,
+        url: networkBody.url || null,
+        status: networkBody.status ?? null,
+        mimeType: networkBody.mimeType || null,
+        text_length: text.length,
+        profile: {
+          identity: candidate.identity,
+          tags: candidate.tags,
+          sections: { html_text: [htmlText] },
+          text: htmlText,
+          source_keys: {
+            network_html_text: true,
+            html_text_length: htmlText.length
+          }
+        }
+      };
+    }
     return {
       ok: false,
       error: "NETWORK_BODY_NOT_JSON",
       text_length: text.length
     };
   }
-  const profile = extractBossGeekDetailInfo(parsed)
-    || extractBossChatGeekInfo(parsed)
-    || extractBossChatHistoryResume(parsed);
+  let profile = null;
+  let parsed = parsedObjects[0];
+  for (const candidateObject of parsedObjects) {
+    profile = extractBossGeekDetailInfo(candidateObject)
+      || extractBossChatGeekInfo(candidateObject)
+      || extractBossChatHistoryResume(candidateObject)
+      || extractBossProfileRecursively(candidateObject);
+    if (profile) {
+      parsed = candidateObject;
+      break;
+    }
+  }
   if (!profile) {
+    const encryptedPayload = parsedObjects.find((item) => (
+      normalizeText(item?.zpData?.encryptGeekDetailInfo || item?.encryptGeekDetailInfo || "")
+    ));
     return {
       ok: false,
-      error: "BOSS_GEEK_DETAIL_INFO_NOT_FOUND",
+      error: encryptedPayload ? "BOSS_GEEK_DETAIL_INFO_ENCRYPTED" : "BOSS_GEEK_DETAIL_INFO_NOT_FOUND",
       text_length: text.length,
-      top_level_keys: Object.keys(parsed).slice(0, 30),
-      zpData_keys: Object.keys(parsed?.zpData || {}).slice(0, 50)
+      parsed_object_count: parsedObjects.length,
+      top_level_keys: Object.keys(parsed || {}).slice(0, 30),
+      zpData_keys: Object.keys(parsed?.zpData || {}).slice(0, 50),
+      data_keys: Object.keys(parsed?.data || parsed?.zpData?.data || {}).slice(0, 50),
+      encrypted_resume: Boolean(encryptedPayload),
+      encrypted_resume_length: normalizeText(encryptedPayload?.zpData?.encryptGeekDetailInfo || encryptedPayload?.encryptGeekDetailInfo || "").length
     };
   }
   return {
@@ -1088,6 +1322,8 @@ export function createFailedLlmScreeningResult(error) {
     decision_cot: "",
     reasoning_content: "",
     raw_model_output: "",
+    image_input_count: Number(error?.image_input_count) || 0,
+    image_inputs: Array.isArray(error?.image_inputs) ? error.image_inputs : [],
     error: error?.message || String(error || "unknown"),
     screened_at: nowIso()
   };
@@ -1176,6 +1412,7 @@ export async function callScreeningLlm({
   const payload = {
     model,
     temperature: 0.1,
+    max_tokens: Math.max(1, Number(config.maxTokens || config.llmMaxTokens) || 64),
     messages: buildScreeningLlmMessages({
       candidate,
       criteria,
@@ -1185,7 +1422,7 @@ export async function callScreeningLlm({
   applyChatCompletionThinking(payload, {
     baseUrl,
     model,
-    thinkingLevel: config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort
+    thinkingLevel: config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "off"
   });
 
   const controller = new AbortController();
@@ -1250,6 +1487,10 @@ export async function callScreeningLlm({
       image_inputs: summarizeLlmImageInputs(imageInputs),
       screened_at: nowIso()
     };
+  } catch (error) {
+    error.image_input_count = imageInputs.length;
+    error.image_inputs = summarizeLlmImageInputs(imageInputs);
+    throw error;
   } finally {
     clearTimeout(timer);
   }

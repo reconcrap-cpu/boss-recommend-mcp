@@ -1273,10 +1273,10 @@ export async function extractChatProfileCandidate(client, {
   resumeHtml: providedResumeHtml = null,
   networkEvents = [],
   targetUrl = "",
-  closeResume = true
+  closeResume = true,
+  networkParseRetryMs = 1800,
+  networkParseIntervalMs = 250
 } = {}) {
-  await sleep(1000);
-  const networkBodies = await readChatProfileNetworkBodies(client, networkEvents);
   let resumeHtml = providedResumeHtml || null;
   if (!resumeHtml) {
     try {
@@ -1292,21 +1292,30 @@ export async function extractChatProfileCandidate(client, {
     resumeHtml.resumeIframeText
   ].filter(Boolean).join("\n\n");
 
-  const detailCandidateResult = buildScreeningCandidateFromDetail({
-    domain: "chat",
-    source: "chat-live-cdp-profile",
-    cardCandidate,
-    detailText,
-    networkBodies,
-    metadata: {
-      target_url: targetUrl,
-      card_node_id: cardNodeId,
-      resume_popup_selector: resumeState?.popup?.selector || null,
-      resume_content_selector: resumeState?.content?.selector || null,
-      resume_iframe_selector: resumeState?.resumeIframe?.selector || null,
-      resume_iframe_document_node_id: resumeHtml.resumeIframeDocumentNodeId
-    }
-  });
+  const parseStarted = Date.now();
+  let networkBodies = [];
+  let detailCandidateResult = null;
+  do {
+    networkBodies = await readChatProfileNetworkBodies(client, networkEvents);
+    detailCandidateResult = buildScreeningCandidateFromDetail({
+      domain: "chat",
+      source: "chat-live-cdp-profile",
+      cardCandidate,
+      detailText,
+      networkBodies,
+      metadata: {
+        target_url: targetUrl,
+        card_node_id: cardNodeId,
+        resume_popup_selector: resumeState?.popup?.selector || null,
+        resume_content_selector: resumeState?.content?.selector || null,
+        resume_iframe_selector: resumeState?.resumeIframe?.selector || null,
+        resume_iframe_document_node_id: resumeHtml.resumeIframeDocumentNodeId
+      }
+    });
+    if (detailCandidateResult.parsed_network_profiles.some((item) => item.ok)) break;
+    if (Date.now() - parseStarted >= Math.max(0, Number(networkParseRetryMs) || 0)) break;
+    await sleep(Math.max(50, Number(networkParseIntervalMs) || 250));
+  } while (true);
 
   let closeResult = null;
   if (closeResume) {
@@ -1317,6 +1326,8 @@ export async function extractChatProfileCandidate(client, {
     candidate: detailCandidateResult.candidate,
     parsed_network_profiles: detailCandidateResult.parsed_network_profiles,
     network_bodies: networkBodies,
+    network_parse_retry_elapsed_ms: Date.now() - parseStarted,
+    network_event_count: networkEvents.length,
     detail: {
       popup_text: resumeHtml.popupText,
       content_text: resumeHtml.contentText,

@@ -487,31 +487,40 @@ export async function extractRecommendDetailCandidate(client, {
   detailState,
   networkEvents = [],
   targetUrl = "",
-  closeDetail = true
+  closeDetail = true,
+  networkParseRetryMs = 1800,
+  networkParseIntervalMs = 250
 } = {}) {
-  await sleep(1000);
-  const networkBodies = await readRecommendDetailNetworkBodies(client, networkEvents);
   const detailHtml = await readRecommendDetailHtml(client, detailState);
   const detailText = [
     detailHtml.popupText,
     detailHtml.resumeText
   ].filter(Boolean).join("\n\n");
 
-  const detailCandidateResult = buildScreeningCandidateFromDetail({
-    cardCandidate,
-    detailText,
-    networkBodies,
-    metadata: {
-      target_url: targetUrl,
-      card_node_id: cardNodeId,
-      detail_popup_selector: detailState?.popup?.selector || null,
-      detail_popup_root: detailState?.popup?.root || null,
-      resume_iframe_selector: detailState?.resumeIframe?.selector || null,
-      resume_iframe_root: detailState?.resumeIframe?.root || null,
-      resume_iframe_document_node_id: detailHtml.resumeIframeDocumentNodeId,
-      detail_html_errors: detailHtml.errors || []
-    }
-  });
+  const parseStarted = Date.now();
+  let networkBodies = [];
+  let detailCandidateResult = null;
+  do {
+    networkBodies = await readRecommendDetailNetworkBodies(client, networkEvents);
+    detailCandidateResult = buildScreeningCandidateFromDetail({
+      cardCandidate,
+      detailText,
+      networkBodies,
+      metadata: {
+        target_url: targetUrl,
+        card_node_id: cardNodeId,
+        detail_popup_selector: detailState?.popup?.selector || null,
+        detail_popup_root: detailState?.popup?.root || null,
+        resume_iframe_selector: detailState?.resumeIframe?.selector || null,
+        resume_iframe_root: detailState?.resumeIframe?.root || null,
+        resume_iframe_document_node_id: detailHtml.resumeIframeDocumentNodeId,
+        detail_html_errors: detailHtml.errors || []
+      }
+    });
+    if (detailCandidateResult.parsed_network_profiles.some((item) => item.ok)) break;
+    if (Date.now() - parseStarted >= Math.max(0, Number(networkParseRetryMs) || 0)) break;
+    await sleep(Math.max(50, Number(networkParseIntervalMs) || 250));
+  } while (true);
 
   let closeResult = null;
   if (closeDetail) {
@@ -522,6 +531,8 @@ export async function extractRecommendDetailCandidate(client, {
     candidate: detailCandidateResult.candidate,
     parsed_network_profiles: detailCandidateResult.parsed_network_profiles,
     network_bodies: networkBodies,
+    network_parse_retry_elapsed_ms: Date.now() - parseStarted,
+    network_event_count: networkEvents.length,
     detail: {
       popup_text: detailHtml.popupText,
       resume_text: detailHtml.resumeText,

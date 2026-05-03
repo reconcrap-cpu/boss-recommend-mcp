@@ -80,8 +80,14 @@ function testProfileCountingAndEvidenceSummary() {
     file_paths: ["page-01.png"]
   }), {
     source: "image-scroll-sequence",
+    elapsed_ms: 0,
+    capture_count: 2,
     screenshot_count: 2,
     unique_screenshot_count: 2,
+    dropped_duplicate_count: 0,
+    total_byte_length: 0,
+    original_total_byte_length: 0,
+    optimization: null,
     file_paths: ["page-01.png"],
     first_clip: null
   });

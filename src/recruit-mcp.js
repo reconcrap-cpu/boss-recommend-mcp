@@ -449,7 +449,7 @@ export function createRecruitPipelineInputSchema() {
       },
       llm_image_detail: {
         type: "string",
-        description: "可选，图片输入 detail，默认 high"
+        description: "可选，图片输入 detail，默认 low"
       },
       delay_ms: {
         type: "integer",
@@ -834,9 +834,17 @@ function getRunOptions(args, parsed, session, configResolution = null) {
     llmConfig: screeningMode === "llm" && configResolution?.ok ? {
       ...configResolution.config
     } : null,
-    llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
-    llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
-    llmImageDetail: normalizeText(args.llm_image_detail) || "high",
+    llmTimeoutMs: parsePositiveInteger(
+      args.llm_timeout_ms,
+      parsePositiveInteger(configResolution?.config?.llmTimeoutMs || configResolution?.config?.timeoutMs, slowLive ? 180000 : 120000)
+    ),
+    llmImageLimit: parsePositiveInteger(
+      args.llm_image_limit,
+      parsePositiveInteger(configResolution?.config?.llmImageLimit || configResolution?.config?.imageLimit, 8)
+    ),
+    llmImageDetail: normalizeText(
+      args.llm_image_detail || configResolution?.config?.llmImageDetail || configResolution?.config?.imageDetail
+    ) || "low",
     imageOutputDir: resolveBossConfiguredOutputDir("", getRecruitRunsDir()),
     name: "mcp-recruit-pipeline-run"
   };

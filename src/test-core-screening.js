@@ -209,6 +209,95 @@ function testBossNetworkProfileExtractionFromGeekDetail() {
   assert.equal(extracted.profile.source_keys.expectation_count, 1);
 }
 
+function testBossNetworkProfileExtractionFromNestedData() {
+  const networkBody = {
+    url: "https://www.zhipin.com/wapi/zpjob/view/geek/info/v2",
+    status: 200,
+    mimeType: "application/json",
+    body: {
+      body: JSON.stringify({
+        code: 0,
+        zpData: {
+          data: {
+            payload: {
+              profile: {
+                geekBaseInfo: {
+                  name: "嵌套候选人",
+                  gender: 1,
+                  degreeCategory: "硕士",
+                  userDescription: "图像算法和多模态模型经验"
+                },
+                geekEduExpList: [
+                  { school: "嵌套大学", major: "人工智能", degreeName: "硕士" }
+                ],
+                geekWorkExpList: [
+                  { company: "视觉科技", positionName: "算法工程师", responsibility: "负责计算机视觉模型" }
+                ]
+              }
+            }
+          }
+        }
+      })
+    }
+  };
+  const extracted = extractBossProfileFromNetworkBody(networkBody);
+  assert.equal(extracted.ok, true);
+  assert.equal(extracted.profile.source_keys.recursive_profile_match, true);
+  assert.equal(extracted.profile.identity.name, "嵌套候选人");
+  assert.equal(extracted.profile.identity.school, "嵌套大学");
+  assert.equal(extracted.profile.text.includes("计算机视觉模型"), true);
+}
+
+function testBossNetworkProfileExtractionFromHtmlEmbeddedJson() {
+  const payload = {
+    zpData: {
+      geekDetailInfo: {
+        geekBaseInfo: {
+          name: "脚本候选人",
+          degreeCategory: "博士"
+        },
+        geekEduExpList: [
+          { school: "脚本大学", major: "计算机视觉", degreeName: "博士" }
+        ]
+      }
+    }
+  };
+  const networkBody = {
+    url: "https://www.zhipin.com/web/frame/c-resume/",
+    status: 200,
+    mimeType: "text/html",
+    body: {
+      body: `<html><script>window.__INITIAL_STATE__=${JSON.stringify(payload)};</script></html>`
+    }
+  };
+  const extracted = extractBossProfileFromNetworkBody(networkBody);
+  assert.equal(extracted.ok, true);
+  assert.equal(extracted.profile.identity.name, "脚本候选人");
+  assert.equal(extracted.profile.identity.school, "脚本大学");
+}
+
+function testBossNetworkEncryptedResumeExplainsImageFallback() {
+  const extracted = extractBossProfileFromNetworkBody({
+    url: "https://www.zhipin.com/wapi/zpjob/view/geek/info/v2",
+    status: 200,
+    mimeType: "application/json",
+    body: {
+      body: JSON.stringify({
+        code: 0,
+        zpData: {
+          geekDetailInfo: {},
+          encryptGeekDetailInfo: "abc123encrypted",
+          wasm: "1.0.2-5081"
+        }
+      })
+    }
+  });
+  assert.equal(extracted.ok, false);
+  assert.equal(extracted.error, "BOSS_GEEK_DETAIL_INFO_ENCRYPTED");
+  assert.equal(extracted.encrypted_resume, true);
+  assert.equal(extracted.encrypted_resume_length > 0, true);
+}
+
 function testBossChatGeekInfoExtraction() {
   const networkBody = {
     url: "https://www.zhipin.com/wapi/zpjob/chat/geek/info",
@@ -377,6 +466,9 @@ testNormalizeProfile();
 testScreenCandidate();
 testBossNetworkProfileExtraction();
 testBossNetworkProfileExtractionFromGeekDetail();
+testBossNetworkProfileExtractionFromNestedData();
+testBossNetworkProfileExtractionFromHtmlEmbeddedJson();
+testBossNetworkEncryptedResumeExplainsImageFallback();
 testBossChatGeekInfoExtraction();
 testBossChatHistoryResumeExtraction();
 testBuildScreeningCandidateFromDetailUsesCleanNetworkText();

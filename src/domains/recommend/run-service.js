@@ -677,8 +677,11 @@ export async function runRecommendWorkflow({
         detailState: openedDetail.detail_state,
         networkEvents: networkRecorder.events,
         targetUrl,
-        closeDetail: false
+        closeDetail: false,
+        networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
+        networkParseIntervalMs: 250
       });
+      addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
 
       const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
       let source = "network";
@@ -698,12 +701,20 @@ export async function runRecommendWorkflow({
               imageOutputDir,
               domain: "recommend",
               runId: runControl?.runId,
-              index
+              index,
+              extension: "jpg"
             }),
+            format: "jpeg",
+            quality: 72,
+            optimize: true,
+            resizeMaxWidth: 1100,
+            captureViewport: true,
             padding: 4,
             maxScreenshots: maxImagePages,
             wheelDeltaY: imageWheelDeltaY,
-            settleMs: 1200,
+            settleMs: 350,
+            duplicateStopCount: 1,
+            skipDuplicateScreenshots: true,
             metadata: {
               domain: "recommend",
               capture_mode: "scroll_sequence",

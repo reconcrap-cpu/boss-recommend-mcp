@@ -126,8 +126,13 @@ export function summarizeImageEvidence(imageEvidence = null) {
   return {
     source: imageEvidence.source || "",
     elapsed_ms: imageEvidence.elapsed_ms || 0,
+    capture_count: imageEvidence.capture_count || imageEvidence.screenshot_count || 0,
     screenshot_count: imageEvidence.screenshot_count || 0,
     unique_screenshot_count: imageEvidence.unique_screenshot_count || 0,
+    dropped_duplicate_count: imageEvidence.dropped_duplicate_count || 0,
+    total_byte_length: imageEvidence.total_byte_length || 0,
+    original_total_byte_length: imageEvidence.original_total_byte_length || 0,
+    optimization: imageEvidence.optimization || null,
     file_paths: imageEvidence.file_paths || [],
     first_clip: imageEvidence.screenshots?.[0]?.clip || imageEvidence.clip || null
   };

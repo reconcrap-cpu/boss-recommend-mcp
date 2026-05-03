@@ -6,6 +6,7 @@ import {
   captureCandidateEvidence,
   captureNodeHtml,
   captureNodeScreenshot,
+  captureScrolledNodeScreenshots,
   captureViewportScreenshot
 } from "./core/capture/index.js";
 
@@ -132,10 +133,32 @@ async function testCaptureCandidateEvidenceScrollScreenshotDefault() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testCaptureScrolledNodeScreenshotsSkipsDuplicateTail() {
+  const client = createFakeClient();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-capture-"));
+  const filePath = path.join(dir, "candidate.jpg");
+  const evidence = await captureScrolledNodeScreenshots(client, 11, {
+    filePath,
+    format: "jpeg",
+    quality: 72,
+    maxScreenshots: 3,
+    duplicateStopCount: 1,
+    skipDuplicateScreenshots: true,
+    settleMs: 0
+  });
+  assert.equal(evidence.capture_count, 2);
+  assert.equal(evidence.screenshot_count, 1);
+  assert.equal(evidence.dropped_duplicate_count, 1);
+  assert.equal(evidence.file_paths.length, 1);
+  assert.equal(path.extname(evidence.file_paths[0]), ".jpg");
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 await testCaptureNodeHtml();
 await testCaptureNodeScreenshot();
 await testCaptureViewportScreenshot();
 await testCaptureCandidateEvidence();
 await testCaptureCandidateEvidenceScrollScreenshotDefault();
+await testCaptureScrolledNodeScreenshotsSkipsDuplicateTail();
 
 console.log("Core capture tests passed");
