@@ -110,95 +110,117 @@ export async function refreshRecommendListAtEnd(client, {
     );
     attempts.push(buttonResult);
     if (buttonResult.ok) {
-      currentRootState = await getRecommendRoots(client);
-      const pageScopeResult = await selectRecommendPageScope(
-        client,
-        currentRootState.iframe.documentNodeId,
-        {
-          pageScope,
-          fallbackScope: fallbackPageScope,
-          settleMs: buttonSettleMs > 10000 ? 3000 : 1200,
-          timeoutMs: Math.max(10000, Math.min(cardTimeoutMs, 60000))
+      try {
+        currentRootState = await getRecommendRoots(client);
+        const pageScopeResult = await selectRecommendPageScope(
+          client,
+          currentRootState.iframe.documentNodeId,
+          {
+            pageScope,
+            fallbackScope: fallbackPageScope,
+            settleMs: buttonSettleMs > 10000 ? 3000 : 1200,
+            timeoutMs: Math.max(10000, Math.min(cardTimeoutMs, 60000))
+          }
+        );
+        if (!pageScopeResult.selected) {
+          throw new Error(`Recommend page scope was not selected after end refresh: ${pageScopeResult.reason || pageScope}`);
         }
-      );
-      if (!pageScopeResult.selected) {
-        throw new Error(`Recommend page scope was not selected after end refresh: ${pageScopeResult.reason || pageScope}`);
+        currentRootState = await getRecommendRoots(client);
+        const filterResult = await selectAndConfirmFirstSafeFilter(
+          client,
+          currentRootState.iframe.documentNodeId,
+          buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
+        );
+        const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
+          timeoutMs: cardTimeoutMs,
+          intervalMs: 500
+        });
+        return {
+          ok: cardNodeIds.length > 0,
+          method: "end_refresh_button",
+          attempts,
+          page_scope: pageScopeResult,
+          filter: filterResult,
+          card_count: cardNodeIds.length,
+          root_state: currentRootState,
+          forced_recent_not_view: forceRecentNotView
+        };
+      } catch (error) {
+        attempts.push({
+          ok: false,
+          method: "end_refresh_button_after_click",
+          reason: "end_refresh_reapply_failed",
+          error: error?.message || String(error)
+        });
       }
-      currentRootState = await getRecommendRoots(client);
-      const filterResult = await selectAndConfirmFirstSafeFilter(
-        client,
-        currentRootState.iframe.documentNodeId,
-        buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
-      );
-      const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
-        timeoutMs: cardTimeoutMs,
-        intervalMs: 500
-      });
-      return {
-        ok: cardNodeIds.length > 0,
-        method: "end_refresh_button",
-        attempts,
-        page_scope: pageScopeResult,
-        filter: filterResult,
-        card_count: cardNodeIds.length,
-        root_state: currentRootState,
-        forced_recent_not_view: forceRecentNotView
-      };
     }
   }
 
-  await client.Page.reload({ ignoreCache: true });
-  if (reloadSettleMs > 0) await sleep(reloadSettleMs);
-  currentRootState = await waitForRecommendRoots(client, {
-    timeoutMs: Math.max(30000, reloadSettleMs * 4),
-    intervalMs: 500
-  });
-  if (!currentRootState?.iframe?.documentNodeId) {
-    throw new Error("Recommend iframe was not ready after refresh reload");
-  }
-  let jobSelection = null;
-  if (jobLabel) {
-    jobSelection = await selectRecommendJob(client, currentRootState.iframe.documentNodeId, {
-      jobLabel,
-      settleMs: reloadSettleMs > 10000 ? 12000 : 6000
+  try {
+    await client.Page.reload({ ignoreCache: true });
+    if (reloadSettleMs > 0) await sleep(reloadSettleMs);
+    currentRootState = await waitForRecommendRoots(client, {
+      timeoutMs: Math.max(30000, reloadSettleMs * 4),
+      intervalMs: 500
     });
-    if (!jobSelection.selected) {
-      throw new Error(`Requested recommend job was not selected after refresh reload: ${jobSelection.reason}`);
+    if (!currentRootState?.iframe?.documentNodeId) {
+      throw new Error("Recommend iframe was not ready after refresh reload");
+    }
+    let jobSelection = null;
+    if (jobLabel) {
+      jobSelection = await selectRecommendJob(client, currentRootState.iframe.documentNodeId, {
+        jobLabel,
+        settleMs: reloadSettleMs > 10000 ? 12000 : 6000
+      });
+      if (!jobSelection.selected) {
+        throw new Error(`Requested recommend job was not selected after refresh reload: ${jobSelection.reason}`);
+      }
+      currentRootState = await getRecommendRoots(client);
+    }
+    const pageScopeResult = await selectRecommendPageScope(
+      client,
+      currentRootState.iframe.documentNodeId,
+      {
+        pageScope,
+        fallbackScope: fallbackPageScope,
+        settleMs: reloadSettleMs > 10000 ? 3000 : 1200,
+        timeoutMs: Math.max(10000, Math.min(cardTimeoutMs, 60000))
+      }
+    );
+    if (!pageScopeResult.selected) {
+      throw new Error(`Recommend page scope was not selected after refresh reload: ${pageScopeResult.reason || pageScope}`);
     }
     currentRootState = await getRecommendRoots(client);
+    const filterResult = await selectAndConfirmFirstSafeFilter(
+      client,
+      currentRootState.iframe.documentNodeId,
+      buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
+    );
+    const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
+      timeoutMs: cardTimeoutMs,
+      intervalMs: 500
+    });
+    return {
+      ok: cardNodeIds.length > 0,
+      method: "page_reload",
+      attempts,
+      job_selection: jobSelection,
+      page_scope: pageScopeResult,
+      filter: filterResult,
+      card_count: cardNodeIds.length,
+      root_state: currentRootState,
+      forced_recent_not_view: forceRecentNotView
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      method: "page_reload",
+      reason: "page_reload_failed",
+      error: error?.message || String(error),
+      attempts,
+      card_count: 0,
+      root_state: currentRootState,
+      forced_recent_not_view: forceRecentNotView
+    };
   }
-  const pageScopeResult = await selectRecommendPageScope(
-    client,
-    currentRootState.iframe.documentNodeId,
-    {
-      pageScope,
-      fallbackScope: fallbackPageScope,
-      settleMs: reloadSettleMs > 10000 ? 3000 : 1200,
-      timeoutMs: Math.max(10000, Math.min(cardTimeoutMs, 60000))
-    }
-  );
-  if (!pageScopeResult.selected) {
-    throw new Error(`Recommend page scope was not selected after refresh reload: ${pageScopeResult.reason || pageScope}`);
-  }
-  currentRootState = await getRecommendRoots(client);
-  const filterResult = await selectAndConfirmFirstSafeFilter(
-    client,
-    currentRootState.iframe.documentNodeId,
-    buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
-  );
-  const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
-    timeoutMs: cardTimeoutMs,
-    intervalMs: 500
-  });
-  return {
-    ok: cardNodeIds.length > 0,
-    method: "page_reload",
-    attempts,
-    job_selection: jobSelection,
-    page_scope: pageScopeResult,
-    filter: filterResult,
-    card_count: cardNodeIds.length,
-    root_state: currentRootState,
-    forced_recent_not_view: forceRecentNotView
-  };
 }

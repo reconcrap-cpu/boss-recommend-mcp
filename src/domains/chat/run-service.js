@@ -98,6 +98,7 @@ function compactLlmResult(llmResult) {
     usage: llmResult.usage || null,
     finish_reason: llmResult.finish_reason || null,
     image_input_count: llmResult.image_input_count || 0,
+    attempt_count: llmResult.attempt_count || 0,
     error: llmResult.error || null
   };
 }
@@ -826,11 +827,15 @@ export async function runChatWorkflow({
                 maxScreenshots: maxImagePages,
                 wheelDeltaY: imageWheelDeltaY,
                 settleMs: 350,
-                duplicateStopCount: 1,
-                skipDuplicateScreenshots: true,
-                metadata: {
-                  domain: "chat",
-                  capture_mode: "scroll_sequence",
+            duplicateStopCount: 1,
+            skipDuplicateScreenshots: true,
+            composeForLlm: true,
+            llmPagesPerImage: 3,
+            llmResizeMaxWidth: 1100,
+            llmQuality: 72,
+            metadata: {
+              domain: "chat",
+              capture_mode: "scroll_sequence",
                   acquisition_reason: normalizedDetailSource === "image"
                     ? "forced_image"
                     : "network_miss_image_fallback",

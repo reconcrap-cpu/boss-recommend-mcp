@@ -440,6 +440,10 @@ export async function runRecruitWorkflow({
             settleMs: 350,
             duplicateStopCount: 1,
             skipDuplicateScreenshots: true,
+            composeForLlm: true,
+            llmPagesPerImage: 3,
+            llmResizeMaxWidth: 1100,
+            llmQuality: 72,
             metadata: {
               domain: "recruit",
               capture_mode: "scroll_sequence",

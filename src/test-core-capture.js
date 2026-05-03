@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import sharp from "sharp";
 import {
   captureCandidateEvidence,
   captureNodeHtml,
@@ -50,6 +51,20 @@ function createFakeClient() {
       }
     }
   };
+}
+
+function createImageSequenceClient(buffers = []) {
+  const client = createFakeClient();
+  let index = 0;
+  client.Page.captureScreenshot = async (params) => {
+    client.calls.push(["Page.captureScreenshot", params.clip]);
+    const buffer = buffers[Math.min(index, buffers.length - 1)] || Buffer.from("fake-image");
+    index += 1;
+    return {
+      data: buffer.toString("base64")
+    };
+  };
+  return client;
 }
 
 async function testCaptureNodeHtml() {
@@ -154,11 +169,55 @@ async function testCaptureScrolledNodeScreenshotsSkipsDuplicateTail() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testCaptureScrolledNodeScreenshotsComposesAllPagesForLlm() {
+  const buffers = await Promise.all([
+    "#ffffff",
+    "#f1f5f9",
+    "#e0f2fe",
+    "#dcfce7",
+    "#fef3c7"
+  ].map((background) => sharp({
+    create: {
+      width: 120,
+      height: 80,
+      channels: 3,
+      background
+    }
+  }).jpeg({ quality: 80 }).toBuffer()));
+  const client = createImageSequenceClient(buffers);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-capture-"));
+  const filePath = path.join(dir, "candidate.jpg");
+  const evidence = await captureScrolledNodeScreenshots(client, 12, {
+    filePath,
+    format: "jpeg",
+    quality: 72,
+    maxScreenshots: 5,
+    duplicateStopCount: 10,
+    skipDuplicateScreenshots: false,
+    composeForLlm: true,
+    llmPagesPerImage: 2,
+    llmResizeMaxWidth: 1100,
+    llmQuality: 72,
+    settleMs: 0
+  });
+  assert.equal(evidence.screenshot_count, 5);
+  assert.equal(evidence.llm_screenshot_count, 3);
+  assert.equal(evidence.llm_file_paths.length, 3);
+  const representedSourcePaths = evidence.llm_screenshots.flatMap((item) => item.source_file_paths);
+  assert.deepEqual(representedSourcePaths, evidence.file_paths);
+  assert.equal(new Set(representedSourcePaths).size, evidence.file_paths.length);
+  assert.equal(evidence.llm_screenshots.reduce((sum, item) => sum + item.source_page_count, 0), evidence.screenshot_count);
+  assert.equal(evidence.llm_file_paths.every((item) => fs.existsSync(item)), true);
+  assert.equal(evidence.llm_total_byte_length > 0, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 await testCaptureNodeHtml();
 await testCaptureNodeScreenshot();
 await testCaptureViewportScreenshot();
 await testCaptureCandidateEvidence();
 await testCaptureCandidateEvidenceScrollScreenshotDefault();
 await testCaptureScrolledNodeScreenshotsSkipsDuplicateTail();
+await testCaptureScrolledNodeScreenshotsComposesAllPagesForLlm();
 
 console.log("Core capture tests passed");

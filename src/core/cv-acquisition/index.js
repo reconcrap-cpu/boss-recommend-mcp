@@ -132,8 +132,13 @@ export function summarizeImageEvidence(imageEvidence = null) {
     dropped_duplicate_count: imageEvidence.dropped_duplicate_count || 0,
     total_byte_length: imageEvidence.total_byte_length || 0,
     original_total_byte_length: imageEvidence.original_total_byte_length || 0,
+    llm_screenshot_count: imageEvidence.llm_screenshot_count || 0,
+    llm_total_byte_length: imageEvidence.llm_total_byte_length || 0,
+    llm_original_total_byte_length: imageEvidence.llm_original_total_byte_length || 0,
+    llm_composition_error: imageEvidence.llm_composition_error || null,
     optimization: imageEvidence.optimization || null,
     file_paths: imageEvidence.file_paths || [],
+    llm_file_paths: imageEvidence.llm_file_paths || [],
     first_clip: imageEvidence.screenshots?.[0]?.clip || imageEvidence.clip || null
   };
 }

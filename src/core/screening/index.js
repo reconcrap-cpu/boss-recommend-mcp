@@ -392,11 +392,18 @@ function normalizeImagePaths({ imageEvidence = null, imagePaths = [] } = {}) {
   if (Array.isArray(imagePaths)) {
     paths.push(...imagePaths);
   }
-  if (Array.isArray(imageEvidence?.file_paths)) {
-    paths.push(...imageEvidence.file_paths);
-  }
-  if (Array.isArray(imageEvidence?.screenshots)) {
-    paths.push(...imageEvidence.screenshots.map((item) => item.file_path));
+  const evidenceLlmPaths = Array.isArray(imageEvidence?.llm_file_paths)
+    ? imageEvidence.llm_file_paths
+    : [];
+  if (evidenceLlmPaths.length) {
+    paths.push(...evidenceLlmPaths);
+  } else {
+    if (Array.isArray(imageEvidence?.file_paths)) {
+      paths.push(...imageEvidence.file_paths);
+    }
+    if (Array.isArray(imageEvidence?.screenshots)) {
+      paths.push(...imageEvidence.screenshots.map((item) => item.file_path));
+    }
   }
   return unique(paths.map((filePath) => String(filePath || "").trim()).filter(Boolean));
 }
@@ -1292,6 +1299,7 @@ export function compactScreeningLlmResult(llmResult) {
     usage: llmResult.usage || null,
     finish_reason: llmResult.finish_reason || null,
     image_input_count: llmResult.image_input_count || 0,
+    attempt_count: llmResult.attempt_count || 0,
     error: llmResult.error || null,
     screened_at: llmResult.screened_at || null
   };
@@ -1324,6 +1332,7 @@ export function createFailedLlmScreeningResult(error) {
     raw_model_output: "",
     image_input_count: Number(error?.image_input_count) || 0,
     image_inputs: Array.isArray(error?.image_inputs) ? error.image_inputs : [],
+    attempt_count: Number(error?.llm_attempt_count) || 0,
     error: error?.message || String(error || "unknown"),
     screened_at: nowIso()
   };
@@ -1352,7 +1361,7 @@ export function buildScreeningLlmMessages({
     `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${safeCriteria}\n\n`
     + `候选人信息:\n${safeText || "候选人的完整简历信息在后续截图中，请按截图顺序阅读。"}\n\n`
     + (images.length
-      ? `候选人简历截图共 ${images.length} 张，按从上到下的滚动顺序排列。请完整阅读所有截图后再判断。\n\n`
+      ? `候选人简历截图共 ${images.length} 张，按从上到下的滚动顺序排列。若截图是拼接长图，请按图内从上到下顺序完整阅读；不要跳过任何一段简历内容。\n\n`
       : "")
     + "要求：\n"
     + "1) 只能依据候选人信息或截图中真实出现的内容判断。\n"
@@ -1381,6 +1390,24 @@ export function buildScreeningLlmMessages({
       content: userContent
     }
   ];
+}
+
+function normalizeLlmMaxRetries(value) {
+  if (value == null || value === "") return 1;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 1;
+  return Math.min(3, Math.floor(parsed));
+}
+
+function isRetryableLlmRequestError(error) {
+  const status = Number(error?.status);
+  if ([408, 409, 425, 429].includes(status) || status >= 500) return true;
+  return /(?:aborted|abort|timeout|timed out|fetch failed|socket|network|ECONNRESET|ETIMEDOUT|EAI_AGAIN)/i
+    .test(String(error?.message || error || ""));
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
 export async function callScreeningLlm({
@@ -1425,9 +1452,13 @@ export async function callScreeningLlm({
     thinkingLevel: config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "low"
   });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
+  const maxRetries = normalizeLlmMaxRetries(config.llmMaxRetries ?? config.maxRetries);
+  const maxAttempts = maxRetries + 1;
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`
@@ -1443,7 +1474,9 @@ export async function callScreeningLlm({
     });
     const responseText = await response.text();
     if (!response.ok) {
-      throw new Error(`LLM request failed: ${response.status} ${responseText.slice(0, 400)}`);
+      const error = new Error(`LLM request failed: ${response.status} ${responseText.slice(0, 400)}`);
+      error.status = response.status;
+      throw error;
     }
     const json = tryParseJson(responseText);
     if (!json) {
@@ -1485,13 +1518,25 @@ export async function callScreeningLlm({
       raw_content_length: content.length,
       image_input_count: imageInputs.length,
       image_inputs: summarizeLlmImageInputs(imageInputs),
+      attempt_count: attempt,
       screened_at: nowIso()
     };
   } catch (error) {
-    error.image_input_count = imageInputs.length;
-    error.image_inputs = summarizeLlmImageInputs(imageInputs);
-    throw error;
+      lastError = error;
+      if (attempt >= maxAttempts || !isRetryableLlmRequestError(error)) {
+        error.image_input_count = imageInputs.length;
+        error.image_inputs = summarizeLlmImageInputs(imageInputs);
+        error.llm_attempt_count = attempt;
+        throw error;
+      }
+      await sleepMs(Math.min(2500, 500 * attempt));
   } finally {
     clearTimeout(timer);
   }
+  }
+  lastError = lastError || new Error("LLM request failed without response");
+  lastError.image_input_count = imageInputs.length;
+  lastError.image_inputs = summarizeLlmImageInputs(imageInputs);
+  lastError.llm_attempt_count = maxAttempts;
+  throw lastError;
 }

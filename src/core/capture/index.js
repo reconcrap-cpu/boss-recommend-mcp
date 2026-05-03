@@ -146,6 +146,14 @@ function filePathForSequence(basePath, index, extension) {
   return path.join(parsed.dir, `${parsed.name}-page-${page}${parsed.ext || `.${extension}`}`);
 }
 
+function filePathForLlmSequence(basePath, index) {
+  const resolved = resolveOutputPath(basePath);
+  if (!resolved) return null;
+  const parsed = path.parse(resolved);
+  const page = String(index + 1).padStart(2, "0");
+  return path.join(parsed.dir, `${parsed.name}-llm-${page}.jpg`);
+}
+
 function screenshotHash(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
@@ -207,6 +215,111 @@ async function optimizeScreenshotBuffer(buffer, {
   }
 }
 
+async function composeScreenshotsForLlm(screenshots = [], {
+  basePath,
+  pagesPerImage = 3,
+  resizeMaxWidth = 1100,
+  quality = 72
+} = {}) {
+  const fileScreenshots = screenshots.filter((item) => item?.file_path);
+  if (!basePath || fileScreenshots.length <= 1) {
+    return {
+      llm_file_paths: fileScreenshots.map((item) => item.file_path),
+      llm_screenshots: [],
+      llm_total_byte_length: 0,
+      llm_original_total_byte_length: 0,
+      llm_composition_error: null
+    };
+  }
+
+  const safePagesPerImage = Math.max(1, Math.min(5, Number(pagesPerImage) || 3));
+  const safeWidth = Math.max(700, Math.min(1400, Number(resizeMaxWidth) || 1100));
+  const safeQuality = Math.max(45, Math.min(90, Number(quality) || 72));
+  const llmScreenshots = [];
+
+  try {
+    for (let index = 0; index < fileScreenshots.length; index += safePagesPerImage) {
+      const group = fileScreenshots.slice(index, index + safePagesPerImage);
+      const prepared = [];
+      for (const item of group) {
+        const sourceBuffer = fs.readFileSync(item.file_path);
+        const { data, info } = await sharp(sourceBuffer, { failOn: "none" })
+          .resize({
+            width: safeWidth,
+            withoutEnlargement: true
+          })
+          .jpeg({
+            quality: safeQuality,
+            mozjpeg: true
+          })
+          .toBuffer({ resolveWithObject: true });
+        prepared.push({
+          input: data,
+          width: info.width,
+          height: info.height,
+          source_file_path: item.file_path
+        });
+      }
+
+      const width = Math.max(...prepared.map((item) => item.width), 1);
+      const height = prepared.reduce((sum, item) => sum + item.height, 0);
+      let top = 0;
+      const composites = prepared.map((item) => {
+        const layer = {
+          input: item.input,
+          left: 0,
+          top
+        };
+        top += item.height;
+        return layer;
+      });
+      const outputBuffer = await sharp({
+        create: {
+          width,
+          height,
+          channels: 3,
+          background: "#ffffff"
+        }
+      })
+        .composite(composites)
+        .jpeg({
+          quality: safeQuality,
+          mozjpeg: true
+        })
+        .toBuffer();
+      const outputPath = filePathForLlmSequence(basePath, llmScreenshots.length);
+      fs.writeFileSync(outputPath, outputBuffer);
+      llmScreenshots.push({
+        index: llmScreenshots.length,
+        file_path: outputPath,
+        byte_length: outputBuffer.length,
+        source_file_paths: prepared.map((item) => item.source_file_path),
+        source_page_count: prepared.length,
+        width,
+        height,
+        format: "jpeg",
+        mime_type: "image/jpeg"
+      });
+    }
+  } catch (error) {
+    return {
+      llm_file_paths: fileScreenshots.map((item) => item.file_path),
+      llm_screenshots: [],
+      llm_total_byte_length: 0,
+      llm_original_total_byte_length: fileScreenshots.reduce((sum, item) => sum + (Number(item.byte_length) || 0), 0),
+      llm_composition_error: error?.message || String(error)
+    };
+  }
+
+  return {
+    llm_file_paths: llmScreenshots.map((item) => item.file_path),
+    llm_screenshots: llmScreenshots,
+    llm_total_byte_length: llmScreenshots.reduce((sum, item) => sum + (Number(item.byte_length) || 0), 0),
+    llm_original_total_byte_length: fileScreenshots.reduce((sum, item) => sum + (Number(item.byte_length) || 0), 0),
+    llm_composition_error: null
+  };
+}
+
 export async function captureScrolledNodeScreenshots(client, nodeId, {
   filePath,
   format = "png",
@@ -222,6 +335,10 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
   skipDuplicateScreenshots = false,
   optimize = false,
   resizeMaxWidth = 0,
+  composeForLlm = false,
+  llmPagesPerImage = 3,
+  llmResizeMaxWidth = 1100,
+  llmQuality = 72,
   metadata = {}
 } = {}) {
   if (!nodeId) throw new Error("captureScrolledNodeScreenshots requires nodeId");
@@ -322,6 +439,21 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
     }
   }
 
+  const llmComposition = composeForLlm
+    ? await composeScreenshotsForLlm(screenshots, {
+        basePath: filePath,
+        pagesPerImage: llmPagesPerImage,
+        resizeMaxWidth: llmResizeMaxWidth,
+        quality: llmQuality
+      })
+    : {
+        llm_file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
+        llm_screenshots: [],
+        llm_total_byte_length: 0,
+        llm_original_total_byte_length: 0,
+        llm_composition_error: null
+      };
+
   return {
     schema_version: 1,
     source: "image-scroll-sequence",
@@ -335,12 +467,22 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
     dropped_duplicate_count: droppedDuplicateCount,
     total_byte_length: screenshots.reduce((sum, item) => sum + (Number(item.byte_length) || 0), 0),
     original_total_byte_length: screenshots.reduce((sum, item) => sum + (Number(item.original_byte_length) || 0), 0),
+    llm_file_paths: llmComposition.llm_file_paths,
+    llm_screenshot_count: llmComposition.llm_file_paths.length,
+    llm_total_byte_length: llmComposition.llm_total_byte_length,
+    llm_original_total_byte_length: llmComposition.llm_original_total_byte_length,
+    llm_composition_error: llmComposition.llm_composition_error,
+    llm_screenshots: llmComposition.llm_screenshots,
     optimization: {
       enabled: Boolean(optimize),
       resize_max_width: Math.max(0, Number(resizeMaxWidth) || 0),
       capture_viewport: Boolean(captureViewport),
       format,
-      quality: quality ?? null
+      quality: quality ?? null,
+      llm_compose_enabled: Boolean(composeForLlm),
+      llm_pages_per_image: Math.max(1, Math.min(5, Number(llmPagesPerImage) || 3)),
+      llm_resize_max_width: Math.max(0, Number(llmResizeMaxWidth) || 0),
+      llm_quality: llmQuality ?? null
     },
     file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
     screenshots,

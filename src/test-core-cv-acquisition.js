@@ -77,7 +77,11 @@ function testProfileCountingAndEvidenceSummary() {
     source: "image-scroll-sequence",
     screenshot_count: 2,
     unique_screenshot_count: 2,
-    file_paths: ["page-01.png"]
+    file_paths: ["page-01.png"],
+    llm_file_paths: ["page-llm-01.jpg"],
+    llm_screenshot_count: 1,
+    llm_total_byte_length: 123,
+    llm_original_total_byte_length: 456
   }), {
     source: "image-scroll-sequence",
     elapsed_ms: 0,
@@ -87,8 +91,13 @@ function testProfileCountingAndEvidenceSummary() {
     dropped_duplicate_count: 0,
     total_byte_length: 0,
     original_total_byte_length: 0,
+    llm_screenshot_count: 1,
+    llm_total_byte_length: 123,
+    llm_original_total_byte_length: 456,
+    llm_composition_error: null,
     optimization: null,
     file_paths: ["page-01.png"],
+    llm_file_paths: ["page-llm-01.jpg"],
     first_clip: null
   });
 }

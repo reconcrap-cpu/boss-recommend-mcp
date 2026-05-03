@@ -460,6 +460,34 @@ function testBuildScreeningLlmMessagesWithImages() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+function testBuildScreeningLlmImageInputsPrefersComposedFullCvImages() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-screening-images-"));
+  const sourcePaths = [
+    path.join(dir, "page-01.jpg"),
+    path.join(dir, "page-02.jpg"),
+    path.join(dir, "page-03.jpg")
+  ];
+  const llmPaths = [
+    path.join(dir, "page-llm-01.jpg"),
+    path.join(dir, "page-llm-02.jpg")
+  ];
+  for (const imagePath of [...sourcePaths, ...llmPaths]) {
+    fs.writeFileSync(imagePath, Buffer.from("fake-image"));
+  }
+  const imageInputs = buildScreeningLlmImageInputs({
+    imageEvidence: {
+      file_paths: sourcePaths,
+      llm_file_paths: llmPaths
+    },
+    maxImages: 8,
+    detail: "low"
+  });
+  assert.equal(imageInputs.length, 2);
+  assert.deepEqual(imageInputs.map((item) => item.metadata.file_path), llmPaths.map((item) => path.resolve(item)));
+  assert.equal(imageInputs.every((item) => item.image_url.detail === "low"), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 async function testCallScreeningLlmDefaultsThinkingLow() {
   const originalFetch = globalThis.fetch;
   let payload = null;
@@ -505,6 +533,55 @@ async function testCallScreeningLlmDefaultsThinkingLow() {
   }
 }
 
+async function testCallScreeningLlmRetriesTransientFailure() {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new Error("fetch failed");
+    }
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: { content: "{\"passed\": false}" },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 12 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "retry-default",
+        text: "张三\n算法工程师\n本科"
+      }),
+      criteria: "算法经验",
+      config: {
+        baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+        apiKey: "test-key",
+        model: "doubao-seed-2.0-lite",
+        llmMaxRetries: 1
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.passed, false);
+    assert.equal(result.attempt_count, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 testHtmlToText();
 testNormalizeFromHtml();
 testNormalizeFromHtmlSkipsSalaryAsName();
@@ -520,6 +597,8 @@ testBossChatHistoryResumeExtraction();
 testBuildScreeningCandidateFromDetailUsesCleanNetworkText();
 testBuildScreeningLlmMessages();
 testBuildScreeningLlmMessagesWithImages();
+testBuildScreeningLlmImageInputsPrefersComposedFullCvImages();
 await testCallScreeningLlmDefaultsThinkingLow();
+await testCallScreeningLlmRetriesTransientFailure();
 
 console.log("Core screening tests passed");
