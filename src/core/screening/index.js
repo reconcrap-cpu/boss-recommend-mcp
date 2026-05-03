@@ -206,11 +206,52 @@ function parseDateLike(value) {
   return normalized;
 }
 
+function isLikelySalaryLine(value = "") {
+  const normalized = normalizeText(value);
+  return Boolean(
+    /^(?:面议|薪资面议)$/i.test(normalized)
+    || /^\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*[kK](?:\s*[·xX*]\s*\d+\s*薪?)?$/.test(normalized)
+    || /^\d+\s*-\s*\d+\s*元\s*\/\s*天$/.test(normalized)
+  );
+}
+
+function isLikelyStatusLine(value = "") {
+  const normalized = normalizeText(value);
+  return Boolean(
+    !normalized
+    || /^沟通|^收藏|^查看|^不合适/.test(normalized)
+    || /^(?:在线|刚刚活跃|今日活跃|本周活跃|本月活跃|继续沟通|打招呼)$/.test(normalized)
+  );
+}
+
+function stripLeadingSalaryToken(value = "") {
+  return normalizeText(value)
+    .replace(/^(?:面议|薪资面议)\s+/i, "")
+    .replace(/^\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*[kK](?:\s*[·xX*]\s*\d+\s*薪?)?\s+/, "")
+    .replace(/^\d+\s*-\s*\d+\s*元\s*\/\s*天\s+/, "")
+    .trim();
+}
+
+function stripTrailingStatusToken(value = "") {
+  return normalizeText(value)
+    .replace(/\s*(?:在线|刚刚活跃|今日活跃|本周活跃|本月活跃|继续沟通|打招呼)$/u, "")
+    .trim();
+}
+
+function cleanInferredNameLine(value = "") {
+  const withoutSalary = stripLeadingSalaryToken(value);
+  const withoutStatus = stripTrailingStatusToken(withoutSalary);
+  return withoutStatus && !isLikelyStatusLine(withoutStatus) && !isLikelySalaryLine(withoutStatus)
+    ? withoutStatus
+    : "";
+}
+
 function firstUsefulLine(lines) {
-  return lines.find((line) => {
-    const normalized = normalizeText(line);
-    return normalized && !/^沟通|^收藏|^查看|^不合适/.test(normalized);
-  }) || null;
+  for (const line of lines) {
+    const cleaned = cleanInferredNameLine(line);
+    if (cleaned) return cleaned;
+  }
+  return null;
 }
 
 function parseNetworkBodyText(networkBody = {}) {
@@ -834,7 +875,8 @@ export function normalizeCandidateProfile(input = {}) {
     || attrs.href
     || ""
   ) || null;
-  const inferredName = normalizeText(input.identity?.name || input.name || firstUsefulLine(lines) || "") || null;
+  const explicitName = cleanInferredNameLine(input.identity?.name || input.name || "");
+  const inferredName = explicitName || firstUsefulLine(lines) || null;
   const fullText = collectTextParts({
     ...input,
     text: rawText,

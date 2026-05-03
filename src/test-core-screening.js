@@ -34,6 +34,17 @@ function testNormalizeFromHtml() {
   assert.equal(candidate.identity.gender, "男");
 }
 
+function testNormalizeFromHtmlSkipsSalaryAsName() {
+  const candidate = normalizeCandidateFromHtml({
+    domain: "recommend",
+    source: "unit-fixture",
+    html: "<div><span>15-30K</span><div>马良</div><div>21岁 27年应届生 本科</div></div>"
+  });
+  assert.equal(candidate.identity.name, "马良");
+  assert.equal(candidate.identity.degree, "本科");
+  assert.equal(candidate.identity.age, 21);
+}
+
 function testNormalizeProfile() {
   const candidate = normalizeCandidateProfile({
     domain: "chat",
@@ -361,6 +372,7 @@ function testBuildScreeningLlmMessagesWithImages() {
 
 testHtmlToText();
 testNormalizeFromHtml();
+testNormalizeFromHtmlSkipsSalaryAsName();
 testNormalizeProfile();
 testScreenCandidate();
 testBossNetworkProfileExtraction();

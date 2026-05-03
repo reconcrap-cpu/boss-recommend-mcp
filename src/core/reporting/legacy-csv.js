@@ -227,8 +227,17 @@ function pickCandidate(row = {}) {
 
 function timingValue(row = {}, ...keys) {
   const timings = row.timings || row.timing || {};
+  const detail = row.detail || {};
+  const acquisition = detail.cv_acquisition || {};
+  const fallbackByKey = {
+    network_cv_wait_ms: acquisition.network_wait?.elapsed_ms,
+    screenshot_capture_ms: acquisition.image_evidence?.elapsed_ms || detail.image_evidence?.elapsed_ms,
+    dom_fallback_ms: acquisition.content_wait?.elapsed_ms,
+    close_detail_ms: detail.close_result?.elapsed_ms,
+    post_action_ms: row.post_action?.elapsed_ms
+  };
   for (const key of keys) {
-    const value = firstDefined(row[key], timings[key]);
+    const value = firstDefined(row[key], timings[key], fallbackByKey[key]);
     if (value !== "") return value;
   }
   return "";

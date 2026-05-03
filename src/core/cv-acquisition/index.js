@@ -125,6 +125,7 @@ export function summarizeImageEvidence(imageEvidence = null) {
   if (!imageEvidence) return null;
   return {
     source: imageEvidence.source || "",
+    elapsed_ms: imageEvidence.elapsed_ms || 0,
     screenshot_count: imageEvidence.screenshot_count || 0,
     unique_screenshot_count: imageEvidence.unique_screenshot_count || 0,
     file_paths: imageEvidence.file_paths || [],

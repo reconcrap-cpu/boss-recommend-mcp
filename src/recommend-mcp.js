@@ -1048,6 +1048,7 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
     llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
     llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
     llmImageDetail: normalizeText(args.llm_image_detail) || "high",
+    imageOutputDir: resolveBossConfiguredOutputDir("", getRunsDir()),
     name: "mcp-recommend-pipeline-run",
     parsed
   };

@@ -1,4 +1,9 @@
 import { createRunLifecycleManager } from "../../core/run/index.js";
+import {
+  addTiming,
+  imageEvidenceFilePath,
+  measureTiming
+} from "../../core/run/timing.js";
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
 import { sleep } from "../../core/browser/index.js";
 import { GREET_CREDITS_EXHAUSTED_CODE } from "../../core/greet-quota/index.js";
@@ -377,7 +382,8 @@ export async function runRecommendWorkflow({
   llmConfig = null,
   llmTimeoutMs = 120000,
   llmImageLimit = 8,
-  llmImageDetail = "high"
+  llmImageDetail = "high",
+  imageOutputDir = ""
 } = {}, runControl) {
   if (!client) throw new Error("runRecommendWorkflow requires a guarded CDP client");
   const normalizedFilter = normalizeFilter(filter);
@@ -520,12 +526,14 @@ export async function runRecommendWorkflow({
   });
 
   while (results.length < limit) {
+    const candidateStarted = Date.now();
+    const timings = {};
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recommend:candidate");
     rootState = await ensureRecommendViewport(rootState, "candidate_loop");
 
-    const nextCandidateResult = await getNextInfiniteListCandidate({
+    const nextCandidateResult = await measureTiming(timings, "card_read_ms", () => getNextInfiniteListCandidate({
       client,
       state: listState,
       maxScrolls: listMaxScrolls,
@@ -552,7 +560,7 @@ export async function runRecommendWorkflow({
           visible_index: visibleIndex
         }
       })
-    });
+    }));
     if (!nextCandidateResult.ok) {
       listEndReason = nextCandidateResult.reason || "list_exhausted";
       if (
@@ -644,11 +652,13 @@ export async function runRecommendWorkflow({
         targetUrl,
         maxAttempts: 2
       });
+      addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
+      addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
       cardNodeId = openedDetail.card_node_id || cardNodeId;
       cardCandidate = openedDetail.card_candidate || cardCandidate;
       screeningCandidate = cardCandidate;
       const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
-      const networkWait = await waitForCvNetworkEvents(
+      const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
         waitForRecommendDetailNetworkEvents,
         networkRecorder,
         {
@@ -657,7 +667,10 @@ export async function runRecommendWorkflow({
           requireLoaded: true,
           intervalMs: 120
         }
-      );
+      ));
+      if (networkWait?.elapsed_ms != null) {
+        timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
+      }
       detailResult = await extractRecommendDetailCandidate(client, {
         cardCandidate,
         cardNodeId,
@@ -680,7 +693,13 @@ export async function runRecommendWorkflow({
           || openedDetail.detail_state?.resumeIframe?.node_id
           || null;
         if (captureNodeId) {
-          imageEvidence = await captureScrolledNodeScreenshots(client, captureNodeId, {
+          imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+            filePath: imageEvidenceFilePath({
+              imageOutputDir,
+              domain: "recommend",
+              runId: runControl?.runId,
+              index
+            }),
             padding: 4,
             maxScreenshots: maxImagePages,
             wheelDeltaY: imageWheelDeltaY,
@@ -692,7 +711,7 @@ export async function runRecommendWorkflow({
               run_candidate_index: index,
               candidate_key: candidateKey
             }
-          });
+          }));
           source = "image";
           recordCvImageFallback(cvAcquisitionState, {
             parsedNetworkProfileCount,
@@ -730,7 +749,10 @@ export async function runRecommendWorkflow({
         llmResult = createMissingLlmConfigResult();
       } else {
         try {
-          llmResult = await callScreeningLlm({
+          const llmTimingKey = detailResult?.image_evidence?.file_paths?.length
+            ? "vision_model_ms"
+            : "text_model_ms";
+          llmResult = await measureTiming(timings, llmTimingKey, () => callScreeningLlm({
             candidate: screeningCandidate,
             criteria,
             config: llmConfig,
@@ -738,7 +760,7 @@ export async function runRecommendWorkflow({
             imageEvidence: detailResult?.image_evidence || null,
             maxImages: llmImageLimit,
             imageDetail: llmImageDetail
-          });
+          }));
         } catch (error) {
           llmResult = createFailedLlmScreeningResult(error);
         }
@@ -751,6 +773,7 @@ export async function runRecommendWorkflow({
     let actionDiscovery = null;
     let postActionResult = null;
     if (postActionEnabled && detailResult) {
+      const postActionStarted = Date.now();
       await runControl.waitIfPaused();
       runControl.throwIfCanceled();
       runControl.setPhase("recommend:post-action");
@@ -772,10 +795,12 @@ export async function runRecommendWorkflow({
       if (postActionResult.counted_as_greet && postActionResult.action_clicked) {
         greetCount += 1;
       }
+      addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
     }
     if (detailResult && closeDetail) {
-      detailResult.close_result = await closeRecommendDetail(client);
+      detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
     }
+    timings.total_ms = Date.now() - candidateStarted;
     const compactResult = {
       index,
       candidate_key: candidateKey,
@@ -785,7 +810,8 @@ export async function runRecommendWorkflow({
       llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
       screening: compactScreening(screening),
       action_discovery: compactActionDiscovery(actionDiscovery),
-      post_action: postActionResult
+      post_action: postActionResult,
+      timings
     };
     results.push(compactResult);
     markInfiniteListCandidateProcessed(listState, candidateKey, {
@@ -816,6 +842,7 @@ export async function runRecommendWorkflow({
       last_candidate_key: candidateKey,
       last_score: screening.score
     });
+    const checkpointStarted = Date.now();
     runControl.checkpoint({
       results,
       last_candidate: {
@@ -831,6 +858,7 @@ export async function runRecommendWorkflow({
         post_action: postActionResult
       }
     });
+    addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
 
     if (postActionResult?.stop_run) {
       listEndReason = postActionResult.reason || "post_action_stop";
@@ -838,7 +866,10 @@ export async function runRecommendWorkflow({
     }
 
     if (delayMs > 0) {
+      const sleepStarted = Date.now();
       await runControl.sleep(delayMs);
+      addTiming(compactResult.timings, "sleep_ms", Date.now() - sleepStarted);
+      compactResult.timings.total_ms = Date.now() - candidateStarted;
     }
   }
 
@@ -912,6 +943,7 @@ export function createRecommendRunService({
     llmTimeoutMs = 120000,
     llmImageLimit = 8,
     llmImageDetail = "high",
+    imageOutputDir = "",
     name = "recommend-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecommendRun requires a guarded CDP client");
@@ -955,7 +987,8 @@ export function createRecommendRunService({
         llm_configured: Boolean(llmConfig),
         llm_timeout_ms: llmTimeoutMs,
         llm_image_limit: llmImageLimit,
-        llm_image_detail: llmImageDetail
+        llm_image_detail: llmImageDetail,
+        image_output_dir: imageOutputDir || ""
       },
       progress: {
         card_count: 0,
@@ -1004,7 +1037,8 @@ export function createRecommendRunService({
         llmConfig,
         llmTimeoutMs,
         llmImageLimit,
-        llmImageDetail
+        llmImageDetail,
+        imageOutputDir
       }, runControl)
     });
   }

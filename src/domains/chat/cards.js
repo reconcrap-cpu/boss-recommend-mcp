@@ -5,6 +5,7 @@ import {
   querySelectorAll,
   sleep
 } from "../../core/browser/index.js";
+import { mergeBossCandidateCardFields } from "../../core/boss-cards/index.js";
 import {
   htmlToText,
   normalizeCandidateProfile,
@@ -22,6 +23,12 @@ function firstCandidateId(attributes = {}) {
     || attributes.id
     || ""
   ) || null;
+}
+
+function mergeChatCardFields(candidate, outerHTML = "") {
+  return mergeBossCandidateCardFields(candidate, outerHTML, {
+    metadataKey: "chat_card_fields"
+  });
 }
 
 export async function findChatCandidateNodeIds(client, rootNodeId, {
@@ -97,7 +104,7 @@ export async function readChatCardCandidate(client, cardNodeId, {
     getAttributesMap(client, cardNodeId),
     getOuterHTML(client, cardNodeId)
   ]);
-  return normalizeCandidateProfile({
+  const candidate = normalizeCandidateProfile({
     domain: "chat",
     source,
     id: firstCandidateId(attributes),
@@ -110,6 +117,7 @@ export async function readChatCardCandidate(client, cardNodeId, {
       ...metadata
     }
   });
+  return mergeChatCardFields(candidate, outerHTML);
 }
 
 export async function readFirstChatCardCandidate(client, rootNodeId, options = {}) {

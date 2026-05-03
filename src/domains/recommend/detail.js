@@ -279,15 +279,25 @@ export async function openRecommendCardDetail(client, cardNodeId, {
   timeoutMs = 12000,
   scrollIntoView = true
 } = {}) {
+  const started = Date.now();
+  const clickStarted = Date.now();
   const cardBox = await clickNodeCenter(client, cardNodeId, { scrollIntoView });
+  const candidateClickMs = Date.now() - clickStarted;
+  const detailStarted = Date.now();
   const detailState = await waitForRecommendDetail(client, { timeoutMs });
+  const detailOpenMs = Date.now() - detailStarted;
   if (!detailState?.popup && !detailState?.resumeIframe) {
     throw new Error("Candidate detail did not open or no known detail selectors mounted");
   }
 
   return {
     card_box: cardBox,
-    detail_state: detailState
+    detail_state: detailState,
+    timings: {
+      candidate_click_ms: candidateClickMs,
+      detail_open_ms: detailOpenMs,
+      open_total_ms: Date.now() - started
+    }
   };
 }
 

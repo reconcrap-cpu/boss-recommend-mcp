@@ -1,4 +1,9 @@
 import { createRunLifecycleManager } from "../../core/run/index.js";
+import {
+  addTiming,
+  imageEvidenceFilePath,
+  measureTiming
+} from "../../core/run/timing.js";
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
 import {
   compactCvAcquisitionState,
@@ -150,7 +155,8 @@ export async function runRecruitWorkflow({
   llmConfig = null,
   llmTimeoutMs = 120000,
   llmImageLimit = 8,
-  llmImageDetail = "high"
+  llmImageDetail = "high",
+  imageOutputDir = ""
 } = {}, runControl) {
   if (!client) throw new Error("runRecruitWorkflow requires a guarded CDP client");
   const normalizedSearchParams = normalizeSearchParams(searchParams);
@@ -258,12 +264,14 @@ export async function runRecruitWorkflow({
   });
 
   while (results.length < limit) {
+    const candidateStarted = Date.now();
+    const timings = {};
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recruit:candidate");
     rootState = await ensureRecruitViewport(rootState, "candidate_loop");
 
-    const nextCandidateResult = await getNextInfiniteListCandidate({
+    const nextCandidateResult = await measureTiming(timings, "card_read_ms", () => getNextInfiniteListCandidate({
       client,
       state: listState,
       maxScrolls: listMaxScrolls,
@@ -291,7 +299,7 @@ export async function runRecruitWorkflow({
           search_params: normalizedSearchParams
         }
       })
-    });
+    }));
     if (!nextCandidateResult.ok) {
       listEndReason = nextCandidateResult.reason || "list_exhausted";
       if (
@@ -373,8 +381,10 @@ export async function runRecruitWorkflow({
       rootState = await ensureRecruitViewport(rootState, "detail");
       networkRecorder.clear();
       const openedDetail = await openRecruitCardDetail(client, cardNodeId);
+      addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
+      addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
       const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
-      const networkWait = await waitForCvNetworkEvents(
+      const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
         waitForRecruitDetailNetworkEvents,
         networkRecorder,
         {
@@ -383,7 +393,10 @@ export async function runRecruitWorkflow({
           requireLoaded: true,
           intervalMs: 120
         }
-      );
+      ));
+      if (networkWait?.elapsed_ms != null) {
+        timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
+      }
       detailResult = await extractRecruitDetailCandidate(client, {
         cardCandidate,
         cardNodeId,
@@ -405,7 +418,13 @@ export async function runRecruitWorkflow({
           || openedDetail.detail_state?.resumeIframe?.node_id
           || null;
         if (captureNodeId) {
-          imageEvidence = await captureScrolledNodeScreenshots(client, captureNodeId, {
+          imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+            filePath: imageEvidenceFilePath({
+              imageOutputDir,
+              domain: "recruit",
+              runId: runControl?.runId,
+              index
+            }),
             padding: 4,
             maxScreenshots: maxImagePages,
             wheelDeltaY: imageWheelDeltaY,
@@ -417,7 +436,7 @@ export async function runRecruitWorkflow({
               run_candidate_index: index,
               candidate_key: candidateKey
             }
-          });
+          }));
           source = "image";
           recordCvImageFallback(cvAcquisitionState, {
             parsedNetworkProfileCount,
@@ -436,7 +455,7 @@ export async function runRecruitWorkflow({
 
       let closeResult = null;
       if (closeDetail) {
-        closeResult = await closeRecruitDetail(client);
+        closeResult = await measureTiming(timings, "close_detail_ms", () => closeRecruitDetail(client));
       }
       detailResult.close_result = closeResult;
       detailResult.image_evidence = imageEvidence;
@@ -460,7 +479,10 @@ export async function runRecruitWorkflow({
         llmResult = createMissingLlmConfigResult();
       } else {
         try {
-          llmResult = await callScreeningLlm({
+          const llmTimingKey = detailResult?.image_evidence?.file_paths?.length
+            ? "vision_model_ms"
+            : "text_model_ms";
+          llmResult = await measureTiming(timings, llmTimingKey, () => callScreeningLlm({
             candidate: screeningCandidate,
             criteria,
             config: llmConfig,
@@ -468,7 +490,7 @@ export async function runRecruitWorkflow({
             imageEvidence: detailResult?.image_evidence || null,
             maxImages: llmImageLimit,
             imageDetail: llmImageDetail
-          });
+          }));
         } catch (error) {
           llmResult = createFailedLlmScreeningResult(error);
         }
@@ -478,6 +500,7 @@ export async function runRecruitWorkflow({
     const screening = useLlmScreening
       ? llmResultToScreening(llmResult, screeningCandidate)
       : screenCandidate(screeningCandidate, { criteria });
+    timings.total_ms = Date.now() - candidateStarted;
     const compactResult = {
       index,
       candidate_key: candidateKey,
@@ -485,7 +508,8 @@ export async function runRecruitWorkflow({
       candidate: compactCandidate(screeningCandidate),
       detail: compactDetail(detailResult),
       llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
-      screening: compactScreening(screening)
+      screening: compactScreening(screening),
+      timings
     };
     results.push(compactResult);
     markInfiniteListCandidateProcessed(listState, candidateKey, {
@@ -514,6 +538,7 @@ export async function runRecruitWorkflow({
       last_candidate_key: candidateKey,
       last_score: screening.score
     });
+    const checkpointStarted = Date.now();
     runControl.checkpoint({
       results,
       last_candidate: {
@@ -528,9 +553,13 @@ export async function runRecruitWorkflow({
         llm_screening: compactScreeningLlmResult(llmResult)
       }
     });
+    addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
 
     if (delayMs > 0) {
+      const sleepStarted = Date.now();
       await runControl.sleep(delayMs);
+      addTiming(compactResult.timings, "sleep_ms", Date.now() - sleepStarted);
+      compactResult.timings.total_ms = Date.now() - candidateStarted;
     }
   }
 
@@ -593,6 +622,7 @@ export function createRecruitRunService({
     llmTimeoutMs = 120000,
     llmImageLimit = 8,
     llmImageDetail = "high",
+    imageOutputDir = "",
     name = "recruit-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecruitRun requires a guarded CDP client");
@@ -628,7 +658,8 @@ export function createRecruitRunService({
         llm_configured: Boolean(llmConfig),
         llm_timeout_ms: llmTimeoutMs,
         llm_image_limit: llmImageLimit,
-        llm_image_detail: llmImageDetail
+        llm_image_detail: llmImageDetail,
+        image_output_dir: imageOutputDir || ""
       },
       progress: {
         card_count: 0,
@@ -668,7 +699,8 @@ export function createRecruitRunService({
         llmConfig,
         llmTimeoutMs,
         llmImageLimit,
-        llmImageDetail
+        llmImageDetail,
+        imageOutputDir
       }, runControl)
     });
   }

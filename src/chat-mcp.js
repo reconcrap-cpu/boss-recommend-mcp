@@ -872,6 +872,7 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
     listWheelDeltaY: parsePositiveInteger(args.list_wheel_delta_y, 850),
     listSettleMs: parsePositiveInteger(args.list_settle_ms, slowLive ? 1800 : 1200),
     listFallbackPoint: null,
+    imageOutputDir: resolveBossConfiguredOutputDir("", getChatRunsDir()),
     name: "mcp-boss-chat-run"
   };
 }

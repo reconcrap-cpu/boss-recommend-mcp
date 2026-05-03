@@ -7,6 +7,10 @@ import {
   sleep
 } from "../../core/browser/index.js";
 import {
+  mergeBossCandidateCardFields,
+  parseBossCandidateCardFieldsFromHtml
+} from "../../core/boss-cards/index.js";
+import {
   htmlToText,
   normalizeCandidateFromHtml,
   normalizeText
@@ -22,6 +26,16 @@ function uniqueNodeIds(nodeIds = []) {
 
 function normalizeRefreshButtonLabel(outerHTML = "") {
   return normalizeText(htmlToText(outerHTML)).replace(/\s+/g, "");
+}
+
+export function parseRecommendCardFieldsFromHtml(html = "") {
+  return parseBossCandidateCardFieldsFromHtml(html);
+}
+
+function enrichRecommendCardCandidate(candidate, outerHTML = "") {
+  return mergeBossCandidateCardFields(candidate, outerHTML, {
+    metadataKey: "recommend_card_fields"
+  });
 }
 
 function isRefreshButtonLabel(label = "") {
@@ -91,7 +105,7 @@ export async function readRecommendCardCandidate(client, cardNodeId, {
     getAttributesMap(client, cardNodeId),
     getOuterHTML(client, cardNodeId)
   ]);
-  return normalizeCandidateFromHtml({
+  const candidate = normalizeCandidateFromHtml({
     domain: "recommend",
     source,
     html: outerHTML,
@@ -102,6 +116,7 @@ export async function readRecommendCardCandidate(client, cardNodeId, {
       ...metadata
     }
   });
+  return enrichRecommendCardCandidate(candidate, outerHTML);
 }
 
 export async function readFirstRecommendCardCandidate(client, frameNodeId, options = {}) {

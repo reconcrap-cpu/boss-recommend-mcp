@@ -13,6 +13,7 @@ import {
   matchesRecommendDetailNetwork,
   normalizeFilterOptionLabel,
   normalizeRecommendPageScope,
+  parseRecommendCardFieldsFromHtml,
   readRecommendDetailHtml,
   readRecommendCardCandidate,
   selectRecommendPageScope
@@ -107,6 +108,36 @@ async function testCardCandidateReader() {
   assert.equal(candidate.id, "abc123");
   assert.equal(candidate.identity.degree, "本科");
   assert.match(candidate.text.raw, /算法工程师/);
+}
+
+function testRecommendCardFieldParser() {
+  const html = `
+    <div class="card-inner" data-geek="abc123">
+      <div class="salary-wrap css-type-1"><span>15-30K</span></div>
+      <div class="row name-wrap"><span class="name">马良</span><img class="online-marker"></div>
+      <div class="join-text-wrap base-info"><span>21岁</span><span>27年应届生</span><span>本科</span></div>
+      <div class="timeline-wrap work-exps">
+        <div class="timeline-item">
+          <div class="join-text-wrap time"><span>2026.01</span><span>2026.03</span></div>
+          <div class="join-text-wrap content"><span>柠檬微趣</span><span>U3D</span></div>
+        </div>
+      </div>
+      <div class="timeline-wrap edu-exps">
+        <div class="timeline-item">
+          <div class="join-text-wrap time"><span>2023</span><span>2027</span></div>
+          <div class="join-text-wrap content"><span>兰州大学</span><span>计算机科学与技术</span><span>本科</span></div>
+        </div>
+      </div>
+    </div>`;
+  const fields = parseRecommendCardFieldsFromHtml(html);
+  assert.equal(fields.salary, "15-30K");
+  assert.equal(fields.identity.name, "马良");
+  assert.equal(fields.identity.school, "兰州大学");
+  assert.equal(fields.identity.major, "计算机科学与技术");
+  assert.equal(fields.identity.current_company, "柠檬微趣");
+  assert.equal(fields.identity.current_position, "U3D");
+  assert.equal(fields.identity.degree, "本科");
+  assert.equal(fields.identity.age, 21);
 }
 
 async function testFindFreshRecommendCardNodeByKey() {
@@ -286,6 +317,7 @@ testFilterOptionHelpers();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
+testRecommendCardFieldParser();
 await testCardCandidateReader();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();

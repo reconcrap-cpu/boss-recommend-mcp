@@ -56,7 +56,13 @@ writeLegacyScreenCsv(filePath, {
       },
       detail: {
         cv_acquisition: {
-          source: "network"
+          source: "network",
+          network_wait: {
+            elapsed_ms: 123
+          },
+          image_evidence: {
+            elapsed_ms: 456
+          }
         }
       },
       llm: {
@@ -68,6 +74,12 @@ writeLegacyScreenCsv(filePath, {
       post_action: {
         requested: "greet",
         action_clicked: true
+      },
+      timings: {
+        total_ms: 2000,
+        card_read_ms: 10,
+        text_model_ms: 800,
+        post_action_ms: 50
       }
     }
   ]
@@ -82,6 +94,10 @@ assert.equal(csv.includes(LEGACY_RESULT_HEADER.map((header) => `"${header}"`).jo
 assert.equal(csv.includes("完整 CoT / reasoning_content"), true);
 assert.equal(csv.includes("这个字段不应写入评估通过详细原因"), false);
 assert.equal(csv.includes("\"passed\""), true);
+assert.equal(csv.includes("\"network\""), true);
+assert.equal(csv.includes("\"2000\""), true);
+assert.equal(csv.includes("\"123\""), true);
+assert.equal(csv.includes("\"800\""), true);
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("Core reporting tests passed");

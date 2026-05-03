@@ -4,8 +4,15 @@ import {
   querySelectorAll,
   sleep
 } from "../../core/browser/index.js";
+import { mergeBossCandidateCardFields } from "../../core/boss-cards/index.js";
 import { normalizeCandidateFromHtml } from "../../core/screening/index.js";
 import { RECRUIT_CARD_SELECTOR } from "./constants.js";
+
+function mergeRecruitCardFields(candidate, outerHTML = "") {
+  return mergeBossCandidateCardFields(candidate, outerHTML, {
+    metadataKey: "search_card_fields"
+  });
+}
 
 export async function findRecruitCardNodeIds(client, frameNodeId, {
   selector = RECRUIT_CARD_SELECTOR
@@ -37,7 +44,7 @@ export async function readRecruitCardCandidate(client, cardNodeId, {
     getAttributesMap(client, cardNodeId),
     getOuterHTML(client, cardNodeId)
   ]);
-  return normalizeCandidateFromHtml({
+  const candidate = normalizeCandidateFromHtml({
     domain: "recruit",
     source,
     html: outerHTML,
@@ -48,6 +55,7 @@ export async function readRecruitCardCandidate(client, cardNodeId, {
       ...metadata
     }
   });
+  return mergeRecruitCardFields(candidate, outerHTML);
 }
 
 export async function readFirstRecruitCardCandidate(client, frameNodeId, options = {}) {

@@ -213,17 +213,22 @@ export async function waitForRecruitDetailContent(client, {
 export async function openRecruitCardDetail(client, cardNodeId, {
   timeoutMs = 12000
 } = {}) {
+  const openedStarted = Date.now();
   const attempts = [];
+  const clickStarted = Date.now();
   const cardBox = await clickNodeCenter(client, cardNodeId, {
     scrollIntoView: true
   });
+  let candidateClickMs = Date.now() - clickStarted;
   attempts.push({
     mode: "card-center",
     center: cardBox.center
   });
+  const detailStarted = Date.now();
   let detailState = await waitForRecruitDetail(client, { timeoutMs });
 
   if (!detailState?.popup && !detailState?.resumeIframe) {
+    const fallbackClickStarted = Date.now();
     const leftTitlePoint = {
       x: cardBox.rect.x + Math.min(140, Math.max(40, cardBox.rect.width * 0.2)),
       y: cardBox.rect.y + Math.min(42, Math.max(24, cardBox.rect.height * 0.28))
@@ -232,6 +237,7 @@ export async function openRecruitCardDetail(client, cardNodeId, {
       clickCount: 2,
       delayMs: 120
     });
+    candidateClickMs += Date.now() - fallbackClickStarted;
     attempts.push({
       mode: "card-left-title-double-click",
       center: leftTitlePoint
@@ -248,7 +254,12 @@ export async function openRecruitCardDetail(client, cardNodeId, {
   return {
     card_box: cardBox,
     open_attempts: attempts,
-    detail_state: detailState
+    detail_state: detailState,
+    timings: {
+      candidate_click_ms: candidateClickMs,
+      detail_open_ms: Date.now() - detailStarted,
+      open_total_ms: Date.now() - openedStarted
+    }
   };
 }
 

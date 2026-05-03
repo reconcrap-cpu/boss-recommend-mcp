@@ -163,11 +163,13 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
   metadata = {}
 } = {}) {
   if (!nodeId) throw new Error("captureScrolledNodeScreenshots requires nodeId");
+  const sequenceStarted = Date.now();
   const screenshots = [];
   let consecutiveDuplicates = 0;
   let previousHash = "";
 
   for (let index = 0; index < Math.max(1, Number(maxScreenshots) || 1); index += 1) {
+    const captureStarted = Date.now();
     const box = await getNodeBox(client, nodeId);
     const clip = withPadding(box.rect, padding);
     const captureOptions = {
@@ -202,6 +204,7 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
       format,
       mime_type: `image/${format === "jpeg" ? "jpeg" : "png"}`,
       byte_length: buffer.length,
+      elapsed_ms: Date.now() - captureStarted,
       file_path: outputPath,
       sha256: hash,
       duplicate_of_previous: Boolean(duplicateOfPrevious),
@@ -238,6 +241,7 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
     source: "image-scroll-sequence",
     captured_at: nowIso(),
     node_id: nodeId,
+    elapsed_ms: Date.now() - sequenceStarted,
     screenshot_count: screenshots.length,
     unique_screenshot_count: new Set(screenshots.map((item) => item.sha256)).size,
     file_paths: screenshots.map((item) => item.file_path).filter(Boolean),

@@ -25,6 +25,11 @@ import {
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import { createRunLifecycleManager } from "../../core/run/index.js";
 import {
+  addTiming,
+  imageEvidenceFilePath,
+  measureTiming
+} from "../../core/run/timing.js";
+import {
   callScreeningLlm,
   normalizeText,
   screenCandidate
@@ -369,7 +374,8 @@ export async function runChatWorkflow({
   listStableSignatureLimit = 2,
   listWheelDeltaY = 850,
   listSettleMs = 1200,
-  listFallbackPoint = null
+  listFallbackPoint = null,
+  imageOutputDir = ""
 } = {}, runControl) {
   if (!client) throw new Error("runChatWorkflow requires a guarded CDP client");
   const normalizedDetailSource = normalizeDetailSource(detailSource);
@@ -584,6 +590,8 @@ export async function runChatWorkflow({
       || results.filter((item) => item.screening?.passed).length < passTarget
     )
   ) {
+    const candidateStarted = Date.now();
+    const timings = {};
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("chat:candidate");
@@ -596,7 +604,7 @@ export async function runChatWorkflow({
       continue;
     }
 
-    const nextCandidateResult = await getNextInfiniteListCandidate({
+    const nextCandidateResult = await measureTiming(timings, "card_read_ms", () => getNextInfiniteListCandidate({
       client,
       state: listState,
       maxScrolls: listMaxScrolls,
@@ -623,7 +631,7 @@ export async function runChatWorkflow({
           visible_index: visibleIndex
         }
       })
-    });
+    }));
     if (!nextCandidateResult.ok) {
       const endTopLevelState = await getChatTopLevelState(client);
       if (!endTopLevelState.is_chat_shell) {
@@ -665,11 +673,11 @@ export async function runChatWorkflow({
 
         detailStep = "select_candidate";
         networkRecorder.clear();
-        const selected = await selectFreshChatCandidate(client, {
+        const selected = await measureTiming(timings, "candidate_click_ms", () => selectFreshChatCandidate(client, {
           cardNodeId,
           candidate: cardCandidate,
           timeoutMs: onlineResumeButtonTimeoutMs
-        });
+        }));
         if (selected.ready?.forbidden_top_level_navigation) {
           throw makeForbiddenChatResumeNavigationError(selected.ready.top_level_state);
         }
@@ -696,13 +704,13 @@ export async function runChatWorkflow({
         if (!detailResult) {
           detailStep = "open_online_resume";
           networkRecorder.clear();
-          const openedResume = await openChatOnlineResume(client, {
+          const openedResume = await measureTiming(timings, "detail_open_ms", () => openChatOnlineResume(client, {
             timeoutMs: readyTimeoutMs
-          });
+          }));
           const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
           detailStep = "wait_network";
           const networkWait = ["network", "cascade"].includes(normalizedDetailSource)
-            ? await waitForCvNetworkEvents(
+            ? await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
                 waitForChatProfileNetworkEvents,
                 networkRecorder,
                 {
@@ -711,8 +719,11 @@ export async function runChatWorkflow({
                   requireLoaded: true,
                   intervalMs: 200
                 }
-              )
+              ))
             : null;
+          if (networkWait?.elapsed_ms != null) {
+            timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
+          }
           let contentWait = {
             ok: false,
             skipped: false,
@@ -759,10 +770,10 @@ export async function runChatWorkflow({
 
           if (!detailResult) {
             detailStep = "wait_resume_content";
-            contentWait = await waitForChatResumeContent(client, {
+            contentWait = await measureTiming(timings, "dom_fallback_ms", () => waitForChatResumeContent(client, {
               timeoutMs: resumeDomTimeoutMs,
               intervalMs: 300
-            });
+            }));
             resumeState = contentWait.resume_state || openedResume.resume_state;
             resumeHtml = contentWait.resume_html || null;
             resumeNetworkEvents = networkRecorder.events.slice();
@@ -792,7 +803,13 @@ export async function runChatWorkflow({
           if (shouldCaptureImage) {
             if (captureNodeId) {
               detailStep = "capture_image_fallback";
-              imageEvidence = await captureScrolledNodeScreenshots(client, captureNodeId, {
+              imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+                filePath: imageEvidenceFilePath({
+                  imageOutputDir,
+                  domain: "chat",
+                  runId: runControl?.runId,
+                  index
+                }),
                 padding: 8,
                 maxScreenshots: maxImagePages,
                 wheelDeltaY: imageWheelDeltaY,
@@ -806,7 +823,7 @@ export async function runChatWorkflow({
                   run_candidate_index: index,
                   candidate_key: candidateKey
                 }
-              });
+              }));
               source = "image";
               recordCvImageFallback(cvAcquisitionState, {
                 parsedNetworkProfileCount,
@@ -819,7 +836,7 @@ export async function runChatWorkflow({
                   llmResult = createMissingLlmConfigResult();
                 } else {
                   try {
-                    llmResult = await callScreeningLlm({
+                    llmResult = await measureTiming(timings, "vision_model_ms", () => callScreeningLlm({
                       candidate: detailResult.candidate,
                       criteria,
                       config: llmConfig,
@@ -827,7 +844,7 @@ export async function runChatWorkflow({
                       imageEvidence,
                       maxImages: llmImageLimit,
                       imageDetail: llmImageDetail
-                    });
+                    }));
                   } catch (error) {
                     llmResult = createFailedLlmResult(error);
                   }
@@ -861,7 +878,10 @@ export async function runChatWorkflow({
               llmResult = createMissingLlmConfigResult();
             } else {
               try {
-                llmResult = await callScreeningLlm({
+                const llmTimingKey = imageEvidence?.file_paths?.length
+                  ? "vision_model_ms"
+                  : "text_model_ms";
+                llmResult = await measureTiming(timings, llmTimingKey, () => callScreeningLlm({
                   candidate: detailResult.candidate,
                   criteria,
                   config: llmConfig,
@@ -869,7 +889,7 @@ export async function runChatWorkflow({
                   imageEvidence,
                   maxImages: llmImageLimit,
                   imageDetail: llmImageDetail
-                });
+                }));
               } catch (error) {
                 llmResult = createFailedLlmResult(error);
               }
@@ -879,7 +899,7 @@ export async function runChatWorkflow({
           let closeResult = null;
           if (closeResume) {
             detailStep = "close_resume_modal";
-            closeResult = await closeChatResumeModal(client);
+            closeResult = await measureTiming(timings, "close_detail_ms", () => closeChatResumeModal(client));
           }
           detailResult.close_result = closeResult;
           detailResult.image_evidence = imageEvidence;
@@ -927,14 +947,14 @@ export async function runChatWorkflow({
         cardOnlyLlmResult = createMissingLlmConfigResult();
       } else {
         try {
-          cardOnlyLlmResult = await callScreeningLlm({
+          cardOnlyLlmResult = await measureTiming(timings, "text_model_ms", () => callScreeningLlm({
             candidate: screeningCandidate,
             criteria,
             config: llmConfig,
             timeoutMs: llmTimeoutMs,
             maxImages: llmImageLimit,
             imageDetail: llmImageDetail
-          });
+          }));
         } catch (error) {
           cardOnlyLlmResult = createFailedLlmResult(error);
         }
@@ -954,10 +974,10 @@ export async function runChatWorkflow({
         : screenCandidate(screeningCandidate, { criteria });
     let postAction = null;
     if (requestResumeForPassed && screening.passed) {
-      postAction = await requestChatResumeForPassedCandidate(client, {
+      postAction = await measureTiming(timings, "post_action_ms", () => requestChatResumeForPassedCandidate(client, {
         greetingText,
         dryRun: dryRunRequestCv
-      });
+      }));
       if (postAction?.requested) requestSatisfiedCount += 1;
       if (postAction?.skipped) requestSkippedCount += 1;
       if (postAction?.requested && !postAction?.skipped) requestedCount += 1;
@@ -965,6 +985,7 @@ export async function runChatWorkflow({
         throw new Error(`REQUEST_CV_NOT_VERIFIED:${postAction?.reason || "unknown"}`);
       }
     }
+    timings.total_ms = Date.now() - candidateStarted;
     const compactResult = {
       index,
       candidate_key: candidateKey,
@@ -974,7 +995,8 @@ export async function runChatWorkflow({
       llm_screening: detailResult ? null : compactLlmResult(cardOnlyLlmResult),
       screening: compactScreening(screening),
       post_action: postAction,
-      pre_action_state: preActionState
+      pre_action_state: preActionState,
+      timings
     };
     results.push(compactResult);
     markInfiniteListCandidateProcessed(listState, candidateKey, {
@@ -1006,6 +1028,7 @@ export async function runChatWorkflow({
       last_candidate_key: candidateKey,
       last_score: screening.score
     });
+    const checkpointStarted = Date.now();
     runControl.checkpoint({
       results,
       last_candidate: {
@@ -1020,9 +1043,13 @@ export async function runChatWorkflow({
         llm_screening: compactLlmResult(effectiveLlmResult)
       }
     });
+    addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
 
     if (delayMs > 0) {
+      const sleepStarted = Date.now();
       await runControl.sleep(delayMs);
+      addTiming(compactResult.timings, "sleep_ms", Date.now() - sleepStarted);
+      compactResult.timings.total_ms = Date.now() - candidateStarted;
     }
   }
 
@@ -1095,6 +1122,7 @@ export function createChatRunService({
     listWheelDeltaY = 850,
     listSettleMs = 1200,
     listFallbackPoint = null,
+    imageOutputDir = "",
     name = "chat-domain-run"
   } = {}) {
     if (!client) throw new Error("startChatRun requires a guarded CDP client");
@@ -1130,7 +1158,8 @@ export function createChatRunService({
         list_wheel_delta_y: listWheelDeltaY,
         list_settle_ms: listSettleMs,
         list_fallback_point: listFallbackPoint,
-        online_resume_button_timeout_ms: onlineResumeButtonTimeoutMs
+        online_resume_button_timeout_ms: onlineResumeButtonTimeoutMs,
+        image_output_dir: imageOutputDir || ""
       },
       progress: {
         card_count: 0,
@@ -1180,7 +1209,8 @@ export function createChatRunService({
         listStableSignatureLimit,
         listWheelDeltaY,
         listSettleMs,
-        listFallbackPoint
+        listFallbackPoint,
+        imageOutputDir
       }, runControl)
     });
   }
