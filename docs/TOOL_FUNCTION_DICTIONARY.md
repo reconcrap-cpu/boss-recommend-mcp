@@ -32,7 +32,8 @@ Inputs:
 
 Expected behavior:
 
-- Connect to Chrome through `connectToChromeTarget`.
+- Connect to Chrome through `connectToChromeTargetOrOpen`.
+- If local Chrome DevTools `127.0.0.1:9222` is unavailable and navigation is allowed, auto-launch Chrome with the recommend URL before reading the dropdown.
 - Enable `Page`, `DOM`, and `Input`.
 - Bring the recommend page to front.
 - Locate `iframe[name="recommendFrame"]` through DOM `describeNode(...contentDocument)`.
@@ -45,7 +46,8 @@ Expected behavior:
 
 Failure behavior:
 
-- Return `FAILED` with a retryable browser/page readiness error when Chrome, login, or page roots are unavailable.
+- Return `FAILED` with `BOSS_LOGIN_REQUIRED` and `requires_login=true` when Chrome is available/opened but Boss needs human login.
+- Return `FAILED` with a retryable browser/page readiness error when Chrome executable, page roots, or account capability are unavailable.
 - Do not fall back to search/recruit or legacy tools.
 
 Live gate required:
@@ -88,6 +90,8 @@ Expected behavior:
 - Parse request with `parseRecommendInstruction`.
 - Return `NEED_CONFIRMATION` until all required filters, criteria, target, post action, and max greet fields are confirmed.
 - Connect to Chrome only after enough preflight state is available.
+- If the default local debug port is closed, automatically open Chrome and navigate to the recommend page.
+- If Boss login is detected by URL or DOM-only login panel probes, stop before any run mutation and return `BOSS_LOGIN_REQUIRED`.
 - Read job options and ask user to choose job if not confirmed.
 - Require final confirmation before starting.
 - Start the shared recommend run service.
@@ -110,6 +114,7 @@ Failure behavior:
 
 - `NEED_CONFIRMATION` for unconfirmed values.
 - `FAILED` for preflight, Chrome, login, page root, or run creation errors.
+- `BOSS_LOGIN_REQUIRED` is retryable after the user logs in inside the opened Chrome window; callers should retry with the same parameters.
 - Never fall back to recruit/search on recommend page errors.
 
 Live gate required:
@@ -331,6 +336,8 @@ Inputs:
 Expected behavior:
 
 - Return `ACCEPTED` with `run_id` after confirmation and preflight gates.
+- If local Chrome DevTools `127.0.0.1:9222` is unavailable, auto-launch Chrome and navigate to `https://www.zhipin.com/web/chat/search`.
+- If Boss login is detected, return `BOSS_LOGIN_REQUIRED` before starting the run.
 - Run in the shared recruit run service.
 
 Failure behavior:
@@ -403,7 +410,8 @@ Expected behavior:
 
 - Resolve `screening-config.json`.
 - Resolve chat runtime data dir.
-- Connect to Chrome.
+- Connect to Chrome through the shared auto-open browser layer.
+- If local Chrome DevTools `127.0.0.1:9222` is unavailable, auto-launch Chrome and navigate to `https://www.zhipin.com/web/chat/index`.
 - Navigate to chat target if allowed.
 - Run CDP-only health probes.
 - Return readiness information and diagnostics.
@@ -429,6 +437,8 @@ Inputs:
 Expected behavior:
 
 - Connect to chat page.
+- Auto-launch/navigate local Chrome when the debug port is missing.
+- Return `BOSS_LOGIN_REQUIRED` if Boss login is detected by URL or DOM-only login panel probes.
 - Read job options.
 - Return `job_options`, `pending_questions`, and missing required fields.
 - Do not start a run.
@@ -471,6 +481,8 @@ Optional inputs:
 Expected behavior:
 
 - Require all required inputs at start.
+- Auto-launch/navigate local Chrome when the debug port is missing.
+- Return `BOSS_LOGIN_REQUIRED` before run creation if Boss login is required.
 - Normalize all/unlimited target tokens to all-mode.
 - Start async chat run service and return `ACCEPTED` with `run_id`.
 - For passed candidates, request CV unless already available/requested.
@@ -792,10 +804,22 @@ Important exports:
 
 - `ALLOWED_CDP_DOMAINS`: documents permitted CDP domains.
 - `FORBIDDEN_CDP_DOMAINS`: currently contains `Runtime`.
+- `BOSS_LOGIN_URL`: canonical Boss login URL shown to users when login is required.
 - `assertNoForbiddenCdpCalls(methodLog)`: throws if method log contains forbidden calls.
+- `isBossLoginUrl(url)`: detects Boss login URLs.
+- `detectBossLoginState(client, { currentUrl })`: detects login by URL first, then by CDP DOM selectors/outer HTML without page JS.
+- `createBossLoginRequiredError({ domain, currentUrl, targetUrl, loginDetection })`: creates the structured retryable login error used by recommend/search/chat tools.
+- `isChromeDebugUnavailableError(error)`: detects closed/unreachable local DevTools ports.
+- `getChromeExecutable()`: resolves Chrome path from env vars and platform defaults.
+- `getBossChromeUserDataDir(port)`: returns the isolated Boss MCP Chrome profile path.
+- `waitForChromeDebugPort({ host, port })`: polls DevTools target listing until Chrome is reachable.
+- `launchChromeDebugInstance({ host, port, url })`: launches local Chrome with `--remote-debugging-port`, isolated user data dir, and starting URL.
+- `ensureChromeDebugPort({ host, port, url, launchIfMissing })`: reuses an existing debug port or launches Chrome if local and allowed.
+- `openChromeTarget({ host, port, url })`: opens a new DevTools target using `/json/new`.
 - `createGuardedCdpClient(client, { methodLog })`: wraps raw CDP client and records/blocks methods.
 - `listChromeTargets({ host, port })`: reads Chrome targets.
 - `connectToChromeTarget({ host, port, targetUrlIncludes, targetPredicate })`: connects to a matching target and returns guarded client/session data.
+- `connectToChromeTargetOrOpen({ host, port, targetUrlIncludes, targetUrl, allowNavigate })`: shared run-start connector that auto-launches local Chrome when needed, opens/navigates the requested Boss target, then returns a guarded session.
 - `assertRuntimeEvaluateBlocked(client)`: live proof helper that `Runtime.evaluate` is blocked.
 - `enableDomains(client, domains)`: enables allowed CDP domains.
 - `bringPageToFront(client)`: calls `Page.bringToFront`.
@@ -815,6 +839,8 @@ Expected behavior:
 
 - No helper here may call `Runtime.*`.
 - Any new browser primitive must record its CDP method calls through the guarded client.
+- Auto-launch is local-host only; never spawn Chrome for remote debug hosts.
+- Missing Chrome debug port is recoverable through auto-launch. Missing Boss login is recoverable only after human login.
 
 ### `src/core/capture/index.js`
 

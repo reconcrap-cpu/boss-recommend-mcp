@@ -1575,7 +1575,15 @@ Latest chat Phase 10 rerun: FAILED / STOPPED on 2026-05-03 08:26 Asia/Shanghai. 
   - CDP-only: method summary contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; `Runtime.*` count `0`.
   - Fix: recommend MCP now defaults detail opening to `target_count`/`max_candidates`, and accidental `detail_limit=0` is ignored unless `allow_card_only_screening=true` is explicitly supplied for a debug-only card mode.
 - Phase 8 MCP integration is now live-verified for recommend, recruit/search, and chat lifecycle wrappers; `prepare_boss_chat_run` reads chat job options CDP-only, and `boss_chat_health_check` runs shared chat health probes CDP-only. Recommend favorite/greet post-actions are wired into the shared action gate and dry-run live-verified through MCP. Recommend `follow_up.chat` orchestration is legacy-only by decision and remains fenced from the CDP-only route; it no longer blocks completion. Legacy CLI chat commands remain quarantined.
+- Run-start auto-launch/login gate is live-verified for the missing local debug-port branch.
+  - Time: 2026-05-03 18:00 Asia/Shanghai
+  - Chrome: throwaway local port `49336`; user's active Boss `9222` session was not disturbed
+  - Command: inline `node --input-type=module` `handleRequest` smoke calling `start_recommend_pipeline_run` with complete recommend confirmations, `allow_navigate=true`, `port=49336`, `post_action=none`, and `dry_run_post_action=true`
+  - Result: `status=FAILED`, `error.code=BOSS_LOGIN_REQUIRED`, `requires_login=true`, `login_url=https://www.zhipin.com/web/user/?ka=bticket`, `current_url=https://www.zhipin.com/web/user/?ka=bticket`, no `run_id`
+  - Default-port check: `node src\cli.js list-jobs --slow-live --port 9222` at 2026-05-03 18:05 Asia/Shanghai also auto-launched Chrome on `9222` with profile `C:\Users\yaolin\.codex\boss-mcp\chrome-profile-9222`, navigated to recommend, and returned `BOSS_LOGIN_REQUIRED` with `auto_launch.launched=true`
+  - Fix: shared `core/browser` now auto-launches local Chrome when the debug port is missing, recommend/recruit/chat connectors navigate from observed main-frame URL, login detection runs by URL and DOM-only probes, and page-health polling exits early when login appears
+  - Publish result: `2.0.3` published to npm with `latest` dist-tag verified
 
 ## Next exact task
 
-Next task: no mandatory blocker remains for the recommend MCP safe-action/follow-up-chat caveat. Recommend MCP greet is live-verified in both dry-run and mutating modes, recommend MCP favorite is live-verified in mutating mode with post-click `已收藏` verification, and follow-up chat remains an intentional legacy-only fence. Optional next work is product polish or a new user-selected bug. New Codex instances should start by reading this status, `docs/REWRITE_PLAN.md`, `docs/LIVE_TEST_MATRIX.md`, `docs/CDP_ONLY_CONTRACT.md`, and `docs/LEGACY_RUNTIME_INVENTORY.md`.
+Next task: create/push the `v2.0.3` git commit/tag/release after final repository status review. New Codex instances should start by reading this status, `docs/REWRITE_PLAN.md`, `docs/LIVE_TEST_MATRIX.md`, `docs/CDP_ONLY_CONTRACT.md`, and `docs/LEGACY_RUNTIME_INVENTORY.md`.

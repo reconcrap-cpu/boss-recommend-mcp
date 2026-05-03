@@ -25,6 +25,9 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 - 如果用户说聊天页、未读、全部聊天、求简历，必须交给 `boss-chat`。
 - 禁止调用旧包：`@reconcrap/boss-recruit-mcp`、`boss-recruit-mcp`、旧本地 recruit repo、旧 vendor 脚本。
 - 浏览器自动化必须走 CDP-only 2.x MCP 工具；不得要求用户启用 legacy page-JS 或 `Runtime.evaluate` 路径。
+- 启动 search/recruit run 时，若本机默认 `127.0.0.1:9222` Chrome DevTools 端口不可连，工具会自动打开 Chrome 并导航到 `https://www.zhipin.com/web/chat/search`。
+- 只有工具返回 `BOSS_LOGIN_REQUIRED` / `requires_login=true` 时，才要求用户在自动打开的 Chrome 窗口人工登录 Boss 后重试；不要把“没开 9222 Chrome”当作缺参。
+- 若本机找不到 Chrome，可提示用户设置 `BOSS_MCP_CHROME_PATH` 或 `BOSS_RECOMMEND_CHROME_PATH`；非本机 debug host 不自动启动。
 - 若用户未提供岗位，必须先询问岗位。搜索页岗位选择在关键词输入框旁边；不要猜测默认岗位。
 - 若用户提供城市、学历、学校、关键词、过滤已看、人选目标数、筛选条件、post action、max greet 等参数，必须逐项传入或确认。
 - `post_action=greet` 时必须确认 `max_greet_count`；不要默认等于 `target_count`。

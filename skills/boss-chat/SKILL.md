@@ -57,6 +57,9 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
   - 只在用户明确是 chat-only 任务时使用本 skill。
   - 只要用户提到推荐页、先找人后沟通、或需要推荐筛选阶段，禁止直接调用 `start_boss_chat_run`；必须先交给 `boss-recommend-pipeline` 完成推荐页任务。
   - 不得在 recommend 任务尚未完成时并行启动独立 chat run。
+- 启动或准备 chat run 时，若本机默认 `127.0.0.1:9222` Chrome DevTools 端口不可连，工具会自动打开 Chrome 并导航到 `https://www.zhipin.com/web/chat/index`。
+- 只有工具返回 `BOSS_LOGIN_REQUIRED` / `requires_login=true` 时，才要求用户在自动打开的 Chrome 窗口人工登录 Boss 后重试；不要把“没开 9222 Chrome”当作缺参。
+- 若本机找不到 Chrome，可提示用户设置 `BOSS_MCP_CHROME_PATH` 或 `BOSS_RECOMMEND_CHROME_PATH`；非本机 debug host 不自动启动。
 - `job` / `start_from` / `criteria` 缺一不可；缺参时只补缺口。
 - `target_count` 在 chat-only 启动前也是必填项，不能默认省略。
 - 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。

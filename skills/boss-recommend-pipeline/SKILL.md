@@ -118,8 +118,14 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 - 执行前必须通过：
   - `screening-config.json` 可用且非占位值（`baseUrl/apiKey/model`）
-  - Chrome DevTools 端口可连
-  - Boss 已登录且位于 `https://www.zhipin.com/web/chat/recommend`
+  - 工具可连接或自动启动本机 Chrome DevTools 端口（默认 `127.0.0.1:9222`）
+  - Boss 已登录；若当前没有 9222 Chrome，工具会自动打开 Chrome 并导航到 `https://www.zhipin.com/web/chat/recommend`
+  - 只有工具返回 `BOSS_LOGIN_REQUIRED` / `requires_login=true` 时，才要求用户人工登录 Boss 后重试
+
+- 不要在运行前要求用户手动打开 9222 Chrome。只有这些情况需要人工介入：
+  - 工具明确报告 `BOSS_LOGIN_REQUIRED`
+  - 本机找不到 Chrome 可执行文件，并提示设置 `BOSS_MCP_CHROME_PATH` 或 `BOSS_RECOMMEND_CHROME_PATH`
+  - 用户配置的是非本机 debug host，工具无法安全自动启动
 
 - `PIPELINE_PREFLIGHT_FAILED` 处理顺序：
   1. 若 `screen_config` 失败：让用户提供真实 `baseUrl/apiKey/model`，并在 `guidance.config_path` 修改后明确回复“已修改完成”。
@@ -153,3 +159,4 @@ MCP 不可用时：
 - 页面就绪失败提示必须包含 `debug_port`、recommend URL、以及登录 URL（若未登录）：
   - `https://www.zhipin.com/web/chat/recommend`
   - `https://www.zhipin.com/web/user/?ka=bticket`
+- 若错误是 `BOSS_LOGIN_REQUIRED`，提示用户在自动打开的 Chrome 窗口完成登录，然后原参数重试；不要改用 search/recruit 路径。

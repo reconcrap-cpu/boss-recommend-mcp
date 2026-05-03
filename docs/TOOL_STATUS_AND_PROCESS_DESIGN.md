@@ -3,8 +3,8 @@
 Last updated: 2026-05-03 Asia/Shanghai.
 
 Package: `@reconcrap/boss-recommend-mcp`
-Current released version: `2.0.1`
-GitHub release: `v2.0.1`
+Current released version: `2.0.3`
+GitHub release: `v2.0.3`
 Primary runtime entrypoint: `src/index.js`
 Primary CLI entrypoint: `src/cli.js`
 Published binary: `boss-recommend-mcp`
@@ -28,6 +28,7 @@ Current shipped capabilities:
 - Infinite-list processing with duplicate prevention, end-of-list detection, and refresh-round support.
 - Shared self-heal probe engine for selector/accessibility/network health checks.
 - Installer migration for legacy MCP/skill setups on Windows and macOS, including Trae, Trae CN, and OpenClaw.
+- Automatic local Chrome launch for recommend/search/chat run starts when `127.0.0.1:9222` is not reachable; the tool navigates to the correct Boss URL and asks for human input only when Boss login is required.
 
 The active package must not use:
 
@@ -102,6 +103,9 @@ These invariants are more important than individual implementation details:
 - Any `Runtime.*` call must fail immediately.
 - DOM state is read with CDP `DOM` and, where useful, `Accessibility`.
 - User interaction is performed with CDP `Input` based on live `DOM.getBoxModel` centers, not hard-coded screen coordinates.
+- Run-start browser setup first reuses Chrome `127.0.0.1:9222`; if it is unavailable on a local host, it launches Chrome with `--remote-debugging-port=9222`, an isolated Boss MCP profile, and the correct domain URL.
+- Human login is requested only when CDP-only URL or DOM login detection returns `BOSS_LOGIN_REQUIRED`; a missing Chrome debug port alone is no longer a user-facing blocker.
+- Auto-launch is local-only. Non-local debug hosts must be reachable already, and missing Chrome executable errors should instruct users to set `BOSS_MCP_CHROME_PATH` or `BOSS_RECOMMEND_CHROME_PATH`.
 - Network resume capture is preferred because it is faster and cheaper.
 - Full-scroll image fallback must remain available for recommend, search/recruit, and chat when network CV capture is unavailable.
 - Recommend production screening must open candidate detail/CV by default up to the target count. `detail_limit: 0` is debug-only and is ignored unless `allow_card_only_screening=true`.
@@ -141,6 +145,11 @@ Important intentional fences:
 - `boss-recommend-mcp calibrate` returns `CALIBRATE_UNSUPPORTED_CDP_ONLY`.
 - `run_featured_calibration` returns `FEATURED_CALIBRATION_UNSUPPORTED_CDP_ONLY`.
 - Detached legacy recommend workers are fenced with `DETACHED_LEGACY_PIPELINE_UNSUPPORTED_CDP_ONLY`.
+
+Important retryable environment errors:
+
+- `BOSS_LOGIN_REQUIRED`: Chrome is available or was opened, but Boss redirected to login or rendered a login panel. The user must log in inside the opened Chrome window and retry the same run parameters.
+- Chrome executable not found: only occurs when no local debug port is reachable and auto-launch cannot find Chrome. Set `BOSS_MCP_CHROME_PATH` or `BOSS_RECOMMEND_CHROME_PATH`.
 
 ## Process Flowcharts
 
@@ -201,6 +210,16 @@ Source: [editable Mermaid source](visuals/process/source/03-mcp-json-rpc-server-
 ![4. CDP-Only Browser Session Flow](visuals/process/04-cdp-only-browser-session-flow.svg)
 
 Source: [editable Mermaid source](visuals/process/source/04-cdp-only-browser-session-flow.mmd)
+
+Expected behavior:
+
+- `connectToChromeTargetOrOpen` is the shared entry for recommend/search/chat run starts and read-only job preparation.
+- It tries the requested Chrome host/port first.
+- If the port is unavailable and the host is local, it starts Chrome with an isolated profile under the Codex home directory and opens the requested Boss URL.
+- If Chrome is already open but the requested tab is missing, it opens a new DevTools target for the correct Boss URL.
+- After navigation, each domain checks login state by URL and DOM-only login-panel detection.
+- `BOSS_LOGIN_REQUIRED` is the only normal browser setup result that should ask the human to act before retrying.
+- The CDP guard remains active for the whole session; `Runtime.*` is blocked even during startup, launch, navigation, and login detection.
 
 ### 5. Recommend Job List Flow
 

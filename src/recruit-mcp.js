@@ -4,8 +4,13 @@ import path from "node:path";
 import {
   assertNoForbiddenCdpCalls,
   bringPageToFront,
-  connectToChromeTarget,
+  connectToChromeTargetOrOpen,
+  createBossLoginRequiredError,
+  detectBossLoginState,
   enableDomains,
+  getMainFrameUrl,
+  isBossLoginUrl,
+  waitForMainFrameUrl,
   sleep
 } from "./core/browser/index.js";
 import {
@@ -586,6 +591,32 @@ function attachMethodEvidence(payload, runId) {
   };
 }
 
+async function waitForRecruitSearchControlsOrLogin(client, {
+  timeoutMs = 90000,
+  intervalMs = 300
+} = {}) {
+  const started = Date.now();
+  let lastControls = null;
+  while (Date.now() - started <= timeoutMs) {
+    const loginDetection = await detectBossLoginState(client).catch(() => null);
+    if (loginDetection?.requires_login) {
+      return {
+        ok: false,
+        reason: "login_required",
+        loginDetection
+      };
+    }
+    const remainingMs = Math.max(1, timeoutMs - (Date.now() - started));
+    lastControls = await waitForRecruitSearchControls(client, {
+      timeoutMs: Math.min(remainingMs, 1500),
+      intervalMs
+    });
+    if (lastControls.ok) return lastControls;
+    await sleep(intervalMs);
+  }
+  return lastControls || { ok: false, reason: "timeout" };
+}
+
 async function connectRecruitChromeSession({
   host = DEFAULT_RECRUIT_HOST,
   port = DEFAULT_RECRUIT_PORT,
@@ -593,24 +624,18 @@ async function connectRecruitChromeSession({
   allowNavigate = true,
   slowLive = false
 } = {}) {
-  let session;
-  try {
-    session = await connectToChromeTarget({
-      host,
-      port,
-      targetUrlIncludes
-    });
-  } catch (error) {
-    if (!allowNavigate) throw error;
-    session = await connectToChromeTarget({
-      host,
-      port,
-      targetPredicate: (target) => (
-        target?.type === "page"
-        && String(target?.url || "").includes("zhipin.com/web/chat")
-      )
-    });
-  }
+  const session = await connectToChromeTargetOrOpen({
+    host,
+    port,
+    targetUrlIncludes,
+    targetUrl: RECRUIT_TARGET_URL,
+    allowNavigate,
+    slowLive,
+    fallbackTargetPredicate: (target) => (
+      target?.type === "page"
+      && String(target?.url || "").includes("zhipin.com")
+    )
+  });
 
   const { client, target } = session;
   await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
@@ -620,21 +645,102 @@ async function connectRecruitChromeSession({
   await bringPageToFront(client);
 
   const targetUrl = String(target?.url || "");
+  let navigation = {
+    navigated: false,
+    url: targetUrl
+  };
   if (allowNavigate && !targetUrl.includes(targetUrlIncludes)) {
     await client.Page.navigate({ url: RECRUIT_TARGET_URL });
-    await sleep(slowLive ? 8000 : 3000);
+    const settleMs = slowLive ? 8000 : 3000;
+    const waited = await waitForMainFrameUrl(
+      client,
+      (url) => isBossLoginUrl(url) || String(url || "").includes(RECRUIT_TARGET_URL),
+      { timeoutMs: settleMs, intervalMs: 500 }
+    );
+    navigation = {
+      navigated: true,
+      url: RECRUIT_TARGET_URL,
+      settle_ms: settleMs,
+      observed_url: waited.url || null,
+      observed_url_ok: waited.ok
+    };
+  }
+  let currentUrl = await getMainFrameUrl(client).catch(() => targetUrl);
+  if (allowNavigate && !String(currentUrl || "").includes(RECRUIT_TARGET_URL) && !isBossLoginUrl(currentUrl)) {
+    await client.Page.navigate({ url: RECRUIT_TARGET_URL });
+    const settleMs = slowLive ? 8000 : 3000;
+    const waited = await waitForMainFrameUrl(
+      client,
+      (url) => isBossLoginUrl(url) || String(url || "").includes(RECRUIT_TARGET_URL),
+      { timeoutMs: settleMs, intervalMs: 500 }
+    );
+    navigation = {
+      navigated: true,
+      url: RECRUIT_TARGET_URL,
+      settle_ms: settleMs,
+      observed_url: waited.url || null,
+      observed_url_ok: waited.ok,
+      reason: "observed_url_mismatch"
+    };
+    currentUrl = await getMainFrameUrl(client).catch(() => waited.url || currentUrl);
+  }
+  const loginDetection = await detectBossLoginState(client, { currentUrl }).catch(() => ({
+    requires_login: isBossLoginUrl(currentUrl),
+    reason: "login_detection_failed",
+    current_url: currentUrl
+  }));
+  if (loginDetection.requires_login) {
+    await session.close?.();
+    throw createBossLoginRequiredError({
+      domain: "search",
+      currentUrl: loginDetection.current_url || currentUrl,
+      targetUrl: RECRUIT_TARGET_URL,
+      loginDetection,
+      chrome: session.chrome || null
+    });
+  }
+  if (!String(currentUrl || "").includes(RECRUIT_TARGET_URL)) {
+    await session.close?.();
+    throw new Error(`Boss search page did not navigate to ${RECRUIT_TARGET_URL}; current URL: ${currentUrl || "unknown"}`);
   }
 
-  const controls = await waitForRecruitSearchControls(client, {
+  const controls = await waitForRecruitSearchControlsOrLogin(client, {
     timeoutMs: slowLive ? 180000 : 90000,
     intervalMs: 300
   });
+  if (controls.loginDetection?.requires_login) {
+    await session.close?.();
+    throw createBossLoginRequiredError({
+      domain: "search",
+      currentUrl: controls.loginDetection.current_url || currentUrl,
+      targetUrl: RECRUIT_TARGET_URL,
+      loginDetection: controls.loginDetection,
+      chrome: session.chrome || null
+    });
+  }
   if (!controls.ok) {
+    const latestUrl = await getMainFrameUrl(client).catch(() => currentUrl);
+    const latestLoginDetection = await detectBossLoginState(client, { currentUrl: latestUrl }).catch(() => ({
+      requires_login: isBossLoginUrl(latestUrl),
+      reason: "login_detection_failed",
+      current_url: latestUrl
+    }));
+    if (latestLoginDetection.requires_login) {
+      await session.close?.();
+      throw createBossLoginRequiredError({
+        domain: "search",
+        currentUrl: latestLoginDetection.current_url || latestUrl,
+        targetUrl: RECRUIT_TARGET_URL,
+        loginDetection: latestLoginDetection,
+        chrome: session.chrome || null
+      });
+    }
     throw new Error("Boss recruit search page did not expose ready search controls");
   }
 
   return {
     ...session,
+    navigation,
     controls
   };
 }
@@ -712,13 +818,21 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
       slowLive: args.slow_live === true
     });
   } catch (error) {
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       error: {
-        code: "BOSS_SEARCH_PAGE_NOT_READY",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "BOSS_SEARCH_PAGE_NOT_READY",
         message: error?.message || "Boss recruit search page is not ready",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        chrome: error?.chrome || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || RECRUIT_TARGET_URL,
         retryable: true
-      }
+      },
+      chrome: error?.chrome || null
     };
   }
 
@@ -747,7 +861,8 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
       host: normalizeText(args.host) || DEFAULT_RECRUIT_HOST,
       port: parsePositiveInteger(args.port, DEFAULT_RECRUIT_PORT),
       target_url: session.target?.url || RECRUIT_TARGET_URL,
-      target_id: session.target?.id || null
+      target_id: session.target?.id || null,
+      auto_launch: session.chrome || null
     },
     parsed
   });

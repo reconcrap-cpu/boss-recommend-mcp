@@ -4,8 +4,13 @@ import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
   bringPageToFront,
-  connectToChromeTarget,
+  connectToChromeTargetOrOpen,
+  createBossLoginRequiredError,
+  detectBossLoginState,
   enableDomains,
+  getMainFrameUrl,
+  isBossLoginUrl,
+  waitForMainFrameUrl,
   sleep
 } from "./core/browser/index.js";
 import {
@@ -526,27 +531,36 @@ export async function listRecommendJobsTool({ workspaceRoot = "", args = {} } = 
         host,
         port,
         target_url: session.navigation?.url || session.target?.url || RECOMMEND_TARGET_URL,
-        target_id: session.target?.id || null
+        target_id: session.target?.id || null,
+        auto_launch: session.chrome || null
       },
       method_summary: methodSummary(session.methodLog || []),
       method_log: session.methodLog || []
     };
   } catch (error) {
     const methodLog = session?.methodLog || [];
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       stage: "recommend_job_list",
       cdp_only: true,
       runtime_evaluate_used: methodLog.some((entry) => String(entry?.method || entry).startsWith("Runtime.")),
       error: {
-        code: "RECOMMEND_JOB_LIST_FAILED",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "RECOMMEND_JOB_LIST_FAILED",
         message: error?.message || "Failed to read recommend job list",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || RECOMMEND_TARGET_URL,
+        chrome: error?.chrome || null,
         retryable: true
       },
       chrome: {
         host,
         port,
-        target_url: targetUrlIncludes
+        target_url: targetUrlIncludes,
+        auto_launch: error?.chrome || session?.chrome || null
       },
       method_summary: methodSummary(methodLog),
       method_log: methodLog
@@ -585,6 +599,14 @@ async function waitForHealthyRecommend(client, config, {
   const started = Date.now();
   let lastCheck = null;
   while (Date.now() - started <= timeoutMs) {
+    const loginDetection = await detectBossLoginState(client).catch(() => null);
+    if (loginDetection?.requires_login) {
+      return {
+        status: "login_required",
+        summary: "Boss login is required",
+        loginDetection
+      };
+    }
     const roots = await resolveRecommendSelfHealRoots(client, config);
     lastCheck = await runSelfHealCheck({
       client,
@@ -610,24 +632,18 @@ async function connectRecommendChromeSession({
   allowNavigate = true,
   slowLive = false
 } = {}) {
-  let session;
-  try {
-    session = await connectToChromeTarget({
-      host,
-      port,
-      targetUrlIncludes
-    });
-  } catch (error) {
-    if (!allowNavigate) throw error;
-    session = await connectToChromeTarget({
-      host,
-      port,
-      targetPredicate: (target) => (
-        target?.type === "page"
-        && String(target?.url || "").includes("zhipin.com/web/chat")
-      )
-    });
-  }
+  const session = await connectToChromeTargetOrOpen({
+    host,
+    port,
+    targetUrlIncludes,
+    targetUrl: RECOMMEND_TARGET_URL,
+    allowNavigate,
+    slowLive,
+    fallbackTargetPredicate: (target) => (
+      target?.type === "page"
+      && String(target?.url || "").includes("zhipin.com")
+    )
+  });
 
   const { client, target } = session;
   await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
@@ -644,12 +660,56 @@ async function connectRecommendChromeSession({
   if (allowNavigate && shouldNavigateToRecommend(targetUrl)) {
     await client.Page.navigate({ url: RECOMMEND_TARGET_URL });
     const settleMs = slowLive ? 12000 : 5000;
-    await sleep(settleMs);
+    const waited = await waitForMainFrameUrl(
+      client,
+      (url) => isBossLoginUrl(url) || !shouldNavigateToRecommend(url),
+      { timeoutMs: settleMs, intervalMs: 500 }
+    );
     navigation = {
       navigated: true,
       url: RECOMMEND_TARGET_URL,
-      settle_ms: settleMs
+      settle_ms: settleMs,
+      observed_url: waited.url || null,
+      observed_url_ok: waited.ok
     };
+  }
+  let currentUrl = await getMainFrameUrl(client).catch(() => navigation.url || targetUrl);
+  if (allowNavigate && shouldNavigateToRecommend(currentUrl) && !isBossLoginUrl(currentUrl)) {
+    await client.Page.navigate({ url: RECOMMEND_TARGET_URL });
+    const settleMs = slowLive ? 12000 : 5000;
+    const waited = await waitForMainFrameUrl(
+      client,
+      (url) => isBossLoginUrl(url) || !shouldNavigateToRecommend(url),
+      { timeoutMs: settleMs, intervalMs: 500 }
+    );
+    navigation = {
+      navigated: true,
+      url: RECOMMEND_TARGET_URL,
+      settle_ms: settleMs,
+      observed_url: waited.url || null,
+      observed_url_ok: waited.ok,
+      reason: "observed_url_mismatch"
+    };
+    currentUrl = await getMainFrameUrl(client).catch(() => waited.url || currentUrl);
+  }
+  const loginDetection = await detectBossLoginState(client, { currentUrl }).catch(() => ({
+    requires_login: isBossLoginUrl(currentUrl),
+    reason: "login_detection_failed",
+    current_url: currentUrl
+  }));
+  if (loginDetection.requires_login) {
+    await session.close?.();
+    throw createBossLoginRequiredError({
+      domain: "recommend",
+      currentUrl: loginDetection.current_url || currentUrl,
+      targetUrl: RECOMMEND_TARGET_URL,
+      loginDetection,
+      chrome: session.chrome || null
+    });
+  }
+  if (shouldNavigateToRecommend(currentUrl)) {
+    await session.close?.();
+    throw new Error(`Boss recommend page did not navigate to ${RECOMMEND_TARGET_URL}; current URL: ${currentUrl || "unknown"}`);
   }
 
   const selfHealConfig = buildRecommendSelfHealConfig();
@@ -657,7 +717,33 @@ async function connectRecommendChromeSession({
     timeoutMs: slowLive ? 180000 : 90000,
     intervalMs: slowLive ? 1200 : 800
   });
+  if (health?.loginDetection?.requires_login) {
+    await session.close?.();
+    throw createBossLoginRequiredError({
+      domain: "recommend",
+      currentUrl: health.loginDetection.current_url || currentUrl,
+      targetUrl: RECOMMEND_TARGET_URL,
+      loginDetection: health.loginDetection,
+      chrome: session.chrome || null
+    });
+  }
   if (!health || health.status !== HEALTH_STATUS.HEALTHY) {
+    const latestUrl = await getMainFrameUrl(client).catch(() => currentUrl);
+    const latestLoginDetection = await detectBossLoginState(client, { currentUrl: latestUrl }).catch(() => ({
+      requires_login: isBossLoginUrl(latestUrl),
+      reason: "login_detection_failed",
+      current_url: latestUrl
+    }));
+    if (latestLoginDetection.requires_login) {
+      await session.close?.();
+      throw createBossLoginRequiredError({
+        domain: "recommend",
+        currentUrl: latestLoginDetection.current_url || latestUrl,
+        targetUrl: RECOMMEND_TARGET_URL,
+        loginDetection: latestLoginDetection,
+        chrome: session.chrome || null
+      });
+    }
     throw new Error(`Boss recommend page is not healthy: ${health?.status || "missing"}`);
   }
 
@@ -964,13 +1050,21 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
       slowLive: normalized.slowLive
     });
   } catch (error) {
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       error: {
-        code: "BOSS_RECOMMEND_PAGE_NOT_READY",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "BOSS_RECOMMEND_PAGE_NOT_READY",
         message: error?.message || "Boss recommend page is not ready",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        chrome: error?.chrome || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || RECOMMEND_TARGET_URL,
         retryable: true
-      }
+      },
+      chrome: error?.chrome || null
     };
   }
 
@@ -1000,7 +1094,8 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
       host: normalized.host,
       port: normalized.port,
       target_url: session.navigation?.url || session.target?.url || RECOMMEND_TARGET_URL,
-      target_id: session.target?.id || null
+      target_id: session.target?.id || null,
+      auto_launch: session.chrome || null
     },
     health: session.health || null
   });

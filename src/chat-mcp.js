@@ -4,8 +4,13 @@ import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
   bringPageToFront,
-  connectToChromeTarget,
+  connectToChromeTargetOrOpen,
+  createBossLoginRequiredError,
+  detectBossLoginState,
   enableDomains,
+  getMainFrameUrl,
+  isBossLoginUrl,
+  waitForMainFrameUrl,
   sleep
 } from "./core/browser/index.js";
 import {
@@ -472,6 +477,14 @@ async function waitForHealthyChat(client, config, {
   const started = Date.now();
   let lastCheck = null;
   while (Date.now() - started <= timeoutMs) {
+    const loginDetection = await detectBossLoginState(client).catch(() => null);
+    if (loginDetection?.requires_login) {
+      return {
+        status: "login_required",
+        summary: "Boss login is required",
+        loginDetection
+      };
+    }
     const roots = await resolveChatSelfHealRoots(client, config);
     lastCheck = await runSelfHealCheck({
       client,
@@ -493,24 +506,18 @@ async function connectChatChromeSession({
   allowNavigate = true,
   slowLive = false
 } = {}) {
-  let session;
-  try {
-    session = await connectToChromeTarget({
-      host,
-      port,
-      targetUrlIncludes
-    });
-  } catch (error) {
-    if (!allowNavigate) throw error;
-    session = await connectToChromeTarget({
-      host,
-      port,
-      targetPredicate: (target) => (
-        target?.type === "page"
-        && isRecoverableChatTargetUrl(target?.url)
-      )
-    });
-  }
+  const session = await connectToChromeTargetOrOpen({
+    host,
+    port,
+    targetUrlIncludes,
+    targetUrl: CHAT_TARGET_URL,
+    allowNavigate,
+    slowLive,
+    fallbackTargetPredicate: (target) => (
+      target?.type === "page"
+      && (isRecoverableChatTargetUrl(target?.url) || String(target?.url || "").includes("zhipin.com"))
+    )
+  });
 
   const { client, target } = session;
   await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
@@ -527,12 +534,56 @@ async function connectChatChromeSession({
   if (allowNavigate && shouldNavigateToChat(targetUrl)) {
     await client.Page.navigate({ url: CHAT_TARGET_URL });
     const settleMs = slowLive ? 10000 : 5000;
-    await sleep(settleMs);
+    const waited = await waitForMainFrameUrl(
+      client,
+      (url) => isBossLoginUrl(url) || !shouldNavigateToChat(url),
+      { timeoutMs: settleMs, intervalMs: 500 }
+    );
     navigation = {
       navigated: true,
       url: CHAT_TARGET_URL,
-      settle_ms: settleMs
+      settle_ms: settleMs,
+      observed_url: waited.url || null,
+      observed_url_ok: waited.ok
     };
+  }
+  let currentUrl = await getMainFrameUrl(client).catch(() => navigation.url || targetUrl);
+  if (allowNavigate && shouldNavigateToChat(currentUrl) && !isBossLoginUrl(currentUrl)) {
+    await client.Page.navigate({ url: CHAT_TARGET_URL });
+    const settleMs = slowLive ? 10000 : 5000;
+    const waited = await waitForMainFrameUrl(
+      client,
+      (url) => isBossLoginUrl(url) || !shouldNavigateToChat(url),
+      { timeoutMs: settleMs, intervalMs: 500 }
+    );
+    navigation = {
+      navigated: true,
+      url: CHAT_TARGET_URL,
+      settle_ms: settleMs,
+      observed_url: waited.url || null,
+      observed_url_ok: waited.ok,
+      reason: "observed_url_mismatch"
+    };
+    currentUrl = await getMainFrameUrl(client).catch(() => waited.url || currentUrl);
+  }
+  const loginDetection = await detectBossLoginState(client, { currentUrl }).catch(() => ({
+    requires_login: isBossLoginUrl(currentUrl),
+    reason: "login_detection_failed",
+    current_url: currentUrl
+  }));
+  if (loginDetection.requires_login) {
+    await session.close?.();
+    throw createBossLoginRequiredError({
+      domain: "chat",
+      currentUrl: loginDetection.current_url || currentUrl,
+      targetUrl: CHAT_TARGET_URL,
+      loginDetection,
+      chrome: session.chrome || null
+    });
+  }
+  if (shouldNavigateToChat(currentUrl)) {
+    await session.close?.();
+    throw new Error(`Boss chat page did not navigate to ${CHAT_TARGET_URL}; current URL: ${currentUrl || "unknown"}`);
   }
 
   const selfHealConfig = buildChatSelfHealConfig();
@@ -540,7 +591,33 @@ async function connectChatChromeSession({
     timeoutMs: slowLive ? 180000 : 90000,
     intervalMs: slowLive ? 1200 : 800
   });
+  if (health?.loginDetection?.requires_login) {
+    await session.close?.();
+    throw createBossLoginRequiredError({
+      domain: "chat",
+      currentUrl: health.loginDetection.current_url || currentUrl,
+      targetUrl: CHAT_TARGET_URL,
+      loginDetection: health.loginDetection,
+      chrome: session.chrome || null
+    });
+  }
   if (!health || health.status !== HEALTH_STATUS.HEALTHY) {
+    const latestUrl = await getMainFrameUrl(client).catch(() => currentUrl);
+    const latestLoginDetection = await detectBossLoginState(client, { currentUrl: latestUrl }).catch(() => ({
+      requires_login: isBossLoginUrl(latestUrl),
+      reason: "login_detection_failed",
+      current_url: latestUrl
+    }));
+    if (latestLoginDetection.requires_login) {
+      await session.close?.();
+      throw createBossLoginRequiredError({
+        domain: "chat",
+        currentUrl: latestLoginDetection.current_url || latestUrl,
+        targetUrl: CHAT_TARGET_URL,
+        loginDetection: latestLoginDetection,
+        chrome: session.chrome || null
+      });
+    }
     throw new Error(`Boss chat page is not healthy: ${health?.status || "missing"}`);
   }
 
@@ -845,13 +922,21 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) 
       slowLive: normalized.slowLive
     });
   } catch (error) {
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       error: {
-        code: "BOSS_CHAT_PAGE_NOT_READY",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "BOSS_CHAT_PAGE_NOT_READY",
         message: error?.message || "Boss chat page is not ready",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        chrome: error?.chrome || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || CHAT_TARGET_URL,
         retryable: true
-      }
+      },
+      chrome: error?.chrome || null
     };
   }
 
@@ -880,7 +965,8 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) 
       host: normalized.host,
       port: normalized.port,
       target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
-      target_id: session.target?.id || null
+      target_id: session.target?.id || null,
+      auto_launch: session.chrome || null
     },
     health: session.health || null
   });
@@ -912,12 +998,19 @@ export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } =
       slowLive: normalized.slowLive
     });
   } catch (error) {
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       stage: "chat_run_setup",
       error: {
-        code: "BOSS_CHAT_PAGE_NOT_READY",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "BOSS_CHAT_PAGE_NOT_READY",
         message: error?.message || "Boss chat page is not ready",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        chrome: error?.chrome || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || CHAT_TARGET_URL,
         retryable: true
       },
       runtime_evaluate_used: false,
@@ -926,7 +1019,8 @@ export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } =
       chrome: {
         host: normalized.host,
         port: normalized.port,
-        target_url: CHAT_TARGET_URL
+        target_url: CHAT_TARGET_URL,
+        auto_launch: error?.chrome || null
       }
     };
   }
@@ -979,16 +1073,24 @@ export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } =
         host: normalized.host,
         port: normalized.port,
         target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
-        target_id: session.target?.id || null
+        target_id: session.target?.id || null,
+        auto_launch: session.chrome || null
       }
     };
   } catch (error) {
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       stage: "chat_run_setup",
       error: {
-        code: "BOSS_CHAT_PREPARE_FAILED",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "BOSS_CHAT_PREPARE_FAILED",
         message: error?.message || "Boss chat CDP-only prepare failed",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        chrome: error?.chrome || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || CHAT_TARGET_URL,
         retryable: true
       },
       runtime_evaluate_used: false,
@@ -998,7 +1100,8 @@ export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } =
         host: normalized.host,
         port: normalized.port,
         target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
-        target_id: session.target?.id || null
+        target_id: session.target?.id || null,
+        auto_launch: session.chrome || null
       }
     };
   } finally {
@@ -1073,17 +1176,25 @@ export async function bossChatHealthCheckTool({ workspaceRoot = "", args = {} } 
         host,
         port,
         target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
-        target_id: session.target?.id || null
+        target_id: session.target?.id || null,
+        auto_launch: session.chrome || null
       },
       message: "Boss chat CDP-only health check passed with shared self-heal probes."
     };
   } catch (error) {
+    const loginRequired = error?.code === "BOSS_LOGIN_REQUIRED";
     return {
       status: "FAILED",
       ...basePayload,
       error: {
-        code: "BOSS_CHAT_PAGE_NOT_READY",
+        code: loginRequired ? "BOSS_LOGIN_REQUIRED" : "BOSS_CHAT_PAGE_NOT_READY",
         message: error?.message || "Boss chat page is not ready",
+        requires_login: Boolean(error?.requires_login),
+        login_url: error?.login_url || null,
+        login_detection: error?.login_detection || null,
+        chrome: error?.chrome || null,
+        current_url: error?.current_url || null,
+        target_url: error?.target_url || CHAT_TARGET_URL,
         retryable: true
       },
       runtime_evaluate_used: false,
@@ -1093,7 +1204,8 @@ export async function bossChatHealthCheckTool({ workspaceRoot = "", args = {} } 
         host,
         port,
         target_url: session?.navigation?.url || session?.target?.url || targetUrlIncludes,
-        target_id: session?.target?.id || null
+        target_id: session?.target?.id || null,
+        auto_launch: error?.chrome || session?.chrome || null
       }
     };
   } finally {
