@@ -37,7 +37,7 @@ const GENDER_CODE_MAP = {
   2: "女"
 };
 
-const LLM_THINKING_LEVELS = new Set(["off", "low", "medium", "high", "current"]);
+const LLM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "auto", "current"]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -64,9 +64,9 @@ function isVolcengineModel(baseUrl, model) {
 
 function applyChatCompletionThinking(payload, { baseUrl = "", model = "", thinkingLevel = "" } = {}) {
   const level = normalizeLlmThinkingLevel(thinkingLevel);
-  if (!level || level === "current") return payload;
+  if (!level || level === "current" || level === "auto") return payload;
   if (isVolcengineModel(baseUrl, model)) {
-    if (level === "off") {
+    if (level === "off" || level === "minimal") {
       payload.thinking = { type: "disabled" };
     } else {
       payload.thinking = { type: "enabled" };

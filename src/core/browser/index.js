@@ -10,6 +10,7 @@ export const BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/?ka=bticket";
 
 export const ALLOWED_CDP_DOMAINS = new Set([
   "Accessibility",
+  "Browser",
   "DOM",
   "Input",
   "Network",

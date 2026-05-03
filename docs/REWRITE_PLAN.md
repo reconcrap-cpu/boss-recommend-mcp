@@ -113,11 +113,15 @@ Tasks:
 
 - Build config-driven probes, drift reports, repair actions, and repair summaries.
 - Domain modules register recommend, recruit, and chat probe configs.
+- Add a shared viewport-collapse probe copied from the legacy recommend thresholds: absolute body/frame/viewport minimums plus relative collapse detection when a near-fullscreen Chrome window exposes a much smaller content viewport.
+- Viewport recovery must use CDP only: `Page.getLayoutMetrics`, `DOM.getBoxModel`, and `Browser.getWindowForTarget` / `Browser.getWindowBounds` / `Browser.setWindowBounds`. It must never use page JS or `Runtime.evaluate`.
+- Recommend, recruit/search, and chat run services must auto-run the viewport guard at startup, before card discovery, inside candidate-loop node refreshes, after refresh/reload rounds, and before detail extraction. If recovery fails, fail the run with `LIST_VIEWPORT_COLLAPSED` instead of continuing against a broken viewport.
 
 Live gate:
 
 - Run recommend health check against live recommend.
 - Run recruit and chat health checks when those pages are available.
+- Run short live recommend, recruit/search, and chat run-service smokes and verify run summaries include `viewport_health.stats`, `viewport_checks`, and no `Runtime.*` methods. A mock-only viewport guard is only `dev-ready`.
 - Report unavailable pages as blockers, not passes.
 
 ## Phase 5: Recommend Domain Rewrite

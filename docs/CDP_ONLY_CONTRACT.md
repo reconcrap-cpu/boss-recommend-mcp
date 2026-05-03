@@ -7,6 +7,7 @@ This project must not execute JavaScript inside Boss pages.
 - `DOM`
 - `Input`
 - `Accessibility`
+- `Browser` for window bounds/state recovery only
 - `Network`
 - `Page`
 - `Target`

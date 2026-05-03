@@ -92,31 +92,34 @@ function readyArgs(extra = {}) {
   };
 }
 
-function installFakeConnector() {
+function installFakeConnector({ onConnect = null } = {}) {
   let closeCount = 0;
-  setRecommendMcpConnectorForTests(async () => ({
-    client: { guarded: true },
-    target: {
-      id: "fake-recommend-target",
-      url: "https://www.zhipin.com/web/chat/recommend",
-      type: "page"
-    },
-    methodLog: [
-      { method: "DOM.getDocument", at: new Date().toISOString() },
-      { method: "DOM.querySelectorAll", at: new Date().toISOString() },
-      { method: "Input.dispatchMouseEvent", at: new Date().toISOString() }
-    ],
-    navigation: {
-      navigated: false,
-      url: "https://www.zhipin.com/web/chat/recommend"
-    },
-    health: {
-      status: "healthy"
-    },
-    async close() {
-      closeCount += 1;
-    }
-  }));
+  setRecommendMcpConnectorForTests(async (options = {}) => {
+    if (typeof onConnect === "function") onConnect(options);
+    return {
+      client: { guarded: true },
+      target: {
+        id: "fake-recommend-target",
+        url: "https://www.zhipin.com/web/chat/recommend",
+        type: "page"
+      },
+      methodLog: [
+        { method: "DOM.getDocument", at: new Date().toISOString() },
+        { method: "DOM.querySelectorAll", at: new Date().toISOString() },
+        { method: "Input.dispatchMouseEvent", at: new Date().toISOString() }
+      ],
+      navigation: {
+        navigated: false,
+        url: "https://www.zhipin.com/web/chat/recommend"
+      },
+      health: {
+        status: "healthy"
+      },
+      async close() {
+        closeCount += 1;
+      }
+    };
+  });
   return {
     get closeCount() {
       return closeCount;
@@ -196,6 +199,26 @@ async function testRecommendJobListTool() {
   assert.equal(observedContext.normalized.port, 9222);
   assert.equal(observedContext.normalized.slowLive, true);
   assert.equal(connector.closeCount, 1);
+}
+
+async function testRecommendDefaultsUseScreeningConfig() {
+  let connectOptions = null;
+  installFakeConnector({
+    onConnect(options) {
+      connectOptions = options;
+    }
+  });
+  setRecommendMcpJobReaderForTests(async () => ({
+    source: "test-reader",
+    selector: ".job-item",
+    selected_job: null,
+    job_options: []
+  }));
+
+  const payload = await callTool(TOOL_LIST_JOBS, {}, 120);
+  assert.equal(payload.status, "OK");
+  assert.equal(connectOptions.port, 9333);
+  assert.equal(payload.chrome.port, 9333);
 }
 
 async function testRecommendGateBeforeBrowserConnect() {
@@ -486,14 +509,58 @@ async function testRecommendFollowUpChatRemainsFenced() {
   assert.equal(connectorCalled, false);
 }
 
+async function testRecommendArtifactsUseConfiguredOutputDir(outputDir) {
+  installFakeConnector();
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:test-output-dir");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 121);
+  assert.equal(started.status, "ACCEPTED");
+  const completed = await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(path.dirname(completed.result.output_csv), outputDir);
+  assert.equal(path.dirname(completed.result.report_json), outputDir);
+  assert.equal(fs.existsSync(completed.result.output_csv), true);
+  assert.equal(fs.existsSync(completed.result.report_json), true);
+}
+
 async function main() {
   const previousHome = process.env.BOSS_RECOMMEND_HOME;
+  const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-mcp-test-"));
+  const outputDir = path.join(tempHome, "configured-output");
+  const configPath = path.join(tempHome, "screening-config.json");
   process.env.BOSS_RECOMMEND_HOME = tempHome;
+  fs.writeFileSync(configPath, JSON.stringify({
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "sk-test-key",
+    model: "gpt-4.1-mini",
+    debugPort: 9333,
+    outputDir,
+    llmThinkingLevel: "low",
+    humanRestEnabled: false
+  }, null, 2));
+  process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
     await testToolListIncludesRecommendTools();
     resetRecommendMcpStateForTests();
     await testRecommendJobListTool();
+    resetRecommendMcpStateForTests();
+    await testRecommendDefaultsUseScreeningConfig();
     await testRecommendGateBeforeBrowserConnect();
     resetRecommendMcpStateForTests();
     await testRecommendDetailLimitDefaultsToTargetCount();
@@ -509,6 +576,8 @@ async function main() {
     await testRecommendPageScopeWiresIntoRunService();
     resetRecommendMcpStateForTests();
     await testRecommendFollowUpChatRemainsFenced();
+    resetRecommendMcpStateForTests();
+    await testRecommendArtifactsUseConfiguredOutputDir(outputDir);
     console.log("recommend MCP tests passed");
   } finally {
     resetRecommendMcpStateForTests();
@@ -516,6 +585,11 @@ async function main() {
       delete process.env.BOSS_RECOMMEND_HOME;
     } else {
       process.env.BOSS_RECOMMEND_HOME = previousHome;
+    }
+    if (previousScreenConfig === undefined) {
+      delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+    } else {
+      process.env.BOSS_RECOMMEND_SCREEN_CONFIG = previousScreenConfig;
     }
     fs.rmSync(tempHome, { recursive: true, force: true });
   }

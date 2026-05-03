@@ -45,6 +45,7 @@ import {
   getBossChatDataDir,
   getBossChatTargetCountValue,
   normalizeTargetCountInput,
+  resolveBossConfiguredOutputDir,
   resolveBossChatRuntimeLayout,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
@@ -123,12 +124,14 @@ function getChatRunArtifacts(runId) {
   const normalized = normalizeRunId(runId);
   if (!normalized) return null;
   const runsDir = getChatRunsDir();
+  const outputDir = resolveBossConfiguredOutputDir("", runsDir);
   return {
     runs_dir: runsDir,
+    output_dir: outputDir,
     run_state_path: path.join(runsDir, `${normalized}.json`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
-    output_csv: path.join(runsDir, `${normalized}.results.csv`),
-    report_json: path.join(runsDir, `${normalized}.report.json`)
+    output_csv: path.join(outputDir, `${normalized}.results.csv`),
+    report_json: path.join(outputDir, `${normalized}.report.json`)
   };
 }
 
@@ -491,7 +494,8 @@ async function waitForHealthyChat(client, config, {
       domain: "chat",
       roots: roots.roots,
       selectorProbes: config.selectorProbes,
-      accessibilityProbes: config.accessibilityProbes
+      accessibilityProbes: config.accessibilityProbes,
+      viewportProbes: config.viewportProbes
     });
     if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
     await sleep(intervalMs);
@@ -633,7 +637,7 @@ async function readChatJobOptionsFromSession(session) {
   return readChatJobOptions(session.client, roots.rootNodes.top);
 }
 
-function normalizeChatStartInput(args = {}) {
+function normalizeChatStartInput(args = {}, configResolution = null) {
   const target = normalizeTargetCountInput(getBossChatTargetCountValue(args));
   return {
     profile: normalizeText(args.profile) || "default",
@@ -645,7 +649,10 @@ function normalizeChatStartInput(args = {}) {
     targetCount: target.targetCount,
     publicTargetCount: target.publicValue,
     host: normalizeText(args.host) || DEFAULT_CHAT_HOST,
-    port: parsePositiveInteger(args.port, DEFAULT_CHAT_PORT),
+    port: parsePositiveInteger(
+      args.port,
+      configResolution?.ok ? configResolution.config.debugPort : DEFAULT_CHAT_PORT
+    ),
     targetUrlIncludes: normalizeText(args.target_url_includes) || CHAT_TARGET_URL,
     allowNavigate: args.allow_navigate !== false,
     slowLive: args.slow_live === true
@@ -800,7 +807,6 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "" } = {}) {
   const shouldRequestResume = shouldRequestChatResume(args);
   const useLlm = shouldUseChatLlm(args, shouldRequestResume);
   const configResolution = useLlm ? resolveBossScreeningConfig(workspaceRoot) : { ok: false };
-  const configFile = configResolution.ok ? readJsonFile(configResolution.config_path) : null;
   return {
     client: session.client,
     targetUrl: CHAT_TARGET_URL,
@@ -827,8 +833,7 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "" } = {}) {
     maxImagePages: parsePositiveInteger(args.max_image_pages, 8),
     imageWheelDeltaY: parsePositiveInteger(args.image_wheel_delta_y, 650),
     llmConfig: configResolution.ok ? {
-      ...configResolution.config,
-      apiKey: configFile?.apiKey || ""
+      ...configResolution.config
     } : null,
     llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
     llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
@@ -888,7 +893,8 @@ function trackChatRun(runId) {
 }
 
 async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) {
-  const normalized = normalizeChatStartInput(args);
+  const defaultConfigResolution = resolveBossScreeningConfig(workspaceRoot);
+  const normalized = normalizeChatStartInput(args, defaultConfigResolution);
   const missingFields = getMissingChatStartFields(args, normalized);
   if (missingFields.length) {
     return buildNeedInputResponse({
@@ -987,7 +993,8 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) 
 }
 
 export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } = {}) {
-  const normalized = normalizeChatStartInput(args);
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const normalized = normalizeChatStartInput(args, configResolution);
   let session;
   try {
     session = await chatConnectorImpl({
@@ -1129,6 +1136,7 @@ export async function bossChatHealthCheckTool({ workspaceRoot = "", args = {} } 
     cli_path: null,
     config_path: configResolution.config_path || null,
     config_dir: configResolution.config_dir || null,
+    output_dir: configResolution.ok ? configResolution.config.outputDir || null : null,
     debug_port: port,
     shared_llm_config: configResolution.ok === true,
     data_dir: runtimeLayout.data_dir,

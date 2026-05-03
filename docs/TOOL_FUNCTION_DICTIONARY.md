@@ -996,20 +996,23 @@ Expected behavior:
 
 Purpose:
 
-- Shared selector/accessibility/network health probes.
+- Shared selector/accessibility/network health probes plus viewport-collapse detection/recovery.
 
 Important exports:
 
 - Probe/health constants.
-- `createSelectorProbe`, `createAccessibilityProbe`, `createNetworkProbe`.
-- `runSelectorProbe`, `runAccessibilityProbe`, `runNetworkProbe`.
+- `createSelectorProbe`, `createAccessibilityProbe`, `createNetworkProbe`, `createViewportCollapseProbe`.
+- `runSelectorProbe`, `runAccessibilityProbe`, `runNetworkProbe`, `runViewportCollapseProbe`.
 - `summarizeProbeResults`, `buildDriftReport`, `runSelfHealCheck`.
 - `buildRecommendSelfHealConfig`, `buildRecruitSelfHealConfig`, `buildChatSelfHealConfig`.
 - `resolveRecommendSelfHealRoots`, `resolveRecruitSelfHealRoots`, `resolveChatSelfHealRoots`.
+- `buildViewportHealthDiagnostics`, `isListViewportCollapsed`, `ensureHealthyViewport`, `createViewportRunGuard`.
 
 Expected behavior:
 
-- Probes are diagnostic unless an explicit, live-verified apply path exists.
+- Selector/accessibility/network probes are diagnostic unless an explicit, live-verified apply path exists.
+- Viewport-collapse probes may repair Chrome window state because this is a CDP-only browser-window recovery, not page-state mutation.
+- Recommend, search/recruit, and chat runs automatically call `createViewportRunGuard`; recoveries and failures are recorded in run checkpoints and summaries.
 - Failed probes should be actionable and domain-specific.
 
 ### `src/recommend-mcp.js`

@@ -25,7 +25,8 @@ export async function getRecruitRoots(client, {
     ].filter(Boolean),
     rootNodes: {
       top: topRoot.nodeId,
-      frame: iframe?.documentNodeId || 0
+      frame: iframe?.documentNodeId || 0,
+      frameOwner: iframe?.nodeId || 0
     }
   };
 }

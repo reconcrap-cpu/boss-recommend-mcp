@@ -32,6 +32,10 @@ import {
   runRecruitWorkflow,
   waitForRecruitSearchControls
 } from "./domains/recruit/index.js";
+import {
+  resolveBossConfiguredOutputDir,
+  resolveBossScreeningConfig
+} from "./chat-runtime-config.js";
 
 const RUN_MODE_ASYNC = "async";
 const RUN_MODE_SYNC = "sync";
@@ -108,12 +112,14 @@ function getRecruitRunArtifacts(runId) {
   const normalized = normalizeRunId(runId);
   if (!normalized) return null;
   const runsDir = getRecruitRunsDir();
+  const outputDir = resolveBossConfiguredOutputDir("", runsDir);
   return {
     runs_dir: runsDir,
+    output_dir: outputDir,
     run_state_path: path.join(runsDir, `${normalized}.json`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
-    output_csv: path.join(runsDir, `${normalized}.results.csv`),
-    report_json: path.join(runsDir, `${normalized}.report.json`)
+    output_csv: path.join(outputDir, `${normalized}.results.csv`),
+    report_json: path.join(outputDir, `${normalized}.report.json`)
   };
 }
 
@@ -807,12 +813,18 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
   const parsed = parseRecruitPipelineRequest(args);
   const gate = evaluateRecruitPipelineGate(parsed);
   if (gate) return gate;
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const host = normalizeText(args.host) || DEFAULT_RECRUIT_HOST;
+  const port = parsePositiveInteger(
+    args.port,
+    configResolution.ok ? configResolution.config.debugPort : DEFAULT_RECRUIT_PORT
+  );
 
   let session;
   try {
     session = await recruitConnectorImpl({
-      host: normalizeText(args.host) || DEFAULT_RECRUIT_HOST,
-      port: parsePositiveInteger(args.port, DEFAULT_RECRUIT_PORT),
+      host,
+      port,
       targetUrlIncludes: normalizeText(args.target_url_includes) || RECRUIT_TARGET_URL,
       allowNavigate: args.allow_navigate !== false,
       slowLive: args.slow_live === true
@@ -858,8 +870,8 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
     workspaceRoot: normalizeText(workspaceRoot) || globalThis.process?.cwd?.() || "",
     args: clonePlain(args, {}),
     chrome: {
-      host: normalizeText(args.host) || DEFAULT_RECRUIT_HOST,
-      port: parsePositiveInteger(args.port, DEFAULT_RECRUIT_PORT),
+      host,
+      port,
       target_url: session.target?.url || RECRUIT_TARGET_URL,
       target_id: session.target?.id || null,
       auto_launch: session.chrome || null

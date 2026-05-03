@@ -44,6 +44,10 @@ import {
   parseRecommendInstruction
 } from "./parser.js";
 import { getRunsDir } from "./run-state.js";
+import {
+  resolveBossConfiguredOutputDir,
+  resolveBossScreeningConfig
+} from "./chat-runtime-config.js";
 
 const DEFAULT_RECOMMEND_HOST = "127.0.0.1";
 const DEFAULT_RECOMMEND_PORT = 9222;
@@ -115,12 +119,14 @@ function getRecommendRunArtifacts(runId) {
   const normalized = normalizeRunId(runId);
   if (!normalized) return null;
   const runsDir = getRunsDir();
+  const outputDir = resolveBossConfiguredOutputDir("", runsDir);
   return {
     runs_dir: runsDir,
+    output_dir: outputDir,
     run_state_path: path.join(runsDir, `${normalized}.json`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
-    output_csv: path.join(runsDir, `${normalized}.results.csv`),
-    report_json: path.join(runsDir, `${normalized}.report.json`)
+    output_csv: path.join(outputDir, `${normalized}.results.csv`),
+    report_json: path.join(outputDir, `${normalized}.report.json`)
   };
 }
 
@@ -484,8 +490,12 @@ async function readRecommendJobOptionsFromSession(session) {
 }
 
 export async function listRecommendJobsTool({ workspaceRoot = "", args = {} } = {}) {
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
   const host = normalizeText(args.host) || DEFAULT_RECOMMEND_HOST;
-  const port = parsePositiveInteger(args.port, DEFAULT_RECOMMEND_PORT);
+  const port = parsePositiveInteger(
+    args.port,
+    configResolution.ok ? configResolution.config.debugPort : DEFAULT_RECOMMEND_PORT
+  );
   const targetUrlIncludes = normalizeText(args.target_url_includes) || RECOMMEND_TARGET_URL;
   const allowNavigate = args.allow_navigate !== false;
   const slowLive = args.slow_live === true;
@@ -613,7 +623,8 @@ async function waitForHealthyRecommend(client, config, {
       domain: "recommend",
       roots: roots.roots,
       selectorProbes: config.selectorProbes,
-      accessibilityProbes: config.accessibilityProbes
+      accessibilityProbes: config.accessibilityProbes,
+      viewportProbes: config.viewportProbes
     });
     if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
     await sleep(intervalMs);
@@ -922,7 +933,7 @@ function buildRecommendFilter(parsed, args = {}) {
   return groups.length ? { filterGroups: groups } : { enabled: false };
 }
 
-function normalizeRecommendStartInput(args = {}, parsed) {
+function normalizeRecommendStartInput(args = {}, parsed, configResolution = null) {
   const confirmation = args.confirmation || {};
   const overrides = args.overrides || {};
   const slowLive = args.slow_live === true;
@@ -932,7 +943,10 @@ function normalizeRecommendStartInput(args = {}, parsed) {
   );
   return {
     host: normalizeText(args.host) || DEFAULT_RECOMMEND_HOST,
-    port: parsePositiveInteger(args.port, DEFAULT_RECOMMEND_PORT),
+    port: parsePositiveInteger(
+      args.port,
+      configResolution?.ok ? configResolution.config.debugPort : DEFAULT_RECOMMEND_PORT
+    ),
     targetUrlIncludes: normalizeText(args.target_url_includes) || RECOMMEND_TARGET_URL,
     allowNavigate: args.allow_navigate !== false,
     slowLive,
@@ -1038,7 +1052,8 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
   const parsed = parseRecommendPipelineRequest(args);
   const gate = evaluateRecommendPipelineGate(parsed, args);
   if (gate) return gate;
-  const normalized = normalizeRecommendStartInput(args, parsed);
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const normalized = normalizeRecommendStartInput(args, parsed, configResolution);
 
   let session;
   try {

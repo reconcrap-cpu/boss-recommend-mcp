@@ -223,6 +223,22 @@ function parsePositiveInteger(raw, fallback = null) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseConfigBoolean(raw, fallback = false) {
+  if (typeof raw === "boolean") return raw;
+  const normalized = normalizeText(raw).toLowerCase();
+  if (["true", "1", "yes", "y", "on", "enabled"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off", "disabled"].includes(normalized)) return false;
+  return fallback;
+}
+
+function resolveConfigPathValue(raw, configDir) {
+  const normalized = normalizeText(raw);
+  if (!normalized) return "";
+  return path.isAbsolute(normalized)
+    ? path.resolve(normalized)
+    : path.resolve(configDir || process.cwd(), normalized);
+}
+
 function validateScreeningConfig(config) {
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     return {
@@ -369,13 +385,24 @@ export function resolveBossScreeningConfig(workspaceRoot) {
     ok: true,
     config: {
       baseUrl: normalizeText(parsed.baseUrl).replace(/\/+$/, ""),
+      apiKey: normalizeText(parsed.apiKey),
       model: normalizeText(parsed.model),
-      debugPort: parsePositiveInteger(parsed.debugPort, 9222)
+      debugPort: parsePositiveInteger(parsed.debugPort, 9222),
+      llmThinkingLevel: normalizeText(parsed.llmThinkingLevel || parsed.thinkingLevel || parsed.reasoningEffort),
+      outputDir: resolveConfigPathValue(parsed.outputDir, configDir),
+      humanRestEnabled: parseConfigBoolean(parsed.humanRestEnabled, false)
     },
     config_path: configPath,
     config_dir: configDir,
     candidate_paths: candidatePaths
   };
+}
+
+export function resolveBossConfiguredOutputDir(workspaceRoot, fallbackDir = "") {
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const configuredDir = configResolution.ok ? normalizeText(configResolution.config.outputDir) : "";
+  if (configuredDir) return configuredDir;
+  return fallbackDir ? path.resolve(fallbackDir) : "";
 }
 
 function isUnlimitedTargetCountToken(value) {

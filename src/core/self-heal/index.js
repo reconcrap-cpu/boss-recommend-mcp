@@ -5,6 +5,26 @@ import {
   querySelectorAll,
   sleep
 } from "../browser/index.js";
+import {
+  compactViewportHealthResult,
+  ensureHealthyViewport
+} from "./viewport.js";
+
+export {
+  buildViewportHealthDiagnostics,
+  compactViewportHealthResult,
+  compactViewportState,
+  createViewportRunGuard,
+  ensureHealthyViewport,
+  getCurrentWindowInfo,
+  isListViewportCollapsed,
+  readViewportState,
+  setWindowStateIfPossible,
+  toggleWindowStateForViewportRecovery,
+  VIEWPORT_COLLAPSE_MIN_EXPECTED_WIDTH,
+  VIEWPORT_COLLAPSE_NEAR_FULLSCREEN_RATIO,
+  VIEWPORT_COLLAPSE_RATIO_THRESHOLD
+} from "./viewport.js";
 
 export const PROBE_STATUS = Object.freeze({
   PASS: "pass",
@@ -245,6 +265,26 @@ export function createNetworkProbe({
   };
 }
 
+export function createViewportCollapseProbe({
+  id = "viewport_collapse",
+  root = "frame",
+  frameOwnerRoot = "frameOwner",
+  required = true,
+  repair = true,
+  description = ""
+} = {}) {
+  if (!id) throw new Error("Viewport collapse probe requires an id");
+  return {
+    type: "viewport",
+    id,
+    root,
+    frameOwnerRoot,
+    required: Boolean(required),
+    repair: Boolean(repair),
+    description
+  };
+}
+
 export async function runSelectorProbe(client, roots, probe) {
   const nodeId = rootNodeId(roots, probe.root);
   if (!nodeId) {
@@ -338,6 +378,52 @@ export function runNetworkProbe(networkEvents = [], probe) {
   };
 }
 
+export async function runViewportCollapseProbe(client, roots, probe) {
+  const nodeId = rootNodeId(roots, probe.root);
+  if (!nodeId) {
+    return {
+      ...probe,
+      ok: !probe.required,
+      status: probe.required ? PROBE_STATUS.BLOCKED : PROBE_STATUS.OPTIONAL_ABSENT,
+      count: 0,
+      collapsed: false,
+      recovered: false,
+      error: `Root not found: ${probe.root}`
+    };
+  }
+
+  try {
+    const health = await ensureHealthyViewport(client, {
+      roots,
+      root: probe.root,
+      frameOwnerRoot: probe.frameOwnerRoot,
+      reason: probe.id,
+      repair: probe.repair
+    });
+    const ok = Boolean(health.ok);
+    return {
+      ...probe,
+      ok: probe.required ? ok : true,
+      status: ok ? PROBE_STATUS.PASS : probe.required ? PROBE_STATUS.FAIL : PROBE_STATUS.OPTIONAL_ABSENT,
+      count: ok ? 1 : 0,
+      collapsed: Boolean(health.collapsed),
+      recovered: Boolean(health.recovered),
+      viewport_health: compactViewportHealthResult(health),
+      error: health.error || null
+    };
+  } catch (error) {
+    return {
+      ...probe,
+      ok: !probe.required,
+      status: probe.required ? PROBE_STATUS.ERROR : PROBE_STATUS.OPTIONAL_ABSENT,
+      count: 0,
+      collapsed: false,
+      recovered: false,
+      error: error?.message || String(error)
+    };
+  }
+}
+
 export function summarizeProbeResults(probes = []) {
   const required = probes.filter((probe) => probe.required);
   const blocked = required.filter((probe) => probe.status === PROBE_STATUS.BLOCKED);
@@ -370,6 +456,7 @@ export function buildDriftReport(probes = []) {
       expected_min_count: probe.minCount,
       observed_count: probe.count || 0,
       selectors: probe.selectors || [],
+      viewport_health: probe.viewport_health || undefined,
       error: probe.error || null
     }));
 }
@@ -380,6 +467,7 @@ export async function runSelfHealCheck({
   roots = {},
   selectorProbes = [],
   accessibilityProbes = [],
+  viewportProbes = [],
   networkProbes = [],
   networkEvents = []
 } = {}) {
@@ -393,8 +481,13 @@ export async function runSelfHealCheck({
     accessibilityResults.push(await runAccessibilityProbe(client, probe));
   }
 
+  const viewportResults = [];
+  for (const probe of viewportProbes) {
+    viewportResults.push(await runViewportCollapseProbe(client, roots, probe));
+  }
+
   const networkResults = networkProbes.map((probe) => runNetworkProbe(networkEvents, probe));
-  const probes = [...selectorResults, ...accessibilityResults, ...networkResults];
+  const probes = [...selectorResults, ...accessibilityResults, ...viewportResults, ...networkResults];
   const summary = summarizeProbeResults(probes);
 
   return {
@@ -507,6 +600,16 @@ export function buildRecommendSelfHealConfig(rules = {}) {
         description: "Candidate detail popup may mount inside the recommend frame"
       })
     ],
+    viewportProbes: [
+      createViewportCollapseProbe({
+        id: "recommend_viewport_collapse",
+        root: "frame",
+        frameOwnerRoot: "frameOwner",
+        required: true,
+        repair: true,
+        description: "Recommend frame/list viewport has not collapsed relative to the Chrome window"
+      })
+    ],
     accessibilityProbes: [
       createAccessibilityProbe({
         id: "accessibility_tree",
@@ -610,6 +713,16 @@ export function buildRecruitSelfHealConfig(rules = {}) {
         description: "Candidate detail popup may mount inside the search frame"
       })
     ],
+    viewportProbes: [
+      createViewportCollapseProbe({
+        id: "recruit_viewport_collapse",
+        root: "frame",
+        frameOwnerRoot: "frameOwner",
+        required: true,
+        repair: true,
+        description: "Search frame/list viewport has not collapsed relative to the Chrome window"
+      })
+    ],
     accessibilityProbes: [
       createAccessibilityProbe({
         id: "accessibility_tree",
@@ -711,6 +824,16 @@ export function buildChatSelfHealConfig(rules = {}) {
         description: "Resume iframe appears after the online resume is opened"
       })
     ],
+    viewportProbes: [
+      createViewportCollapseProbe({
+        id: "chat_viewport_collapse",
+        root: "top",
+        frameOwnerRoot: "top",
+        required: true,
+        repair: true,
+        description: "Chat list viewport has not collapsed relative to the Chrome window"
+      })
+    ],
     accessibilityProbes: [
       createAccessibilityProbe({
         id: "accessibility_tree",
@@ -756,7 +879,8 @@ export async function resolveRecommendSelfHealRoots(client, config = buildRecomm
   return {
     roots: {
       top: topRoot.nodeId,
-      frame: iframe.documentNodeId
+      frame: iframe.documentNodeId,
+      frameOwner: iframe.nodeId
     },
     topRoot,
     iframe
@@ -779,7 +903,8 @@ export async function resolveRecruitSelfHealRoots(client, config = buildRecruitS
   return {
     roots: {
       top: topRoot.nodeId,
-      frame: iframe.documentNodeId
+      frame: iframe.documentNodeId,
+      frameOwner: iframe.nodeId
     },
     topRoot,
     iframe

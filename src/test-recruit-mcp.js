@@ -70,23 +70,26 @@ function readyArgs(extra = {}) {
   };
 }
 
-function installFakeConnector() {
+function installFakeConnector({ onConnect = null } = {}) {
   let closeCount = 0;
-  setRecruitMcpConnectorForTests(async () => ({
-    client: { guarded: true },
-    target: {
-      id: "fake-recruit-target",
-      url: "https://www.zhipin.com/web/chat/search",
-      type: "page"
-    },
-    methodLog: [
-      { method: "DOM.getDocument", at: new Date().toISOString() },
-      { method: "Input.dispatchMouseEvent", at: new Date().toISOString() }
-    ],
-    async close() {
-      closeCount += 1;
-    }
-  }));
+  setRecruitMcpConnectorForTests(async (options = {}) => {
+    if (typeof onConnect === "function") onConnect(options);
+    return {
+      client: { guarded: true },
+      target: {
+        id: "fake-recruit-target",
+        url: "https://www.zhipin.com/web/chat/search",
+        type: "page"
+      },
+      methodLog: [
+        { method: "DOM.getDocument", at: new Date().toISOString() },
+        { method: "Input.dispatchMouseEvent", at: new Date().toISOString() }
+      ],
+      async close() {
+        closeCount += 1;
+      }
+    };
+  });
   return {
     get closeCount() {
       return closeCount;
@@ -122,6 +125,35 @@ async function testRecruitGateBeforeBrowserConnect() {
   assert.equal(connectorCalled, false);
 }
 
+async function testRecruitDefaultsUseScreeningConfig() {
+  let connectOptions = null;
+  installFakeConnector({
+    onConnect(options) {
+      connectOptions = options;
+    }
+  });
+  setRecruitMcpWorkflowForTests(async (_options, runControl) => {
+    runControl.setPhase("recruit:test-config-port");
+    runControl.updateProgress({ processed: 1, screened: 1, passed: 0 });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+
+  const payload = await callTool(TOOL_RUN, {
+    ...readyArgs(),
+    execution_mode: "sync"
+  }, 20);
+  assert.equal(payload.status, "COMPLETED");
+  assert.equal(connectOptions.port, 9444);
+  assert.equal(payload.chrome.port, 9444);
+}
+
 async function testRecruitSyncRun() {
   const connector = installFakeConnector();
   setRecruitMcpWorkflowForTests(async (_options, runControl) => {
@@ -146,8 +178,10 @@ async function testRecruitSyncRun() {
   assert.equal(payload.result.processed_count, 1);
   assert.equal(typeof payload.result.output_csv, "string");
   assert.equal(fs.existsSync(payload.result.output_csv), true);
+  assert.equal(path.dirname(payload.result.output_csv), process.env.TEST_BOSS_OUTPUT_DIR);
   assert.equal(typeof payload.result.report_json, "string");
   assert.equal(fs.existsSync(payload.result.report_json), true);
+  assert.equal(path.dirname(payload.result.report_json), process.env.TEST_BOSS_OUTPUT_DIR);
   assert.equal(typeof payload.result.checkpoint_path, "string");
   assert.equal(fs.existsSync(payload.result.checkpoint_path), true);
   assert.equal(payload.run.result.processed_count, 1);
@@ -222,11 +256,28 @@ async function testRecruitAsyncPauseResume() {
 
 async function main() {
   const previousHome = process.env.BOSS_RECRUIT_HOME;
+  const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+  const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recruit-mcp-test-"));
+  const outputDir = path.join(tempHome, "configured-output");
+  const configPath = path.join(tempHome, "screening-config.json");
   process.env.BOSS_RECRUIT_HOME = tempHome;
+  process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
+  fs.writeFileSync(configPath, JSON.stringify({
+    baseUrl: "https://api.example.com/v1",
+    apiKey: "sk-test-key",
+    model: "gpt-4.1-mini",
+    debugPort: 9444,
+    outputDir,
+    llmThinkingLevel: "low",
+    humanRestEnabled: false
+  }, null, 2));
+  process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
     await testToolListIncludesRecruitTools();
     await testRecruitGateBeforeBrowserConnect();
+    resetRecruitMcpStateForTests();
+    await testRecruitDefaultsUseScreeningConfig();
     resetRecruitMcpStateForTests();
     await testRecruitSyncRun();
     resetRecruitMcpStateForTests();
@@ -238,6 +289,16 @@ async function main() {
       delete process.env.BOSS_RECRUIT_HOME;
     } else {
       process.env.BOSS_RECRUIT_HOME = previousHome;
+    }
+    if (previousScreenConfig === undefined) {
+      delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+    } else {
+      process.env.BOSS_RECOMMEND_SCREEN_CONFIG = previousScreenConfig;
+    }
+    if (previousOutputDir === undefined) {
+      delete process.env.TEST_BOSS_OUTPUT_DIR;
+    } else {
+      process.env.TEST_BOSS_OUTPUT_DIR = previousOutputDir;
     }
     fs.rmSync(tempHome, { recursive: true, force: true });
   }

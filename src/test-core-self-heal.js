@@ -2,17 +2,21 @@
 import assert from "node:assert/strict";
 import {
   buildRecommendSelfHealConfig,
+  buildViewportHealthDiagnostics,
   classifyBossTargets,
   createAccessibilityProbe,
   createNetworkProbe,
   createSelectorProbe,
+  createViewportCollapseProbe,
   HEALTH_STATUS,
+  isListViewportCollapsed,
   PROBE_STATUS,
   runAccessibilityProbe,
   runNetworkProbe,
   runRepairAction,
   runSelfHealCheck,
-  runSelectorProbe
+  runSelectorProbe,
+  runViewportCollapseProbe
 } from "./core/self-heal/index.js";
 
 function makeFakeClient(selectorCounts = {}) {
@@ -40,8 +44,127 @@ function makeFakeClient(selectorCounts = {}) {
       }
     },
     Page: {
+      async getLayoutMetrics() {
+        calls.push({ method: "Page.getLayoutMetrics" });
+        return {
+          cssVisualViewport: {
+            clientWidth: selectorCounts.layoutWidth || 1280,
+            clientHeight: selectorCounts.layoutHeight || 720,
+            scale: 1
+          },
+          cssLayoutViewport: {
+            clientWidth: selectorCounts.layoutWidth || 1280,
+            clientHeight: selectorCounts.layoutHeight || 720
+          }
+        };
+      },
+      async bringToFront() {
+        calls.push({ method: "Page.bringToFront" });
+        return {};
+      },
       async reload(params) {
         calls.push({ method: "Page.reload", params });
+        return {};
+      }
+    },
+    Browser: {
+      async getWindowForTarget() {
+        calls.push({ method: "Browser.getWindowForTarget" });
+        return {
+          windowId: 7,
+          bounds: {
+            windowState: selectorCounts.windowState || "maximized",
+            width: selectorCounts.windowWidth || 1440,
+            height: selectorCounts.windowHeight || 900
+          }
+        };
+      },
+      async getWindowBounds(params) {
+        calls.push({ method: "Browser.getWindowBounds", params });
+        return {
+          bounds: {
+            windowState: selectorCounts.windowState || "maximized",
+            width: selectorCounts.windowWidth || 1440,
+            height: selectorCounts.windowHeight || 900
+          }
+        };
+      },
+      async setWindowBounds(params) {
+        calls.push({ method: "Browser.setWindowBounds", params });
+        return {};
+      }
+    }
+  };
+}
+
+function makeViewportFakeClient({
+  widthSequence = [785, 1280],
+  height = 585,
+  windowState = "maximized",
+  windowWidth = 1440
+} = {}) {
+  const calls = [];
+  let boxIndex = 0;
+  return {
+    calls,
+    DOM: {
+      async getBoxModel({ nodeId }) {
+        calls.push({ method: "DOM.getBoxModel", nodeId });
+        const width = widthSequence[Math.min(boxIndex, widthSequence.length - 1)];
+        boxIndex += 1;
+        return {
+          model: {
+            border: [0, 0, width, 0, width, height, 0, height],
+            content: [0, 0, width, 0, width, height, 0, height]
+          }
+        };
+      }
+    },
+    Page: {
+      async getLayoutMetrics() {
+        calls.push({ method: "Page.getLayoutMetrics" });
+        const width = widthSequence[Math.min(boxIndex, widthSequence.length - 1)];
+        return {
+          cssVisualViewport: {
+            clientWidth: width,
+            clientHeight: height,
+            scale: 1
+          },
+          cssLayoutViewport: {
+            clientWidth: width,
+            clientHeight: height
+          }
+        };
+      },
+      async bringToFront() {
+        calls.push({ method: "Page.bringToFront" });
+        return {};
+      }
+    },
+    Browser: {
+      async getWindowForTarget() {
+        calls.push({ method: "Browser.getWindowForTarget" });
+        return {
+          windowId: 7,
+          bounds: {
+            windowState,
+            width: windowWidth,
+            height: 900
+          }
+        };
+      },
+      async getWindowBounds(params) {
+        calls.push({ method: "Browser.getWindowBounds", params });
+        return {
+          bounds: {
+            windowState,
+            width: windowWidth,
+            height: 900
+          }
+        };
+      },
+      async setWindowBounds(params) {
+        calls.push({ method: "Browser.setWindowBounds", params });
         return {};
       }
     }
@@ -134,6 +257,86 @@ async function testRepairAction() {
   });
 }
 
+async function testViewportCollapseDiagnosticsCopyLegacyThresholds() {
+  const state = {
+    ok: true,
+    clientWidth: 785,
+    clientHeight: 585,
+    frameRect: {
+      width: 785,
+      height: 585
+    },
+    viewport: {
+      width: 785,
+      height: 585
+    },
+    topViewport: {
+      screenAvailWidth: 1440,
+      outerWidth: 1454
+    }
+  };
+  state.viewportDiagnostics = buildViewportHealthDiagnostics(state, {
+    bounds: {
+      windowState: "maximized",
+      width: 1454
+    }
+  }, {
+    cssVisualViewport: {
+      clientWidth: 785,
+      clientHeight: 585
+    }
+  });
+  assert.equal(state.viewportDiagnostics.relativeCollapsed, true);
+  assert.equal(isListViewportCollapsed(state), true);
+  assert.equal(Math.round(state.viewportDiagnostics.widthRatio * 1000), 545);
+
+  const normalWindow = {
+    ...state,
+    topViewport: {
+      screenAvailWidth: 1440,
+      outerWidth: 800
+    }
+  };
+  normalWindow.viewportDiagnostics = buildViewportHealthDiagnostics(normalWindow, {
+    bounds: {
+      windowState: "normal",
+      width: 800
+    }
+  }, {
+    cssVisualViewport: {
+      clientWidth: 785,
+      clientHeight: 585
+    }
+  });
+  assert.equal(normalWindow.viewportDiagnostics.nearFullscreen, false);
+  assert.equal(normalWindow.viewportDiagnostics.relativeCollapsed, false);
+  assert.equal(isListViewportCollapsed(normalWindow), false);
+}
+
+async function testViewportCollapseProbeRepairs() {
+  const client = makeViewportFakeClient({
+    widthSequence: [785, 1280],
+    windowState: "maximized",
+    windowWidth: 1440
+  });
+  const result = await runViewportCollapseProbe(client, { frame: 10 }, createViewportCollapseProbe({
+    id: "viewport",
+    root: "frame",
+    required: true,
+    repair: true
+  }));
+  assert.equal(result.status, PROBE_STATUS.PASS);
+  assert.equal(result.viewport_health.recovered, true);
+  assert.equal(result.viewport_health.before.collapsed, true);
+  assert.equal(result.viewport_health.state.collapsed, false);
+  assert.deepEqual(
+    client.calls
+      .filter((call) => call.method === "Browser.setWindowBounds")
+      .map((call) => call.params.bounds.windowState),
+    ["normal", "maximized"]
+  );
+}
+
 function testTargetClassificationAndConfig() {
   const targets = classifyBossTargets([
     {
@@ -162,6 +365,7 @@ function testTargetClassificationAndConfig() {
   const config = buildRecommendSelfHealConfig();
   assert.equal(config.domain, "recommend");
   assert.ok(config.selectorProbes.some((probe) => probe.id === "candidate_cards" && probe.required));
+  assert.ok(config.viewportProbes.some((probe) => probe.id === "recommend_viewport_collapse" && probe.required));
   assert.ok(config.accessibilityProbes.length > 0);
   assert.ok(config.networkProbes.length > 0);
 }
@@ -171,6 +375,8 @@ await testSelectorProbeFailureAffectsSummary();
 await testMissingRootBlocksRequiredProbe();
 await testAccessibilityAndNetworkProbes();
 await testRepairAction();
+await testViewportCollapseDiagnosticsCopyLegacyThresholds();
+await testViewportCollapseProbeRepairs();
 testTargetClassificationAndConfig();
 
 console.log("core self-heal tests passed");

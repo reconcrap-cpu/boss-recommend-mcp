@@ -25,7 +25,8 @@ export async function getRecommendRoots(client, {
     ].filter(Boolean),
     rootNodes: {
       top: topRoot.nodeId,
-      frame: iframe?.documentNodeId || 0
+      frame: iframe?.documentNodeId || 0,
+      frameOwner: iframe?.nodeId || 0
     }
   };
 }
@@ -49,7 +50,8 @@ export async function waitForRecommendRoots(client, {
         roots: [],
         rootNodes: {
           top: 0,
-          frame: 0
+          frame: 0,
+          frameOwner: 0
         }
       };
     }

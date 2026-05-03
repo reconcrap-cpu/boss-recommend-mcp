@@ -22,6 +22,7 @@ import {
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed
 } from "../../core/infinite-list/index.js";
+import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import { createRunLifecycleManager } from "../../core/run/index.js";
 import {
   callScreeningLlm,
@@ -250,9 +251,13 @@ async function setupChatRunContext(client, {
   normalizedStartFrom,
   readyTimeoutMs,
   listSettleMs,
-  runControl
+  runControl,
+  ensureViewport = null
 } = {}) {
-  const rootState = await getChatRoots(client);
+  let rootState = await getChatRoots(client);
+  if (ensureViewport) {
+    rootState = await ensureViewport(rootState, "context_roots");
+  }
   runControl.checkpoint({
     top_document_node_id: rootState.rootNodes.top
   });
@@ -280,6 +285,10 @@ async function setupChatRunContext(client, {
   if (normalizeText(job) && !jobSelection.selected) {
     throw new Error(`Chat job selection failed: ${jobSelection.reason || "unknown"}`);
   }
+  rootState = await getChatRoots(client);
+  if (ensureViewport) {
+    rootState = await ensureViewport(rootState, "context_job");
+  }
   runControl.checkpoint({
     chat_context_step: "job_selection",
     primary_label: primaryLabel,
@@ -293,6 +302,10 @@ async function setupChatRunContext(client, {
   });
   if (!startFilter.ok) {
     throw new Error(`Chat start filter selection failed: ${startFilter.error || "unknown"}`);
+  }
+  rootState = await getChatRoots(client);
+  if (ensureViewport) {
+    rootState = await ensureViewport(rootState, "context_start_filter");
   }
   runControl.checkpoint({
     chat_context_step: "start_filter",
@@ -362,6 +375,18 @@ export async function runChatWorkflow({
     domain: "chat",
     listName: "chat-candidates"
   });
+  const viewportGuard = createViewportRunGuard({
+    client,
+    domain: "chat",
+    root: "top",
+    frameOwnerRoot: "top",
+    runControl,
+    getRoots: getChatRoots
+  });
+  async function ensureChatViewport(rootState, phase) {
+    const result = await viewportGuard.ensure(rootState, { phase });
+    return result.rootState || rootState;
+  }
   const results = [];
   let cardNodeIds = [];
   let listEndReason = "";
@@ -398,7 +423,8 @@ export async function runChatWorkflow({
     normalizedStartFrom,
     readyTimeoutMs,
     listSettleMs,
-    runControl
+    runControl,
+    ensureViewport: ensureChatViewport
   });
   let rootState = setup.rootState;
   contextSetup = {
@@ -431,7 +457,8 @@ export async function runChatWorkflow({
       normalizedStartFrom,
       readyTimeoutMs,
       listSettleMs,
-      runControl
+      runControl,
+      ensureViewport: ensureChatViewport
     });
     rootState = recoveredSetup.rootState;
     contextSetup = {
@@ -449,7 +476,7 @@ export async function runChatWorkflow({
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
   runControl.setPhase("chat:cards");
-  const cardRootState = await getChatRoots(client);
+  const cardRootState = await ensureChatViewport(await getChatRoots(client), "cards");
   const initialCards = await waitForChatCandidateNodeIds(client, cardRootState.rootNodes.top, {
     timeoutMs: cardTimeoutMs,
     intervalMs: 500
@@ -479,7 +506,9 @@ export async function runChatWorkflow({
       request_skipped: 0,
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
-      list_end_reason: listEndReason
+      list_end_reason: listEndReason,
+      viewport_checks: viewportGuard.getStats().checks,
+      viewport_recoveries: viewportGuard.getStats().recoveries
     });
     runControl.setPhase("chat:done");
     return {
@@ -493,6 +522,10 @@ export async function runChatWorkflow({
         requested_start_from: normalizedStartFrom
       },
       candidate_list: compactInfiniteListState(listState),
+      viewport_health: {
+        stats: viewportGuard.getStats(),
+        events: viewportGuard.getEvents()
+      },
       list_end_reason: listEndReason,
       target_pass_count: passTarget,
       process_until_list_end: Boolean(processUntilListEnd),
@@ -524,7 +557,9 @@ export async function runChatWorkflow({
     request_satisfied: 0,
     request_skipped: 0,
     unique_seen: compactInfiniteListState(listState).seen_count,
-    scroll_count: 0
+    scroll_count: 0,
+    viewport_checks: viewportGuard.getStats().checks,
+    viewport_recoveries: viewportGuard.getStats().recoveries
   });
 
   while (
@@ -537,6 +572,7 @@ export async function runChatWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("chat:candidate");
+    rootState = await ensureChatViewport(rootState, "candidate_loop");
     const loopTopLevelState = await getChatTopLevelState(client);
     if (!loopTopLevelState.is_chat_shell) {
       await recoverAndReapplyChatContext("candidate_loop_non_chat_shell", {
@@ -554,7 +590,8 @@ export async function runChatWorkflow({
       settleMs: listSettleMs,
       fallbackPoint: listFallbackPoint,
       findNodeIds: async () => {
-        const currentRootState = await getChatRoots(client);
+        const currentRootState = await ensureChatViewport(await getChatRoots(client), "candidate_find_nodes");
+        rootState = currentRootState;
         const currentCards = await waitForChatCandidateNodeIds(client, currentRootState.rootNodes.top, {
           timeoutMs: Math.min(cardTimeoutMs, 8000),
           intervalMs: 500
@@ -609,6 +646,7 @@ export async function runChatWorkflow({
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
         runControl.setPhase("chat:detail");
+        rootState = await ensureChatViewport(rootState, "detail");
 
         detailStep = "select_candidate";
         networkRecorder.clear();
@@ -921,6 +959,8 @@ export async function runChatWorkflow({
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
       list_end_reason: listEndReason || null,
+      viewport_checks: viewportGuard.getStats().checks,
+      viewport_recoveries: viewportGuard.getStats().recoveries,
       last_candidate_id: screeningCandidate.id || null,
       last_candidate_key: candidateKey,
       last_score: screening.score
@@ -950,6 +990,10 @@ export async function runChatWorkflow({
     card_count: cardNodeIds.length,
     context_setup: contextSetup,
     candidate_list: compactInfiniteListState(listState),
+    viewport_health: {
+      stats: viewportGuard.getStats(),
+      events: viewportGuard.getEvents()
+    },
     list_end_reason: listEndReason || null,
     target_pass_count: passTarget,
     process_until_list_end: Boolean(processUntilListEnd),

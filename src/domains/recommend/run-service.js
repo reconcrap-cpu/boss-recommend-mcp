@@ -20,6 +20,7 @@ import {
   markInfiniteListCandidateProcessed,
   resetInfiniteListForRefreshRound
 } from "../../core/infinite-list/index.js";
+import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import { screenCandidate } from "../../core/screening/index.js";
 import {
   closeRecommendDetail,
@@ -372,6 +373,18 @@ export async function runRecommendWorkflow({
     domain: "recommend",
     listName: "recommend-candidates"
   });
+  const viewportGuard = createViewportRunGuard({
+    client,
+    domain: "recommend",
+    root: "frame",
+    frameOwnerRoot: "frameOwner",
+    runControl,
+    getRoots: getRecommendRoots
+  });
+  async function ensureRecommendViewport(rootState, phase) {
+    const result = await viewportGuard.ensure(rootState, { phase });
+    return result.rootState || rootState;
+  }
   const results = [];
   const refreshAttempts = [];
   let refreshRounds = 0;
@@ -389,6 +402,7 @@ export async function runRecommendWorkflow({
   runControl.throwIfCanceled();
   runControl.setPhase("recommend:roots");
   let rootState = await getRecommendRoots(client);
+  rootState = await ensureRecommendViewport(rootState, "roots");
   runControl.checkpoint({
     iframe_selector: rootState.iframe.selector,
     iframe_document_node_id: rootState.iframe.documentNodeId
@@ -406,6 +420,7 @@ export async function runRecommendWorkflow({
       throw new Error(`Requested recommend job was not selected: ${jobSelection.reason}`);
     }
     rootState = await getRecommendRoots(client);
+    rootState = await ensureRecommendViewport(rootState, "job");
     runControl.checkpoint({
       job_selection: compactJobSelection(jobSelection)
     });
@@ -424,6 +439,7 @@ export async function runRecommendWorkflow({
     throw new Error(`Recommend page scope was not selected: ${pageScopeSelection.reason || pageScopeSelection.effective_scope || requestedPageScope}`);
   }
   rootState = await getRecommendRoots(client);
+  rootState = await ensureRecommendViewport(rootState, "page_scope");
   runControl.checkpoint({
     page_scope: compactPageScopeSelection(pageScopeSelection)
   });
@@ -440,6 +456,8 @@ export async function runRecommendWorkflow({
     if (!filterResult.confirmed) {
       throw new Error("Recommend run filter selection was not confirmed");
     }
+    rootState = await getRecommendRoots(client);
+    rootState = await ensureRecommendViewport(rootState, "filter");
     runControl.checkpoint({
       filter: compactFilterResult(filterResult)
     });
@@ -448,6 +466,7 @@ export async function runRecommendWorkflow({
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
   runControl.setPhase("recommend:cards");
+  rootState = await ensureRecommendViewport(rootState, "cards");
   cardNodeIds = await waitForRecommendCardNodeIds(client, rootState.iframe.documentNodeId, {
     timeoutMs: cardTimeoutMs,
     intervalMs: 300
@@ -468,13 +487,16 @@ export async function runRecommendWorkflow({
     unique_seen: compactInfiniteListState(listState).seen_count,
     scroll_count: 0,
     refresh_rounds: 0,
-    refresh_attempts: 0
+    refresh_attempts: 0,
+    viewport_checks: viewportGuard.getStats().checks,
+    viewport_recoveries: viewportGuard.getStats().recoveries
   });
 
   while (results.length < limit) {
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recommend:candidate");
+    rootState = await ensureRecommendViewport(rootState, "candidate_loop");
 
     const nextCandidateResult = await getNextInfiniteListCandidate({
       client,
@@ -485,7 +507,9 @@ export async function runRecommendWorkflow({
       settleMs: listSettleMs,
       fallbackPoint: listFallbackPoint,
       findNodeIds: async () => {
-        const currentRootState = await getRecommendRoots(client);
+        let currentRootState = await getRecommendRoots(client);
+        currentRootState = await ensureRecommendViewport(currentRootState, "candidate_find_nodes");
+        rootState = currentRootState;
         const currentCardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
           timeoutMs: Math.min(cardTimeoutMs, 5000),
           intervalMs: 300
@@ -544,10 +568,13 @@ export async function runRecommendWorkflow({
           refresh_attempts: refreshAttempts.length,
           refresh_method: refreshResult.method || null,
           refresh_forced_recent_not_view: true,
-          list_end_reason: listEndReason
+          list_end_reason: listEndReason,
+          viewport_checks: viewportGuard.getStats().checks,
+          viewport_recoveries: viewportGuard.getStats().recoveries
         });
         if (refreshResult.ok) {
           rootState = refreshResult.root_state || await getRecommendRoots(client);
+          rootState = await ensureRecommendViewport(rootState, "refresh_after");
           cardNodeIds = await waitForRecommendCardNodeIds(client, rootState.iframe.documentNodeId, {
             timeoutMs: cardTimeoutMs,
             intervalMs: 300
@@ -579,6 +606,7 @@ export async function runRecommendWorkflow({
       await runControl.waitIfPaused();
       runControl.throwIfCanceled();
       runControl.setPhase("recommend:detail");
+      rootState = await ensureRecommendViewport(rootState, "detail");
       networkRecorder.clear();
       const openedDetail = await openRecommendCardDetail(client, cardNodeId);
       const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
@@ -719,6 +747,8 @@ export async function runRecommendWorkflow({
       refresh_rounds: refreshRounds,
       refresh_attempts: refreshAttempts.length,
       list_end_reason: listEndReason || null,
+      viewport_checks: viewportGuard.getStats().checks,
+      viewport_recoveries: viewportGuard.getStats().recoveries,
       last_candidate_id: screeningCandidate.id || null,
       last_candidate_key: candidateKey,
       last_score: screening.score
@@ -756,6 +786,10 @@ export async function runRecommendWorkflow({
     filter: compactFilterResult(filterResult),
     card_count: cardNodeIds.length,
     candidate_list: compactInfiniteListState(listState),
+    viewport_health: {
+      stats: viewportGuard.getStats(),
+      events: viewportGuard.getEvents()
+    },
     list_end_reason: listEndReason || null,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,

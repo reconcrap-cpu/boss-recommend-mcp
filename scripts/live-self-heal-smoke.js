@@ -154,6 +154,9 @@ function compactCheck(check) {
       required: probe.required,
       count: probe.count,
       root: probe.root || null,
+      collapsed: probe.collapsed,
+      recovered: probe.recovered,
+      viewport_health: probe.viewport_health || undefined,
       matched_selectors: probe.matched_selectors || undefined,
       selector_counts: probe.selector_counts || undefined,
       total_ax_nodes: probe.total_ax_nodes || undefined,
@@ -184,6 +187,7 @@ async function runSelfHealWithRetry({
       roots: rootsState.roots,
       selectorProbes: config.selectorProbes,
       accessibilityProbes: config.accessibilityProbes,
+      viewportProbes: config.viewportProbes,
       networkProbes: includeNetwork ? config.networkProbes : [],
       networkEvents
     });

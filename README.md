@@ -221,10 +221,10 @@ config/screening-config.example.json
 
 - `openaiOrganization`
 - `openaiProject`
-- `debugPort`
-- `outputDir`
+- `debugPort`：未显式传 `port` 时，recommend / search / chat CDP-only MCP run 和健康检查默认连接这个 Chrome 调试端口。
+- `outputDir`：recommend / search / chat 完成后的最终 CSV 与 report JSON 会写入这里；run state / checkpoint 仍保留在各自状态目录，方便 pause/resume/cancel。
 - `llmThinkingLevel`：默认 `low`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。
-- `humanRestEnabled`：默认 `false`。`false` 时 recommend-screen 随机休息/批次休息与 boss-chat 批次休息均为 `0ms`；`true` 时恢复随机休息节奏。
+- `humanRestEnabled`：默认 `false`。当前 CDP-only recommend / search / chat run 尚未实现随机休息层，因此会读取并保留该字段但不改变节奏；如后续重新加入 human rest，应以此字段为默认值。
 
 ## 常用命令
 

@@ -184,7 +184,10 @@ function compactHealth(check) {
       type: probe.type,
       status: probe.status,
       count: probe.count,
-      required: probe.required
+      required: probe.required,
+      collapsed: probe.collapsed,
+      recovered: probe.recovered,
+      viewport_health: probe.viewport_health || undefined
     }))
   };
 }
@@ -202,7 +205,8 @@ async function waitForHealthyRecommend(client, selfHealConfig, {
       domain: "recommend",
       roots: selfHealRoots.roots,
       selectorProbes: selfHealConfig.selectorProbes,
-      accessibilityProbes: selfHealConfig.accessibilityProbes
+      accessibilityProbes: selfHealConfig.accessibilityProbes,
+      viewportProbes: selfHealConfig.viewportProbes
     });
     if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
     await sleep(intervalMs);

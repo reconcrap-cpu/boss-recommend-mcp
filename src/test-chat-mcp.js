@@ -64,31 +64,34 @@ function readyArgs(extra = {}) {
   };
 }
 
-function installFakeConnector() {
+function installFakeConnector({ onConnect = null } = {}) {
   let closeCount = 0;
-  setChatMcpConnectorForTests(async () => ({
-    client: { guarded: true },
-    target: {
-      id: "fake-chat-target",
-      url: "https://www.zhipin.com/web/chat/index",
-      type: "page"
-    },
-    methodLog: [
-      { method: "DOM.getDocument", at: new Date().toISOString() },
-      { method: "DOM.querySelectorAll", at: new Date().toISOString() },
-      { method: "Input.dispatchMouseEvent", at: new Date().toISOString() }
-    ],
-    navigation: {
-      navigated: false,
-      url: "https://www.zhipin.com/web/chat/index"
-    },
-    health: {
-      status: "healthy"
-    },
-    async close() {
-      closeCount += 1;
-    }
-  }));
+  setChatMcpConnectorForTests(async (options = {}) => {
+    if (typeof onConnect === "function") onConnect(options);
+    return {
+      client: { guarded: true },
+      target: {
+        id: "fake-chat-target",
+        url: "https://www.zhipin.com/web/chat/index",
+        type: "page"
+      },
+      methodLog: [
+        { method: "DOM.getDocument", at: new Date().toISOString() },
+        { method: "DOM.querySelectorAll", at: new Date().toISOString() },
+        { method: "Input.dispatchMouseEvent", at: new Date().toISOString() }
+      ],
+      navigation: {
+        navigated: false,
+        url: "https://www.zhipin.com/web/chat/index"
+      },
+      health: {
+        status: "healthy"
+      },
+      async close() {
+        closeCount += 1;
+      }
+    };
+  });
   return {
     get closeCount() {
       return closeCount;
@@ -158,7 +161,12 @@ async function testChatPrepareReadsJobOptions() {
 }
 
 async function testChatHealthCheckUsesCdpRoute() {
-  const connector = installFakeConnector();
+  let connectOptions = null;
+  const connector = installFakeConnector({
+    onConnect(options) {
+      connectOptions = options;
+    }
+  });
   const payload = await callTool(TOOL_HEALTH, {}, 23);
   assert.equal(payload.status, "OK");
   assert.equal(payload.mode, "cdp-only");
@@ -167,6 +175,10 @@ async function testChatHealthCheckUsesCdpRoute() {
   assert.equal(payload.runtime_evaluate_used, false);
   assert.equal(payload.method_summary["DOM.getDocument"], 1);
   assert.equal(payload.cli_path, null);
+  assert.equal(connectOptions.port, 9555);
+  assert.equal(payload.chrome.port, 9555);
+  assert.equal(payload.debug_port, 9555);
+  assert.equal(payload.output_dir, process.env.TEST_BOSS_OUTPUT_DIR);
   assert.equal(connector.closeCount, 1);
 }
 
@@ -308,6 +320,11 @@ async function testChatRequestCvLoadsLlmConfig() {
     assert.equal(options.targetPassCount, 2);
     assert.equal(options.detailLimit, 100000);
     assert.equal(options.llmConfig.apiKey, "sk-test-key");
+    assert.equal(options.llmConfig.baseUrl, "https://api.example.com/v1");
+    assert.equal(options.llmConfig.model, "gpt-4.1-mini");
+    assert.equal(options.llmConfig.llmThinkingLevel, "low");
+    assert.equal(options.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
+    assert.equal(options.llmConfig.humanRestEnabled, false);
     runControl.setPhase("chat:test");
     runControl.updateProgress({
       processed: 1,
@@ -359,6 +376,8 @@ async function testChatRequestCvLoadsLlmConfig() {
   const completed = await waitForChatRun(started.run_id, (run) => run?.status === "completed");
   assert.equal(completed.result.passed_count, 1);
   assert.equal(completed.result.results[0].post_action.requested, true);
+  assert.equal(path.dirname(completed.result.output_csv), process.env.TEST_BOSS_OUTPUT_DIR);
+  assert.equal(path.dirname(completed.result.report_json), process.env.TEST_BOSS_OUTPUT_DIR);
   assert.equal(fs.existsSync(completed.result.output_csv), true);
   const csv = fs.readFileSync(completed.result.output_csv, "utf8");
   assert.equal(csv.includes("internal reasoning"), true);
@@ -368,14 +387,20 @@ async function testChatRequestCvLoadsLlmConfig() {
 async function main() {
   const previousHome = process.env.BOSS_CHAT_HOME;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+  const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-mcp-test-"));
+  const outputDir = path.join(tempHome, "configured-output");
   process.env.BOSS_CHAT_HOME = tempHome;
+  process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
   const configPath = path.join(tempHome, "screening-config.json");
   fs.writeFileSync(configPath, JSON.stringify({
     baseUrl: "https://api.example.com/v1",
     apiKey: "sk-test-key",
     model: "gpt-4.1-mini",
-    debugPort: 9222
+    debugPort: 9555,
+    outputDir,
+    llmThinkingLevel: "low",
+    humanRestEnabled: false
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
@@ -405,6 +430,11 @@ async function main() {
       delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
     } else {
       process.env.BOSS_RECOMMEND_SCREEN_CONFIG = previousScreenConfig;
+    }
+    if (previousOutputDir === undefined) {
+      delete process.env.TEST_BOSS_OUTPUT_DIR;
+    } else {
+      process.env.TEST_BOSS_OUTPUT_DIR = previousOutputDir;
     }
     fs.rmSync(tempHome, { recursive: true, force: true });
   }

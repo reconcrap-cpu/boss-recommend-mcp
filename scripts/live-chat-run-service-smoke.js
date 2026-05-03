@@ -166,7 +166,8 @@ async function waitForHealthyChat(client, config, {
       domain: "chat",
       roots: roots.roots,
       selectorProbes: config.selectorProbes,
-      accessibilityProbes: config.accessibilityProbes
+      accessibilityProbes: config.accessibilityProbes,
+      viewportProbes: config.viewportProbes
     });
     if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
     await sleep(intervalMs);
@@ -184,7 +185,10 @@ function compactHealth(check) {
       type: probe.type,
       status: probe.status,
       count: probe.count,
-      required: probe.required
+      required: probe.required,
+      collapsed: probe.collapsed,
+      recovered: probe.recovered,
+      viewport_health: probe.viewport_health || undefined
     }))
   };
 }

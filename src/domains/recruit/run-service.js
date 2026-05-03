@@ -18,6 +18,7 @@ import {
   markInfiniteListCandidateProcessed,
   resetInfiniteListForRefreshRound
 } from "../../core/infinite-list/index.js";
+import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import { screenCandidate } from "../../core/screening/index.js";
 import {
   closeRecruitDetail,
@@ -140,6 +141,18 @@ export async function runRecruitWorkflow({
     domain: "recruit",
     listName: "search-results"
   });
+  const viewportGuard = createViewportRunGuard({
+    client,
+    domain: "recruit",
+    root: "frame",
+    frameOwnerRoot: "frameOwner",
+    runControl,
+    getRoots: getRecruitRoots
+  });
+  async function ensureRecruitViewport(rootState, phase) {
+    const result = await viewportGuard.ensure(rootState, { phase });
+    return result.rootState || rootState;
+  }
   const results = [];
   const refreshAttempts = [];
   let refreshRounds = 0;
@@ -153,6 +166,7 @@ export async function runRecruitWorkflow({
   runControl.throwIfCanceled();
   runControl.setPhase("recruit:roots");
   let rootState = await getRecruitRoots(client);
+  rootState = await ensureRecruitViewport(rootState, "roots");
   runControl.checkpoint({
     iframe_selector: rootState.iframe.selector,
     iframe_document_node_id: rootState.iframe.documentNodeId,
@@ -186,11 +200,13 @@ export async function runRecruitWorkflow({
       }
     });
     rootState = await getRecruitRoots(client);
+    rootState = await ensureRecruitViewport(rootState, "search");
   }
 
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
   runControl.setPhase("recruit:cards");
+  rootState = await ensureRecruitViewport(rootState, "cards");
   cardNodeIds = await waitForRecruitCardNodeIds(client, rootState.iframe.documentNodeId, {
     timeoutMs: cardTimeoutMs,
     intervalMs: 300
@@ -209,13 +225,16 @@ export async function runRecruitWorkflow({
     unique_seen: compactInfiniteListState(listState).seen_count,
     scroll_count: 0,
     refresh_rounds: 0,
-    refresh_attempts: 0
+    refresh_attempts: 0,
+    viewport_checks: viewportGuard.getStats().checks,
+    viewport_recoveries: viewportGuard.getStats().recoveries
   });
 
   while (results.length < limit) {
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recruit:candidate");
+    rootState = await ensureRecruitViewport(rootState, "candidate_loop");
 
     const nextCandidateResult = await getNextInfiniteListCandidate({
       client,
@@ -226,7 +245,9 @@ export async function runRecruitWorkflow({
       settleMs: listSettleMs,
       fallbackPoint: listFallbackPoint,
       findNodeIds: async () => {
-        const currentRootState = await getRecruitRoots(client);
+        let currentRootState = await getRecruitRoots(client);
+        currentRootState = await ensureRecruitViewport(currentRootState, "candidate_find_nodes");
+        rootState = currentRootState;
         const currentCardNodeIds = await waitForRecruitCardNodeIds(client, currentRootState.iframe.documentNodeId, {
           timeoutMs: Math.min(cardTimeoutMs, 5000),
           intervalMs: 300
@@ -283,10 +304,13 @@ export async function runRecruitWorkflow({
           refresh_attempts: refreshAttempts.length,
           refresh_method: refreshResult.method || null,
           refresh_forced_recent_viewed: true,
-          list_end_reason: listEndReason
+          list_end_reason: listEndReason,
+          viewport_checks: viewportGuard.getStats().checks,
+          viewport_recoveries: viewportGuard.getStats().recoveries
         });
         if (refreshResult.ok) {
           rootState = await getRecruitRoots(client);
+          rootState = await ensureRecruitViewport(rootState, "refresh_after");
           cardNodeIds = await waitForRecruitCardNodeIds(client, rootState.iframe.documentNodeId, {
             timeoutMs: cardTimeoutMs,
             intervalMs: 300
@@ -318,6 +342,7 @@ export async function runRecruitWorkflow({
       await runControl.waitIfPaused();
       runControl.throwIfCanceled();
       runControl.setPhase("recruit:detail");
+      rootState = await ensureRecruitViewport(rootState, "detail");
       networkRecorder.clear();
       const openedDetail = await openRecruitCardDetail(client, cardNodeId);
       const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
@@ -430,6 +455,8 @@ export async function runRecruitWorkflow({
       refresh_rounds: refreshRounds,
       refresh_attempts: refreshAttempts.length,
       list_end_reason: listEndReason || null,
+      viewport_checks: viewportGuard.getStats().checks,
+      viewport_recoveries: viewportGuard.getStats().recoveries,
       last_candidate_id: screeningCandidate.id || null,
       last_candidate_key: candidateKey,
       last_score: screening.score
@@ -459,6 +486,10 @@ export async function runRecruitWorkflow({
     search_params: normalizedSearchParams,
     card_count: cardNodeIds.length,
     candidate_list: compactInfiniteListState(listState),
+    viewport_health: {
+      stats: viewportGuard.getStats(),
+      events: viewportGuard.getEvents()
+    },
     list_end_reason: listEndReason || null,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,

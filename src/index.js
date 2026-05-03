@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import {
   getFeaturedCalibrationResolution,
   getBossChatTargetCountValue,
-  normalizeTargetCountInput
+  normalizeTargetCountInput,
+  resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import {
   __resetChatMcpStateForTests,
@@ -1890,7 +1891,8 @@ async function handleRunRecommendSelfHealTool({ workspaceRoot, args }) {
   }
 
   const host = "127.0.0.1";
-  const port = parsePositiveInteger(args.port, 9222);
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const port = parsePositiveInteger(args.port, configResolution.ok ? configResolution.config.debugPort : 9222);
   let session = null;
   try {
     session = await connectToChromeTarget({
@@ -1909,7 +1911,8 @@ async function handleRunRecommendSelfHealTool({ workspaceRoot, args }) {
       domain: "recommend",
       roots: rootState?.roots || {},
       selectorProbes: config.selectorProbes,
-      accessibilityProbes: config.accessibilityProbes
+      accessibilityProbes: config.accessibilityProbes,
+      viewportProbes: config.viewportProbes
     });
     assertNoForbiddenCdpCalls(methodLog);
 

@@ -199,7 +199,8 @@ async function waitForHealthyChat(client, config, {
       domain: "chat",
       roots: roots.roots,
       selectorProbes: config.selectorProbes,
-      accessibilityProbes: config.accessibilityProbes
+      accessibilityProbes: config.accessibilityProbes,
+      viewportProbes: config.viewportProbes
     });
     if (lastCheck.status === HEALTH_STATUS.HEALTHY) {
       return {
@@ -232,6 +233,9 @@ function compactCheck(check) {
       required: probe.required,
       count: probe.count,
       root: probe.root || null,
+      collapsed: probe.collapsed,
+      recovered: probe.recovered,
+      viewport_health: probe.viewport_health || undefined,
       matched_selectors: probe.matched_selectors || undefined,
       total_ax_nodes: probe.total_ax_nodes || undefined,
       error: probe.error || undefined

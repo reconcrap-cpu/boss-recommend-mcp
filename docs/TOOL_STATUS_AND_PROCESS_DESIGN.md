@@ -335,7 +335,10 @@ Source: [editable Mermaid source](visuals/process/source/14-self-heal-flow.mmd)
 
 Expected behavior:
 
-- Self-heal is an explicit maintenance tool, not automatically injected into normal runs.
+- Selector/accessibility/network self-heal remains an explicit maintenance tool.
+- Viewport-collapse self-heal is automatic during recommend, search/recruit, and chat runs: it checks at run setup, card discovery, candidate-loop node refresh, post-refresh, and detail-opening checkpoints.
+- If the viewport is collapsed, the tool toggles Chrome window state with CDP `Browser.setWindowBounds`, brings the page forward, rereads CDP DOM geometry, and continues only after the viewport is healthy.
+- If the viewport cannot be restored, the active run fails with `LIST_VIEWPORT_COLLAPSED` and records `viewport_health` diagnostics in the checkpoint.
 - Unavailable pages are environment blockers, not passes.
 - Probe failures should describe missing selectors/root causes clearly.
 
