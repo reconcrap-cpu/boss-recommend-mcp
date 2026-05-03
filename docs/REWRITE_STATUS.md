@@ -1,0 +1,1574 @@
+# Rewrite Status
+
+Last updated: 2026-05-03 15:40 Asia/Shanghai
+
+## Current phase
+
+Phase 0, Phase 1, and Phase 2 foundation slices are complete. Phase 1.5 shared infinite-list traversal is live-verified across recommend, recruit/search, and chat: the cursor tracks seen/queued/processed candidate keys, prefers stable candidate ids such as recruit/search `data-expect`, falls back to id/text fingerprints when needed, scrolls with CDP `DOM`/`Input` only, and supports an explicit diagnostic fallback wheel point for live-test investigation only; packaged run services and MCP entrypoints now default to no fixed fallback coordinates. Phase 3 shared screening is complete: live recommend, recruit, and chat candidates have now passed shared screening gates, including a configured real LLM call and chat full-CV image-sequence LLM screening. Shared adaptive CV acquisition is live-verified across chat, recommend, and recruit/search: production cascade starts with Network, requires a parsed Boss profile, then falls back to the full-CV scroll image sequence; per-run state preserves the legacy image-mode short grace wait. Phase 4 shared self-heal is complete with recommend live health plus refresh repair, recruit search readiness, and chat live health plus refresh repair all verified without `Runtime.*`. Phase 5 recommend domain rewrite has reusable CDP-only vertical slices live-verified: self-heal, filter selection, multi-degree selection, card extraction, infinite-list traversal, detail extraction, Network profile parsing, forced DOM fallback, full-CV scroll forced image fallback, adaptive Network-primary cascade, screening, recommend action preparation, recommend run service lifecycle, and recommend MCP lifecycle routing. Phase 6 recruit domain rewrite now has a broader CDP-only vertical slice live-verified: external recruit instruction parsing semantics imported, keyword/city/degree/school/recent-viewed search application through CDP-only `DOM`/`Input`, city edge handling for explicit `全国` and illegal-city fallback to `全国`, search-frame card discovery, infinite-list traversal, first-card detail open, Network profile extraction from `zpData.geekDetail`, strict forced DOM fallback, full-CV scroll forced image fallback, adaptive Network-primary cascade, shared screening, recruit self-heal readiness, run-service pause/resume/cancel, recruit MCP lifecycle wrappers, recruit MCP sync-result compatibility, persisted run snapshots, checkpoint JSON, result CSV, report JSON, and disk-only status fallback. Recruit is not complete yet because legacy quarantine remains open. Phase 7 chat domain now has reusable CDP-only roots/card/resume modules, chat infinite-list traversal, chat self-heal live-verified, full-CV scroll image fallback live-verified, multimodal LLM screening from image pages live-verified, chat summary Network parsing live-verified from stable `historyMsg` / `chat/geek/info` payloads, adaptive Network-primary cascade live-verified, and direct chat run-service lifecycle live-verified through shared `core/run` plus `core/infinite-list`. Phase 8 now has recommend, recruit/search, and chat MCP lifecycle wrappers routed through CDP-only shared run services and live-verified for `start -> pause -> resume -> cancel` where applicable; `prepare_boss_chat_run` and `boss_chat_health_check` now use CDP-only chat routes and no longer call the legacy chat wrapper. Phase 9 now has twenty-one live/package-entrypoint verified quarantine slices and `gate:phase9-static` passes. Phase 10 prep now has a mandatory full-run completion gate: the project cannot be marked fully complete until recommend, search/recruit, and chat each have at least one completed live run with `processed >= 20`, `screened >= 20`, final status `completed`, and no `Runtime.*`. Canceled, paused, failed, partial, mock-only, and one-candidate smoke runs are explicitly insufficient. `docs/PHASE10_LIVE_VALIDATION.md` defines the commands and `npm run gate:phase10-complete` enforces the artifact checks.
+
+Current correction: Phase 9 legacy quarantine is no longer open for active runtime/package paths; `gate:phase9-static` passes. The Phase 10 mandatory 20+ full-run gate is no longer pending; it passed in this session and is recorded below. The remaining `core/self-heal` chat repair blocker is now closed by the 2026-05-03 live refresh-repair gate. The remaining recommend MCP API caveat is also resolved: recommend favorite/greet post-actions now route through the shared CDP-only action gate, while recommend `follow_up.chat` is explicitly legacy-only by product decision and no longer blocks the CDP-only rewrite.
+
+Latest recommend MCP safe-action gates: PASS on 2026-05-03 10:22-15:38 Asia/Shanghai. Dry-run command `npm run live:recommend-mcp -- --slow-live --target-count 1 --detail-limit 0 --delay-ms 500 --complete-without-cancel --post-action greet --max-greet-count 1 --dry-run-post-action --no-filter --timeout-ms 600000 --save-report .live-artifacts\recommend-mcp-safe-action-dry-run-live-20260503-1015.json` completed with `processed=1`, `screened=1`, `passed=1`, `detail_opened=1`, discovered live `打招呼` selector `button.btn-v2.btn-sure-v2.btn-greet`, recorded `would_click=true`, clicked nothing, and used no `Runtime.*`. User-approved mutating greet command `npm run live:recommend-mcp -- --slow-live --target-count 2 --detail-limit 0 --delay-ms 500 --complete-without-cancel --post-action greet --max-greet-count 1 --execute-post-action --no-filter --timeout-ms 600000 --save-report .live-artifacts\recommend-mcp-safe-action-greet-verified-live-20260503-1032.json` completed with `status=PASS`, final `completed`, `processed=2`, `screened=2`, `passed=2`, `detail_opened=2`, `greet_count=1`, and `post_action_clicked=1`. The first candidate was already `继续沟通`; the second candidate clicked live `打招呼`, then the post-click CDP read saw `control_after.label=继续沟通` and `verified_after_click=true`. User-approved mutating favorite command `npm run live:recommend-mcp -- --slow-live --target-count 1 --detail-limit 0 --delay-ms 500 --complete-without-cancel --post-action favorite --execute-post-action --no-filter --timeout-ms 600000 --save-report .live-artifacts\recommend-mcp-safe-action-favorite-live-20260503-1538.json` completed with `status=PASS`, final `completed`, `processed=1`, `screened=1`, `passed=1`, `detail_opened=1`, and `post_action_clicked=1`; it clicked live selector `.like-icon-and-text` with label `收藏`, then post-click CDP discovery saw `control_after.label=已收藏`, `control_after.active=true`, and `verified_after_click=true`. Method summaries used `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; no `Runtime.*`.
+
+Latest note: Phase 10 mandatory 20+ candidate live completion gate passed on 2026-05-02 11:59 Asia/Shanghai. Recommend, search/recruit, and chat each completed one non-mutating live run with `processed=20`, `screened=20`, `unique_seen=20`, final status `completed`, and no `Runtime.*`; `npm run gate:phase10-complete` returned `status=pass`. During the search/recruit run, `applyRecruitSearchParams` was hardened to wait for live search controls after slow VPN navigation before applying city/keyword filters.
+
+Latest recommend Phase 10 targeted criteria gate: PASS on 2026-05-02 21:27 Asia/Shanghai. Artifact `.live-artifacts\phase10-recommend-criteria-aggregate-pass.json` aggregates the approved mutating Boss recommend test for job `算法工程师 23-27届实习/校招/早期职业 _ 杭州`, filters `school=985/211/国内外名校`, `degree=本科/硕士/博士`, `gender=男`, `recentNotView=近14天没有`, strict LLM criteria, and `post_action=greet` capped at 5. The gate selected the job CDP-only, confirmed all filters CDP-only, opened detail pages CDP-only, used Network-primary CV extraction for a clean 5-candidate LLM pass, clicked exactly 5 live greet buttons across the approved mutating execution, verified each clicked button changed to `继续沟通`, and separately passed forced JPEG full-CV image fallback with 5 image inputs. All artifacts blocked `Runtime.evaluate` and method summaries contain no `Runtime.*`.
+
+Latest CSV/reporting correction: dev-ready on 2026-05-02 21:45 Asia/Shanghai. Added shared legacy-compatible CSV reporting in `src/core/reporting/legacy-csv.js` and wired recommend, search/recruit, chat, and `scripts/live-recommend-phase10-full.js` artifact writers through it. New CSV output uses the legacy two-section shape: `运行输入字段/运行输入值` input rows first, then the legacy result header from the attached CSV. Candidate screening no longer asks the LLM for `reason` or `evidence`; `buildScreeningLlmMessages()` now requests only `{"passed": true/false}`. CSV `评估通过详细原因` is intentionally blank. CSV `判断依据(CoT)` records only reasoning text actually returned by the provider (`reasoning_content`/`cot`) or raw model output, without prompting the model to generate an explanation. Regression checks passed: `npm run test:core-screening`, `npm run test:core-reporting`, `npm run test:recommend-mcp`, `npm run test:recruit-mcp`, `npm run test:chat-mcp`, and `npm run test:runtime-scan`. Existing live artifact `.live-artifacts\phase10-recommend-full-live-criteria-screening-pass.json` was re-exported to `.live-artifacts\phase10-recommend-criteria-results-legacy-format.csv` to verify the legacy CSV shape without taking additional live candidate actions; because that source artifact predates CoT capture, its CoT cells are blank.
+
+Latest search Phase 10 targeted criteria gate: PASS on 2026-05-03 09:54 Asia/Shanghai. Command `node scripts/live-search-phase10-full.js --slow-live --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --city 杭州 --degrees 硕士 --schools 985,211,QS100 --keyword 算法 --filter-recent-viewed true --target-count 3 --max-screened 60 --criteria "必须有ccf-a论文或会议成果，本科学历必须至少211及以上或者海外qs200院校" --post-action greet --max-greet-count 3 --execute-post-action --save-report .live-artifacts\phase10-search-criteria-greet-live-rerun-20260503-095247.json` completed with `status=PASS`, `processed=7`, `llm_screened=7`, `llm_passed=3`, `post_action_clicked=3`, `new_greet_count=3`, Network CV hits `7`, and no `Runtime.*`. The run selected the explicit job by matching user label `算法工程师 23-27届实习/校招/早期职业 _ 杭州` to live option `算法工程师 23-27届实习/校招/早期职业 杭州 本科 在校/应届 25-50K·14薪`, applied city/degree/school/keyword/recent-viewed filters, clicked only detail-page `立即沟通(n/d)` buttons, and verified the greet quota was not exhausted. Follow-up fixes from the failed reruns are now in place: search job matching treats `_` as a user-label separator, detail action discovery uses fresh popup node IDs instead of stale DOM roots, the search live script no longer has a default fixed list fallback point, and recruit/search candidate identity now prefers stable `data-expect` ids so visible text changes do not double-screen the same candidate.
+
+Latest greet safeguard: the shared `core/greet-quota` guard now parses Boss button text like `立即沟通(30/135)` and blocks any greet click when the numerator is larger than the denominator, for example `30/20`. The guard is called by both recommend and recruit/search action click wrappers, and the Phase 10 recommend/search scripts stop the run with `reason=greet_credits_exhausted` instead of continuing toward the target count. Non-mutating live probe on the current Boss search detail read `立即沟通(30/135)`, parsed `exhausted=false`, and used only `DOM.*`, `Page.bringToFront`, `Network.enable`, and `Accessibility.enable`; no `Runtime.*`.
+
+Latest coordinate/visual-control audit: dev-ready on 2026-05-03 08:20 Asia/Shanghai. Product UI clicks are DOM-box based through `clickNodeCenter()`/`DOM.getBoxModel` or measured candidate/action centers. Fixed product scroll defaults `{x:320,y:620}` and `{x:700,y:620}` were removed from chat, recommend, and recruit/search run services, and packaged MCP wrappers now pass `listFallbackPoint: null`. `docs/CDP_ONLY_CONTRACT.md` now forbids hard-coded product viewport coordinates and clarifies that visual empty-list inspection is test-only evidence, not product control flow. Regression checks passed: `npm run test:chat-run-service`, `npm run test:recommend-run-service`, `npm run test:recruit-mcp`, `npm run test:chat-mcp`, `npm run test:chat-domain`, `npm run test:recommend-mcp`, `npm run test:core-infinite-list`, and `npm run test:runtime-scan`. This correction is not a live completion gate by itself; the next live run should confirm no fixed-coordinate fallback is needed under slow VPN conditions.
+
+Latest chat Phase 10 rerun: FAILED / STOPPED on 2026-05-03 08:26 Asia/Shanghai. User stopped run `mcp_chat_mop07qt0_pgmd8t5r` because the browser visibly reopened 李鹏涛's CV more than twice while the artifact counters advanced to other candidate ids. The run had `processed=15`, `screened=15`, `detail_opened=15`, `passed=1`, `requested=0`, `list_fallback_point=null`, and was left in `chat:detail`; the process was force-stopped and the resume modal was closed CDP-only (`dialog-wrap.active=0`, `resume-container=0`, `iframe[src*="c-resume"]=0`). This live gate is invalid/failed, not partial pass. Root cause now under fix: the chat row click path did not force the next card fully into view and did not verify the active chat card id before opening the online resume, so an old visible online-resume button could belong to the previous candidate; request-CV also performed an early `has_ask_resume` check before sending the greeting, while legacy sends the greeting first because the message can activate the request-CV button. Dev fixes now added: scroll selected chat card with `DOM.scrollIntoViewIfNeeded`, verify active `data-id` before using the online-resume button, remove the early ask-resume precheck, send greeting before request-CV attempts, broaden requested/confirm text recognition, and fail loudly when a passed candidate is not skipped and the CV request cannot be verified. Regression checks passed: `npm run test:chat-domain`, `npm run test:chat-run-service`, `npm run test:chat-mcp`, and `npm run test:runtime-scan`. A fresh live rerun is required before chat Phase 10 can be counted.
+
+## Workstream status
+
+| Workstream | Status | Notes |
+| --- | --- | --- |
+| Documentation and handoff | complete | Session restart docs, plan, status, live matrix, CDP contract, and inventory are in place |
+| Forbidden-runtime scanner | complete | Scanner is quarantine-aware. `npm run scan:runtime:strict` now passes with `0` reachable active findings while preserving `457` raw legacy findings as `legacy-quarantined`; `npm run scan:runtime:package:strict` passes on the publish surface with `0` raw non-allowed findings; `scan:legacy-boundary` hard-fails active code/package scripts/live scripts that point back to package-local legacy quarantine or moved modules; `scan:package-boundary` hard-fails real npm dry-run package contents if archived legacy/development-only files are included; `gate:phase9-static` aggregates all four hard static gates; `--fail-on-legacy` remains available to fail on any raw non-allowed finding |
+| Live CDP harness | complete | `npm run live:cdp-smoke` passed against Chrome 9222 with `Runtime.evaluate` blocked |
+| `core/browser` | complete | CDP-only helpers passed unit guard test and live filter-panel gate |
+| `core/infinite-list` | live-verified | Shared cursor implemented in `src/core/infinite-list/index.js`; recommend, recruit/search, and chat live gates passed on 2026-05-01 with no duplicate processed keys and no `Runtime.*`. Recommend scrolled once and stopped on stable signature after 30 unique candidates; recruit/search processed 18 unique id+text keys; chat processed 45 unique candidates using a diagnostic fallback wheel point after stale-anchor remounts. Product run-service and MCP defaults were later hardened to `null` so normal runs rely on DOM-anchored scroll points rather than fixed viewport coordinates |
+| `core/run` | complete | Shared lifecycle passed unit test and live recommend-connected pause/resume/cancel gate |
+| `core/screening` | complete | Shared normalizer, Boss detail Network parser, deterministic screening, text LLM screening, and image-sequence LLM screening are implemented. Recommend card/detail/LLM passed live; recruit Network profile screening passed live; chat full-CV image LLM screening and chat summary Network screening passed live |
+| `core/self-heal` | complete | Shared DOM/AX/Network probe runner and recommend/recruit/chat configs are implemented. Recommend passed live health and refresh repair; recruit search readiness passed live when cards were present; chat passed live health and refresh repair on 2026-05-03 with 40 conversation cards before and after `Page.reload`, 1,296 post-refresh AX nodes, 157 Boss network matches, and no `Runtime.*` |
+| Recommend domain rewrite | live-verified | Reusable CDP-only slices passed live: filters, cards, detail, screening, action preparation, domain run service pause/resume/cancel, MCP lifecycle routing, targeted job selection, user-approved greet execution, user-approved favorite execution, and forced JPEG image fallback. The run service now consumes `core/infinite-list` and records `unique_seen`, `scroll_count`, `list_end_reason`, and `last_candidate_key`. The Phase 10 targeted criteria gate clicked exactly 5 live greet controls and verified `继续沟通` after each click without `Runtime.*`; recommend MCP now passes favorite/greet post-actions into the shared action gate, and the user-approved MCP safe-action gates clicked live `打招呼` then verified `继续沟通`, and clicked live `收藏` then verified `已收藏` |
+| Shared capture fallback | live-verified | `core/capture` is implemented with CDP-only HTML, screenshot, and scroll-screenshot sequence helpers; recommend full-CV image fallback passed live with 6 captures and 4 unique screenshots; recruit/search full-CV image fallback passed live with 7 captures and 5 unique screenshots; chat full-CV image fallback passed live with 8 captures and 6 unique screenshots. Basic single-clip screenshots are debugging evidence only and no longer count as full-CV fallback validation |
+| Shared adaptive CV acquisition | live-verified | `core/cv-acquisition` centralizes Network-primary waits, parsed-profile source decisions, per-run source mode, image-mode grace timing, and evidence summaries. Chat, recommend, and recruit/search cascade gates passed live on 2026-05-01 17:33-17:34 Asia/Shanghai using Network source; forced recruit/search image regression passed at 17:36 with 6 scroll pages and 4 unique screenshots; no `Runtime.*` |
+| Recruit domain rewrite | dev-ready | CDP-only live slice passed for parser semantics, keyword/city/degree/school/recent-viewed search application, city edge handling for `全国` and invalid city defaulting, search-frame card discovery, Network detail extraction, strict DOM fallback, shared screening, self-heal readiness, lifecycle pause/resume/cancel, full-CV scroll image fallback, MCP lifecycle wrappers, terminal status parity, sync-result compatibility, persisted run snapshots, result CSV/report JSON/checkpoint artifacts, and disk-only status fallback. The run service now consumes `core/infinite-list` and records unique candidate keys across the live search frame. Search detail opening now retries a CDP-only left/title double-click when Boss ignores a center click. Remaining work: legacy quarantine |
+| Search targeted criteria + greet | complete | PASS on 2026-05-03 09:54 Asia/Shanghai after the hardened detail-page greet selector, explicit job selection, fresh detail-root reacquisition, and stable `data-expect` candidate keys. Live run `.live-artifacts\phase10-search-criteria-greet-live-rerun-20260503-095247.json` applied `job=算法工程师 23-27届实习/校招/早期职业 _ 杭州`, `city=杭州`, `degree=硕士`, `schools=985/211/QS100`, `keyword=算法`, and `filter_recent_viewed=true`; screened 7 unique candidates, parsed 7 Network CVs, found 3 LLM passes, clicked 3 real detail-page `立即沟通(n/d)` buttons, wrote `.csv`, and used no `Runtime.*`. The earlier 2026-05-02 anchor-click artifact remains invalidated and is kept only as failure evidence |
+| Chat domain rewrite | live-verified | CDP-only roots, card reader, online-resume open/close, Network recorder, scroll image fallback, image-sequence LLM screening, chat summary Network parsing, self-heal config, shared infinite-list traversal, direct run-service lifecycle, and chat MCP lifecycle wrappers are implemented and live-verified. Legacy quarantine remains later |
+| MCP integration | live-verified | Recommend, recruit/search, and chat MCP lifecycle wrappers are implemented and live-verified through `handleRequest`; recruit sync success, persisted artifact writing, and disk fallback status are live-verified. `prepare_boss_chat_run` now reads chat job options CDP-only and `boss_chat_health_check` now runs shared chat self-heal probes CDP-only. Latest slow live health gate saw 40 chat cards and 1,368 AX nodes. Recommend MCP safe-action routing is live-verified in dry-run and mutating modes with `post_action=greet` and in mutating mode with `post_action=favorite`; the greet gate clicked live `打招呼` and post-click CDP verification saw `继续沟通`, while the favorite gate clicked live `收藏` and post-click CDP verification saw `已收藏`. The recommend `follow_up.chat` chain is intentionally legacy-only and fenced from the CDP-only route; it is not a remaining rewrite blocker |
+| Legacy removal | live-verified | Phase 9 has twenty-one live/package-entrypoint verified slices. Package-local legacy modules, legacy tests, and vendor automation have been physically moved to `legacy/research/` with active npm script references removed. Policy is settled: keep `legacy/research/` in-repo as a research-only archive. `scan:legacy-boundary` enforces that active code and package scripts cannot point back to package-local legacy quarantine or moved modules; `scan:package-boundary` enforces that clean npm packages exclude archive/development files; `gate:phase9-static` now runs the full static gate set. Strict scanner mode passes for active package-entrypoint paths, package-surface strict mode passes with no raw non-allowed findings, and clean npm installs exclude the research quarantine. Phase 9 remains clean after the Phase 10 live runs |
+| Phase 10 full-run completion | complete | `npm run gate:phase10-complete` passed on 2026-05-02 11:59 Asia/Shanghai using three completed live artifacts: recommend `.live-artifacts\phase10-recommend-full-run-20-live.json`, search/recruit `.live-artifacts\phase10-search-full-run-20-live.json`, and chat `.live-artifacts\phase10-chat-full-run-20-live.json`; each recorded `processed=20`, `screened=20`, `unique_seen=20`, final status `completed`, and no `Runtime.*`. Additional targeted gates now passed: recommend aggregate `.live-artifacts\phase10-recommend-criteria-aggregate-pass.json` clicked 5 approved live greets, search artifact `.live-artifacts\phase10-search-criteria-greet-live-rerun-20260503-095247.json` clicked 3 approved live greets, and chat artifact `.live-artifacts\phase10-chat-unread-target5-live-20260503-091912.json` verified request-CV on passed candidates; all used no `Runtime.*` |
+
+## Files changed this session
+
+- `docs/CDP_ONLY_CONTRACT.md`
+- `docs/SESSION_START.md`
+- `docs/REWRITE_PLAN.md`
+- `docs/LIVE_TEST_MATRIX.md`
+- `docs/LEGACY_RUNTIME_INVENTORY.md`
+- `docs/REWRITE_STATUS.md`
+- `docs/CAPTURE_FALLBACK_AUDIT.md`
+- `docs/LEGACY_ARCHIVE_POLICY.md`
+- `docs/PHASE10_LIVE_VALIDATION.md`
+- `scripts/scan-forbidden-runtime.js`
+- `scripts/scan-legacy-boundary.js`
+- `scripts/scan-package-boundary.js`
+- `scripts/phase9-static-gate.js`
+- `scripts/phase10-completion-gate.js`
+- `scripts/live-cdp-smoke.js`
+- `scripts/live-run-lifecycle-smoke.js`
+- `src/core/browser/index.js`
+- `src/core/capture/index.js`
+- `src/core/cv-acquisition/index.js`
+- `src/core/infinite-list/index.js`
+- `src/core/reporting/legacy-csv.js`
+- `src/core/run/index.js`
+- `src/core/screening/index.js`
+- `src/core/self-heal/index.js`
+- `src/test-core-reporting.js`
+- `src/domains/recommend/constants.js`
+- `src/domains/recommend/roots.js`
+- `src/domains/recommend/filters.js`
+- `src/domains/recommend/cards.js`
+- `src/domains/recommend/detail.js`
+- `src/domains/recommend/actions.js`
+- `src/domains/recommend/jobs.js`
+- `src/domains/recommend/run-service.js`
+- `src/domains/recommend/index.js`
+- `src/recommend-mcp.js`
+- `src/domains/recruit/constants.js`
+- `src/domains/recruit/roots.js`
+- `src/domains/recruit/cards.js`
+- `src/domains/recruit/detail.js`
+- `src/domains/recruit/actions.js`
+- `src/domains/recruit/instruction-parser.js`
+- `src/domains/recruit/search.js`
+- `src/domains/recruit/run-service.js`
+- `src/domains/recruit/index.js`
+- `src/recruit-mcp.js`
+- `src/test-cdp-browser.js`
+- `src/test-core-capture.js`
+- `src/test-core-cv-acquisition.js`
+- `src/test-core-infinite-list.js`
+- `src/test-core-run.js`
+- `src/test-core-screening.js`
+- `src/test-core-self-heal.js`
+- `src/test-recommend-domain.js`
+- `src/test-recommend-actions.js`
+- `src/test-recommend-run-service.js`
+- `src/test-recommend-mcp.js`
+- `src/test-recruit-domain.js`
+- `src/test-recruit-mcp.js`
+- `scripts/live-screening-smoke.js`
+- `scripts/live-detail-smoke.js`
+- `scripts/live-infinite-list-smoke.js`
+- `scripts/live-scroll-end-screenshot.js`
+- `scripts/live-self-heal-smoke.js`
+- `scripts/live-recommend-domain-smoke.js`
+- `scripts/live-recommend-actions-smoke.js`
+- `scripts/live-recommend-phase10-full.js`
+- `scripts/live-recommend-run-service-smoke.js`
+- `scripts/live-recommend-mcp-smoke.js`
+- `scripts/live-recruit-domain-smoke.js`
+- `scripts/live-search-phase10-full.js`
+- `scripts/live-recruit-mcp-smoke.js`
+- `scripts/live-recruit-run-service-smoke.js`
+- `src/domains/chat/constants.js`
+- `src/domains/chat/roots.js`
+- `src/domains/chat/cards.js`
+- `src/domains/chat/detail.js`
+- `src/domains/chat/jobs.js`
+- `src/domains/chat/run-service.js`
+- `src/domains/chat/index.js`
+- `src/chat-runtime-config.js`
+- `src/chat-mcp.js`
+- `src/cli.js`
+- `src/test-chat-domain.js`
+- `src/test-chat-run-service.js`
+- `src/test-chat-mcp.js`
+- `src/test-runtime-scan.js`
+- `scripts/live-chat-domain-smoke.js`
+- `scripts/live-chat-run-service-smoke.js`
+- `scripts/live-chat-mcp-smoke.js`
+- `src/index.js`
+- `src/test-index-async.js`
+- `src/test-boss-chat.js`
+- `package.json`
+
+## Tests run
+
+- `npm run test:cdp-browser` - PASS
+- `npm run test:core-capture` - PASS
+- `npm run test:core-run` - PASS
+- `npm run test:core-screening` - PASS
+- `npm run test:core-self-heal` - PASS
+- `npm run test:recommend-actions` - PASS
+- `npm run test:recommend-domain` - PASS
+- `npm run live:detail -- --detail-source network --save-payload .live-artifacts\recommend-network-geekdetail-parser-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- `npm run live:detail -- --detail-source dom --save-payload .live-artifacts\recommend-forced-dom-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- `npm run live:detail -- --detail-source image --save-payload .live-artifacts\recommend-forced-image-fallback-live.json --save-image .live-artifacts\recommend-forced-image-fallback-live.png --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- Inline image sanity check for `.live-artifacts\recommend-forced-image-fallback-live.png` - PASS; 2552x1474 PNG and nonblank pixel variance
+- `npm run live:recommend-actions -- --save-report .live-artifacts\recommend-actions-discovery-live.json --post-action greet --greet-count 0 --max-greet-count 1` - PASS
+- `npm run test:recommend-run-service` - PASS
+- `npm run test:recommend-domain` - PASS after action discovery changes
+- `npm run test:recommend-run-service` - PASS after action discovery changes
+- `npm run test:recruit-domain` - PASS
+- `node --check src/test-recruit-domain.js` - PASS
+- `node --check scripts/live-recruit-domain-smoke.js` - PASS
+- `node --check scripts/live-recruit-run-service-smoke.js` - PASS
+- `node --check src/domains/recruit/search.js` - PASS
+- `node --check src/domains/recruit/run-service.js` - PASS
+- `npm run live:recruit-domain -- --search-only --degree 本科 --keyword 算法工程师 --save-payload .live-artifacts\recruit-search-degree-live.json` - PASS
+- `npm run live:recruit-domain -- --search-only --school 985院校 --keyword 算法工程师 --save-payload .live-artifacts\recruit-search-school-live.json` - PASS
+- `npm run live:recruit-domain -- --search-only --city 上海 --keyword 算法工程师 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-city-live.json` - PASS
+- `npm run live:recruit-domain -- --search-only --filter-recent-viewed true --keyword 算法工程师 --city 上海 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-recent-viewed-live.json` - PASS
+- `node --check src/domains/recruit/search.js` - PASS after national/invalid city edge handling
+- `node --check src/test-recruit-domain.js` - PASS after national-city helper assertions
+- `node --check scripts/live-recruit-domain-smoke.js` - PASS
+- `npm run test:recruit-domain` - PASS after national-city helper assertions
+- `npm run live:recruit-domain -- --search-only --city 全国 --keyword 算法工程师 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-city-national-live.json` - PASS
+- `npm run live:recruit-domain -- --search-only --city 不存在城市XYZ --keyword 算法工程师 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-city-invalid-default-live.json` - PASS
+- `npm run scan:runtime` - PASS in inventory mode; 459 total findings, 457 active legacy findings, 2 allowed guard findings
+- `node --check src/domains/recruit/detail.js` - PASS
+- `node --check src/domains/recruit/run-service.js` - PASS
+- `npm run live:recruit-domain -- --save-payload .live-artifacts\recruit-domain-first-card-detail.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- `npm run live:recruit-run-service -- --save-report .live-artifacts\recruit-run-service-lifecycle.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- `npm run live:recruit-domain -- --detail-source image --save-payload .live-artifacts\recruit-forced-image-fallback-live.json --save-image .live-artifacts\recruit-forced-image-fallback-live.png --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- Inline image sanity check for `.live-artifacts\recruit-forced-image-fallback-live.png` - PASS; 2896x1562 PNG and nonblank pixel variance
+- `npm run live:recruit-domain -- --detail-source dom --save-payload .live-artifacts\recruit-forced-dom-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS after CDP-only keyword search application seeded `算法工程师`
+- `npm run live:recruit-run-service -- --save-report .live-artifacts\recruit-run-service-lifecycle.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS after run service received parsed search params and reapplied keyword search CDP-only
+- `npm run test:cdp-browser` - PASS
+- `npm run scan:runtime` - PASS in inventory mode
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+  - By domain: recommend 287, chat 89, recruit 83
+- `npm run scan:runtime` - PASS in inventory mode after national/invalid city edge handling
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check src/recruit-mcp.js` - PASS
+- `node --check src/index.js` - PASS
+- `node --check src/test-recruit-mcp.js` - PASS
+- `node --check scripts/live-recruit-mcp-smoke.js` - PASS
+- `npm run test:recruit-mcp` - PASS
+- `npm run test:recruit-domain` - PASS after recruit MCP wrapper integration
+- `npm run test:recruit-run-service` - not run; package script does not exist
+- `npm run live:recruit-mcp -- --slow-live --no-reset-search --city 全国 --keyword 算法工程师 --max-candidates 4 --detail-limit 0 --delay-ms 1600 --save-report .live-artifacts\recruit-mcp-lifecycle-live.json` - PASS
+- `npm run scan:runtime` - PASS in inventory mode after recruit MCP wrapper integration
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check src/recruit-mcp.js` - PASS after recruit MCP status/result compatibility patch
+- `node --check src/test-recruit-mcp.js` - PASS after recruit MCP status/result compatibility patch
+- `node --check scripts/live-recruit-mcp-smoke.js` - PASS after sync-only live mode addition
+- `npm run test:recruit-mcp` - PASS after terminal pause/cancel/resume status parity and sync result shape assertions
+- `npm run test:recruit-domain` - PASS after recruit MCP compatibility patch
+- `npm run scan:runtime` - PASS in inventory mode after recruit MCP compatibility patch
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `npm run live:recruit-mcp -- --sync-only --slow-live --no-reset-search --city 全国 --keyword 算法工程师 --max-candidates 1 --sync-max-candidates 1 --detail-limit 0 --delay-ms 0 --timeout-ms 360000 --save-report .live-artifacts\recruit-mcp-sync-success-live.json` - PASS
+- `node --check src/recruit-mcp.js` - PASS after recruit MCP persisted snapshot/report-output compatibility patch
+- `node --check src/test-recruit-mcp.js` - PASS after disk fallback assertion
+- `node --check scripts/live-recruit-mcp-smoke.js` - PASS after disk fallback live mode
+- `npm run test:recruit-mcp` - PASS after persisted run/report artifacts and disk fallback
+- `npm run test:recruit-domain` - PASS after recruit MCP persistence compatibility patch
+- `npm run scan:runtime` - PASS in inventory mode after recruit MCP persistence compatibility patch
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `npm run live:recruit-mcp -- --sync-only --slow-live --no-reset-search --city 全国 --keyword 算法工程师 --max-candidates 1 --sync-max-candidates 1 --detail-limit 0 --delay-ms 0 --timeout-ms 360000 --save-report .live-artifacts\recruit-mcp-sync-artifacts-disk-live.json` - PASS
+- `node --check src/domains/chat/constants.js` - PASS
+- `node --check src/domains/chat/roots.js` - PASS
+- `node --check src/domains/chat/cards.js` - PASS
+- `node --check src/domains/chat/detail.js` - PASS
+- `node --check src/test-chat-domain.js` - PASS
+- `node --check scripts/live-chat-domain-smoke.js` - PASS
+- `npm run test:chat-domain` - PASS
+- `npm run test:core-self-heal` - PASS after adding chat self-heal config
+- `npm run test:core-capture` - PASS after adding CDP-only scroll screenshot sequence
+- `npm run live:chat-domain -- --slow-live --candidate-index 1 --save-payload .live-artifacts\chat-domain-candidate1-resume-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - FAIL as expected diagnostic: online resume opened and Network events were observed, but 0 parser-usable `geekDetailInfo`/`geekDetail` profiles were found; no `Runtime.*`
+- `npm run live:chat-domain -- --slow-live --detail-source image --candidate-index 1 --max-image-pages 8 --resume-dom-timeout-ms 15000 --save-image .live-artifacts\chat-full-cv-image-fallback.png --save-payload .live-artifacts\chat-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- Image sanity check for `.live-artifacts\chat-full-cv-image-fallback-page-*.png` - PASS; 8 images at 1546x1344, 6 unique hashes, nonblank pixel variance
+- `npm run scan:runtime` - PASS in inventory mode after chat domain/image fallback work
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check scripts\live-detail-smoke.js`; `node --check scripts\live-recruit-domain-smoke.js`; `node --check src\domains\recruit\detail.js` - PASS after recommend/search full-CV scroll image fallback work
+- `node --check src\core\capture\index.js`; `node --check src\test-core-capture.js` - PASS after switching `captureCandidateEvidence(...includeScreenshot)` to full-CV scroll sequence by default
+- `npm run test:core-capture` - PASS after recommend/search full-CV scroll image fallback work and shared capture default change
+- `npm run test:recommend-domain` - PASS after recommend/search full-CV scroll image fallback work
+- `npm run test:recruit-domain` - PASS after adding the search-detail left/title double-click retry
+- `npm run live:detail -- --detail-source image --max-image-pages 8 --save-image .live-artifacts\recommend-full-cv-image-fallback.png --save-payload .live-artifacts\recommend-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- Image sanity check for `.live-artifacts\recommend-full-cv-image-fallback-page-*.png` - PASS; 6 images at 2552x1474, 4 unique screenshots, nonblank pixel variance
+- `npm run live:recruit-domain -- --detail-source image --slow-live --no-reset-search --max-image-pages 8 --save-image .live-artifacts\recruit-full-cv-image-fallback.png --save-payload .live-artifacts\recruit-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - FAIL diagnostic before the opener retry; search page had 15 cards but the center click did not mount a detail popup
+- `npm run live:recruit-domain -- --detail-source image --slow-live --no-reset-search --no-navigate --max-image-pages 8 --save-image .live-artifacts\recruit-full-cv-image-fallback.png --save-payload .live-artifacts\recruit-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS after CDP-only left/title double-click retry
+- Image sanity check for `.live-artifacts\recruit-full-cv-image-fallback-page-*.png` - PASS; 7 images at 2896x1562, 5 unique screenshots, nonblank pixel variance
+- `npm run scan:runtime` - PASS in inventory mode after recommend/search full-CV scroll image fallback work
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check src\core\screening\index.js`; `node --check src\test-core-screening.js`; `node --check scripts\live-chat-domain-smoke.js`; `node --check scripts\live-chat-image-screening-smoke.js` - PASS after chat image LLM and summary Network parser work
+- `npm run test:core-screening` - PASS after adding multimodal LLM message construction and chat summary Network parser fixtures
+- `npm run test:chat-domain` - PASS after preserving chat selection-phase Network events for parsing
+- `npm run live:chat-image-screening -- --source-payload .live-artifacts\chat-full-cv-image-fallback-live.json --save-report .live-artifacts\chat-full-cv-image-llm-screening-live.json --config C:\Users\yaolin\.boss-recommend-mcp\screening-config.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历" --max-images 8 --timeout-ms 180000` - PASS
+- `npm run live:chat-domain -- --slow-live --detail-source image --candidate-index 1 --max-image-pages 8 --llm-image-limit 8 --resume-dom-timeout-ms 15000 --save-image .live-artifacts\chat-full-cv-image-llm-integrated.png --save-payload .live-artifacts\chat-full-cv-image-llm-integrated-live.json --call-llm --config C:\Users\yaolin\.boss-recommend-mcp\screening-config.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS
+- Image sanity check for `.live-artifacts\chat-full-cv-image-llm-integrated-page-*.png` - PASS; 7 images at 1546x1344, 5 unique screenshots, nonblank pixel variance
+- `npm run live:chat-domain -- --slow-live --detail-source network --candidate-index 1 --resume-dom-timeout-ms 15000 --save-payload .live-artifacts\chat-network-summary-parser-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for chat summary Network parser; parsed `historyMsg` and `chat/geek/info` profiles, no `Runtime.*`
+- `npm run scan:runtime` - PASS in inventory mode after chat image LLM and summary Network parser work
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- Final shared/domain regression sweep after docs update:
+  - `npm run test:core-screening` - PASS
+  - `npm run test:recommend-domain` - PASS
+  - `npm run test:recruit-domain` - PASS
+  - `npm run test:chat-domain` - PASS
+  - `npm run scan:runtime` - PASS in inventory mode; 459 total findings, 457 active legacy findings, 2 allowed guard findings
+- Adaptive CV acquisition update:
+  - `node --check src\core\cv-acquisition\index.js`; `node --check src\test-core-cv-acquisition.js`; `node --check src\domains\recommend\detail.js`; `node --check src\domains\recommend\run-service.js`; `node --check src\domains\recruit\run-service.js`; `node --check scripts\live-detail-smoke.js`; `node --check scripts\live-recruit-domain-smoke.js`; `node --check scripts\live-chat-domain-smoke.js` - PASS
+  - `npm run test:core-cv-acquisition` - PASS
+  - `npm run test:recommend-domain` - PASS
+  - `npm run test:recommend-run-service` - PASS
+  - `npm run test:recruit-domain` - PASS
+  - `npm run test:chat-domain` - PASS
+  - `npm run test:core-screening` - PASS
+  - `npm run scan:runtime` - PASS in inventory mode; 459 total findings, 457 active legacy findings, 2 allowed guard findings
+  - `npm run live:chat-domain -- --slow-live --detail-source cascade --candidate-index 1 --network-wait-ms 12000 --network-retry-wait-ms 5000 --max-image-pages 8 --llm-image-limit 8 --resume-dom-timeout-ms 15000 --save-image .live-artifacts\chat-adaptive-cv-cascade-live.png --save-payload .live-artifacts\chat-adaptive-cv-cascade-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS; 2 parsed Network profiles, selected `source=network`, no image fallback, no `Runtime.*`
+  - CDP navigation helper to recommend with `Page.navigate` - PASS; no `Runtime.*`
+  - `npm run live:detail -- --detail-source cascade --network-wait-ms 12000 --network-retry-wait-ms 5000 --max-image-pages 8 --save-image .live-artifacts\recommend-adaptive-cv-cascade-live.png --save-payload .live-artifacts\recommend-adaptive-cv-cascade-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS; 1 parsed `geekDetailInfo` profile, selected `source=network`, no image fallback, no `Runtime.*`
+  - `npm run live:recruit-domain -- --detail-source cascade --slow-live --no-reset-search --network-wait-ms 12000 --network-retry-wait-ms 5000 --max-image-pages 8 --save-image .live-artifacts\recruit-adaptive-cv-cascade-live.png --save-payload .live-artifacts\recruit-adaptive-cv-cascade-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS; 1 parsed `geekDetail` profile, selected `source=network`, no image fallback, no `Runtime.*`
+  - `npm run live:recruit-domain -- --detail-source image --slow-live --no-reset-search --no-navigate --max-image-pages 8 --save-image .live-artifacts\recruit-adaptive-cv-forced-image-live.png --save-payload .live-artifacts\recruit-adaptive-cv-forced-image-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS after bookkeeping fix; forced image path ignored Network bodies for candidate construction, recorded `mode=image`, captured 6 scroll pages and 4 unique screenshot hashes, no `Runtime.*`
+- Infinite-list run-service integration:
+  - `npm run live:recommend-run-service -- --no-filter --max-candidates 2 --detail-limit 0 --delay-ms 500 --pause-after-processed 1 --save-report .live-artifacts\recommend-run-service-infinite-list-live.json` - PASS on 2026-05-01 18:03 Asia/Shanghai; processed 2 live recommend candidates through `core/infinite-list`, paused stable at processed=1, resumed to processed=2, canceled, `unique_seen=2`, `last_candidate_key` recorded, no `Runtime.*`
+  - `npm run live:recruit-run-service -- --slow-live --no-reset-search --keyword 算法工程师 --city 全国 --max-candidates 2 --detail-limit 0 --delay-ms 500 --pause-after-processed 1 --save-report .live-artifacts\recruit-run-service-infinite-list-live.json` - FAIL diagnostic on 2026-05-01 18:03 Asia/Shanghai because the VPN-slow search page had not mounted the search controls before city selection; this is an environment/readiness wait issue, not a cursor duplicate/end issue
+  - `npm run live:recruit-run-service -- --slow-live --no-navigate --no-apply-search --no-reset-search --max-candidates 2 --detail-limit 0 --delay-ms 500 --pause-after-processed 1 --save-report .live-artifacts\recruit-run-service-infinite-list-live.json` - PASS on 2026-05-01 18:04 Asia/Shanghai after the search page was loaded; processed 2 live search candidates through `core/infinite-list`, paused stable at processed=1, resumed to processed=2, canceled, `unique_seen=2`, id+text candidate keys recorded, no `Runtime.*`
+- Final validation after infinite-list run-service documentation:
+  - `npm run test:core-infinite-list` - PASS
+  - `npm run test:recommend-run-service` - PASS
+  - `npm run test:recruit-domain` - PASS
+  - `npm run scan:runtime` - PASS in inventory mode; 459 total findings, 457 active legacy findings, 2 allowed guard findings
+- Scroll-end screenshot verification:
+  - `npm run live:scroll-end -- --domain chat --slow-live --max-scrolls 320 --stable-signature-limit 6 --wheel-delta-y 2400 --settle-ms 3500 --save-image .live-artifacts\chat-scroll-end.png --save-report .live-artifacts\chat-scroll-end.json` - PASS on 2026-05-01 18:31 Asia/Shanghai; 5,213 unique chat attribute keys seen in this run, 148 scrolls, six repeated stable visible signatures, screenshot shows `没有更多了`, no `Runtime.*`
+  - `npm run live:scroll-end -- --domain recruit --no-navigate --read-candidates --max-scrolls 40 --stable-signature-limit 3 --wheel-delta-y 2400 --settle-ms 1200 --save-image .live-artifacts\search-scroll-end.png --save-report .live-artifacts\search-scroll-end.json` - PASS on 2026-05-01 18:20 Asia/Shanghai; 450 search candidates loaded, 32 scrolls, screenshot shows `没有更多了`, no `Runtime.*`
+  - `npm run live:scroll-end -- --domain recommend --slow-live --read-candidates --max-scrolls 100 --stable-signature-limit 3 --wheel-delta-y 2400 --settle-ms 1200 --save-image .live-artifacts\recommend-scroll-end.png --save-report .live-artifacts\recommend-scroll-end.json` - PASS on 2026-05-01 18:21 Asia/Shanghai; 450 recommend candidates loaded, 32 scrolls, screenshot shows `当前列表没有更多牛人了`, no `Runtime.*`
+- Chat MCP lifecycle wrapper integration:
+  - `node --check src\chat-mcp.js`; `node --check src\index.js`; `node --check src\test-chat-mcp.js`; `node --check scripts\live-chat-mcp-smoke.js` - PASS
+  - `npm run test:chat-mcp` - PASS
+  - `npm run test:chat-run-service` - PASS
+  - `npm run test:core-run` - PASS
+  - `npm run test:chat-domain` - PASS
+  - `npm run test:boss-chat` - PASS after preserving legacy direct adapter tests while routing MCP lifecycle tools through `src/chat-mcp.js`
+  - `npm run scan:runtime` - PASS in inventory mode after chat MCP wrapper integration
+    - Total findings: 459
+    - Active findings: 457
+    - Allowed guard findings: 2
+  - `npm run live:chat-mcp -- --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --save-report .live-artifacts\chat-mcp-lifecycle-live.json` - PASS on 2026-05-01 20:34 Asia/Shanghai; run `mcp_chat_momwa3nw_isx4zoxi` started from MCP, processed 1 live chat card, paused with stable progress, resumed to 2 processed/screened cards, canceled with final status `canceled`, method log count 249, no `Runtime.*`
+- Recommend MCP lifecycle wrapper integration:
+  - `node --check src\recommend-mcp.js`; `node --check src\index.js`; `node --check src\test-recommend-mcp.js`; `node --check scripts\live-recommend-mcp-smoke.js` - PASS
+  - `npm run test:recommend-mcp` - PASS; includes confirmation gating before browser connect, artifact persistence, disk-only get fallback, and multi-select filter mapping for `本科`, `硕士`, `博士`
+  - `npm run test:async` - PASS through the new recommend MCP compatibility entrypoint
+  - `npm run test:recommend-run-service` - PASS
+  - `npm run test:recommend-domain` - PASS
+  - `npm run test:chat-mcp` - PASS
+  - `npm run test:recruit-mcp` - PASS
+  - `npm run test:core-run` - PASS
+  - `npm run test:core-screening` - PASS
+  - `npm run scan:runtime` - PASS in inventory mode after recommend MCP wrapper integration
+    - Time: 2026-05-01 20:46 Asia/Shanghai
+    - Total findings: 459
+    - Active findings: 457
+    - Allowed guard findings: 2
+  - `npm run live:recommend-mcp -- --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --no-filter --timeout-ms 480000 --save-report .live-artifacts\recommend-mcp-lifecycle-live.json` - PASS on 2026-05-01 20:47 Asia/Shanghai; run `mcp_recommend_momwr2yh_52fme2wo` started from MCP, processed 1 live recommend card, paused with stable progress, resumed to 2 processed/screened cards, canceled with final status `canceled`, method log count 218, no `Runtime.*`
+
+## Live test results
+
+- `npm run live:cdp-smoke` - PASS
+  - Time: 2026-04-30 15:38 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Accessibility`, `Input`; no `Runtime.*`
+  - Observed: iframe `iframe[name="recommendFrame"]`; filter trigger center approximately `{ x: 1351.77, y: 70 }`
+  - Before open: panel 0, options 0, cards 15
+  - After open: panel 1, check boxes 12, options 68, cards 15
+  - Cleanup: panel closed with `Escape` plus filter-trigger toggle; final panel count 0
+- `npm run live:run-lifecycle` - PASS
+  - Time: 2026-04-30 15:41 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`; no `Runtime.*`
+  - Observed: live recommend card count 15
+  - Pause gate: progress stayed stable at 2 iterations while paused
+  - Resume gate: progress advanced to 3 iterations after resume
+  - Cancel gate: final status `canceled`
+- `npm run live:screening` - PASS for recommend only
+  - Time: 2026-04-30 16:06 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`; no `Runtime.*`
+  - Observed: 15 recommend candidate cards
+  - Extracted first card with `DOM.getAttributes` and `DOM.getOuterHTML`
+  - Normalized candidate schema version 1 with redacted identity, live text length 243, degree `硕士`, age 21, and candidate id present
+  - Screening result schema version 1, status `review`, score 0, with reason `No explicit screening criteria supplied; candidate normalized for review.`
+  - Recruit/chat not tested because Chrome 9222 currently exposes only the recommend Boss page plus `chrome://newtab-footer`
+- `npm run live:detail -- --save-payload .live-artifacts\recommend-first-card-detail-payload.json` - PASS for recommend detail
+  - Time: 2026-04-30 16:14 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Opened first recommend card with `Input.dispatchMouseEvent`
+  - Detail popup found; resume iframe not found in this run
+  - Extracted visible detail DOM text length 2,683
+  - Captured 1 matching Network response body
+  - Combined screening payload text length 18,094
+  - Saved unredacted local artifact: `.live-artifacts/recommend-first-card-detail-payload.json`
+  - Closed detail popup successfully
+- `npm run live:detail -- --save-payload .live-artifacts\recommend-first-card-detail-clean-payload.json` - PASS for cleaned recommend detail payload
+  - Time: 2026-04-30 16:23 Asia/Shanghai
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Parsed Boss `zpData.geekDetailInfo` Network response into structured sections
+  - Cleaned LLM payload text length 4,665
+  - Verified cleaned payload does not contain raw `"zpData"`
+  - Extracted current position/company, school, major, degree, age, and gender
+  - Saved local artifact: `.live-artifacts/recommend-first-card-detail-clean-payload.json`
+- `npm run live:detail -- --save-payload .live-artifacts\recommend-first-card-detail-llm-payload.json --call-llm --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for configured LLM screening
+  - Time: 2026-04-30 16:26 Asia/Shanghai
+  - Config source: `C:\Users\yaolin\.boss-recommend-mcp\screening-config.json`
+  - Model: `doubao-seed-2.0-code`
+  - LLM result: `passed=true`, evidence count 6, finish reason `stop`
+  - Usage: 3,068 prompt tokens, 866 completion tokens, 3,934 total tokens
+  - Saved local artifact: `.live-artifacts/recommend-first-card-detail-llm-payload.json`
+  - Verified saved artifact does not contain API key, `Bearer`, or `Authorization`
+- `npm run live:self-heal -- --save-report .live-artifacts\recommend-self-heal-report.json` - PASS for recommend self-heal
+  - Time: 2026-04-30 16:38 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Accessibility`, `Network`; no `Runtime.*`
+  - Initial health: `healthy`; required probes passed for recommend iframe, filter trigger, candidate cards, and Accessibility tree
+  - Initial counts: recommend iframe max 2, filter trigger 1, candidate cards 15, tab items 2, Accessibility nodes 163
+  - Controlled repair: `Page.reload` completed through CDP
+  - Post-refresh health: `healthy`; candidate cards 15, Accessibility nodes 157, Boss network events after refresh 184, network probe matched 175 zhipin URLs
+  - Recruit/chat availability: blocked because Chrome 9222 currently has no `/web/chat/search` or chat target
+  - Saved local report: `.live-artifacts/recommend-self-heal-report.json`
+- `npm run live:recommend-domain -- --save-payload .live-artifacts\recommend-domain-first-card-detail.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for Phase 5 recommend-domain slice
+  - Time: 2026-04-30 16:47 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Shared self-heal precheck: `healthy`
+  - Filter behavior: opened panel, selected safe non-active option `recentNotView / 近14天没有`, confirmed, panel closed, filter left applied
+  - Counts: 15 cards before confirm, 15 cards after confirm
+  - Detail behavior: opened first filtered card, popup found, 2,933 chars visible popup text, 1 matching Network event, 1 response body, 1 parsed Network profile, detail closed
+  - Screening result: deterministic shared screening returned `pass`, score 10, matched preferred keyword `数据`
+  - Saved local artifact: `.live-artifacts/recommend-domain-first-card-detail.json`
+- `npm run live:recommend-domain -- --filter-group degree --filter-label 本科 --filter-label 硕士 --filter-label 博士 --save-payload .live-artifacts\recommend-degree-filter-first-card-detail.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for targeted degree filter selection
+  - Time: 2026-04-30 17:03 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Targeted filter behavior: opened panel, selected `degree / 本科` from preferred labels `本科, 硕士, 博士`, confirmed by panel closing, filter left applied
+  - Counts: 15 cards before selecting, 15 cards after confirm
+  - Detail behavior: opened first filtered card, popup found, 2,846 chars visible popup text, detail closed
+  - Screening result: deterministic shared screening returned `pass`, score 10, matched preferred keyword `数据`
+  - Saved local artifact: `.live-artifacts/recommend-degree-filter-first-card-detail.json`
+  - Note: one earlier targeted attempt clicked the page into `https://www.zhipin.com/web/chat/user-center`; the live script now recovers by CDP `Page.navigate` back to recommend and waits for shared self-heal readiness before continuing.
+
+- `npm run live:recommend-domain -- --filter-group degree --filter-label 本科 --filter-label 硕士 --filter-label 博士 --select-all-labels --skip-detail --leave-panel-open --save-payload .live-artifacts\recommend-degree-multi-filter.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for multi-degree filter selection
+  - Time: 2026-04-30 17:20 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Targeted filter behavior: selected all requested degree labels `本科`, `硕士`, and `博士`; confirmed by panel closing; reopened panel and left it open
+  - Final verification: CDP DOM inspection reported `本科`, `硕士`, and `博士` all `option active`
+  - Visual handoff: final screenshot saved at `.live-artifacts\recommend-degree-selected-final.png`
+  - Counts: 15 cards after filter confirmation
+  - Saved local artifact: `.live-artifacts\recommend-degree-multi-filter.json`
+  - Implementation note: added CDP `DOM.scrollIntoViewIfNeeded` before option clicks because the degree row can be mounted below the visible panel area and otherwise clicks may land on the candidate/detail surface.
+- `npm run live:recommend-actions -- --save-report .live-artifacts\recommend-actions-discovery-live.json --post-action greet --greet-count 0 --max-greet-count 1` - PASS for recommend action preparation
+  - Time: 2026-04-30 19:44 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Behavior: opened the first live recommend candidate detail, waited for Boss to replace the loading popup node, discovered detail-panel action controls, and closed the detail popup
+  - Action plan: requested `greet`, effective `greet`, `greet_count=0`, `max_greet_count=1`
+  - Discovery result: `scope=detail`, `elapsed_ms=923`, `detail_root_count=1`
+  - Favorite control: found `收藏`, inactive, enabled, selector `.like-icon-and-text`, center approximately `{ x: 1102.38, y: 113 }`
+  - Greet control: found `打招呼`, available, enabled, selector `button.btn-v2.btn-sure-v2.btn-greet`, center approximately `{ x: 1199.5, y: 168 }`
+  - Close result: detail popup closed through `.boss-popup__close`
+  - Saved local report: `.live-artifacts\recommend-actions-discovery-live.json`
+  - Implementation note: action discovery must reacquire the detail popup root while polling because Boss replaces the initial `正在加载中...` node with the loaded detail DOM.
+- `npm run live:recommend-run-service -- --save-report .live-artifacts\recommend-run-service-lifecycle.json` - PASS for recommend run service lifecycle
+  - Time: 2026-04-30 17:31 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Shared self-heal precheck: `healthy`
+  - Run service behavior: selected/confirmed active degree filters `本科`, `硕士`, and `博士`; opened one live detail; parsed one Network detail response; screened live candidates
+  - Lifecycle behavior: paused after 1 processed candidate; progress stayed stable while paused; resumed to 2 processed candidates; canceled cleanly with final status `canceled`
+  - Counts: 15 cards available; `detail_opened=1`; `screened=2` before cancel
+  - Saved local report: `.live-artifacts\recommend-run-service-lifecycle.json`
+  - Implementation note: the run service reacquires recommend iframe roots and card nodes per candidate because Boss remounts DOM nodes after detail open/close.
+- `npm run live:detail -- --save-payload .live-artifacts\one-candidate-network-cv-check.json` - PASS for one-candidate Network CV availability check
+  - Time: 2026-04-30 17:45 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Observed: one `/wapi/zpitem/web/boss/search/geek/info` response, HTTP 200, body length 10,805, top-level `code=0`, contains `zpData.geekDetail`
+  - Parser gap: current Network profile parser reported `BOSS_GEEK_DETAIL_INFO_NOT_FOUND` because this live page returned `zpData.geekDetail`, not the previously handled detail key
+  - Final candidate still had usable DOM/detail evidence with text length 4,327; no image fallback was needed for evidence availability, but parser support must be expanded
+- Inline CDP-only image fallback feasibility trial - PASS
+  - Time: 2026-04-30 17:47 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`; no `Runtime.*`
+  - Captured `.dialog-wrap.active` with `Page.captureScreenshot`, clip 1440x773
+  - Saved image evidence: `.live-artifacts\one-candidate-image-fallback.png` (690,494 bytes)
+  - Saved report: `.live-artifacts\one-candidate-image-fallback-report.json`
+- `npm run live:detail -- --save-payload .live-artifacts\this-page-network-cv-check.json` - PASS for current-page Network CV parser check
+  - Time: 2026-04-30 17:57 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Observed: one `/wapi/zpjob/view/geek/info` response, HTTP 200, body length 16,721, top-level `code=0`, contains `zpData.geekDetailInfo`
+  - Parser result: ok; final candidate text length 7,913 and identity fields populated for current position, current company, school, major, degree, age, and gender
+- Inline CDP-only search-page Network CV trial - PASS
+  - Time: 2026-04-30 18:04 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Search frame: `iframe[name="searchFrame"]`
+  - Observed candidates: 15 `li.geek-info-card a[data-jid]`
+  - Detail opened from first search result with `Input.dispatchMouseEvent`
+  - Network result: 2 matching bodies captured; usable `/wapi/zpitem/web/boss/search/geek/info` response, HTTP 200, body length 6,816, top-level `code=0`, contains `zpData.geekDetail`
+  - Evidence present: geek base info and education list; work/project lists were absent for this selected search candidate
+  - Saved report: `.live-artifacts\search-page-network-cv-check.json`
+- Inline CDP-only chat-page candidate Network trial - PASS
+  - Time: 2026-04-30 18:08 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Observed candidates: 40 `.geek-item[data-id]` chat conversation items
+  - Candidate selection: first `.geek-item[data-id]` clicked with `Input.dispatchMouseEvent`
+  - Network result: 19 matching events, 19 response bodies, 12 usable JSON/text bodies
+  - Useful endpoints: `/wapi/zpchat/boss/historyMsg`, `/wapi/zpjob/chat/geek/info`, and `/wapi/zpchat/session/bossEnter`
+  - Evidence present: chat history, candidate/geek info, resume-related status fields, and identity hints
+  - Resume UI discovery: online resume control `a.btn.resume-btn-online` was present after candidate selection, but was not clicked in this trial
+  - Saved report: `.live-artifacts\chat-page-network-candidate-check.json`
+- Inline CDP-only chat online-resume Network trial - PASS
+  - Time: 2026-04-30 19:16 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Observed candidates: 40 `.geek-item[data-id]` chat conversation items
+  - Candidate selection: live `.geek-item[data-id]` clicked with `Input.dispatchMouseEvent`
+  - Resume action: `a.btn.resume-btn-online` found and clicked with `Input.dispatchMouseEvent`
+  - Network result: 20 events after the resume click, 20 response bodies, 6 usable resume/profile bodies
+  - Key profile response: `/wapi/zpjob/view/geek/info/v2`, HTTP 200, body length 16,229, contains `zpData.geekDetailInfo`
+  - DOM after click: `.dialog-wrap.active=1`, `.resume-container=1`, `.boss-popup__content=1`, 4 iframes
+  - Saved report: `.live-artifacts\chat-online-resume-network-check.json`
+- `npm run live:detail -- --detail-source network --save-payload .live-artifacts\recommend-network-geekdetail-parser-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for forced recommend Network parser
+  - Time: 2026-04-30 19:22 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Forced source: `network`; detail DOM text was ignored for candidate construction
+  - Observed: 15 recommend cards, first detail opened and closed
+  - Network result: 1 detail event, 1 body, 1 parsed profile with `source_key=geekDetailInfo`
+  - Saved report: `.live-artifacts\recommend-network-geekdetail-parser-live.json`
+- `npm run live:detail -- --detail-source dom --save-payload .live-artifacts\recommend-forced-dom-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for forced recommend DOM fallback
+  - Time: 2026-04-30 19:23 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Forced source: `dom`; Network bodies were captured but ignored for candidate construction
+  - DOM evidence: 1,093 chars detail text, 18,445 chars outer HTML
+  - Screening used DOM detail text and returned `pass` with matched preferred keyword `数据`
+  - Saved report: `.live-artifacts\recommend-forced-dom-fallback-live.json`
+- `npm run live:detail -- --detail-source image --save-payload .live-artifacts\recommend-forced-image-fallback-live.json --save-image .live-artifacts\recommend-forced-image-fallback-live.png --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for forced recommend image fallback
+  - Time: 2026-04-30 19:23 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Forced source: `image`; Network and DOM detail text were ignored for candidate construction
+  - Image evidence: `.live-artifacts\recommend-forced-image-fallback-live.png`, 415,920 bytes, CDP clip 1276x737 at x=164/y=36
+  - Pixel sanity check: 2552x1474 PNG with nonblank channel stdevs
+  - Saved report: `.live-artifacts\recommend-forced-image-fallback-live.json`
+- `npm run live:detail -- --detail-source image --max-image-pages 8 --save-image .live-artifacts\recommend-full-cv-image-fallback.png --save-payload .live-artifacts\recommend-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for recommend full-CV scroll image fallback
+  - Time: 2026-05-01 16:52 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`; no `Runtime.*`
+  - Forced source: `image`; visible single-clip fallback is superseded by scroll sequence validation
+  - Image evidence: `image-scroll-sequence`, 6 screenshots, 4 unique screenshots, CDP clip 1276x737 at x=164/y=36
+  - Pixel sanity check: page images 2552x1474 with nonblank channel stdevs
+  - Saved console/result log: `.live-artifacts\recommend-full-cv-image-fallback-console.txt`; saved local artifact: `.live-artifacts\recommend-full-cv-image-fallback-live.json`
+- `npm run live:recruit-domain -- --save-payload .live-artifacts\recruit-domain-first-card-detail.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for Phase 6 recruit-domain Network extraction slice
+  - Time: 2026-04-30 20:54 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Shared self-heal precheck: `healthy`; search iframe count 2, candidate cards 15, Accessibility tree 163
+  - Detail behavior: opened first search candidate with `Input.dispatchMouseEvent`, waited for loaded Network detail event, parsed 1 Network profile, then closed detail through `.boss-popup__close`
+  - Network parser: source key `geekDetail` from `zpData.geekDetail`; work count 2, project count 3, education count 2, expectation count 3
+  - Candidate identity: position `大模型算法`, company `快手科技`, school `加州大学伯克利分校`, major `分析学(运筹与优化)`, degree `硕士`, age 22, gender `男`
+  - Screening result: deterministic shared screening returned `pass`, score 10, matched preferred keyword `数据`
+  - Saved local artifact: `.live-artifacts\recruit-domain-first-card-detail.json`
+- `npm run live:recruit-run-service -- --save-report .live-artifacts\recruit-run-service-lifecycle.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for recruit run service lifecycle
+  - Time: 2026-04-30 20:54 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Shared self-heal precheck: `healthy`
+  - Run service behavior: opened live recruit details, waited for loaded Network detail events, parsed Network profile data, and screened candidates
+  - Lifecycle behavior: paused after 1 processed candidate; processed/screened/detail-opened counts stayed stable while paused; resumed to 2 processed candidates; canceled cleanly with final status `canceled`
+  - Saved local artifact: `.live-artifacts\recruit-run-service-lifecycle.json`
+- `npm run live:recruit-domain -- --detail-source image --save-payload .live-artifacts\recruit-forced-image-fallback-live.json --save-image .live-artifacts\recruit-forced-image-fallback-live.png --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for recruit forced image fallback
+  - Time: 2026-04-30 20:55 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Forced source: `image`; Network profile was also available, but screenshot evidence was saved for fallback validation
+  - Image evidence: `.live-artifacts\recruit-forced-image-fallback-live.png`, 593,594 bytes, CDP clip 1448x781
+  - Pixel sanity check: 2896x1562 PNG with nonblank channel stdevs
+  - Saved local artifact: `.live-artifacts\recruit-forced-image-fallback-live.json`
+- `npm run live:recruit-domain -- --detail-source image --slow-live --no-reset-search --no-navigate --max-image-pages 8 --save-image .live-artifacts\recruit-full-cv-image-fallback.png --save-payload .live-artifacts\recruit-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for recruit/search full-CV scroll image fallback
+  - Time: 2026-05-01 16:59 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Detail behavior: first center-click attempt did not open detail in the prior diagnostic run; patched opener retried a CDP-only left/title double-click and mounted `.dialog-wrap.active`
+  - Forced source: `image`; visible single-clip fallback is superseded by scroll sequence validation
+  - Image evidence: `image-scroll-sequence`, 7 screenshots, 5 unique screenshots, CDP clip 1448x781
+  - Pixel sanity check: page images 2896x1562 with nonblank channel stdevs
+  - Saved console/result log: `.live-artifacts\recruit-full-cv-image-fallback-console.txt`; saved local artifact: `.live-artifacts\recruit-full-cv-image-fallback-live.json`
+- `npm run live:recruit-domain -- --detail-source dom --save-payload .live-artifacts\recruit-forced-dom-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for recruit forced DOM fallback under stricter content gate
+  - Time: 2026-04-30 22:56 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: parsed default instruction `搜索关键词算法工程师，目标筛选1位`; clicked `input.search-input`, cleared with key events, inserted `算法工程师` through `Input.insertText`, clicked `.icon-search`, and produced 15 candidate cards
+  - Detail behavior: opened first card, waited for loaded detail content, captured 5,367 chars popup text and 33,810 chars outer HTML, then closed detail
+  - DOM fallback evidence: `dom_evidence.text_length=6,257`, `outer_html_length=33,810`
+  - Network still observed 2 detail bodies and 1 parsed `zpData.geekDetail` profile, but forced DOM mode used DOM text for the candidate construction gate
+  - Screening result: deterministic shared screening returned `pass`, score 10, matched preferred keyword `数据`
+  - Saved local artifact: `.live-artifacts\recruit-forced-dom-fallback-live.json`
+- `npm run live:recruit-run-service -- --save-report .live-artifacts\recruit-run-service-lifecycle.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for recruit run service with parsed search params
+  - Time: 2026-04-30 22:57 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: seeded keyword `算法工程师` CDP-only before self-heal and run service; run service checkpoint also recorded keyword search steps and 15 post-search cards
+  - Lifecycle behavior: paused after 1 processed candidate; processed/screened/detail-opened counts stayed stable while paused; resumed to 2 processed candidates; canceled cleanly with final status `canceled`
+  - Saved local artifact: `.live-artifacts\recruit-run-service-lifecycle.json`
+- `npm run live:recruit-domain -- --search-only --degree 本科 --keyword 算法工程师 --save-payload .live-artifacts\recruit-search-degree-live.json` - PASS for recruit degree search parameter gate
+  - Time: 2026-04-30 23:16 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: reset through CDP page/frame navigation, selected `本科及以上`, inserted keyword `算法工程师`, clicked search
+  - Post-search counts: `candidate_card=15`, `no_data=0`; validation `ok=true`
+  - Saved local artifact: `.live-artifacts\recruit-search-degree-live.json`
+- `npm run live:recruit-domain -- --search-only --school 985院校 --keyword 算法工程师 --save-payload .live-artifacts\recruit-search-school-live.json` - PASS for recruit school-label search parameter gate
+  - Time: 2026-04-30 23:21 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: reset through CDP, clicked `985院校`, inserted keyword `算法工程师`, clicked search
+  - Post-search counts: `candidate_card=15`, `no_data=0`; validation `ok=true`
+  - Saved local artifact: `.live-artifacts\recruit-search-school-live.json`
+- `npm run live:recruit-domain -- --search-only --city 上海 --keyword 算法工程师 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-city-live.json` - PASS for recruit city search parameter gate
+  - Time: 2026-05-01 15:44 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Initial target: `https://www.zhipin.com/web/chat/index`; script navigated with CDP `Page.navigate` to `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - VPN note: live page loads through VPN were slow and full reloads sometimes left a temporary iframe skeleton; this gate used `--slow-live --no-reset-search` plus the new post-navigation readiness wait.
+  - Search application: clicked city input, inserted `上海`, polled DOM for the city result, clicked selected label `上海`, inserted keyword `算法工程师`, clicked search
+  - Post-search counts: `candidate_card=15`, `no_data=0`; validation `ok=true`
+  - Saved local artifact: `.live-artifacts\recruit-search-city-live.json`
+- `npm run live:recruit-domain -- --search-only --filter-recent-viewed true --keyword 算法工程师 --city 上海 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-recent-viewed-live.json` - PASS for recruit recent-viewed search parameter gate
+  - Time: 2026-05-01 15:44 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: selected city `上海`, inserted keyword `算法工程师`, clicked search, then clicked `过滤近14天查看`
+  - Post-search counts: `candidate_card=15`, `no_data=0`; validation `ok=true`
+  - Saved local artifact: `.live-artifacts\recruit-search-recent-viewed-live.json`
+- `npm run live:recruit-domain -- --search-only --city 全国 --keyword 算法工程师 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-city-national-live.json` - PASS for recruit national-city edge gate
+  - Time: 2026-05-01 15:52 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: clicked city input, cleared through key events, selected `全国` through CDP-only picker path `城市 -> 热门 -> 全国`, inserted keyword `算法工程师`, clicked search
+  - Post-search counts: `candidate_card=15`, `no_data=0`; validation `ok=true`
+  - Saved local artifact: `.live-artifacts\recruit-search-city-national-live.json`
+- `npm run live:recruit-domain -- --search-only --city 不存在城市XYZ --keyword 算法工程师 --slow-live --no-reset-search --save-payload .live-artifacts\recruit-search-city-invalid-default-live.json` - PASS for recruit illegal-city default-to-national edge gate
+  - Time: 2026-05-01 15:53 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Search application: inserted invalid city `不存在城市XYZ`, observed stable `暂无结果`, then defaulted by selecting `全国` through picker path `城市 -> 热门 -> 全国`
+  - City result fields: `requested_city_not_found=true`, `fallback_to_national=true`, `selection_mode=city_picker`, `selected_label=全国`
+  - Post-search counts: `candidate_card=15`, `no_data=0`; validation `ok=true`
+  - Saved local artifact: `.live-artifacts\recruit-search-city-invalid-default-live.json`
+- `npm run live:recruit-mcp -- --slow-live --no-reset-search --city 全国 --keyword 算法工程师 --max-candidates 4 --detail-limit 0 --delay-ms 1600 --save-report .live-artifacts\recruit-mcp-lifecycle-live.json` - PASS for recruit MCP lifecycle wrappers
+  - Time: 2026-05-01 16:07 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - MCP tools registered: `run_recruit_pipeline`, `start_recruit_pipeline_run`, `get_recruit_pipeline_run`, `cancel_recruit_pipeline_run`, `pause_recruit_pipeline_run`, and `resume_recruit_pipeline_run`
+  - Start behavior: `start_recruit_pipeline_run` returned `ACCEPTED` with run id `mcp_recruit_mommqcbs_25trrlnk`
+  - Search params: city `全国`, degree `不限`, schools `[]`, keyword `算法工程师`, recent-viewed filter `false`
+  - Search checkpoint: 15 candidate cards, 0 no-data nodes; `reset_before_search=false` and slow VPN timeouts were used
+  - Lifecycle behavior through MCP handlers: paused while active, observed stable progress while paused, resumed, then canceled; final status `canceled`
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recruit-mcp-lifecycle-live.json`
+- `npm run live:recruit-mcp -- --sync-only --slow-live --no-reset-search --city 全国 --keyword 算法工程师 --max-candidates 1 --sync-max-candidates 1 --detail-limit 0 --delay-ms 0 --timeout-ms 360000 --save-report .live-artifacts\recruit-mcp-sync-success-live.json` - PASS for recruit MCP sync success/result compatibility
+  - Time: 2026-05-01 16:18 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - MCP path: `run_recruit_pipeline` with `execution_mode=sync`
+  - Search params: city `全国`, degree `不限`, schools `[]`, keyword `算法工程师`, recent-viewed filter `false`
+  - Search checkpoint: 15 candidate cards, 0 no-data nodes; `reset_before_search=false` and slow VPN timeouts were used
+  - Sync result compatibility: status `COMPLETED`, `result.run_id=mcp_recruit_momn4awb_ad17ix5l`, `result.processed_count=1`, `result.target_count=1`, `target_count_semantics` preserved
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recruit-mcp-sync-success-live.json`
+- `npm run live:recruit-mcp -- --sync-only --slow-live --no-reset-search --city 全国 --keyword 算法工程师 --max-candidates 1 --sync-max-candidates 1 --detail-limit 0 --delay-ms 0 --timeout-ms 360000 --save-report .live-artifacts\recruit-mcp-sync-artifacts-disk-live.json` - PASS for recruit MCP persisted artifacts and disk status fallback
+  - Time: 2026-05-01 16:24 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - MCP path: `run_recruit_pipeline` with `execution_mode=sync`
+  - Run id: `mcp_recruit_momnd2rg_ap5a1pg9`
+  - Search checkpoint: 15 candidate cards, 0 no-data nodes; `reset_before_search=false` and slow VPN timeouts were used
+  - Processing result: 1 candidate processed, status `COMPLETED`
+  - Persisted artifacts: run state JSON exists, checkpoint JSON exists, result CSV exists, report JSON exists
+  - Disk fallback after in-memory reset: `get_recruit_pipeline_run` returned `RUN_STATUS`, run state `completed`, `persistence.source=disk`, and `active_control_available=false`
+  - CDP methods: `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recruit-mcp-sync-artifacts-disk-live.json`
+- `npm run live:chat-domain -- --slow-live --detail-source image --candidate-index 1 --max-image-pages 8 --resume-dom-timeout-ms 15000 --save-image .live-artifacts\chat-full-cv-image-fallback.png --save-payload .live-artifacts\chat-full-cv-image-fallback-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for chat full-CV scroll image fallback
+  - Time: 2026-05-01 16:42 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Chat self-heal: `healthy`; 40 `.geek-item[data-id]` conversation candidates were available
+  - Candidate behavior: selected candidate index 1 with `Input.dispatchMouseEvent`, found `a.btn.resume-btn-online`, opened online resume modal, and closed it afterward
+  - Image fallback: captured 8 scroll pages through CDP-only `Input.dispatchMouseEvent` wheel events and `Page.captureScreenshot`; 6 unique screenshot hashes; each page was 1546x1344 PNG and nonblank
+  - Network note: Network events were observed but image mode did not depend on a parser-usable body
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`, and `Page.captureScreenshot`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\chat-full-cv-image-fallback-live.json`
+  - Saved image sequence: `.live-artifacts\chat-full-cv-image-fallback-page-01.png` through `.live-artifacts\chat-full-cv-image-fallback-page-08.png`
+- `npm run live:chat-image-screening -- --source-payload .live-artifacts\chat-full-cv-image-fallback-live.json --save-report .live-artifacts\chat-full-cv-image-llm-screening-live.json --config C:\Users\yaolin\.boss-recommend-mcp\screening-config.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历" --max-images 8 --timeout-ms 180000` - PASS for saved live-image LLM screening
+  - Time: 2026-05-01 17:13 Asia/Shanghai
+  - Source live artifact: `.live-artifacts\chat-full-cv-image-fallback-live.json`
+  - Image input: 8 saved full-CV scroll pages, 6 unique screenshots
+  - LLM config: `C:\Users\yaolin\.boss-recommend-mcp\screening-config.json`; provider recorded with redacted host and no API key in artifact
+  - LLM result: `ok=true`, model `doubao-seed-2.0-lite`, `passed=true`, evidence count 6, usage 10,668 total tokens
+  - Saved report: `.live-artifacts\chat-full-cv-image-llm-screening-live.json`
+- `npm run live:chat-domain -- --slow-live --detail-source image --candidate-index 1 --max-image-pages 8 --llm-image-limit 8 --resume-dom-timeout-ms 15000 --save-image .live-artifacts\chat-full-cv-image-llm-integrated.png --save-payload .live-artifacts\chat-full-cv-image-llm-integrated-live.json --call-llm --config C:\Users\yaolin\.boss-recommend-mcp\screening-config.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for integrated chat full-CV image capture plus LLM screening
+  - Time: 2026-05-01 17:16 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Image fallback: captured 7 scroll pages, 5 unique screenshot hashes; each page was 1546x1344 PNG and nonblank
+  - LLM result: `ok=true`, model `doubao-seed-2.0-lite`, `passed=true`, evidence count 5, usage 9,510 total tokens, image input count 7
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`, and `Page.captureScreenshot`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\chat-full-cv-image-llm-integrated-live.json`
+  - Saved image sequence: `.live-artifacts\chat-full-cv-image-llm-integrated-page-01.png` through page 07
+- `npm run live:chat-domain -- --slow-live --detail-source network --candidate-index 1 --resume-dom-timeout-ms 15000 --save-payload .live-artifacts\chat-network-summary-parser-live.json --criteria "候选人具备算法、数据、机器学习或软件开发相关经历"` - PASS for chat summary Network parser
+  - Time: 2026-05-01 17:19 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Parsed 2 stable chat summary profiles from `historyMsg` and `chat/geek/info` responses; these are summary/profile sources, not a full-CV replacement
+  - Screening result: deterministic shared screening returned `pass`, score 10, matched preferred keyword `数据`
+  - Network note: online-resume `view/geek/info/v2` can still omit parser-usable `geekDetailInfo`/`geekDetail`; full-CV validation remains the image-sequence LLM path
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\chat-network-summary-parser-live.json`
+- `npm run test:core-infinite-list` - PASS after adding shared infinite-list cursor, stale-node skip, id+text key fingerprinting, and fallback wheel support
+- `npm run test:recommend-run-service` - PASS after wiring recommend run service to shared infinite-list cursor
+- `npm run test:recruit-domain` - PASS after wiring recruit/search run service to shared infinite-list cursor
+- `npm run test:chat-domain` - PASS after shared cursor changes
+- `npm run scan:runtime` - PASS in inventory mode after shared infinite-list work
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `npm run live:infinite-list -- --domain recommend --slow-live --target-unique 36 --max-scrolls-per-candidate 6 --save-report .live-artifacts\recommend-infinite-list-scroll-live.json` - PASS for recommend infinite-list cursor
+  - Time: 2026-05-01 17:53-17:56 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Result: processed 30 unique candidate keys, 0 duplicate processed keys, `scroll_count=1`, stopped on `stable_visible_signature` because no new mounted cards appeared after wheel scroll
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recommend-infinite-list-scroll-live.json`
+- `npm run live:infinite-list -- --domain recruit --slow-live --target-unique 18 --max-scrolls-per-candidate 4 --save-report .live-artifacts\recruit-infinite-list-keyed-live.json` - PASS for recruit/search infinite-list cursor
+  - Time: 2026-05-01 17:57 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Result: processed 18 unique id+text candidate keys, 0 duplicate processed keys. This gate exposed repeated parsed ids on search cards, so the shared key now appends a text fingerprint when available
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recruit-infinite-list-keyed-live.json`
+- `npm run live:infinite-list -- --domain chat --slow-live --target-unique 45 --max-scrolls-per-candidate 4 --save-report .live-artifacts\chat-infinite-list-fallback-wheel-live.json` - PASS for chat infinite-list cursor
+  - Time: 2026-05-01 17:59 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Result: processed 45 unique conversation candidate keys, 0 duplicate processed keys, `scroll_count=1`; stale card anchors were handled by a diagnostic fallback wheel point during this live test. Product defaults were later hardened to `null` so normal runs do not rely on fixed viewport coordinates.
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\chat-infinite-list-fallback-wheel-live.json`
+- `npm run live:refresh-round -- --domain recommend --slow-live --save-report .live-artifacts\recommend-refresh-round-live.json` - PASS for recommend end-of-list refresh round
+  - Time: 2026-05-01 19:55 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - End detection: CDP-only wheel scrolling found the bottom `刷新` control after 57 scroll attempts
+  - Refresh behavior: clicked `刷新` with `Input.dispatchMouseEvent`; before count 450 mounted cards, after count 15 cards
+  - Filter behavior: reapplied multi-label degree filters `本科`, `硕士`, `博士`; forced `recentNotView / 近14天没有` even though refresh forcing is independent of user input
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, `Accessibility`, and `DOM.performSearch`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recommend-refresh-round-live.json`
+- `npm run live:refresh-round -- --domain recruit --slow-live --keyword 算法工程师 --city 全国 --degree 本科,硕士,博士 --save-report .live-artifacts\recruit-refresh-round-live.json` - PASS for search refresh/reload round
+  - Time: 2026-05-01 19:52 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Refresh behavior: navigated to search, performed `Page.reload`, reapplied the same keyword/city/degree filter inputs, and ended with 15 candidate cards
+  - Search params after forced refresh: `city=全国`, `keyword=算法工程师`, `degrees=[本科, 硕士, 博士]`, `filter_recent_viewed=true`
+  - CDP methods included `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\recruit-refresh-round-live.json`
+- `node --check src\domains\chat\run-service.js` - PASS
+- `node --check scripts\live-chat-run-service-smoke.js` - PASS
+- `node --check src\test-chat-run-service.js` - PASS
+- `npm run test:chat-run-service` - PASS
+- `npm run test:chat-domain` - PASS after exporting chat run service
+- `npm run live:chat-run-service -- --slow-live --max-candidates 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --save-report .live-artifacts\chat-run-service-lifecycle-live.json` - PASS for chat direct run-service lifecycle
+  - Time: 2026-05-01 20:08 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Initial target: `https://www.zhipin.com/web/chat/recommend`; script navigated CDP-only to `https://www.zhipin.com/web/chat/index`
+  - Runtime guard: `Runtime.evaluate` blocked before transport
+  - Self-heal: `healthy`; 40 chat candidate cards and 1,359 Accessibility nodes observed
+  - Lifecycle: started through `createChatRunService`, processed 1 card candidate, paused with stable progress, resumed to 2 processed card candidates, then canceled with final status `canceled`
+  - Shared cursor: recorded id+text candidate keys, `unique_seen=2`, `scroll_count=0`, no duplicate processed keys in this focused lifecycle gate
+  - CDP methods included `Page`, `DOM`, `Network`, and `Accessibility`; no `Runtime.*`
+  - Saved local artifact: `.live-artifacts\chat-run-service-lifecycle-live.json`
+- `npm run test:core-infinite-list` - PASS after chat run-service wiring
+- `npm run test:core-run` - PASS after chat run-service wiring
+- `npm run scan:runtime` - PASS in inventory mode after chat run-service wiring
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check src\chat-runtime-config.js; node --check src\chat-mcp.js; node --check src\index.js; node --check src\test-chat-mcp.js` - PASS after Phase 9 chat helper split
+- `npm run test:chat-mcp` - PASS after Phase 9 chat helper split
+- `npm run test:boss-chat` - PASS after adjusting legacy compatibility assertions for CDP-only chat start missing-input behavior
+- `npm run test:async` - PASS after Phase 9 chat helper split
+- `npm run test:recommend-mcp` - PASS after Phase 9 chat helper split
+- `npm run test:recruit-mcp` - PASS after Phase 9 chat helper split
+- `npm run live:chat-mcp -- --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --timeout-ms 480000 --save-report .live-artifacts\chat-mcp-phase9-helper-split-live.json` - PASS
+  - Time: 2026-05-01 20:58 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Run id: `mcp_chat_momx5clb_txy0vkoa`
+  - Result: final status `canceled`, processed 2 live chat card candidates, screened 2, method count 250
+  - Runtime guard: no `Runtime.*` methods
+- `npm run scan:runtime` - PASS in inventory mode after Phase 9 chat helper split
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `npm run live:recommend-mcp -- --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --no-filter --timeout-ms 480000 --save-report .live-artifacts\recommend-mcp-phase9-index-lazy-live.json` - PASS
+  - Time: 2026-05-01 21:01 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Run id: `mcp_recommend_momx9gjk_kn1y92f2`
+  - Result: final status `canceled`, processed 2 live recommend card candidates, screened 2, method count 218
+  - Runtime guard: no `Runtime.*` methods
+- `node --check src\index.js` - PASS after lazy-loading legacy index imports
+- `npm run test:chat-mcp` - PASS after lazy-loading legacy index imports
+- `npm run test:recommend-mcp` - PASS after lazy-loading legacy index imports
+- `npm run test:boss-chat` - PASS after lazy-loading legacy index imports
+- `npm run test:async` - PASS after lazy-loading legacy index imports
+- `npm run test:recruit-mcp` - PASS after lazy-loading legacy index imports
+- `npm run test:self-heal` - PASS after lazy-loading legacy index imports
+- `npm run test:core-self-heal` - PASS after lazy-loading legacy index imports
+- `npm run scan:runtime` - PASS in inventory mode after lazy-loading legacy index imports
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check src\cli.js` - PASS after lazy-loading legacy CLI imports
+- `node src\cli.js help` - PASS after lazy-loading legacy CLI imports
+- `node src\cli.js where` - PASS after lazy-loading legacy CLI imports
+- `node bin\boss-recommend-mcp.js help` - PASS after lazy-loading legacy CLI imports
+- `node bin\boss-recommend-mcp.js where` - PASS after lazy-loading legacy CLI imports
+- `npm run test:boss-chat` - PASS after lazy-loading legacy CLI imports
+- `npm run test:async` - PASS after lazy-loading legacy CLI imports
+- `npm run test:chat-mcp` - PASS after lazy-loading legacy CLI imports
+- `npm run test:recommend-mcp` - PASS after lazy-loading legacy CLI imports
+- `npm run test:recruit-mcp` - PASS after lazy-loading legacy CLI imports
+- `npm run live:recommend-mcp -- --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --no-filter --timeout-ms 480000 --save-report .live-artifacts\recommend-mcp-phase9-cli-lazy-live.json` - PASS
+  - Time: 2026-05-01 21:08 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Run id: `mcp_recommend_momxi05d_1de0v9p4`
+  - Result: final status `canceled`, processed 2 live recommend card candidates, screened 2, method count 217
+  - Runtime guard: no `Runtime.*` methods
+- `npm run scan:runtime` - PASS in inventory mode after lazy-loading legacy CLI imports
+  - Total findings: 459
+  - Active findings: 457
+  - Allowed guard findings: 2
+- `node --check scripts\scan-forbidden-runtime.js` - PASS after scanner reachability/quarantine awareness
+- `node --check src\test-runtime-scan.js` - PASS
+- `npm run scan:runtime` - PASS with quarantine-aware status model
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run scan:runtime:strict` - PASS after scanner reachability/quarantine awareness
+- `npm run test:runtime-scan` - PASS; asserts repo-only raw findings are quarantined, strict mode passes, and `--fail-on-legacy` still fails on raw non-allowed findings
+- `npm run test:async` - PASS after scanner reachability/quarantine awareness
+- `npm run test:recommend-mcp` - PASS after scanner reachability/quarantine awareness
+- `npm run test:recruit-mcp` - PASS after scanner reachability/quarantine awareness
+- `npm run test:chat-mcp` - PASS after scanner reachability/quarantine awareness
+- `npm run test:boss-chat` - PASS after scanner reachability/quarantine awareness
+- `npm run live:recommend-mcp -- --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --no-filter --timeout-ms 480000 --save-report .live-artifacts\recommend-mcp-phase9-scanner-aware-live.json` - PASS
+  - Time: 2026-05-01 21:17 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Run id: `mcp_recommend_momxt58u_0jjsam3l`
+  - Result: final status `canceled`, processed 2 live recommend card candidates, screened 2, method count 217
+  - Runtime guard: no `Runtime.*` methods
+- `node --check src\domains\chat\jobs.js` - PASS after CDP-only chat job-list reader
+- `node --check src\chat-mcp.js` - PASS after CDP-only `prepare_boss_chat_run`
+- `node --check src\index.js` - PASS after routing `prepare_boss_chat_run` to `src/chat-mcp.js`
+- `node --check scripts\live-chat-mcp-smoke.js` - PASS after adding `--prepare-first`
+- `npm run test:chat-mcp` - PASS after CDP-only prepare route and job-reader test seam
+- `npm run test:boss-chat` - PASS after prepare-route compatibility assertions
+- `npm run test:async` - PASS after prepare-route integration
+- `npm run scan:runtime:strict` - PASS after CDP-only prepare route
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run scan:runtime` - PASS in inventory mode after CDP-only prepare route
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run test:runtime-scan` - PASS after CDP-only prepare route
+- `npm run live:chat-mcp -- --prepare-first --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --timeout-ms 480000 --save-report .live-artifacts\chat-mcp-phase9-prepare-cdp-live.json` - PASS
+  - Time: 2026-05-01 21:28 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Prepare result: `NEED_INPUT`, 9 job options discovered from `.chat-job .ui-dropmenu-list li`, selected job label `全部职位`
+  - Run id: `mcp_chat_momy7hpq_4r039ioi`
+  - Result: final run status `canceled`, processed 2 live chat card candidates, screened 2, method count 249
+  - Runtime guard: no `Runtime.*` methods
+- `node --check src\chat-runtime-config.js` - PASS after CDP-only chat health config/runtime resolver
+- `node --check src\chat-mcp.js` - PASS after CDP-only `boss_chat_health_check`
+- `node --check src\index.js` - PASS after routing `boss_chat_health_check` to `src/chat-mcp.js`
+- `node --check scripts\live-chat-mcp-smoke.js` - PASS after adding `--health-first`
+- `node --check src\test-chat-mcp.js` - PASS
+- `node --check src\test-boss-chat.js` - PASS
+- `npm run test:chat-mcp` - PASS after CDP-only health route
+- `npm run test:boss-chat` - PASS after MCP health compatibility assertions
+- `npm run scan:runtime:strict` - PASS after CDP-only health route
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:async` - PASS after CDP-only health route
+- `npm run test:runtime-scan` - PASS after CDP-only health route
+- `npm run scan:runtime` - PASS in inventory mode after CDP-only health route
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run live:chat-mcp -- --health-first --prepare-first --slow-live --target-count 8 --detail-limit 0 --delay-ms 1600 --pause-after-processed 1 --timeout-ms 480000 --save-report .live-artifacts\chat-mcp-phase9-health-cdp-live.json` - PASS
+  - Time: 2026-05-01 21:40 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Health result: `OK`, shared config `C:\Users\yaolin\.boss-recommend-mcp\screening-config.json`, 40 chat cards, 1,368 AX nodes, health method count 35
+  - Prepare result: `NEED_INPUT`, 9 job options discovered from `.chat-job .ui-dropmenu-list li`
+  - Run id: `mcp_chat_momyn52n_reb7bjag`
+  - Result: final run status `canceled`, processed 2 live chat card candidates, screened 2, method count 249
+  - Runtime guard: no `Runtime.*` methods
+- `node --check src\cli.js` - PASS after CDP-only chat CLI routing
+- `node --check src\test-boss-chat.js` - PASS after CDP-only chat CLI routing
+- `node src\cli.js chat start-run --job test --start-from all --criteria test --target-count 1` - PASS as a fenced unsupported CLI start path
+  - Result: `FAILED`, error code `CHAT_CLI_ASYNC_UNSUPPORTED_CDP_ONLY`, `runtime_evaluate_used=false`
+- `npm run test:boss-chat` - PASS after chat CLI health/prepare moved to `src/chat-mcp.js`
+- `npm run test:chat-mcp` - PASS after chat CLI routing changes
+- `npm run scan:runtime:strict` - PASS after chat CLI routing changes
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run scan:runtime` - PASS in inventory mode after chat CLI routing changes
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run test:runtime-scan` - PASS after chat CLI routing changes
+- `node src\cli.js where` - PASS after non-legacy chat runtime layout routing
+  - `boss_chat_runtime=C:\Users\yaolin\.boss-recommend-mcp\boss-chat`
+- `node src\cli.js chat health-check --slow-live --port 9222` - PASS
+  - Time: 2026-05-01 21:52 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Artifact: `.live-artifacts\chat-cli-phase9-health-cdp-live.json`
+  - Result: `OK`, 40 chat cards, 1,368 AX nodes, method count 35
+  - Runtime guard: no `Runtime.*` methods
+- `node src\cli.js chat prepare-run --slow-live --port 9222` - PASS
+  - Time: 2026-05-01 21:52 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Artifact: `.live-artifacts\chat-cli-phase9-prepare-cdp-live.json`
+  - Result: `NEED_INPUT`, 9 job options discovered from `.chat-job .ui-dropmenu-list li`, selected job label `全部职位`, method count 57
+  - Runtime guard: no `Runtime.*` methods
+- `node --check src\cli.js` - PASS after pure `where` path resolver
+- `node src\cli.js where` - PASS after pure path resolver
+  - Time: 2026-05-01 22:00 Asia/Shanghai
+  - Artifact: `.live-artifacts\cli-where-phase9-pure-paths.txt`
+  - Result: prints package/config/runtime paths without importing `src/adapters.js`; calibration script resolves to `C:\Users\yaolin\Documents\codex_projects\boss recruit pipeline\boss-recruit-mcp\vendor\boss-screen-cli\calibrate-favorite-position-v2.cjs`
+- `npm run test:boss-chat` - PASS after pure `where` path resolver
+- `npm run scan:runtime:strict` - PASS after pure `where` path resolver
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after pure `where` path resolver
+- `npm run scan:runtime` - PASS in inventory mode after pure `where` path resolver
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `node --check src\chat-runtime-config.js` - PASS after exporting pure config resolution
+- `node --check src\cli.js` - PASS after moving config target helpers off `src/adapters.js`
+- Isolated CLI config flow with temp `BOSS_RECOMMEND_SCREEN_CONFIG` and temp `BOSS_RECOMMEND_HOME` - PASS
+  - Time: 2026-05-01 22:06 Asia/Shanghai
+  - Commands:
+    - `node src\cli.js init-config --workspace-root <temp-workspace>`
+    - `node src\cli.js config set --workspace-root <temp-workspace> --base-url https://api.example.com/v1 --api-key sk-temp-config-test --model gpt-4.1-mini --thinking-level low`
+    - `node src\cli.js set-port --workspace-root <temp-workspace> --port 9222`
+  - Artifacts:
+    - `.live-artifacts\cli-config-phase9-init-config.txt`
+    - `.live-artifacts\cli-config-phase9-config-set.txt`
+    - `.live-artifacts\cli-config-phase9-set-port.txt`
+    - `.live-artifacts\cli-config-phase9-summary.json`
+  - Result: temp config existed with `baseUrl=https://api.example.com/v1`, `apiKey=sk-temp-config-test`, `model=gpt-4.1-mini`, `debugPort=9222`, `llmThinkingLevel=low`
+- `npm run test:boss-chat` - PASS after pure config resolution
+- `npm run test:chat-mcp` - PASS after pure config resolution
+- `npm run scan:runtime:strict` - PASS after pure config resolution
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after pure config resolution
+- `npm run scan:runtime` - PASS in inventory mode after pure config resolution
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `node --check src\cli.js` - PASS after CDP-only `launch-chrome`
+- `node src\cli.js launch-chrome --port 9222 --slow-live` - PASS
+  - Time: 2026-05-01 22:13 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Artifact: `.live-artifacts\cli-launch-chrome-phase9-cdp.txt`
+  - Result: reused existing Chrome debug instance, verified Boss recommend page readiness, brought recommend tab to front
+  - CDP methods: `Page.enable`, `Page.bringToFront`
+  - Runtime guard: no `Runtime.*` methods
+- `node bin\boss-recommend-mcp.js launch-chrome --port 9222 --slow-live` - PASS
+  - Time: 2026-05-01 22:13 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Artifact: `.live-artifacts\bin-launch-chrome-phase9-cdp.txt`
+  - Result: package bin shim reused existing Chrome debug instance, verified Boss recommend page readiness, brought recommend tab to front
+  - CDP methods: `Page.enable`, `Page.bringToFront`
+  - Runtime guard: no `Runtime.*` methods
+- `npm run test:boss-chat` - PASS after CDP-only `launch-chrome`
+- `npm run test:chat-mcp` - PASS after CDP-only `launch-chrome`
+- `npm run scan:runtime:strict` - PASS after CDP-only `launch-chrome`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after CDP-only `launch-chrome`
+- `npm run scan:runtime` - PASS in inventory mode after CDP-only `launch-chrome`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `node --check src\cli.js` - PASS after CDP-only `doctor`
+- `node src\cli.js doctor --port 9222 --page-scope recommend --slow-live` - PASS
+  - Time: 2026-05-01 22:21 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Artifact: `.live-artifacts\cli-doctor-phase9-cdp-live.json`
+  - Result: `ok=true`; config, vendor CLI dirs/entries, Node/npm dependencies, favorite calibration, debug port, and recruit calibration script all passed; recommend iframe ready
+  - CDP methods: `Page.enable`, `DOM.enable`, `DOM.getDocument`, `DOM.querySelector`, `DOM.describeNode`
+  - Runtime guard: no `Runtime.*` methods
+- `node bin\boss-recommend-mcp.js doctor --port 9222 --page-scope recommend --slow-live` - PASS
+  - Time: 2026-05-01 22:21 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Artifact: `.live-artifacts\bin-doctor-phase9-cdp-live.json`
+  - Result: package bin shim returned `ok=true`; recommend iframe ready; same check set passed
+  - CDP methods: `Page.enable`, `DOM.enable`, `DOM.getDocument`, `DOM.querySelector`, `DOM.describeNode`
+  - Runtime guard: no `Runtime.*` methods
+- `npm run test:boss-chat` - PASS after CDP-only `doctor`
+- `npm run test:chat-mcp` - PASS after CDP-only `doctor`
+- `npm run scan:runtime:strict` - PASS after CDP-only `doctor`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after CDP-only `doctor`
+- `npm run scan:runtime` - PASS in inventory mode after CDP-only `doctor`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `node --check src\cli.js` - PASS after fenced CDP-only `calibrate`
+- `node src\cli.js calibrate --port 9222 --timeout-ms 5000` - PASS as an intentionally fenced package-entrypoint route
+  - Time: 2026-05-01 22:25 Asia/Shanghai
+  - Artifact: `.live-artifacts\cli-calibrate-phase9-fenced.txt`
+  - Result: exit code `1`, status `FAILED`, error code `CALIBRATE_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`
+  - CDP methods: none; `method_log=[]`
+  - Browser interaction: none
+- `node bin\boss-recommend-mcp.js calibrate --port 9222 --timeout-ms 5000` - PASS as an intentionally fenced package-entrypoint route
+  - Time: 2026-05-01 22:25 Asia/Shanghai
+  - Artifact: `.live-artifacts\bin-calibrate-phase9-fenced.txt`
+  - Result: exit code `1`, status `FAILED`, error code `CALIBRATE_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`
+  - CDP methods: none; `method_log=[]`
+  - Browser interaction: none
+- `npm run test:boss-chat` - PASS after fenced CDP-only `calibrate`
+- `npm run test:chat-mcp` - PASS after fenced CDP-only `calibrate`
+- `npm run scan:runtime:strict` - PASS after fenced CDP-only `calibrate`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after fenced CDP-only `calibrate`
+- `npm run scan:runtime` - PASS in inventory mode after fenced CDP-only `calibrate`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `node --check src\cli.js` - PASS after fenced CDP-only one-shot recommend CLI `run`
+- `node src\cli.js run --instruction 'CDP-only package gate' --port 9222` - PASS as an intentionally fenced package-entrypoint route
+  - Time: 2026-05-01 22:31 Asia/Shanghai
+  - Artifact: `.live-artifacts\cli-run-phase9-fenced.txt`
+  - Result: exit code `1`, status `FAILED`, error code `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`
+  - CDP methods: none; `method_log=[]`
+  - Browser interaction: none
+- `node bin\boss-recommend-mcp.js run --instruction 'CDP-only package gate' --port 9222` - PASS as an intentionally fenced package-entrypoint route
+  - Time: 2026-05-01 22:31 Asia/Shanghai
+  - Artifact: `.live-artifacts\bin-run-phase9-fenced.txt`
+  - Result: exit code `1`, status `FAILED`, error code `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`
+  - CDP methods: none; `method_log=[]`
+  - Browser interaction: none
+- `npm run test:boss-chat` - PASS after fenced CDP-only one-shot recommend CLI `run`
+- `npm run test:chat-mcp` - PASS after fenced CDP-only one-shot recommend CLI `run`
+- `npm run scan:runtime:strict` - PASS after fenced CDP-only one-shot recommend CLI `run`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after fenced CDP-only one-shot recommend CLI `run`
+- `npm run scan:runtime` - PASS in inventory mode after fenced CDP-only one-shot recommend CLI `run`
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- MCP `get_featured_calibration_status` handler gate - PASS after pure calibration resolution
+  - Time: 2026-05-01 22:36 Asia/Shanghai
+  - Artifact: `.live-artifacts\mcp-featured-calibration-status-phase9-pure.json`
+  - Result: returned `CALIBRATION_STATUS`, `ready=true`, existing `favorite-calibration.json`, and the recruit calibration script path
+  - Browser interaction: none
+- MCP `run_featured_calibration` handler fence - PASS
+  - Time: 2026-05-01 22:36 Asia/Shanghai
+  - Artifact: `.live-artifacts\mcp-featured-calibration-run-phase9-fenced.json`
+  - Result: `FEATURED_CALIBRATION_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`, empty `method_log`
+  - Browser interaction: none
+- MCP `run_recommend_self_heal` scan - PASS live through shared CDP self-heal
+  - Time: 2026-05-01 22:39 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Artifact: `.live-artifacts\mcp-recommend-self-heal-phase9-cdp-live.json`
+  - Result: `status=OK`, recommend health `healthy`, iframe selectors matched, filter trigger count `1`, candidate card count `15`, tab count `2`, AX node count `163`
+  - CDP methods: `Page.enable`, `DOM.enable`, `Accessibility.enable`, `Page.bringToFront`, `DOM.getDocument`, `DOM.querySelector`, `DOM.describeNode`, `DOM.querySelectorAll`, `Accessibility.getFullAXTree`
+  - Runtime guard: no `Runtime.*`
+- MCP `run_recommend_self_heal` apply fence - PASS
+  - Time: 2026-05-01 22:39 Asia/Shanghai
+  - Artifact: `.live-artifacts\mcp-recommend-self-heal-apply-phase9-fenced.json`
+  - Result: `RECOMMEND_SELF_HEAL_APPLY_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`, empty `method_log`
+  - Browser interaction: none
+- Detached legacy worker fence - PASS with isolated run-state home
+  - Time: 2026-05-01 22:41 Asia/Shanghai
+  - Artifact: `.live-artifacts\detached-worker-phase9-fenced.json`
+  - Result: run snapshot ended `state=failed`, error code `DETACHED_LEGACY_PIPELINE_UNSUPPORTED_CDP_ONLY`, `retryable=false`
+  - Browser interaction: none
+- `node --check src\index.js`, `node --check src\chat-runtime-config.js`, and `node --check src\cli.js` - PASS after MCP calibration/self-heal and detached-worker fences
+- `npm run test:self-heal` - PASS after MCP self-heal route rewrite
+- `npm run test:async` - PASS after MCP calibration/self-heal and detached-worker fences
+- `npm run test:boss-chat` - PASS after MCP calibration/self-heal and detached-worker fences
+- `npm run test:chat-mcp` - PASS after MCP calibration/self-heal and detached-worker fences
+- `npm run scan:runtime:strict` - PASS after MCP calibration/self-heal and detached-worker fences
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+  - Strict gate: pass
+- `npm run test:runtime-scan` - PASS after MCP calibration/self-heal and detached-worker fences
+- `npm run scan:runtime` - PASS in inventory mode after MCP calibration/self-heal and detached-worker fences
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run scan:runtime:package` - PASS after package publish-surface narrowing
+  - Total findings: 2
+  - Raw non-allowed findings: 0
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 0
+  - Allowed guard findings: 2
+- `npm run scan:runtime:package:strict` - PASS after package publish-surface narrowing
+  - Total findings: 2
+  - Raw non-allowed findings: 0
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 0
+  - Allowed guard findings: 2
+- `npm pack --dry-run --json > .live-artifacts\package-dry-run-phase9.json` - PASS
+  - Entry count: 49
+  - Blocked/quarantined paths included: 0
+  - Excluded: `legacy/`, `vendor/`, `docs/`, `scripts/live-*`, `scripts/scan-forbidden-runtime.js`, legacy runtime modules, and `src/test-*`
+- `node bin\boss-recommend-mcp.js doctor --port 9222 --page-scope recommend --slow-live` - PASS after package publish-surface narrowing and optional legacy vendor checks
+  - Time: 2026-05-02 10:36 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Result: `ok=true`; recommend iframe ready; package-root dependencies passed; legacy vendor checks are optional compatibility/reference checks
+  - CDP methods: `Page.enable`, `DOM.enable`, `DOM.getDocument`, `DOM.querySelector`, `DOM.describeNode`
+  - Runtime guard: no `Runtime.*`
+- Installed tarball package-bin doctor smoke - PASS
+  - Command: pack to `.live-artifacts\reconcrap-boss-recommend-mcp-1.3.39.tgz`, install with `npm install --ignore-scripts --no-audit --no-fund`, then run `node node_modules\@reconcrap\boss-recommend-mcp\bin\boss-recommend-mcp.js doctor --port 9222 --page-scope recommend --slow-live`
+  - Artifact: `.live-artifacts\package-install-doctor-phase9.json`
+  - Result: `ok=true`; installed package had `legacy_exists=false` and `vendor_exists=false`; target `https://www.zhipin.com/web/chat/recommend`; no `Runtime.*`
+- Legacy research quarantine move - PASS
+  - Time: 2026-05-02 10:52 Asia/Shanghai
+  - Moved package-local legacy runtime modules and tests from `src/` plus package-local `vendor/` to `legacy/research/`
+  - Active `src/` now contains only CDP-only shared/domain/MCP modules and active tests
+  - Active npm scripts no longer reference legacy tests or package-local vendors
+  - Scanner inventories `legacy/research/` as `legacy-quarantined` research-only code
+- `npm run scan:runtime:strict` - PASS after legacy research quarantine move
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run scan:runtime:package:strict` - PASS after legacy research quarantine move
+  - Total findings: 2
+  - Raw non-allowed findings: 0
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 0
+  - Allowed guard findings: 2
+- Legacy boundary guard - PASS
+  - Time: 2026-05-02 11:06 Asia/Shanghai
+  - Command: `npm run scan:legacy-boundary`
+  - Result: active files scanned 81; findings 0; strict gate pass
+  - Guard scope: active `bin/`, `src/`, package scripts/files, and live scripts; scanner tooling and `legacy/research/` itself are excluded
+  - Enforced boundary: no active references to `legacy/research/`, package-local Boss vendor paths, moved legacy modules, moved legacy tests, or moved legacy healing rules
+- Recommend self-heal default rules fallback - PASS
+  - Command: `npm run live:self-heal -- --skip-refresh-repair --save-report .live-artifacts\self-heal-phase9-boundary-default-rules-live.json`
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/recommend`
+  - Result: `status=PASS`, recommend health `healthy`, candidate card count 15, AX nodes 187, method log contained no `Runtime.*`
+  - Note: recruit/chat were reported as blocked because only the recommend target was open, not counted as pass for those domains
+- Package-local vendor doctor removal - PASS
+  - Command: `node bin\boss-recommend-mcp.js doctor --port 9222 --page-scope recommend --slow-live`
+  - Artifact: `.live-artifacts\bin-doctor-phase9-boundary-cdp-live.json`
+  - Result: `ok=true`; doctor checks no longer include package-local legacy recommend search/screen vendor directory or entry checks; target `https://www.zhipin.com/web/chat/recommend`; no `Runtime.*`
+- Installed tarball boundary smoke - PASS
+  - Command: pack to `.live-artifacts\reconcrap-boss-recommend-mcp-1.3.39.tgz`, install under `.live-artifacts\package-install-phase9-boundary`, then run installed package `bin\boss-recommend-mcp.js doctor --port 9222 --page-scope recommend --slow-live`
+  - Artifact: `.live-artifacts\package-install-doctor-phase9-boundary.json`
+  - Result: installed package had `legacy_exists=false`, `vendor_exists=false`, doctor `ok=true`, target `https://www.zhipin.com/web/chat/recommend`, method log `Page.enable`, `DOM.enable`, `DOM.getDocument`, `DOM.querySelector`, `DOM.describeNode`, runtime count 0
+- Research archive policy - PASS
+  - Time: 2026-05-02 11:12 Asia/Shanghai
+  - Decision: keep `legacy/research/` in-repo as research-only archive
+  - Docs: `docs/LEGACY_ARCHIVE_POLICY.md`, `legacy/README.md`, `legacy/research/README.md`, and `docs/SESSION_START.md`
+  - Command: `npm run scan:package-boundary`
+  - Result: package boundary scan used real `npm pack --dry-run --json`, entry count 49, findings 0, strict gate pass
+  - Command: installed tarball doctor smoke from `.live-artifacts\package-install-phase9-archive-policy`
+  - Result: installed package had `legacy_exists=false`, `vendor_exists=false`, `docs_exists=false`, `live_script_exists=false`, `scanner_exists=false`; doctor `ok=true`; target `https://www.zhipin.com/web/chat/recommend`; no `Runtime.*`
+- `npm run scan:legacy-boundary` - PASS after archive policy
+  - Active files scanned: 82
+  - Findings: 0
+- `npm run test:runtime-scan` - PASS after archive policy
+- `npm run scan:runtime:strict` - PASS after archive policy
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run scan:runtime:package:strict` - PASS after archive policy
+  - Total findings: 2
+  - Raw non-allowed findings: 0
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 0
+  - Allowed guard findings: 2
+- Phase 9 aggregate static gate - PASS
+  - Time: 2026-05-02 11:14 Asia/Shanghai
+  - Command: `npm run gate:phase9-static`
+  - Result: all 4 gates passed: `scan:runtime:strict`, `scan:runtime:package:strict`, `scan:legacy-boundary`, and `scan:package-boundary`
+  - Command: installed tarball doctor smoke from `.live-artifacts\package-install-phase9-static-gate`
+  - Result: installed package had `legacy_exists=false`, `vendor_exists=false`, `docs_exists=false`, `live_script_exists=false`, `scanner_exists=false`; doctor `ok=true`; target `https://www.zhipin.com/web/chat/recommend`; no `Runtime.*`
+- Phase 10 20+ completion gate setup - PASS/PENDING
+  - Time: 2026-05-02 11:22 Asia/Shanghai
+  - Command: `node --check scripts\phase10-completion-gate.js`
+  - Result: PASS
+  - Command: `npm run gate:phase10-complete -- --allow-pending`
+  - Result: expected `status=pending`; default reports for recommend, search/recruit, and chat are missing because the 20+ completed live runs have not been executed yet
+  - Command: `npm run gate:phase9-static`
+  - Result: PASS after adding the Phase 10 gate
+  - Command: `npm run test:runtime-scan`
+  - Result: PASS after adding the Phase 10 gate
+- Phase 10 mandatory 20+ completion runs - PASS
+  - Time: 2026-05-02 11:59 Asia/Shanghai
+  - Command: `npm run scan:runtime`
+  - Result: PASS; reachable active findings `0`, legacy-quarantined findings `457`, allowed guard findings `2`
+  - Command: `npm run gate:phase9-static`
+  - Result: PASS; runtime strict, package runtime strict, legacy boundary, and package boundary all passed
+  - Command: `npm run live:recommend-run-service -- --slow-live --no-filter --max-candidates 20 --detail-limit 0 --delay-ms 800 --pause-after-processed 0 --save-report .live-artifacts\phase10-recommend-full-run-20-live.json`
+  - Result: PASS; target `https://www.zhipin.com/web/chat/recommend`, final status `completed`, `processed=20`, `screened=20`, `unique_seen=20`, `scroll_count=2`, no `Runtime.*`
+  - Command: `npm run live:recruit-run-service -- --slow-live --no-reset-search --keyword 算法工程师 --city 全国 --max-candidates 20 --detail-limit 0 --delay-ms 800 --pause-after-processed 0 --save-report .live-artifacts\phase10-search-full-run-20-live.json`
+  - Result: first attempt failed because the VPN-slow search page had not mounted city controls after navigation; patched shared recruit search setup to wait for controls. Retry PASS; target `https://www.zhipin.com/web/chat/search`, final status `completed`, `processed=20`, `screened=20`, `unique_seen=20`, `scroll_count=1`, no `Runtime.*`
+  - Command: `node --check src\domains\recruit\search.js`, `node --check scripts\live-recruit-run-service-smoke.js`, `npm run test:recruit-domain`, `npm run scan:runtime:strict`
+  - Result: PASS after the slow-load readiness patch
+  - Command: `npm run live:chat-run-service -- --slow-live --max-candidates 20 --detail-limit 0 --delay-ms 1600 --pause-after-processed 0 --save-report .live-artifacts\phase10-chat-full-run-20-live.json`
+  - Result: PASS; context target `https://www.zhipin.com/web/chat/index`, final status `completed`, `processed=20`, `screened=20`, `unique_seen=20`, `scroll_count=0`, no `Runtime.*`
+  - Command: `npm run gate:phase10-complete`
+  - Result: PASS; recommend, search/recruit, and chat all satisfied the 20+ live completion artifact gate
+- Final handoff checks after docs update - PASS
+  - Time: 2026-05-02 12:01 Asia/Shanghai
+  - Command: `npm run gate:phase9-static`
+  - Result: PASS; all four Phase 9 static/package gates passed
+  - Command: `npm run gate:phase10-complete`
+  - Result: PASS; recommend, search/recruit, and chat artifacts still pass
+  - Command: `npm run test:runtime-scan`
+  - Result: PASS
+  - Command: `git diff --check`
+  - Result: PASS; only existing LF-to-CRLF warnings were reported
+- Search targeted Phase 10 criteria + greet run - INVALIDATED FOR POST-ACTION
+  - Time: 2026-05-02 22:24 Asia/Shanghai
+  - Command: `npm run live:search-phase10-full -- --slow-live --no-reset-search --city 杭州 --degrees 硕士 --schools 985,211,QS100 --keyword 算法 --filter-recent-viewed true --target-count 3 --max-screened 30 --criteria "必须有ccf-a论文或会议成果，本科学历必须至少211及以上或者海外qs200院校" --post-action greet --max-greet-count 3 --execute-post-action --save-report .live-artifacts/phase10-search-criteria-greet-live.json`
+  - Result: filters validated; `processed=22`, `detail_opened=21`, `llm_screened=21`, `llm_passed=3`, Network hits `20`, image fallbacks `1`, no `Runtime.*`
+  - Artifacts: `.live-artifacts\phase10-search-criteria-greet-live.json`, `.live-artifacts\phase10-search-criteria-greet-live.csv`, `.live-artifacts\phase10-search-llm-inputs\candidate-*.json`, `.live-artifacts\phase10-search-cv-images\candidate-17-page-*.png`
+  - Invalidated post-action: saved clicked controls were search-result card anchors with `ka=search_click_open_resume`, long candidate-card labels, and large row-sized boxes; they were not real greet controls. This run cannot count as a search greet pass.
+  - Follow-up hardening: raw `a` action scanning removed; external/href/open-resume anchors rejected; action discovery now requires button-like controls and short exact action labels; whole search-frame action fallback removed. Verification after patch: `node --check scripts\live-search-phase10-full.js`, `npm run test:recruit-domain`, and `npm run test:runtime-scan` all PASS
+- Search targeted Phase 10 criteria + greet rerun - LIVE PASS
+  - Time: 2026-05-03 09:52-09:54 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/search`
+  - Command: `node scripts/live-search-phase10-full.js --slow-live --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --city 杭州 --degrees 硕士 --schools 985,211,QS100 --keyword 算法 --filter-recent-viewed true --target-count 3 --max-screened 60 --criteria "必须有ccf-a论文或会议成果，本科学历必须至少211及以上或者海外qs200院校" --post-action greet --max-greet-count 3 --execute-post-action --save-report .live-artifacts\phase10-search-criteria-greet-live-rerun-20260503-095247.json`
+  - Result: `status=PASS`, `processed=7`, `detail_opened=7`, `llm_screened=7`, `llm_passed=3`, `post_action_clicked=3`, `new_greet_count=3`, `unique_keys=7`, Network hits `7`, image fallbacks `0`, no `Runtime.*`.
+  - Artifacts: `.live-artifacts\phase10-search-criteria-greet-live-rerun-20260503-095247.json`, `.live-artifacts\phase10-search-criteria-greet-live-rerun-20260503-095247.csv`, `.live-artifacts\phase10-search-llm-inputs\candidate-*.json`.
+  - Selected job: requested `算法工程师 23-27届实习/校招/早期职业 _ 杭州`; live selected label `算法工程师 23-27届实习/校招/早期职业 杭州 本科 在校/应届 25-50K·14薪`; matched term `算法工程师 23-27届实习/校招/早期职业 杭州`.
+  - Clicked candidates: indexes `3`, `5`, and `6`; controls were real detail-page `button` controls with labels `立即沟通(30/140)`, `立即沟通(30/110)`, and `立即沟通(30/80)`; greet quota guard parsed `exhausted=false` for each.
+  - Fixes validated live: `_` job-label separator matching, fresh detail popup root reacquisition before action discovery, disabled default fixed list fallback point, and stable `data-expect` candidate ids so changing card text does not double-screen the same candidate.
+- Final handoff checks after search targeted pass - PASS
+  - Time: 2026-05-03 09:59-10:00 Asia/Shanghai
+  - Commands: `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `npm run test:runtime-scan`; `npm run test:core-infinite-list`; `npm run test:recruit-domain`; `git diff --check -- scripts\live-search-phase10-full.js src\domains\recruit\search.js src\test-recruit-domain.js src\core\screening\index.js src\core\infinite-list\index.js src\test-core-infinite-list.js docs\REWRITE_STATUS.md docs\LIVE_TEST_MATRIX.md`
+  - Result: PASS. Phase 9 aggregate static gate still passes; Phase 10 mandatory 20+ completion gate still passes for recommend, search/recruit, and chat; runtime scan still passes; recruit-domain and infinite-list regression tests pass; diff whitespace check is clean for the touched files.
+- Chat self-heal refresh/repair gate - LIVE PASS
+  - Time: 2026-05-03 10:02 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Command: `npm run live:self-heal -- --domain chat --slow-live --save-report .live-artifacts\chat-self-heal-refresh-repair-live-20260503-1000.json`
+  - Result: `status=PASS`; script navigated the existing Boss tab from `https://www.zhipin.com/web/chat/search` to `https://www.zhipin.com/web/chat/index`, verified initial chat health with 40 `.geek-item[data-id]` candidate cards and 1,339 AX nodes, ran controlled `Page.reload`, then verified post-refresh chat health with 40 candidate cards, 1,296 AX nodes, 165 captured network events, and 157 `zhipin.com` network matches.
+  - Artifact: `.live-artifacts\chat-self-heal-refresh-repair-live-20260503-1000.json`
+  - CDP-only evidence: method summary contained `Page.navigate`, `DOM.getDocument`, `DOM.querySelectorAll`, `Accessibility.getFullAXTree`, `Page.reload`, and `Network.*`; no `Runtime.*`.
+- Verification after chat self-heal script/docs update - PASS
+  - Time: 2026-05-03 10:04 Asia/Shanghai
+  - Commands: `node --check scripts\live-self-heal-smoke.js`; `npm run test:core-self-heal`; `npm run test:runtime-scan`; `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `git diff --check`
+  - Result: PASS. Phase 9 static gate and Phase 10 20+ completion gate remain green; `git diff --check` exited 0 with only existing LF-to-CRLF warnings on tracked files.
+- Recommend MCP safe-action routing and legacy follow-up decision - PASS / LIVE-VERIFIED
+  - Time: 2026-05-03 10:22 Asia/Shanghai
+  - Active workstream: Phase 8 MCP integration / recommend post-action routing
+  - Chrome target: `127.0.0.1:9222`, final target `https://www.zhipin.com/web/chat/recommend`
+  - Dev checks: `node --check src\domains\recommend\run-service.js`; `node --check src\recommend-mcp.js`; `node --check src\index.js`; `node --check scripts\live-recommend-mcp-smoke.js`; `npm run test:recommend-run-service`; `npm run test:recommend-mcp`; `npm run test:recommend-actions`; `npm run test:runtime-scan`
+  - Live command: `npm run live:recommend-mcp -- --slow-live --target-count 1 --detail-limit 0 --delay-ms 500 --complete-without-cancel --post-action greet --max-greet-count 1 --dry-run-post-action --no-filter --timeout-ms 600000 --save-report .live-artifacts\recommend-mcp-safe-action-dry-run-live-20260503-1015.json`
+  - Observed result: `status=PASS`, run `mcp_recommend_mop5aluu_mvc99fb3`, final `completed`, `processed=1`, `screened=1`, `passed=1`, `detail_opened=1`, `post_action_clicked=0`, `greet_count=0`. The first result had `post_action.reason=dry_run_post_action`, `would_click=true`, and live greet control text `打招呼`.
+  - CDP-only evidence: method summary contained `Page.enable`, `DOM.enable`, `Network.enable`, `Accessibility.enable`, `Page.navigate`, `DOM.getDocument`, `DOM.querySelector`, `DOM.querySelectorAll`, `DOM.getBoxModel`, `Input.dispatchMouseEvent`, `Network.getResponseBody`, and `Input.dispatchKeyEvent`; no `Runtime.*`.
+  - Decision: recommend `follow_up.chat` is legacy-only and remains fenced from the CDP-only MCP route. It is not a pending rewrite blocker.
+- Final verification after recommend MCP safe-action wiring - PASS
+  - Time: 2026-05-03 10:27 Asia/Shanghai
+  - Commands: `node --check src\domains\recommend\run-service.js`; `node --check src\recommend-mcp.js`; `node --check src\index.js`; `node --check scripts\live-recommend-mcp-smoke.js`; `node --check src\test-recommend-mcp.js`; `node --check src\test-recommend-run-service.js`; `npm run test:recommend-run-service`; `npm run test:recommend-mcp`; `npm run test:recommend-actions`; `npm run test:runtime-scan`; `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `git diff --check`
+  - Result: PASS. The first `test:runtime-scan` attempt caught an active-code error string mentioning the research quarantine path; that message was corrected to "archived legacy lane", after which `test:runtime-scan` and `gate:phase9-static` passed. `git diff --check` exited 0 with only existing LF-to-CRLF warnings.
+- Recommend MCP mutating safe-action gate - PASS / LIVE-VERIFIED
+  - Time: 2026-05-03 10:31 Asia/Shanghai
+  - Active workstream: Phase 8 MCP integration / recommend live post-action execution
+  - Chrome target: `127.0.0.1:9222`, target `https://www.zhipin.com/web/chat/recommend`
+  - Command: `npm run live:recommend-mcp -- --slow-live --target-count 2 --detail-limit 0 --delay-ms 500 --complete-without-cancel --post-action greet --max-greet-count 1 --execute-post-action --no-filter --timeout-ms 600000 --save-report .live-artifacts\recommend-mcp-safe-action-greet-verified-live-20260503-1032.json`
+  - Observed result: `status=PASS`, run `mcp_recommend_mop5lz1k_6rv7izc1`, final `completed`, `processed=2`, `screened=2`, `passed=2`, `detail_opened=2`, `greet_count=1`, `post_action_clicked=1`, and `unique_seen=2`.
+  - Action evidence: row 0 was already connected with `control_label=继续沟通` and was not clicked; row 1 clicked selector `button.btn-v2.btn-sure-v2.btn-greet`, `click_result.clicked=true`, `counted_as_greet=true`, then post-click CDP discovery found `control_after.label=继续沟通`, `control_after.continue_chat=true`, and `verified_after_click=true`.
+  - CDP-only evidence: method summary contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; no `Runtime.*`.
+- Final verification after mutating MCP safe-action gate - PASS
+  - Time: 2026-05-03 10:33 Asia/Shanghai
+  - Commands: `node --check src\domains\recommend\run-service.js`; `node --check src\recommend-mcp.js`; `node --check src\index.js`; `node --check scripts\live-recommend-mcp-smoke.js`; `npm run test:recommend-run-service`; `npm run test:recommend-mcp`; `npm run test:recommend-actions`; `npm run test:runtime-scan`; `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `git diff --check`
+  - Result: PASS. `git diff --check` exited 0 with only existing LF-to-CRLF warnings.
+- Recommend MCP favorite safe-action gate - PASS / LIVE-VERIFIED
+  - Time: 2026-05-03 15:38 Asia/Shanghai
+  - Active workstream: Phase 8 MCP integration / recommend live post-action execution
+  - Chrome target: `127.0.0.1:9222`, target `https://www.zhipin.com/web/chat/recommend`
+  - Command: `npm run live:recommend-mcp -- --slow-live --target-count 1 --detail-limit 0 --delay-ms 500 --complete-without-cancel --post-action favorite --execute-post-action --no-filter --timeout-ms 600000 --save-report .live-artifacts\recommend-mcp-safe-action-favorite-live-20260503-1538.json`
+  - Observed result: `status=PASS`, run `mcp_recommend_mopgljfm_94l40z4w`, final `completed`, `processed=1`, `screened=1`, `passed=1`, `detail_opened=1`, `greet_count=0`, `post_action_clicked=1`, and `unique_seen=1`.
+  - Action evidence: clicked selector `.like-icon-and-text`, `click_result.clicked=true`, original control label `收藏`, then post-click CDP discovery found `control_after.label=已收藏`, `control_after.active=true`, and `verified_after_click=true`. The run service now skips favorite clicks when a candidate is already favorited so it will not toggle a saved candidate off.
+  - CDP-only evidence: method summary contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; no `Runtime.*`.
+- Final verification after favorite MCP safe-action gate - PASS
+  - Time: 2026-05-03 15:40 Asia/Shanghai
+  - Commands: `node --check src\domains\recommend\run-service.js`; `node --check src\recommend-mcp.js`; `node --check src\index.js`; `node --check scripts\live-recommend-mcp-smoke.js`; `npm run test:recommend-run-service`; `npm run test:recommend-mcp`; `npm run test:recommend-actions`; `npm run test:runtime-scan`; `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `git diff --check`
+  - Result: PASS. Phase 9 aggregate static gate still passes, Phase 10 mandatory 20+ completion gate still passes for recommend/search/chat, and `git diff --check` exited 0 with only existing LF-to-CRLF warnings.
+- Recommend MCP page-scope selection - PASS / LIVE-VERIFIED
+  - Time: 2026-05-03 15:53 Asia/Shanghai
+  - Active workstream: Phase 8 MCP integration / recommend page-scope routing
+  - Chrome target: `127.0.0.1:9222`, target `https://www.zhipin.com/web/chat/recommend`
+  - Selected job: `算法工程师 23-27届实习/校招/早期职业 _ 杭州`
+  - Commands: `npm run live:recommend-mcp -- --slow-live --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --page-scope recommend --target-count 1 --detail-limit 1 --delay-ms 500 --complete-without-cancel --post-action none --no-filter --timeout-ms 900000 --save-report .live-artifacts\recommend-mcp-page-scope-recommend-live-20260503-155308.json`; repeated with `--page-scope featured` saving `.live-artifacts\recommend-mcp-page-scope-featured-live-20260503-155315.json`; repeated with `--page-scope latest` saving `.live-artifacts\recommend-mcp-page-scope-latest-live-20260503-155324.json`.
+  - Observed result: all three runs returned `status=PASS`, final phase `recommend:done`, `processed=1`, `screened=1`, `detail_opened=1`, and `card_count=15`. Effective scopes were `recommend`, `featured`, and `latest` respectively; all runs saw available scopes `recommend`, `featured`, and `latest`; `fallback_applied=false` because this selected job exposes all three.
+  - CDP-only evidence: method summaries contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; `Runtime.*` count was `0`.
+  - Fallback behavior: `selectRecommendPageScope()` now falls back to `推荐` if the requested scope tab is unavailable. The current live job exposes all three scopes, so unavailable-scope fallback could not be triggered on this role; the regression path is covered in `npm run test:recommend-domain` by simulating missing `精选` and verifying it clicks/selects `推荐`.
+- Recommend Phase 10 page-scope full-flow spot checks - PASS / LIVE-VERIFIED
+  - Time: 2026-05-03 15:58-15:59 Asia/Shanghai
+  - Chrome target: `127.0.0.1:9222`, target `https://www.zhipin.com/web/chat/recommend`
+  - Selected job: `算法工程师 23-27届实习/校招/早期职业 _ 杭州`
+  - Command template: `npm run live:recommend-phase10-full -- --slow-live --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --page-scope <recommend|featured|latest> --target-count 1 --max-screened 1 --post-action none --dry-run-post-action --delay-ms 500 --llm-timeout-ms 480000 --save-report <artifact>`
+  - Artifacts: `.live-artifacts\recommend-phase10-page-scope-recommend-live-20260503-155834.json`, `.live-artifacts\recommend-phase10-page-scope-featured-live-20260503-155854.json`, `.live-artifacts\recommend-phase10-page-scope-latest-live-20260503-155924.json`.
+  - Observed result: all three returned `status=PASS`, selected the requested effective scope, confirmed the full filter set (`recentNotView=近14天没有`, `school=985/211/国内外名校`, `degree=本科/硕士/博士`, `gender=男`), opened one candidate detail, captured parser-usable Network CV data, called the configured LLM, wrote a legacy-style CSV, and used `post_action=none`.
+  - CDP-only evidence: each artifact had `runtime_evaluate_used=false` and no `Runtime.*` methods.
+- Recommend job-list helper - PASS / LIVE-VERIFIED
+  - Time: 2026-05-03 16:04 Asia/Shanghai
+  - Active workstream: recommend cron/one-shot setup helper
+  - Chrome target: `127.0.0.1:9222`, target `https://www.zhipin.com/web/chat/recommend`
+  - Commands: `node src\cli.js list-jobs --slow-live --port 9222 > .live-artifacts\recommend-job-list-live-20260503-160437.json`; direct MCP `tools/call` for `list_recommend_jobs` saving `.live-artifacts\recommend-job-list-mcp-live-20260503-160557.json`.
+  - Observed result: `status=OK`, `job_count=7`, selected job `算法工程师 23-27届实习/校招/早期职业 _ 杭州`. Returned `job_names`: `全部牛人`, `大模型高招岗位 _ 杭州`, `算法工程师 23-27届实习/校招/早期职业 _ 杭州`, `研发实习生（AI应用方向）- 26/27届校招 _ 杭州`, `【星核人才计划】校招 _ 杭州`, `数据分析实习生 _ 杭州`, `算法工程师（视频/图像模型方向） _ 杭州`; `job_full_labels` preserves salary suffixes.
+  - CDP-only evidence: method summary contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; `Runtime.*` count was `0`.
+  - Product surface: new MCP tool `list_recommend_jobs` and CLI command `boss-recommend-mcp list-jobs`; bundled recommend skill now directs cron setup users to read `job_names` first.
+- Final verification after recommend job-list helper - PASS
+  - Time: 2026-05-03 16:06 Asia/Shanghai
+  - Commands: `node --check src\recommend-mcp.js`; `node --check src\index.js`; `node --check src\cli.js`; `npm run test:recommend-mcp`; `npm run test:runtime-scan`; `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `git diff --check`.
+  - Result: PASS. Phase 9 aggregate static gate returned `status=pass`; Phase 10 completion gate still passed with recommend/search/chat `processed=20`, `screened=20`, `unique_seen=20`; `git diff --check` exited 0 with only existing LF-to-CRLF warnings.
+- Final verification after recommend page-scope routing - PASS
+  - Time: 2026-05-03 15:58 Asia/Shanghai
+  - Commands: `node --check src\domains\recommend\scopes.js`; `node --check src\domains\recommend\run-service.js`; `node --check src\domains\recommend\refresh.js`; `node --check src\recommend-mcp.js`; `node --check scripts\live-recommend-mcp-smoke.js`; `node --check scripts\live-recommend-run-service-smoke.js`; `node --check scripts\live-recommend-domain-smoke.js`; `node --check scripts\live-recommend-phase10-full.js`; `npm run test:recommend-domain`; `npm run test:recommend-run-service`; `npm run test:recommend-mcp`; `npm run test:runtime-scan`; `npm run gate:phase9-static`; `npm run gate:phase10-complete`; `git diff --check`.
+  - Result: PASS. `npm run gate:phase9-static` returned `status=pass`; `npm run gate:phase10-complete` returned `status=pass` with recommend/search/chat all still at `processed=20`, `screened=20`, `unique_seen=20`; `git diff --check` exited 0 with only existing LF-to-CRLF warnings.
+- `npm pack --dry-run --json` - PASS after aggregate static gate
+  - Artifact: `.live-artifacts\package-dry-run-phase9-static-gate.json`
+  - Entry count: 49
+  - Blocked/quarantined paths included: 0
+- `npm pack --dry-run --json` - PASS after boundary guard
+  - Artifact: `.live-artifacts\package-dry-run-phase9-boundary.json`
+  - Entry count: 49
+  - Blocked/quarantined paths included: 0
+- `npm run test:runtime-scan` - PASS after boundary guard
+- `npm run test:core-self-heal` - PASS after boundary guard
+- `npm run test:async` - PASS after boundary guard
+- `node --check scripts\scan-legacy-boundary.js`, `node --check src\cli.js`, `node --check scripts\live-recommend-domain-smoke.js`, `node --check scripts\live-recommend-run-service-smoke.js`, `node --check scripts\live-self-heal-smoke.js`, and `node --check src\test-runtime-scan.js` - PASS after boundary guard
+- `git diff --check` - PASS after boundary guard; only existing LF/CRLF conversion warnings were reported
+- Fenced package bin one-shot run assertion - PASS
+  - Command: `node bin\boss-recommend-mcp.js run --instruction "CDP-only package gate" --port 9222`
+  - Result: expected exit code `1`, error code `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`, `cdp_only=true`, `runtime_evaluate_used=false`, `method_log=[]`
+- `npm run scan:runtime:strict` - PASS after package publish-surface narrowing
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run scan:runtime` - PASS in inventory mode after package publish-surface narrowing
+  - Total findings: 459
+  - Raw non-allowed findings: 457
+  - Reachable active findings: 0
+  - Legacy quarantined findings: 457
+  - Allowed guard findings: 2
+- `npm run test:runtime-scan` - PASS after package publish-surface narrowing
+- `npm run test:async` - PASS after package publish-surface narrowing
+- `npm run test:boss-chat` - PASS after package publish-surface narrowing
+- `npm run test:chat-mcp` - PASS after package publish-surface narrowing
+- `npm run test:self-heal` - PASS after package publish-surface narrowing
+- `node --check scripts\scan-forbidden-runtime.js`, `node --check src\test-runtime-scan.js`, `node --check src\cli.js`, `node --check src\index.js`, and `node --check src\chat-runtime-config.js` - PASS after package publish-surface narrowing
+- `git diff --check` - PASS; only existing LF/CRLF conversion warnings were reported
+
+## Blockers
+
+- Phase 10 chat targeted unread run - PARTIAL LIVE PASS / REQUEST-CV NOT EXERCISED
+  - Time: 2026-05-03 00:52 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Command: `node scripts/live-chat-phase10-full.js --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --start-from unread --target-count 30 --criteria "<strict 211/QS/985/QS100/CAS + AI/LLM/CV/3D algorithm + 24-27 graduate criteria>" --max-candidates 100000 --delay-ms 1200 --llm-timeout-ms 480000 --online-resume-button-timeout-ms 12000 --max-image-pages 8 --list-max-scrolls 320 --save-report .live-artifacts/phase10-chat-unread-strict-request-cv-live-v2.json --timeout-ms 10800000 --poll-interval-ms 10000`
+  - Result: `status=PASS`, selected job value `534000582`, start filter `未读`, processed remaining unread list until `list_end_reason=empty_visible_list`; `processed=8`, `screened=8`, `detail_opened=1`, `llm_screened=1`, `passed=0`, `requested=0`
+  - Artifacts: `.live-artifacts\phase10-chat-unread-strict-request-cv-live-v2.json`, `C:\Users\yaolin\.boss-recommend-mcp\boss-chat\runs\mcp_chat_mookwahq_gdzvq8sq.results.csv`, `C:\Users\yaolin\.boss-recommend-mcp\boss-chat\runs\mcp_chat_mookwahq_gdzvq8sq.report.json`
+  - CDP-only: method summary contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; `Runtime.*` count `0`
+  - Evaluation: this validates chat job selection, unread/all start-page handling for `未读`, stable id-only chat de-duplication, faster no-online-resume skips, Network-primary CV extraction with DOM wait skipped after parsed Network profile, LLM screening from live chat Network data, CSV/report output, and completion when target pass count is not met because unread list ended
+  - Not passed: request-CV sequence was not exercised because no candidate passed the strict criteria in the remaining unread list. A follow-up live gate must use `start_from=all` or a known pass/test candidate/criteria before marking chat request-CV complete.
+  - Follow-up fixes made during this gate: empty unread completion now requires CDP chat-shell state checks instead of visual product control flow; chat list keys use stable `data-id` only; card clicks reacquire fresh nodes and click measured points; online-resume button clicks use measured points and retry stale nodes; Network-primary detail extraction skips the long DOM-content wait once parser-usable Network profiles are found; `online_resume_button_timeout_ms` was added so slow VPN runs do not wait minutes on candidates without online resumes; chat CSV now records `post_action=request_cv` when request-CV aliases are supplied.
+- Phase 10 chat unread early-stop/root-navigation diagnosis - FIXED / PARTIAL LIVE GUARD PASS
+  - Time: 2026-05-03 07:40-07:42 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target after run: `https://www.zhipin.com/web/chat/index`
+  - User observation: there should be more than 8 unread candidates, and the browser had stopped at top-level `https://www.zhipin.com/web/frame/c-resume/?source=chat-resume-online`, which is not a valid chat-run terminal state.
+  - Root cause: clicking Boss's visible `a.resume-btn-online` can navigate the whole tab to `/web/frame/c-resume/` instead of leaving that URL inside a modal/iframe. Once the top-level tab leaves `/web/chat/index`, the infinite-list reader can see no chat cards and wrongly classify the run as `empty_visible_list`.
+  - Fix: added top-level URL inspection through CDP `Page.getFrameTree`; top-level `/web/frame/c-resume/` is now a forbidden chat state; chat MCP can reconnect to that recoverable target; the run navigates back only to `CHAT_TARGET_URL`, reapplies job/start filters, and refuses to mark terminal `empty_visible_list` complete without correct chat-shell context. Visual empty-list inspection was moved to `scripts/live-helpers/` as test-only evidence and is not part of product run control.
+  - Additional fix: Network-primary chat extraction now tolerates stale resume DOM nodes when Network bodies exist, so parser-usable Network profiles are processed before any DOM/image fallback dependency.
+  - Live guard command: `node scripts\live-chat-phase10-full.js --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --start-from unread --target-count 1 --criteria "测试防护：必须明确包含XYZ_NAV_GUARD_IMPOSSIBLE_KEYWORD才通过" --max-candidates 3 --detail-limit 3 --no-request-cv --no-llm --online-resume-button-timeout-ms 6000 --delay-ms 500 --list-max-scrolls 20 --save-report .live-artifacts\chat-network-primary-stale-fix-live.json --timeout-ms 900000 --poll-interval-ms 5000`
+  - Result: `status=PASS`, `processed=2`, `detail_opened=1`, `parsed_network_profile_count=2`, final Chrome page stayed on `/web/chat/index`, and method log contained no `Runtime.*`. This is a focused guard pass only; full chat request-CV Phase 10 remains pending.
+- Phase 10 chat unread target-count 5 rerun - FAILED / USER STOPPED
+  - Time: 2026-05-03 08:00-08:26 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Run id: `mcp_chat_mop07qt0_pgmd8t5r`
+  - Command: `node scripts/live-chat-phase10-full.js --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --start-from unread --target-count 5 --criteria-file .live-artifacts\chat-target5-criteria-20260503-080001.txt --max-candidates 100000 --delay-ms 1200 --llm-timeout-ms 480000 --online-resume-button-timeout-ms 12000 --max-image-pages 8 --list-max-scrolls 320 --timeout-ms 10800000 --poll-interval-ms 10000 --slow-live --save-report .live-artifacts\phase10-chat-unread-target5-live-20260503-080001.json`
+  - Result: stopped by user after observing repeated CV/detail opens for 李鹏涛. Final recorded progress before stop: `processed=15`, `screened=15`, `detail_opened=15`, `llm_screened=15`, `passed=1`, `requested=0`, `unique_seen=15`, `scroll_count=0`.
+  - Cleanup: PID `17104` stopped; CDP-only modal cleanup succeeded; final DOM counts: `.dialog-wrap.active=0`, `.resume-container=0`, `iframe[src*="c-resume"]=0`, `.geek-item[data-id]=40`.
+  - Evaluation: failed gate. Do not treat `detail_opened=processed` as proof of correct candidate targeting; user visual observation showed the old candidate CV could be reopened while counters advanced.
+  - Follow-up fixes: selected chat cards now scroll into view before click, active candidate id must match the intended card before opening the online resume, request-CV now follows legacy order by sending the greeting before looking for/clicking the request-CV button, and unverified request-CV after a non-skipped pass now fails loudly.
+- Phase 10 chat unread target-count 5 rerun - LIVE PASS / REQUEST-CV VERIFIED
+  - Time: 2026-05-03 09:19-09:24 Asia/Shanghai
+  - Chrome: `127.0.0.1:9222`
+  - Target: `https://www.zhipin.com/web/chat/index`
+  - Run id: `mcp_chat_mop31keq_on37po6l`
+  - Command: `node scripts/live-chat-phase10-full.js --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --start-from unread --target-count 5 --criteria-file .live-artifacts\chat-target5-criteria-20260503-083720.txt --max-candidates 100000 --delay-ms 1200 --llm-timeout-ms 480000 --online-resume-button-timeout-ms 12000 --max-image-pages 8 --list-max-scrolls 320 --timeout-ms 10800000 --poll-interval-ms 10000 --slow-live --request-cv --save-report .live-artifacts\phase10-chat-unread-target5-live-20260503-091912.json`
+  - Result: `status=PASS`, selected job value `534000582`, start filter `未读`, `processed=21`, `screened=21`, `detail_opened=21`, `llm_screened=21`, `passed=5`, `requested=2`, `request_satisfied=5`, `request_skipped=3`, `unique_seen=21`, `scroll_count=0`.
+  - Artifacts: `.live-artifacts\phase10-chat-unread-target5-live-20260503-091912.json`, `C:\Users\yaolin\.boss-recommend-mcp\boss-chat\runs\mcp_chat_mop31keq_on37po6l.results.csv`, `C:\Users\yaolin\.boss-recommend-mcp\boss-chat\runs\mcp_chat_mop31keq_on37po6l.report.json`
+  - CDP-only: method summary contained `Page`, `DOM`, `Input`, `Network`, and `Accessibility`; `Runtime.*` count `0`.
+  - Evaluation: request-CV sequence is live-verified. Two passed candidates had active `求简历`, received the greeting, clicked `求简历`, clicked `确定`, and verified `简历请求已发送`. Three passed candidates were skipped as already satisfied from existing `简历请求已发送` history; the skip was not caused by disabled `求简历`. Active `附件简历` remains a separate satisfied skip condition. Disabled `求简历` alone is not classified as already requested.
+  - Follow-up fixes made for this gate: plain `附件简历` is no longer treated as `求简历`; active `附件简历` is checked before request; disabled `求简历` is not treated as already requested; editor/send/ask/confirm clicks prefer measured coordinates from fresh DOM reads and retry stale node churn; editor verification reacquires the editor after `Input.insertText`.
+- Existing legacy runtime/page-JS code is no longer active in the scanner's package-entrypoint strict gate, and the npm package publish surface now excludes the quarantined legacy modules/vendors. The policy decision is now explicit: package-local legacy remains in `legacy/research/` as research-only archive, while external recruit source remains migration-reference inventory. The 457 raw repo/external-source non-allowed findings remain explicitly `legacy-quarantined` by design and must not become active runtime paths.
+- `legacy/research/vendor/boss-recommend-search-cli/src/cli.js` preserves the pre-existing uncommitted vendor edit from before this session; it was moved intact and must not be overwritten.
+- Recruit search parameter application is live-verified for keyword, city, degree, school label, recent-viewed filtering, explicit `全国`, and illegal-city defaulting to `全国`. Recruit MCP lifecycle wrappers, sync result compatibility, persisted snapshots, CSV/report/checkpoint artifacts, and disk-only status fallback are live-verified. Full recruit domain completion still waits for legacy quarantine and the later hard static gate.
+- Recruit MCP wrappers now cover lifecycle/status, terminal pause/cancel/resume parity, shared run-service execution, old-style snake_case run aliases, `run_recruit_pipeline` sync success `result.run_id`/processed-count shape, `BOSS_RECRUIT_HOME` persisted run-state files, checkpoint JSON, results CSV, report JSON, and disk-only `get_recruit_pipeline_run` fallback. Design note: disk-only fallback does not resume/cancel active browser work without a current in-memory CDP session; this is intentional because active CDP work must be reattached and validated safely.
+- External recruit vendor runtime/page-JS remains in scanner inventory as `legacy-quarantined` migration-reference code.
+- Chat full-CV scroll image fallback and image-sequence LLM screening work live without page JS: latest integrated gate captured 7 screenshots, 5 unique, sent 7 image pages to the configured LLM, and received structured screening JSON.
+- Chat summary Network parsing now works live for stable `historyMsg` and `chat/geek/info` payloads. Full online-resume Network extraction is still incomplete when Boss returns `view/geek/info/v2` without parser-usable `geekDetailInfo`/`geekDetail`; image-sequence LLM remains the full-CV fallback path.
+- `core/self-heal` is complete after live recommend refresh repair, recruit search readiness, and chat refresh repair all passed without `Runtime.*`.
+- Recommend domain rewrite has CDP-only filters/cards/detail/capture/run-service and MCP lifecycle routing live-verified. Full completion still waits for legacy recommend runtime path quarantine/removal and the later hard static gate. Mutating favorite/greet execution is verified in the Phase 10 recommend script with explicit user approval; MCP post-action routing is now live-verified in dry-run mode and requires explicit `execute_post_action`/non-dry-run configuration before clicking live.
+- Recommend forced DOM and image fallback now pass live; recruit forced DOM and image fallback now pass live; chat full-CV scroll image fallback now passes live.
+- Shared adaptive CV acquisition now passes live across chat, recommend, and recruit/search. The production order is Network first; image fallback uses full-CV scroll screenshots only after no parser-usable Network profile is available. Live cascade tests used longer Network waits because VPN loading was slow; shared defaults remain the legacy 4200 ms primary wait, 2000 ms retry wait, and 1000 ms image-mode grace wait.
+- Recommend Network parser now supports `zpData.geekDetail` responses from `/wapi/zpitem/web/boss/search/geek/info` in regression coverage derived from saved live data; a fresh live re-hit of this exact endpoint is still useful before calling the alternate-shape parser gate complete.
+- Current-page Network CV parsing works for `/wapi/zpjob/view/geek/info` responses with `zpData.geekDetailInfo`.
+- Search-page Network CV capture also works for `/wapi/zpitem/web/boss/search/geek/info` responses with `zpData.geekDetail`; recruit/search parsing should support this shape.
+- Infinite-list traversal is now live-verified for recommend, recruit/search, and chat. Recommend, recruit/search, and chat run services now use `core/infinite-list`; direct lifecycle gates record unique candidate keys, processed counts, scroll counts, and end/cancel state without `Runtime.*`.
+- Recommend and recruit/search refresh rounds are live-verified with CDP-only methods. Recommend first tries the bottom `刷新` button and then reapplies filters; search reloads and reapplies the same search params. Both refreshed paths force the recent-view exclusion (`recentNotView / 近14天没有` for recommend, `filter_recent_viewed=true` for search) regardless of original user input. Run-service integration is implemented; a long full-target run can be added later if target-count behavior needs an end-to-end soak beyond the focused live gate.
+- Chat direct run-service lifecycle and chat MCP lifecycle wrappers are live-verified through shared `core/run` and `core/infinite-list`: latest direct gate processed 2 live chat card candidates, and latest MCP gate processed 2 live chat card candidates through `handleRequest`, paused/resumed/canceled safely, persisted run artifacts under `C:\Users\yaolin\.boss-recommend-mcp\boss-chat\runs`, and did not open an outreach/send-message action.
+- Phase 9 chat helper split, `src/index.js` lazy legacy import slice, `src/cli.js` lazy legacy import slice, scanner reachability/quarantine awareness, CDP-only `prepare_boss_chat_run` job-list preflight, CDP-only `boss_chat_health_check`, CDP-only chat CLI health/prepare/status routing, pure `where` path resolution, pure CLI config target resolution, CDP-only `launch-chrome` reuse/readiness, CDP-only `doctor`, fenced CDP-only `calibrate`, fenced CDP-only one-shot recommend CLI `run`, pure/fenced MCP featured calibration, CDP-only MCP recommend self-heal scan with fenced apply, detached legacy worker fencing, and package publish-surface narrowing are live-verified/package-entrypoint verified. Old vendor modules and quarantined migration-reference files still keep forbidden APIs in raw scanner inventory until final removal or compatibility decisions.
+- Recommend MCP lifecycle wrappers are live-verified through shared `core/run` and `core/infinite-list`: latest MCP gate processed 2 live recommend card candidates through `handleRequest`, paused/resumed/canceled safely, persisted run artifacts under `C:\Users\yaolin\.boss-recommend-mcp\runs`, used `--no-filter`, `detail_limit=0`, and `post_action=none`, and did not open detail or click favorite/greet.
+- Phase 8 MCP integration is now live-verified for recommend, recruit/search, and chat lifecycle wrappers; `prepare_boss_chat_run` reads chat job options CDP-only, and `boss_chat_health_check` runs shared chat health probes CDP-only. Recommend favorite/greet post-actions are wired into the shared action gate and dry-run live-verified through MCP. Recommend `follow_up.chat` orchestration is legacy-only by decision and remains fenced from the CDP-only route; it no longer blocks completion. Legacy CLI chat commands remain quarantined.
+
+## Next exact task
+
+Next task: no mandatory blocker remains for the recommend MCP safe-action/follow-up-chat caveat. Recommend MCP greet is live-verified in both dry-run and mutating modes, recommend MCP favorite is live-verified in mutating mode with post-click `已收藏` verification, and follow-up chat remains an intentional legacy-only fence. Optional next work is product polish or a new user-selected bug. New Codex instances should start by reading this status, `docs/REWRITE_PLAN.md`, `docs/LIVE_TEST_MATRIX.md`, `docs/CDP_ONLY_CONTRACT.md`, and `docs/LEGACY_RUNTIME_INVENTORY.md`.

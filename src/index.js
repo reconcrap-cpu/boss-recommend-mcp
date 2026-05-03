@@ -6,21 +6,61 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
   getFeaturedCalibrationResolution,
-  runRecommendCalibration
-} from "./adapters.js";
-import {
-  cancelBossChatRun,
-  getBossChatHealthCheck,
-  getBossChatRun,
   getBossChatTargetCountValue,
-  normalizeTargetCountInput,
-  pauseBossChatRun,
-  prepareBossChatRun,
-  resumeBossChatRun,
-  startBossChatRun
-} from "./boss-chat.js";
-import { runRecommendPipeline } from "./pipeline.js";
-import { runRecommendSelfHeal } from "./self-heal.js";
+  normalizeTargetCountInput
+} from "./chat-runtime-config.js";
+import {
+  __resetChatMcpStateForTests,
+  __setChatMcpConnectorForTests,
+  __setChatMcpJobReaderForTests,
+  __setChatMcpWorkflowForTests,
+  bossChatHealthCheckTool,
+  cancelBossChatRunTool,
+  getBossChatRunTool,
+  pauseBossChatRunTool,
+  prepareBossChatRunTool,
+  resumeBossChatRunTool,
+  startBossChatRunTool
+} from "./chat-mcp.js";
+import {
+  __resetRecruitMcpStateForTests,
+  __setRecruitMcpConnectorForTests,
+  __setRecruitMcpWorkflowForTests,
+  cancelRecruitPipelineRunTool,
+  createRecruitPipelineInputSchema,
+  createRecruitRunIdInputSchema,
+  getRecruitPipelineRunTool,
+  pauseRecruitPipelineRunTool,
+  resumeRecruitPipelineRunTool,
+  runRecruitPipelineTool,
+  startRecruitPipelineRunTool,
+  validateRecruitPipelineArgs
+} from "./recruit-mcp.js";
+import {
+  __resetRecommendMcpStateForTests,
+  __setRecommendMcpConnectorForTests,
+  __setRecommendMcpJobReaderForTests,
+  __setRecommendMcpWorkflowForTests,
+  cancelRecommendPipelineRunTool,
+  getRecommendPipelineRunTool,
+  listRecommendJobsTool,
+  pauseRecommendPipelineRunTool,
+  resumeRecommendPipelineRunTool,
+  startRecommendPipelineRunTool
+} from "./recommend-mcp.js";
+import {
+  assertNoForbiddenCdpCalls,
+  bringPageToFront,
+  connectToChromeTarget,
+  enableDomains,
+  sleep as sleepMs
+} from "./core/browser/index.js";
+import {
+  buildRecommendSelfHealConfig,
+  HEALTH_STATUS,
+  resolveRecommendSelfHealRoots,
+  runSelfHealCheck
+} from "./core/self-heal/index.js";
 import {
   RUN_MODE_ASYNC,
   RUN_STAGE_CHAT_FOLLOWUP,
@@ -50,6 +90,7 @@ const TOOL_GET_RUN = "get_recommend_pipeline_run";
 const TOOL_CANCEL_RUN = "cancel_recommend_pipeline_run";
 const TOOL_PAUSE_RUN = "pause_recommend_pipeline_run";
 const TOOL_RESUME_RUN = "resume_recommend_pipeline_run";
+const TOOL_LIST_RECOMMEND_JOBS = "list_recommend_jobs";
 const TOOL_RUN_FEATURED_CALIBRATION = "run_featured_calibration";
 const TOOL_GET_FEATURED_CALIBRATION_STATUS = "get_featured_calibration_status";
 const TOOL_RUN_RECOMMEND_SELF_HEAL = "run_recommend_self_heal";
@@ -60,6 +101,12 @@ const TOOL_BOSS_CHAT_GET_RUN = "get_boss_chat_run";
 const TOOL_BOSS_CHAT_PAUSE_RUN = "pause_boss_chat_run";
 const TOOL_BOSS_CHAT_RESUME_RUN = "resume_boss_chat_run";
 const TOOL_BOSS_CHAT_CANCEL_RUN = "cancel_boss_chat_run";
+const TOOL_RUN_RECRUIT_PIPELINE = "run_recruit_pipeline";
+const TOOL_START_RECRUIT_PIPELINE_RUN = "start_recruit_pipeline_run";
+const TOOL_GET_RECRUIT_PIPELINE_RUN = "get_recruit_pipeline_run";
+const TOOL_CANCEL_RECRUIT_PIPELINE_RUN = "cancel_recruit_pipeline_run";
+const TOOL_PAUSE_RECRUIT_PIPELINE_RUN = "pause_recruit_pipeline_run";
+const TOOL_RESUME_RECRUIT_PIPELINE_RUN = "resume_recruit_pipeline_run";
 
 const SERVER_NAME = "boss-recommend-mcp";
 const FRAMING_UNKNOWN = "unknown";
@@ -68,11 +115,23 @@ const FRAMING_LINE = "line";
 const DETACHED_WORKER_FLAG = "--detached-worker";
 const DETACHED_WORKER_RUN_ID_FLAG = "--run-id";
 const DETACHED_WORKER_RESUME_FLAG = "--resume";
+const featuredCalibrationUnsupportedCode = "FEATURED_CALIBRATION_UNSUPPORTED_CDP_ONLY";
+const recommendSelfHealApplyUnsupportedCode = "RECOMMEND_SELF_HEAL_APPLY_UNSUPPORTED_CDP_ONLY";
+const detachedLegacyPipelineUnsupportedCode = "DETACHED_LEGACY_PIPELINE_UNSUPPORTED_CDP_ONLY";
+const recommendTargetUrl = "https://www.zhipin.com/web/chat/recommend";
 
-let runPipelineImpl = runRecommendPipeline;
-let runSelfHealImpl = runRecommendSelfHeal;
+let runPipelineImpl = null;
+let runSelfHealImpl = null;
 let spawnProcessImpl = spawn;
 const TERMINAL_RUN_STATES = new Set([RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_STATE_CANCELED]);
+
+async function getRunPipelineImpl() {
+  if (typeof runPipelineImpl === "function") return runPipelineImpl;
+  const error = new Error("Detached legacy recommend workers are fenced during the CDP-only rewrite. Active recommend execution must use start_recommend_pipeline_run, which routes through the shared CDP-only recommend run service.");
+  error.code = detachedLegacyPipelineUnsupportedCode;
+  error.retryable = false;
+  throw error;
+}
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -455,6 +514,78 @@ function createRunInputSchema() {
           }
         },
         additionalProperties: false
+      },
+      host: {
+        type: "string",
+        description: "可选，Chrome 调试 host；默认 127.0.0.1"
+      },
+      port: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，Chrome 调试端口；默认 9222"
+      },
+      target_url_includes: {
+        type: "string",
+        description: "可选，Chrome target URL 匹配片段；默认 Boss recommend 页"
+      },
+      allow_navigate: {
+        type: "boolean",
+        description: "可选，未在 recommend 页时允许通过 Page.navigate 切换；默认 true"
+      },
+      slow_live: {
+        type: "boolean",
+        description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
+      },
+      max_candidates: createTargetCountInputSchema("本次最多处理候选人数；默认使用确认后的 target_count，未设置时为 5"),
+      detail_limit: {
+        type: "integer",
+        minimum: 0,
+        description: "打开详情的人数上限；默认 0，0 表示只用卡片信息"
+      },
+      delay_ms: {
+        type: "integer",
+        minimum: 0,
+        description: "候选人之间的延迟；live pause/resume 测试可增大它"
+      },
+      execute_post_action: {
+        type: "boolean",
+        description: "可选，是否实际执行通过后的 recommend 后置动作 favorite/greet；默认 true"
+      },
+      dry_run_post_action: {
+        type: "boolean",
+        description: "可选，只验证 recommend 后置动作发现/配额/可点击路径，不实际点击 favorite/greet"
+      },
+      action_timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，等待详情页 favorite/greet 控件出现的超时时间"
+      },
+      action_interval_ms: {
+        type: "integer",
+        minimum: 100,
+        description: "可选，轮询详情页 favorite/greet 控件的间隔"
+      },
+      action_after_click_delay_ms: {
+        type: "integer",
+        minimum: 0,
+        description: "可选，点击 favorite/greet 后等待页面状态稳定的时间"
+      },
+      no_filter: {
+        type: "boolean",
+        description: "开发/live gate 专用：跳过本次筛选器点击，默认 false"
+      },
+      filter_enabled: {
+        type: "boolean",
+        description: "开发/live gate 专用：false 时跳过本次筛选器点击"
+      },
+      refresh_on_end: {
+        type: "boolean",
+        description: "列表到底且目标数未达成时是否刷新/重新应用筛选；默认 true"
+      },
+      max_refresh_rounds: {
+        type: "integer",
+        minimum: 0,
+        description: "列表到底后的最大刷新轮数；默认 2"
       }
     },
     required: ["instruction"],
@@ -491,12 +622,96 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
         type: "string",
         description: "兼容字段；优先使用 greeting_text。可选首条打招呼消息"
       },
-      target_count: createTargetCountInputSchema("本次处理人数上限；支持正整数、all 或 -1（扫到底），也兼容 { value: \"all\" } 等包装对象"),
-      targetCount: createTargetCountInputSchema("兼容字段；优先使用 target_count。本次处理人数上限，支持正整数、all 或 -1（扫到底）"),
+      target_count: createTargetCountInputSchema("通过筛选的人数目标；数字表示通过人数目标，未达标但列表扫到底也算完成；all/全部/扫到底 表示处理完整列表"),
+      targetCount: createTargetCountInputSchema("兼容字段；优先使用 target_count。数字表示通过人数目标，all/全部/扫到底 表示处理完整列表"),
       port: {
         type: "integer",
         minimum: 1,
         description: "可选，覆盖 Chrome 调试端口；未传时读取 screening-config.json.debugPort"
+      },
+      host: {
+        type: "string",
+        description: "可选，Chrome 调试 host；默认 127.0.0.1"
+      },
+      target_url_includes: {
+        type: "string",
+        description: "可选，Chrome target URL 匹配片段；默认 Boss chat index"
+      },
+      allow_navigate: {
+        type: "boolean",
+        description: "可选，未在 chat index 时允许通过 Page.navigate 切换到 chat 页面；默认 true"
+      },
+      slow_live: {
+        type: "boolean",
+        description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
+      },
+      max_candidates: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，仅用于 target_count=all 时给 CDP-only run 设置安全上限"
+      },
+      detail_limit: {
+        type: "integer",
+        minimum: 0,
+        description: "可选，打开在线简历详情的人数上限；LLM 或求简历任务默认跟随安全处理上限"
+      },
+      detail_source: {
+        type: "string",
+        enum: ["cascade", "network", "dom", "image"],
+        description: "可选，详情/CV 抽取来源；默认 cascade"
+      },
+      delay_ms: {
+        type: "integer",
+        minimum: 0,
+        description: "可选，每个候选人之间的等待毫秒数"
+      },
+      use_llm: {
+        type: "boolean",
+        description: "可选，是否使用 screening-config.json 中的 LLM 配置筛选；求简历任务默认使用"
+      },
+      request_cv: {
+        type: "boolean",
+        description: "可选，通过筛选后发送消息并点击求简历"
+      },
+      request_resume: {
+        type: "boolean",
+        description: "request_cv 的兼容别名"
+      },
+      ask_cv: {
+        type: "boolean",
+        description: "request_cv 的兼容别名"
+      },
+      execute_post_action: {
+        type: "boolean",
+        description: "可选，执行通过后的后置动作；chat 中等同 request_cv"
+      },
+      post_action: {
+        type: "string",
+        description: "可选，支持 request_cv / ask_cv / request_resume / 求简历"
+      },
+      dry_run_request_cv: {
+        type: "boolean",
+        description: "可选，只验证求简历动作路径，不实际发送消息或点击求简历"
+      },
+      llm_timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，单个候选人的 LLM 调用超时"
+      },
+      online_resume_button_timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，选中 chat 候选人后等待在线简历按钮出现的毫秒数；慢 VPN 默认 30000"
+      },
+      max_image_pages: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，图片简历 fallback 的滚动截图页数上限"
+      },
+      list_max_scrolls: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，聊天列表无限滚动最大次数"
       },
       dry_run: { type: "boolean" },
       no_state: { type: "boolean" },
@@ -589,8 +804,43 @@ function createRunRecommendSelfHealInputSchema() {
   };
 }
 
+function createListRecommendJobsInputSchema() {
+  return {
+    type: "object",
+    properties: {
+      host: {
+        type: "string",
+        description: "可选，Chrome 调试 host；默认 127.0.0.1"
+      },
+      port: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，Chrome 调试端口；默认 9222"
+      },
+      target_url_includes: {
+        type: "string",
+        description: "可选，Chrome target URL 匹配片段；默认 Boss recommend 页"
+      },
+      allow_navigate: {
+        type: "boolean",
+        description: "可选，未在 recommend 页时允许通过 Page.navigate 切换；默认 true"
+      },
+      slow_live: {
+        type: "boolean",
+        description: "可选，VPN/慢页面模式，放宽等待时间"
+      }
+    },
+    additionalProperties: false
+  };
+}
+
 function createToolsSchema() {
   return [
+    {
+      name: TOOL_LIST_RECOMMEND_JOBS,
+      description: "CDP-only 读取 Boss 推荐页岗位下拉框，返回所有可用岗位完整名称，方便 cron/一次性任务提前填写 job 参数。不会启动筛选任务。",
+      inputSchema: createListRecommendJobsInputSchema()
+    },
     {
       name: TOOL_START_RUN,
       description: "异步启动 Boss 推荐页流水线（含同步门禁预检）；只有在前置确认与页面就绪通过后才返回 run_id。",
@@ -665,13 +915,30 @@ function createToolsSchema() {
     },
     {
       name: TOOL_BOSS_CHAT_HEALTH_CHECK,
-      description: "检查内置 boss-chat 运行时与共享 screening-config.json 是否可用。",
+      description: "CDP-only 检查 Boss chat 页面、自愈 probes、共享 screening-config.json 与 chat runtime 目录是否可用。",
       inputSchema: {
         type: "object",
         properties: {
+          host: {
+            type: "string",
+            description: "可选，Chrome 调试 host；默认 127.0.0.1"
+          },
           port: {
             type: "integer",
-            minimum: 1
+            minimum: 1,
+            description: "可选，Chrome 调试端口；默认读取 screening-config.json.debugPort 或 9222"
+          },
+          target_url_includes: {
+            type: "string",
+            description: "可选，Chrome target URL 匹配片段；默认 Boss chat 页"
+          },
+          allow_navigate: {
+            type: "boolean",
+            description: "可选，未在 chat 页时允许通过 Page.navigate 切换；默认 true"
+          },
+          slow_live: {
+            type: "boolean",
+            description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
           }
         },
         additionalProperties: false
@@ -738,6 +1005,36 @@ function createToolsSchema() {
         required: ["run_id"],
         additionalProperties: false
       }
+    },
+    {
+      name: TOOL_RUN_RECRUIT_PIPELINE,
+      description: "兼容 Boss recruit 入口：默认 async；sync 模式会等待终态。所有浏览器动作走共享 CDP-only recruit service。",
+      inputSchema: createRecruitPipelineInputSchema()
+    },
+    {
+      name: TOOL_START_RECRUIT_PIPELINE_RUN,
+      description: "异步启动 Boss recruit 流水线；先完成参数/criteria/default 确认门禁，再连接 Chrome search 页执行。",
+      inputSchema: createRecruitPipelineInputSchema()
+    },
+    {
+      name: TOOL_GET_RECRUIT_PIPELINE_RUN,
+      description: "查询 Boss recruit run_id 的当前状态。",
+      inputSchema: createRecruitRunIdInputSchema()
+    },
+    {
+      name: TOOL_CANCEL_RECRUIT_PIPELINE_RUN,
+      description: "取消运行中的 Boss recruit 任务。",
+      inputSchema: createRecruitRunIdInputSchema()
+    },
+    {
+      name: TOOL_PAUSE_RECRUIT_PIPELINE_RUN,
+      description: "暂停运行中的 Boss recruit 任务。",
+      inputSchema: createRecruitRunIdInputSchema()
+    },
+    {
+      name: TOOL_RESUME_RECRUIT_PIPELINE_RUN,
+      description: "继续已暂停的 Boss recruit 任务。",
+      inputSchema: createRecruitRunIdInputSchema()
     }
   ];
 }
@@ -886,6 +1183,40 @@ function getLastOutputLine(text) {
     .map((line) => normalizeText(line))
     .filter(Boolean);
   return lines.length > 0 ? lines[lines.length - 1] : null;
+}
+
+function buildCdpMethodSummary(methodLog = []) {
+  const summary = {};
+  for (const entry of methodLog) {
+    const method = typeof entry === "string" ? entry : entry?.method;
+    if (!method) continue;
+    summary[method] = (summary[method] || 0) + 1;
+  }
+  return summary;
+}
+
+function compactSelfHealCheck(check) {
+  return {
+    domain: check?.domain || null,
+    status: check?.status || null,
+    summary: check?.summary || null,
+    probes: Array.isArray(check?.probes)
+      ? check.probes.map((probe) => ({
+        id: probe.id,
+        type: probe.type,
+        status: probe.status,
+        ok: probe.ok,
+        required: probe.required,
+        count: probe.count,
+        root: probe.root || null,
+        matched_selectors: probe.matched_selectors || undefined,
+        selector_counts: probe.selector_counts || undefined,
+        total_ax_nodes: probe.total_ax_nodes || undefined,
+        error: probe.error || undefined
+      }))
+      : [],
+    drift_report: check?.drift_report || null
+  };
 }
 
 function normalizeRequiredConfirmations(value) {
@@ -1246,7 +1577,8 @@ async function executeTrackedPipeline({
 
   let result;
   try {
-    result = await runPipelineImpl(
+    const pipelineImpl = await getRunPipelineImpl();
+    result = await pipelineImpl(
       {
         workspaceRoot,
         instruction: args.instruction,
@@ -1307,9 +1639,9 @@ async function executeTrackedPipeline({
     const failedResult = {
       status: "FAILED",
       error: {
-        code: "UNEXPECTED_ERROR",
+        code: error?.code || "UNEXPECTED_ERROR",
         message: error?.message || "Unexpected error",
-        retryable: true
+        retryable: error?.retryable !== false
       }
     };
     safeUpdateRunState(runId, {
@@ -1457,347 +1789,23 @@ async function runDetachedWorker({ runId, resumeRun = false, workerPid = process
 }
 
 async function handleStartRunTool({ workspaceRoot, args }) {
-  const precheckArgs = buildAsyncPrecheckArgs(args);
-  let precheckResult;
-  try {
-    precheckResult = await runPipelineImpl(
-      {
-        workspaceRoot,
-        instruction: precheckArgs.instruction,
-        confirmation: precheckArgs.confirmation,
-        overrides: precheckArgs.overrides,
-        followUp: precheckArgs.follow_up
-      },
-      undefined,
-      null
-    );
-  } catch (error) {
-    precheckResult = {
-      status: "FAILED",
-      error: {
-        code: "UNEXPECTED_ERROR",
-        message: error?.message || "Unexpected error",
-        retryable: true
-      }
-    };
-  }
-
-  if (precheckResult?.status !== "NEED_CONFIRMATION") {
-    return precheckResult;
-  }
-  if (!hasExplicitFinalConfirmation(args) || !isFinalReviewOnlyConfirmation(precheckResult)) {
-    return precheckResult;
-  }
-
-  cleanupExpiredRuns();
-  const runId = createRunId();
-  try {
-    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
-  } catch (error) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_STATE_IO_ERROR",
-        message: `无法写入运行状态目录：${error.message || "unknown"}`,
-        retryable: false
-      }
-    };
-  }
-
-  let worker;
-  try {
-    worker = launchDetachedRunWorker({
-      runId,
-      resumeRun: false
-    });
-  } catch (error) {
-    const failedMessage = `无法启动 detached 运行进程：${error?.message || "unknown"}`;
-    safeUpdateRunState(runId, {
-      state: RUN_STATE_FAILED,
-      stage: RUN_STAGE_PREFLIGHT,
-      last_message: failedMessage,
-      error: {
-        code: "RUN_WORKER_LAUNCH_FAILED",
-        message: failedMessage,
-        retryable: true
-      },
-      result: buildWorkerLaunchFailedPayload(failedMessage)
-    });
-    return buildWorkerLaunchFailedPayload(failedMessage);
-  }
-
-  safeUpdateRunState(runId, {
-    pid: worker?.pid,
-    state: "queued",
-    last_message: "异步流水线已启动（detached）。"
-  });
-
-  return {
-    status: "ACCEPTED",
-    run_id: runId,
-    state: "queued",
-    poll_after_sec: getRecommendedPollAfterSec(args),
-    message: getDefaultAcceptedMessage(args)
-  };
+  return startRecommendPipelineRunTool({ workspaceRoot, args });
 }
 
 function handleGetRunTool(args) {
-  cleanupExpiredRuns();
-  const runId = normalizeText(args?.run_id);
-  if (!runId) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "INVALID_RUN_ID",
-        message: "run_id is required",
-        retryable: false
-      }
-    };
-  }
-  const snapshot = readRunState(runId);
-  if (!snapshot) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_NOT_FOUND",
-        message: `未找到 run_id=${runId} 的运行记录。`,
-        retryable: false
-      }
-    };
-  }
-  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot);
-  return {
-    status: "RUN_STATUS",
-    run: reconciled
-  };
+  return getRecommendPipelineRunTool({ args });
 }
 
 function handleCancelRunTool(args) {
-  const runId = normalizeText(args?.run_id);
-  if (!runId) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "INVALID_RUN_ID",
-        message: "run_id is required",
-        retryable: false
-      }
-    };
-  }
-  const snapshot = readRunState(runId);
-  if (!snapshot) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_NOT_FOUND",
-        message: `未找到 run_id=${runId} 的运行记录。`,
-        retryable: false
-      }
-    };
-  }
-  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot) || snapshot;
-
-  if (TERMINAL_RUN_STATES.has(reconciled.state)) {
-    return {
-      status: "CANCEL_IGNORED",
-      run: reconciled,
-      message: "目标任务已结束，无需取消。"
-    };
-  }
-
-  if (reconciled.state === RUN_STATE_PAUSED || !isProcessAlive(reconciled.pid)) {
-    const canceledRun = finalizeCanceledRun(runId, reconciled);
-    return {
-      status: "CANCEL_REQUESTED",
-      run: canceledRun
-    };
-  }
-  safeUpdateRunState(runId, {
-    stage: reconciled.stage || RUN_STAGE_PREFLIGHT,
-    last_message: "已收到取消请求，将在当前候选人处理完成后安全停止并落盘 CSV。",
-    control: {
-      pause_requested: true,
-      pause_requested_at: new Date().toISOString(),
-      pause_requested_by: TOOL_CANCEL_RUN,
-      cancel_requested: true
-    }
-  });
-
-  const latest = readRunState(runId) || reconciled;
-  return {
-    status: "CANCEL_REQUESTED",
-    run: latest
-  };
+  return cancelRecommendPipelineRunTool({ args });
 }
 
 function handlePauseRunTool(args) {
-  const runId = normalizeText(args?.run_id);
-  if (!runId) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "INVALID_RUN_ID",
-        message: "run_id is required",
-        retryable: false
-      }
-    };
-  }
-  const snapshot = readRunState(runId);
-  if (!snapshot) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_NOT_FOUND",
-        message: `未找到 run_id=${runId} 的运行记录。`,
-        retryable: false
-      }
-    };
-  }
-  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot) || snapshot;
-
-  if (TERMINAL_RUN_STATES.has(reconciled.state)) {
-    return {
-      status: "PAUSE_IGNORED",
-      run: reconciled,
-      message: "目标任务已结束，无需暂停。"
-    };
-  }
-  if (reconciled.state === RUN_STATE_PAUSED) {
-    return {
-      status: "PAUSE_IGNORED",
-      run: reconciled,
-      message: "目标任务已经处于 paused 状态。"
-    };
-  }
-
-  const requestedRun = safeUpdateRunState(runId, {
-    control: {
-      pause_requested: true,
-      pause_requested_at: new Date().toISOString(),
-      pause_requested_by: TOOL_PAUSE_RUN,
-      cancel_requested: false
-    },
-    last_message: "已收到暂停请求，将在当前候选人处理完成后暂停。"
-  }) || readRunState(runId) || reconciled;
-  return {
-    status: "PAUSE_REQUESTED",
-    run: requestedRun,
-    message: "暂停请求已接收，将在当前候选人处理完成后进入 paused。"
-  };
+  return pauseRecommendPipelineRunTool({ args });
 }
 
 function handleResumeRunTool(args) {
-  const runId = normalizeText(args?.run_id);
-  if (!runId) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "INVALID_RUN_ID",
-        message: "run_id is required",
-        retryable: false
-      }
-    };
-  }
-  const snapshot = readRunState(runId);
-  if (!snapshot) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_NOT_FOUND",
-        message: `未找到 run_id=${runId} 的运行记录。`,
-        retryable: false
-      }
-    };
-  }
-  const reconciled = reconcileOrphanRunIfNeeded(runId, snapshot) || snapshot;
-  if (TERMINAL_RUN_STATES.has(reconciled.state)) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_ALREADY_TERMINATED",
-        message: "目标任务已结束，无法继续。",
-        retryable: false
-      }
-    };
-  }
-  if (reconciled.state !== RUN_STATE_PAUSED) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_NOT_PAUSED",
-        message: "仅 paused 状态的 run 才能继续。",
-        retryable: true
-      },
-      run: reconciled
-    };
-  }
-
-  const executionContext = resolveRunContext(reconciled);
-  if (!executionContext) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "RUN_CONTEXT_MISSING",
-        message: "run 缺少可恢复的执行上下文，无法继续。",
-        retryable: false
-      }
-    };
-  }
-
-  const updated = safeUpdateRunState(runId, (current) => ({
-    state: "queued",
-    last_message: "已收到继续请求，准备恢复执行。",
-    control: {
-      pause_requested: false,
-      pause_requested_at: null,
-      pause_requested_by: null,
-      cancel_requested: false
-    },
-    resume: {
-      checkpoint_path: current?.resume?.checkpoint_path || getRunArtifacts(runId).checkpoint_path,
-      pause_control_path: current?.resume?.pause_control_path || getRunArtifacts(runId).run_state_path,
-      output_csv: current?.resume?.output_csv || null,
-      resume_count: Number.isInteger(current?.resume?.resume_count) ? current.resume.resume_count + 1 : 1,
-      last_resumed_at: new Date().toISOString()
-    }
-  })) || readRunState(runId) || reconciled;
-
-  let worker;
-  try {
-    worker = launchDetachedRunWorker({
-      runId,
-      resumeRun: true
-    });
-  } catch (error) {
-    const failedMessage = `无法启动 detached 恢复进程：${error?.message || "unknown"}`;
-    safeUpdateRunState(runId, {
-      state: RUN_STATE_FAILED,
-      stage: reconciled.stage || RUN_STAGE_PREFLIGHT,
-      last_message: failedMessage,
-      error: {
-        code: "RUN_WORKER_LAUNCH_FAILED",
-        message: failedMessage,
-        retryable: true
-      },
-      result: buildWorkerLaunchFailedPayload(failedMessage)
-    });
-    return buildWorkerLaunchFailedPayload(failedMessage);
-  }
-
-  const started = safeUpdateRunState(runId, {
-    pid: worker?.pid,
-    state: "queued",
-    last_message: "已恢复 Recommend 流水线（detached）。"
-  }) || readRunState(runId) || updated;
-
-  return {
-    status: "RESUME_REQUESTED",
-    run: started,
-    poll_after_sec: getRecommendedPollAfterSec(executionContext?.args || {}),
-    message: hasFollowUpChatRequest(executionContext?.args || {})
-      ? "已恢复 Recommend 流水线（detached）。recommend+chat 联动任务建议按 30 分钟间隔查询状态；手动查询到完成时会立即衔接聊天流程。"
-      : "已恢复 Recommend 流水线（detached）。默认不自动轮询；如需进度请按需调用 get_recommend_pipeline_run。"
-  };
+  return resumeRecommendPipelineRunTool({ args });
 }
 
 function handleGetFeaturedCalibrationStatusTool(workspaceRoot) {
@@ -1816,69 +1824,162 @@ function handleGetFeaturedCalibrationStatusTool(workspaceRoot) {
 }
 
 async function handleRunFeaturedCalibrationTool({ workspaceRoot, args }) {
-  const result = await runRecommendCalibration(workspaceRoot, {
-    port: args.port,
-    timeoutMs: args.timeout_ms,
-    output: args.output
-  });
+  return {
+    status: "FAILED",
+    error: {
+      code: featuredCalibrationUnsupportedCode,
+      message: "run_featured_calibration is fenced during the CDP-only rewrite because the legacy handler delegates to Runtime/page-JS adapter calibration. A replacement must discover and validate featured detail/action controls with CDP DOM/Input only and pass a user-approved live safe-action gate before this tool is re-enabled.",
+      retryable: false
+    },
+    cdp_only: true,
+    runtime_evaluate_used: false,
+    method_summary: {},
+    method_log: [],
+    port: args.port ?? null,
+    timeout_ms: args.timeout_ms ?? null,
+    output: args.output ?? null,
+    calibration_resolution: getFeaturedCalibrationResolution(workspaceRoot),
+    guidance: {
+      current_workaround: "Use an existing favorite-calibration.json if present; get_featured_calibration_status reports whether it is usable.",
+      next_development_task: "Implement CDP-only featured calibration with explicit user approval for any mutating favorite/greet action."
+    }
+  };
+}
 
-  if (!result?.ok) {
+async function resolveRecommendSelfHealRootsWithRetry(client, config, {
+  timeoutMs = 30000,
+  intervalMs = 1000
+} = {}) {
+  const startedAt = Date.now();
+  let lastState = null;
+  while (Date.now() - startedAt <= timeoutMs) {
+    lastState = await resolveRecommendSelfHealRoots(client, config);
+    if (lastState?.roots?.top && lastState?.roots?.frame) return lastState;
+    await sleepMs(intervalMs);
+  }
+  return lastState;
+}
+
+async function handleRunRecommendSelfHealTool({ workspaceRoot, args }) {
+  if (typeof runSelfHealImpl === "function") {
+    return runSelfHealImpl({ workspaceRoot, args });
+  }
+
+  const mode = normalizeText(args.mode || "scan").toLowerCase() || "scan";
+  if (mode === "apply") {
     return {
       status: "FAILED",
       error: {
-        code: result?.error?.code || "CALIBRATION_REQUIRED",
-        message: result?.error?.message || "精选页收藏校准失败，请在推荐页精选 tab 打开候选人详情后点击收藏按钮再重试。",
-        retryable: true
+        code: recommendSelfHealApplyUnsupportedCode,
+        message: "run_recommend_self_heal apply mode is fenced during the CDP-only rewrite. The shared CDP self-heal scan route is available, but repair application needs a dedicated safe-action/live-review gate before it can mutate browser or project state.",
+        retryable: false
       },
-      calibration_path: result?.calibration_path || null,
-      calibration_script_path: result?.calibration_script_path || null,
-      debug_port: result?.debug_port || null,
-      diagnostics: {
-        stdout_last_line: getLastOutputLine(result?.stdout),
-        stderr_last_line: getLastOutputLine(result?.stderr)
+      cdp_only: true,
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      guidance: {
+        supported_mode: "scan",
+        next_development_task: "Add config-driven CDP-only repair sessions with explicit user approval and live verification before re-enabling apply mode."
       }
     };
   }
 
-  return {
-    status: "CALIBRATED",
-    message: "精选页收藏按钮校准完成，可重新执行 start_recommend_pipeline_run。",
-    calibration_path: result.calibration_path,
-    calibration_script_path: result.calibration_script_path,
-    debug_port: result.debug_port
-  };
+  const host = "127.0.0.1";
+  const port = parsePositiveInteger(args.port, 9222);
+  let session = null;
+  try {
+    session = await connectToChromeTarget({
+      host,
+      port,
+      targetUrlIncludes: recommendTargetUrl
+    });
+    const { client, methodLog, target } = session;
+    await enableDomains(client, ["Page", "DOM", "Accessibility"]);
+    await bringPageToFront(client);
+
+    const config = buildRecommendSelfHealConfig();
+    const rootState = await resolveRecommendSelfHealRootsWithRetry(client, config);
+    const check = await runSelfHealCheck({
+      client,
+      domain: "recommend",
+      roots: rootState?.roots || {},
+      selectorProbes: config.selectorProbes,
+      accessibilityProbes: config.accessibilityProbes
+    });
+    assertNoForbiddenCdpCalls(methodLog);
+
+    const healthy = check.status === HEALTH_STATUS.HEALTHY;
+    return {
+      status: healthy ? "OK" : "DEGRADED",
+      cdp_only: true,
+      runtime_evaluate_used: false,
+      workspace_root: workspaceRoot,
+      chrome: {
+        host,
+        port,
+        target: {
+          id: target?.id || null,
+          type: target?.type || null,
+          url: target?.url || null,
+          title: target?.title || null
+        }
+      },
+      mode,
+      scope: normalizeText(args.scope || "full") || "full",
+      validation_profile: normalizeText(args.validation_profile || "full") || "full",
+      self_heal: {
+        recommend: compactSelfHealCheck(check)
+      },
+      method_summary: buildCdpMethodSummary(methodLog),
+      method_log: methodLog
+    };
+  } catch (error) {
+    const methodLog = session?.methodLog || [];
+    return {
+      status: "FAILED",
+      error: {
+        code: "RECOMMEND_SELF_HEAL_CDP_FAILED",
+        message: error?.message || String(error),
+        retryable: true
+      },
+      cdp_only: true,
+      runtime_evaluate_used: methodLog.some((entry) => String(entry?.method || entry).startsWith("Runtime.")),
+      method_summary: buildCdpMethodSummary(methodLog),
+      method_log: methodLog,
+      chrome: { host, port, target_url_includes: recommendTargetUrl }
+    };
+  } finally {
+    if (session) await session.close();
+  }
 }
 
-async function handleRunRecommendSelfHealTool({ workspaceRoot, args }) {
-  return runSelfHealImpl({ workspaceRoot, args });
-}
-
-function handleBossChatHealthCheckTool(workspaceRoot, args) {
-  return getBossChatHealthCheck(workspaceRoot, args);
+async function handleBossChatHealthCheckTool(workspaceRoot, args) {
+  return bossChatHealthCheckTool({ workspaceRoot, args });
 }
 
 async function handleBossChatPrepareRunTool({ workspaceRoot, args }) {
-  return prepareBossChatRun({ workspaceRoot, input: args });
+  return prepareBossChatRunTool({ workspaceRoot, args });
 }
 
 async function handleBossChatStartRunTool({ workspaceRoot, args }) {
-  return startBossChatRun({ workspaceRoot, input: args });
+  return startBossChatRunTool({ workspaceRoot, args });
 }
 
 async function handleBossChatGetRunTool({ workspaceRoot, args }) {
-  return getBossChatRun({ workspaceRoot, input: args });
+  return getBossChatRunTool({ workspaceRoot, args });
 }
 
 async function handleBossChatPauseRunTool({ workspaceRoot, args }) {
-  return pauseBossChatRun({ workspaceRoot, input: args });
+  return pauseBossChatRunTool({ workspaceRoot, args });
 }
 
 async function handleBossChatResumeRunTool({ workspaceRoot, args }) {
-  return resumeBossChatRun({ workspaceRoot, input: args });
+  return resumeBossChatRunTool({ workspaceRoot, args });
 }
 
 async function handleBossChatCancelRunTool({ workspaceRoot, args }) {
-  return cancelBossChatRun({ workspaceRoot, input: args });
+  return cancelBossChatRunTool({ workspaceRoot, args });
 }
 
 async function handleRequest(message, workspaceRoot) {
@@ -1930,6 +2031,13 @@ async function handleRequest(message, workspaceRoot) {
       }
     }
 
+    if ([TOOL_RUN_RECRUIT_PIPELINE, TOOL_START_RECRUIT_PIPELINE_RUN].includes(toolName)) {
+      const inputError = validateRecruitPipelineArgs(args);
+      if (inputError) {
+        return createJsonRpcError(id, -32602, inputError);
+      }
+    }
+
     if (toolName === TOOL_RUN_FEATURED_CALIBRATION) {
       const inputError = validateRunFeaturedCalibrationArgs(args);
       if (inputError) {
@@ -1959,7 +2067,11 @@ async function handleRequest(message, workspaceRoot) {
       TOOL_BOSS_CHAT_GET_RUN,
       TOOL_BOSS_CHAT_CANCEL_RUN,
       TOOL_BOSS_CHAT_PAUSE_RUN,
-      TOOL_BOSS_CHAT_RESUME_RUN
+      TOOL_BOSS_CHAT_RESUME_RUN,
+      TOOL_GET_RECRUIT_PIPELINE_RUN,
+      TOOL_CANCEL_RECRUIT_PIPELINE_RUN,
+      TOOL_PAUSE_RECRUIT_PIPELINE_RUN,
+      TOOL_RESUME_RECRUIT_PIPELINE_RUN
     ].includes(toolName)) {
       if (!args || typeof args.run_id !== "string" || !normalizeText(args.run_id)) {
         return createJsonRpcError(id, -32602, "run_id is required and must be a string");
@@ -1968,7 +2080,9 @@ async function handleRequest(message, workspaceRoot) {
 
     try {
       let payload;
-      if (toolName === TOOL_START_RUN) {
+      if (toolName === TOOL_LIST_RECOMMEND_JOBS) {
+        payload = await listRecommendJobsTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_START_RUN) {
         payload = await handleStartRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_RUN) {
         payload = handleGetRunTool(args);
@@ -1979,13 +2093,13 @@ async function handleRequest(message, workspaceRoot) {
       } else if (toolName === TOOL_RESUME_RUN) {
         payload = handleResumeRunTool(args);
       } else if (toolName === TOOL_GET_FEATURED_CALIBRATION_STATUS) {
-        payload = handleGetFeaturedCalibrationStatusTool(workspaceRoot);
+        payload = await handleGetFeaturedCalibrationStatusTool(workspaceRoot);
       } else if (toolName === TOOL_RUN_FEATURED_CALIBRATION) {
         payload = await handleRunFeaturedCalibrationTool({ workspaceRoot, args });
       } else if (toolName === TOOL_RUN_RECOMMEND_SELF_HEAL) {
         payload = await handleRunRecommendSelfHealTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_HEALTH_CHECK) {
-        payload = handleBossChatHealthCheckTool(workspaceRoot, args);
+        payload = await handleBossChatHealthCheckTool(workspaceRoot, args);
       } else if (toolName === TOOL_BOSS_CHAT_PREPARE_RUN) {
         payload = await handleBossChatPrepareRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_START_RUN) {
@@ -1998,6 +2112,18 @@ async function handleRequest(message, workspaceRoot) {
         payload = await handleBossChatResumeRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_CANCEL_RUN) {
         payload = await handleBossChatCancelRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_RUN_RECRUIT_PIPELINE) {
+        payload = await runRecruitPipelineTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_START_RECRUIT_PIPELINE_RUN) {
+        payload = await startRecruitPipelineRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_GET_RECRUIT_PIPELINE_RUN) {
+        payload = getRecruitPipelineRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_CANCEL_RECRUIT_PIPELINE_RUN) {
+        payload = cancelRecruitPipelineRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_PAUSE_RECRUIT_PIPELINE_RUN) {
+        payload = pauseRecruitPipelineRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_RESUME_RECRUIT_PIPELINE_RUN) {
+        payload = resumeRecruitPipelineRunTool({ workspaceRoot, args });
       } else {
         return createJsonRpcError(id, -32602, `Unknown tool: ${toolName || ""}`);
       }
@@ -2132,10 +2258,43 @@ export const __testables = {
     spawnProcessImpl = typeof nextImpl === "function" ? nextImpl : spawn;
   },
   setRunPipelineImplForTests(nextImpl) {
-    runPipelineImpl = typeof nextImpl === "function" ? nextImpl : runRecommendPipeline;
+    runPipelineImpl = typeof nextImpl === "function" ? nextImpl : null;
   },
   setRunSelfHealImplForTests(nextImpl) {
-    runSelfHealImpl = typeof nextImpl === "function" ? nextImpl : runRecommendSelfHeal;
+    runSelfHealImpl = typeof nextImpl === "function" ? nextImpl : null;
+  },
+  setRecommendMcpConnectorForTests(nextImpl) {
+    __setRecommendMcpConnectorForTests(nextImpl);
+  },
+  setRecommendMcpJobReaderForTests(nextImpl) {
+    __setRecommendMcpJobReaderForTests(nextImpl);
+  },
+  setRecommendMcpWorkflowForTests(nextImpl) {
+    __setRecommendMcpWorkflowForTests(nextImpl);
+  },
+  resetRecommendMcpStateForTests() {
+    __resetRecommendMcpStateForTests();
+  },
+  setChatMcpConnectorForTests(nextImpl) {
+    __setChatMcpConnectorForTests(nextImpl);
+  },
+  setChatMcpJobReaderForTests(nextImpl) {
+    __setChatMcpJobReaderForTests(nextImpl);
+  },
+  setChatMcpWorkflowForTests(nextImpl) {
+    __setChatMcpWorkflowForTests(nextImpl);
+  },
+  resetChatMcpStateForTests() {
+    __resetChatMcpStateForTests();
+  },
+  setRecruitMcpConnectorForTests(nextImpl) {
+    __setRecruitMcpConnectorForTests(nextImpl);
+  },
+  setRecruitMcpWorkflowForTests(nextImpl) {
+    __setRecruitMcpWorkflowForTests(nextImpl);
+  },
+  resetRecruitMcpStateForTests() {
+    __resetRecruitMcpStateForTests();
   }
 };
 

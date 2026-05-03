@@ -95,6 +95,10 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 ## Tool Usage
 
+- 岗位发现工具：`list_recommend_jobs`
+  - 用途：当用户需要为 cron / 一次性自动任务提前填写完整参数时，先用它读取推荐页岗位下拉框的全部可用岗位名。
+  - 输出：优先把 `job_names` 里的值作为后续 `overrides.job` / `confirmation.job_value`。
+  - 限制：只读岗位列表，不启动筛选任务；仍然必须在正式 `start_recommend_pipeline_run` 前完成岗位与最终确认。
 - 主工具：`start_recommend_pipeline_run`
 - 必填：`instruction`
 - 关键输入：

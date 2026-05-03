@@ -1,0 +1,1333 @@
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import {
+  assertNoForbiddenCdpCalls,
+  bringPageToFront,
+  connectToChromeTarget,
+  enableDomains,
+  sleep
+} from "./core/browser/index.js";
+import {
+  RUN_STATUS_CANCELING,
+  RUN_STATUS_CANCELED,
+  RUN_STATUS_COMPLETED,
+  RUN_STATUS_FAILED,
+  RUN_STATUS_PAUSED
+} from "./core/run/index.js";
+import {
+  buildLegacyScreenInputRows,
+  cloneReportInput,
+  writeLegacyScreenCsv
+} from "./core/reporting/legacy-csv.js";
+import {
+  buildChatSelfHealConfig,
+  HEALTH_STATUS,
+  resolveChatSelfHealRoots,
+  runSelfHealCheck
+} from "./core/self-heal/index.js";
+import {
+  CHAT_TARGET_URL,
+  closeChatResumeModal,
+  createChatRunService,
+  getChatRoots,
+  isForbiddenChatResumeTopLevelUrl,
+  readChatJobOptions,
+  runChatWorkflow
+} from "./domains/chat/index.js";
+import {
+  buildTargetCountCompatibilityHints,
+  getBossChatDataDir,
+  getBossChatTargetCountValue,
+  normalizeTargetCountInput,
+  resolveBossChatRuntimeLayout,
+  resolveBossScreeningConfig
+} from "./chat-runtime-config.js";
+
+const DEFAULT_CHAT_HOST = "127.0.0.1";
+const DEFAULT_CHAT_PORT = 9222;
+const DEFAULT_CHAT_POLL_AFTER_SEC = 10;
+const DEFAULT_CHAT_GREETING_TEXT = "Hi同学，能麻烦发下简历吗？";
+const CHAT_ALL_MAX_CANDIDATES = 100000;
+const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screening; numeric targets scan until that many candidates pass or the list ends; all/全部/扫到底 scans to the end";
+const RUN_MODE_ASYNC = "async";
+
+const CHAT_REQUIRED_FIELDS = Object.freeze([
+  "job",
+  "start_from",
+  "target_count",
+  "criteria"
+]);
+
+const TERMINAL_STATUSES = new Set([
+  RUN_STATUS_COMPLETED,
+  RUN_STATUS_FAILED,
+  RUN_STATUS_CANCELED
+]);
+
+let chatWorkflowImpl = runChatWorkflow;
+let chatConnectorImpl = connectChatChromeSession;
+let chatJobReaderImpl = readChatJobOptionsFromSession;
+let chatRunService = createChatRunService({
+  idPrefix: "mcp_chat",
+  workflow: (...args) => chatWorkflowImpl(...args)
+});
+const chatRunMeta = new Map();
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function parsePositiveInteger(raw, fallback) {
+  const parsed = Number.parseInt(String(raw || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInteger(raw, fallback) {
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function methodSummary(methodLog = []) {
+  const summary = {};
+  for (const entry of methodLog || []) {
+    summary[entry.method] = (summary[entry.method] || 0) + 1;
+  }
+  return summary;
+}
+
+function clonePlain(value, fallback = null) {
+  try {
+    return value === undefined ? fallback : JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeRunId(runId) {
+  const normalized = normalizeText(runId);
+  if (!normalized || normalized.includes("/") || normalized.includes("\\")) return "";
+  return normalized;
+}
+
+function getChatRunsDir() {
+  return path.join(getBossChatDataDir(), "runs");
+}
+
+function getChatRunArtifacts(runId) {
+  const normalized = normalizeRunId(runId);
+  if (!normalized) return null;
+  const runsDir = getChatRunsDir();
+  return {
+    runs_dir: runsDir,
+    run_state_path: path.join(runsDir, `${normalized}.json`),
+    checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    output_csv: path.join(runsDir, `${normalized}.results.csv`),
+    report_json: path.join(runsDir, `${normalized}.report.json`)
+  };
+}
+
+function ensureDirectory(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function writeJsonAtomic(filePath, payload) {
+  ensureDirectory(path.dirname(filePath));
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.renameSync(tempPath, filePath);
+}
+
+function readJsonFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function selectedChatJobForCsv(meta = {}) {
+  const job = normalizeText(meta.normalized?.job || meta.args?.job || "");
+  return {
+    value: job,
+    title: job,
+    label: job
+  };
+}
+
+function buildChatCsvInputRows(snapshot = {}, meta = {}) {
+  const normalized = meta.normalized || {};
+  const postAction = shouldRequestChatResume(meta.args)
+    ? "request_cv"
+    : normalizeText(meta.args?.post_action || meta.args?.action || "") || "none";
+  const searchParams = {
+    job: normalized.job || meta.args?.job || "",
+    start_from: normalized.startFrom || meta.args?.start_from || "",
+    target_count: normalized.publicTargetCount ?? normalized.targetCount ?? snapshot.progress?.target_count ?? "",
+    detail_source: meta.args?.detail_source || snapshot.summary?.detail_source || snapshot.context?.detail_source || ""
+  };
+  return buildLegacyScreenInputRows({
+    instruction: meta.args?.instruction || "启动boss聊天任务",
+    selectedPage: "chat",
+    selectedJob: selectedChatJobForCsv(meta),
+    userSearchParams: cloneReportInput(searchParams, {}),
+    effectiveSearchParams: cloneReportInput(searchParams, {}),
+    screenParams: {
+      criteria: normalized.criteria || meta.args?.criteria || "",
+      target_count: searchParams.target_count,
+      post_action: postAction,
+      max_greet_count: meta.args?.max_greet_count ?? ""
+    },
+    followUp: meta.args?.follow_up || null,
+    extraRows: [
+      ["chat_params.greeting_text", normalized.greetingText || meta.args?.greeting_text || meta.args?.greetingText || DEFAULT_CHAT_GREETING_TEXT],
+      ["chat_params.profile", normalized.profile || meta.args?.profile || "default"]
+    ]
+  });
+}
+
+function writeChatLegacyCsvAtomic(filePath, rows = [], snapshot = {}, meta = {}) {
+  writeLegacyScreenCsv(filePath, {
+    inputRows: buildChatCsvInputRows(snapshot, meta),
+    results: rows
+  });
+}
+
+function readChatRunState(runId) {
+  const artifacts = getChatRunArtifacts(runId);
+  if (!artifacts) return null;
+  return readJsonFile(artifacts.run_state_path);
+}
+
+function toIsoOrNull(value) {
+  const normalized = normalizeText(value);
+  return normalized || null;
+}
+
+function secondsBetween(startedAt, endedAt) {
+  const startMs = Date.parse(startedAt || "");
+  const endMs = Date.parse(endedAt || "") || Date.now();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return null;
+  return Math.max(1, Math.round((endMs - startMs) / 1000));
+}
+
+function countPostActionResults(results = []) {
+  let requested = 0;
+  let requestSatisfied = 0;
+  let requestSkipped = 0;
+  for (const row of results || []) {
+    const action = row?.post_action || {};
+    if (action.requested) requestSatisfied += 1;
+    if (action.skipped) requestSkipped += 1;
+    if (action.requested && !action.skipped) requested += 1;
+  }
+  return {
+    requested,
+    request_satisfied: requestSatisfied,
+    request_skipped: requestSkipped
+  };
+}
+
+function normalizeLegacyProgress(progress = {}, summary = null) {
+  const countedRequests = countPostActionResults(Array.isArray(summary?.results) ? summary.results : []);
+  const processed = Number.isInteger(progress.processed)
+    ? progress.processed
+    : Number.isInteger(summary?.processed)
+      ? summary.processed
+      : 0;
+  const screened = Number.isInteger(progress.screened)
+    ? progress.screened
+    : Number.isInteger(summary?.screened)
+      ? summary.screened
+      : processed;
+  const passed = Number.isInteger(progress.passed)
+    ? progress.passed
+    : Number.isInteger(summary?.passed)
+      ? summary.passed
+      : 0;
+  const requested = Number.isInteger(progress.requested)
+    ? progress.requested
+    : Number.isInteger(summary?.requested)
+      ? summary.requested
+      : countedRequests.requested;
+  const requestSatisfied = Number.isInteger(progress.request_satisfied)
+    ? progress.request_satisfied
+    : Number.isInteger(summary?.request_satisfied)
+      ? summary.request_satisfied
+      : countedRequests.request_satisfied;
+  const requestSkipped = Number.isInteger(progress.request_skipped)
+    ? progress.request_skipped
+    : Number.isInteger(summary?.request_skipped)
+      ? summary.request_skipped
+      : countedRequests.request_skipped;
+  return {
+    ...progress,
+    processed,
+    inspected: processed,
+    screened,
+    passed,
+    requested,
+    request_satisfied: requestSatisfied,
+    request_skipped: requestSkipped,
+    skipped: Number.isInteger(progress.skipped) ? progress.skipped : Math.max(processed - passed, 0),
+    greet_count: Number.isInteger(progress.greet_count) ? progress.greet_count : 0
+  };
+}
+
+function completionReason(status) {
+  if (status === RUN_STATUS_COMPLETED) return "completed";
+  if (status === RUN_STATUS_CANCELED) return "canceled_by_user";
+  if (status === RUN_STATUS_FAILED) return "failed";
+  if (status === RUN_STATUS_PAUSED) return "paused";
+  return null;
+}
+
+function getChatRunMeta(runId) {
+  return chatRunMeta.get(runId) || {};
+}
+
+function ensureChatRunArtifacts(snapshot) {
+  const artifacts = getChatRunArtifacts(snapshot?.runId || snapshot?.run_id);
+  if (!artifacts) return null;
+
+  const meta = getChatRunMeta(snapshot?.runId || snapshot?.run_id);
+  const checkpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
+    ? snapshot.checkpoint
+    : {};
+  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  if (meta) meta.checkpointPath = artifacts.checkpoint_path;
+
+  const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  if (summary) {
+    const rows = Array.isArray(summary.results) ? summary.results : [];
+    writeChatLegacyCsvAtomic(artifacts.output_csv, rows, snapshot, meta);
+    writeJsonAtomic(artifacts.report_json, {
+      run_id: snapshot.runId || snapshot.run_id,
+      status: snapshot.status || snapshot.state,
+      phase: snapshot.phase || snapshot.stage,
+      progress: snapshot.progress || {},
+      context: snapshot.context || {},
+      checkpoint,
+      summary,
+      generated_at: new Date().toISOString()
+    });
+    if (meta) {
+      meta.outputCsvPath = artifacts.output_csv;
+      meta.reportJsonPath = artifacts.report_json;
+    }
+  }
+
+  return artifacts;
+}
+
+function buildLegacyChatResult(snapshot) {
+  if (!snapshot) return null;
+  const artifacts = ensureChatRunArtifacts(snapshot);
+  const meta = getChatRunMeta(snapshot.runId);
+  const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const progress = normalizeLegacyProgress(snapshot.progress, summary);
+  return {
+    run_id: snapshot.runId,
+    state: snapshot.status,
+    status: snapshot.status,
+    completion_reason: completionReason(snapshot.status),
+    requested_count: progress.requested,
+    request_satisfied_count: progress.request_satisfied,
+    request_skipped_count: progress.request_skipped,
+    processed_count: progress.processed,
+    inspected_count: progress.processed,
+    screened_count: progress.screened,
+    passed_count: progress.passed,
+    skipped_count: progress.skipped,
+    detail_opened: progress.detail_opened || summary?.detail_opened || 0,
+    llm_screened: progress.llm_screened || summary?.llm_screened || 0,
+    output_csv: artifacts?.output_csv || meta.outputCsvPath || null,
+    report_json: artifacts?.report_json || meta.reportJsonPath || null,
+    checkpoint_path: artifacts?.checkpoint_path || meta.checkpointPath || null,
+    started_at: snapshot.startedAt,
+    completed_at: snapshot.completedAt || null,
+    duration_sec: secondsBetween(snapshot.startedAt, snapshot.completedAt),
+    error: snapshot.error || null,
+    results: Array.isArray(summary?.results) ? summary.results : []
+  };
+}
+
+function normalizeRunSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const meta = getChatRunMeta(snapshot.runId);
+  const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const progress = normalizeLegacyProgress(snapshot.progress, summary);
+  const legacyResult = (
+    TERMINAL_STATUSES.has(snapshot.status)
+    || snapshot.status === RUN_STATUS_PAUSED
+  ) ? buildLegacyChatResult({ ...snapshot, progress }) : null;
+  const oldContext = {
+    workspace_root: meta.workspaceRoot || null,
+    profile: meta.normalized?.profile || meta.args?.profile || "default",
+    job: meta.normalized?.job || meta.args?.job || "",
+    start_from: meta.normalized?.startFrom || meta.args?.start_from || "",
+    criteria: meta.normalized?.criteria || meta.args?.criteria || "",
+    greeting_text: meta.normalized?.greetingText || meta.args?.greeting_text || meta.args?.greetingText || DEFAULT_CHAT_GREETING_TEXT,
+    target_count: meta.normalized?.publicTargetCount ?? null,
+    target_count_semantics: TARGET_COUNT_SEMANTICS
+  };
+  return {
+    ...snapshot,
+    progress,
+    run_id: snapshot.runId,
+    mode: RUN_MODE_ASYNC,
+    state: snapshot.status,
+    stage: snapshot.phase,
+    started_at: snapshot.startedAt,
+    updated_at: snapshot.updatedAt,
+    completed_at: toIsoOrNull(snapshot.completedAt),
+    heartbeat_at: snapshot.updatedAt,
+    pid: process.pid || null,
+    last_message: snapshot.error?.message || snapshot.phase || null,
+    context: {
+      ...(snapshot.context || {}),
+      ...oldContext,
+      shared_run_context: snapshot.context || {}
+    },
+    control: {
+      pause_requested: snapshot.status === RUN_STATUS_PAUSED,
+      pause_requested_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null,
+      pause_requested_by: snapshot.status === RUN_STATUS_PAUSED ? "pause_boss_chat_run" : null,
+      cancel_requested: snapshot.status === RUN_STATUS_CANCELING
+    },
+    resume: {
+      checkpoint_path: legacyResult?.checkpoint_path || null,
+      pause_control_path: getChatRunArtifacts(snapshot.runId)?.run_state_path || null,
+      output_csv: legacyResult?.output_csv || null,
+      resume_count: meta.resumeCount || 0,
+      last_resumed_at: meta.lastResumedAt || null,
+      last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
+    },
+    result: legacyResult,
+    artifacts: getChatRunArtifacts(snapshot.runId)
+  };
+}
+
+function persistChatRunSnapshot(snapshot) {
+  const normalized = normalizeRunSnapshot(snapshot);
+  if (!normalized?.run_id) return normalized;
+  const artifacts = getChatRunArtifacts(normalized.run_id);
+  if (!artifacts) return normalized;
+  const payload = {
+    run_id: normalized.run_id,
+    mode: normalized.mode,
+    state: normalized.state,
+    status: normalized.status,
+    stage: normalized.stage,
+    started_at: normalized.started_at,
+    updated_at: normalized.updated_at,
+    heartbeat_at: normalized.heartbeat_at,
+    completed_at: normalized.completed_at,
+    pid: normalized.pid,
+    progress: normalized.progress,
+    last_message: normalized.last_message,
+    context: normalized.context,
+    control: normalized.control,
+    resume: normalized.resume,
+    error: normalized.error,
+    result: normalized.result,
+    summary: normalized.summary,
+    artifacts: normalized.artifacts
+  };
+  writeJsonAtomic(artifacts.run_state_path, payload);
+  return normalized;
+}
+
+function attachMethodEvidence(payload, runId) {
+  const meta = getChatRunMeta(runId);
+  assertNoForbiddenCdpCalls(meta.methodLog || []);
+  return {
+    ...payload,
+    runtime_evaluate_used: false,
+    method_summary: methodSummary(meta.methodLog || []),
+    method_log: meta.methodLog || [],
+    chrome: meta.chrome || null
+  };
+}
+
+function shouldNavigateToChat(url) {
+  const text = String(url || "");
+  return !text.includes("/web/chat/index")
+    || text.includes("/web/chat/recommend")
+    || text.includes("/web/chat/search");
+}
+
+function isRecoverableChatTargetUrl(url) {
+  const text = String(url || "");
+  return text.includes("zhipin.com/web/chat")
+    || isForbiddenChatResumeTopLevelUrl(text);
+}
+
+async function waitForHealthyChat(client, config, {
+  timeoutMs = 90000,
+  intervalMs = 1000
+} = {}) {
+  const started = Date.now();
+  let lastCheck = null;
+  while (Date.now() - started <= timeoutMs) {
+    const roots = await resolveChatSelfHealRoots(client, config);
+    lastCheck = await runSelfHealCheck({
+      client,
+      domain: "chat",
+      roots: roots.roots,
+      selectorProbes: config.selectorProbes,
+      accessibilityProbes: config.accessibilityProbes
+    });
+    if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
+    await sleep(intervalMs);
+  }
+  return lastCheck;
+}
+
+async function connectChatChromeSession({
+  host = DEFAULT_CHAT_HOST,
+  port = DEFAULT_CHAT_PORT,
+  targetUrlIncludes = CHAT_TARGET_URL,
+  allowNavigate = true,
+  slowLive = false
+} = {}) {
+  let session;
+  try {
+    session = await connectToChromeTarget({
+      host,
+      port,
+      targetUrlIncludes
+    });
+  } catch (error) {
+    if (!allowNavigate) throw error;
+    session = await connectToChromeTarget({
+      host,
+      port,
+      targetPredicate: (target) => (
+        target?.type === "page"
+        && isRecoverableChatTargetUrl(target?.url)
+      )
+    });
+  }
+
+  const { client, target } = session;
+  await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
+  if (typeof client?.Network?.setCacheDisabled === "function") {
+    await client.Network.setCacheDisabled({ cacheDisabled: true });
+  }
+  await bringPageToFront(client);
+
+  const targetUrl = String(target?.url || "");
+  let navigation = {
+    navigated: false,
+    url: targetUrl
+  };
+  if (allowNavigate && shouldNavigateToChat(targetUrl)) {
+    await client.Page.navigate({ url: CHAT_TARGET_URL });
+    const settleMs = slowLive ? 10000 : 5000;
+    await sleep(settleMs);
+    navigation = {
+      navigated: true,
+      url: CHAT_TARGET_URL,
+      settle_ms: settleMs
+    };
+  }
+
+  const selfHealConfig = buildChatSelfHealConfig();
+  const health = await waitForHealthyChat(client, selfHealConfig, {
+    timeoutMs: slowLive ? 180000 : 90000,
+    intervalMs: slowLive ? 1200 : 800
+  });
+  if (!health || health.status !== HEALTH_STATUS.HEALTHY) {
+    throw new Error(`Boss chat page is not healthy: ${health?.status || "missing"}`);
+  }
+
+  return {
+    ...session,
+    navigation,
+    health
+  };
+}
+
+async function readChatJobOptionsFromSession(session) {
+  const roots = await getChatRoots(session.client);
+  return readChatJobOptions(session.client, roots.rootNodes.top);
+}
+
+function normalizeChatStartInput(args = {}) {
+  const target = normalizeTargetCountInput(getBossChatTargetCountValue(args));
+  return {
+    profile: normalizeText(args.profile) || "default",
+    job: normalizeText(args.job),
+    startFrom: normalizeText(args.start_from).toLowerCase(),
+    criteria: normalizeText(args.criteria),
+    greetingText: normalizeText(args.greeting_text || args.greetingText || args.greeting),
+    target,
+    targetCount: target.targetCount,
+    publicTargetCount: target.publicValue,
+    host: normalizeText(args.host) || DEFAULT_CHAT_HOST,
+    port: parsePositiveInteger(args.port, DEFAULT_CHAT_PORT),
+    targetUrlIncludes: normalizeText(args.target_url_includes) || CHAT_TARGET_URL,
+    allowNavigate: args.allow_navigate !== false,
+    slowLive: args.slow_live === true
+  };
+}
+
+function buildChatNextCallExample(args, missingFields, normalized) {
+  const example = {};
+  if (normalized.job) example.job = normalized.job;
+  if (normalized.startFrom) example.start_from = normalized.startFrom;
+  if (normalized.target.provided && !normalized.target.parseError) {
+    example.target_count = normalized.publicTargetCount ?? normalized.targetCount;
+  } else if (missingFields.includes("target_count")) {
+    example.target_count = "all";
+  }
+  if (normalized.criteria) example.criteria = normalized.criteria;
+  if (normalizeText(args.greeting_text || args.greetingText || args.greeting)) {
+    example.greeting_text = normalizeText(args.greeting_text || args.greetingText || args.greeting);
+  }
+  return Object.keys(example).length ? example : null;
+}
+
+function getMissingChatStartFields(args = {}, normalized = normalizeChatStartInput(args)) {
+  const missing = [];
+  if (!normalized.job) missing.push("job");
+  if (!["unread", "all"].includes(normalized.startFrom)) missing.push("start_from");
+  if (!normalized.target.provided || normalized.target.parseError) missing.push("target_count");
+  if (!normalized.criteria) missing.push("criteria");
+  return missing;
+}
+
+function buildTargetCountDiagnostics(args, missingFields, normalized) {
+  if (!missingFields.includes("target_count")) return {};
+  const hints = buildTargetCountCompatibilityHints({
+    argumentName: "target_count",
+    recommendedArgumentPatch: { target_count: "all" }
+  });
+  const received = getBossChatTargetCountValue(args);
+  const nextCallExample = {
+    ...(normalizeText(args.job) ? { job: normalizeText(args.job) } : {}),
+    ...(normalizeText(args.start_from) ? { start_from: normalizeText(args.start_from).toLowerCase() } : {}),
+    target_count: "all",
+    ...(normalizeText(args.criteria) ? { criteria: normalizeText(args.criteria) } : {})
+  };
+  return {
+    ...hints,
+    received_target_count: received,
+    target_count_parse_error: normalized.target.parseError || null,
+    next_call_example: nextCallExample
+  };
+}
+
+function buildJobQuestionOptions(jobOptions = []) {
+  return (jobOptions || []).map((option) => ({
+    label: option.label,
+    value: option.value,
+    index: option.index,
+    active: option.active === true
+  }));
+}
+
+function buildPendingChatQuestions({ args, missingFields, normalized, jobOptions = [] }) {
+  const diagnostics = buildTargetCountDiagnostics(args, missingFields, normalized);
+  return missingFields.map((field) => {
+    if (field === "job") {
+      return {
+        field,
+        question: "请提供 Boss chat 岗位，支持岗位名、编号或页面中的岗位 value。",
+        value: normalized.job || null,
+        options: buildJobQuestionOptions(jobOptions)
+      };
+    }
+    if (field === "start_from") {
+      return {
+        field,
+        question: "请确认 chat 起始范围。",
+        value: normalized.startFrom || null,
+        options: [
+          { label: "未读", value: "unread" },
+          { label: "全部", value: "all" }
+        ]
+      };
+    }
+    if (field === "target_count") {
+      return {
+        field,
+        ...diagnostics,
+        question: "请提供 target_count，使用正整数或 all（扫到底）。",
+        value: normalized.publicTargetCount ?? null,
+        options: Array.isArray(diagnostics.options) ? diagnostics.options : [],
+        parse_error: normalized.target.parseError || null
+      };
+    }
+    if (field === "criteria") {
+      return {
+        field,
+        question: "请提供自然语言筛选 criteria。",
+        value: normalized.criteria || null
+      };
+    }
+    return {
+      field,
+      question: `请提供 ${field}。`,
+      value: null
+    };
+  });
+}
+
+async function buildNeedInputResponse({ args, missingFields, normalized }) {
+  const diagnostics = buildTargetCountDiagnostics(args, missingFields, normalized);
+  return {
+    status: "NEED_INPUT",
+    required_fields: CHAT_REQUIRED_FIELDS.slice(),
+    missing_fields: missingFields,
+    ...diagnostics,
+    pending_questions: buildPendingChatQuestions({ args, missingFields, normalized }),
+    job_options: [],
+    error: {
+      code: "MISSING_REQUIRED_FIELDS",
+      message: "缺少必要字段。请补齐 job、start_from、target_count、criteria 后再启动 Boss chat CDP-only run。",
+      retryable: true
+    }
+  };
+}
+
+function shouldRequestChatResume(args = {}) {
+  return (
+    args.request_cv === true
+    || args.request_resume === true
+    || args.ask_cv === true
+    || args.execute_post_action === true
+    || ["request_cv", "ask_cv", "request_resume", "求简历", "索要简历"].includes(normalizeText(args.post_action || args.action))
+  );
+}
+
+function shouldUseChatLlm(args = {}, shouldRequestResume = false) {
+  if (args.use_llm === false) return false;
+  return (
+    args.use_llm === true
+    || shouldRequestResume
+    || parseNonNegativeInteger(args.detail_limit, 0) > 0
+  );
+}
+
+function getRunOptions(args, normalized, session, { workspaceRoot = "" } = {}) {
+  const slowLive = args.slow_live === true;
+  const isAllTarget = normalized.publicTargetCount === "all";
+  const processedLimit = parsePositiveInteger(
+    args.max_candidates,
+    isAllTarget ? CHAT_ALL_MAX_CANDIDATES : CHAT_ALL_MAX_CANDIDATES
+  );
+  const shouldRequestResume = shouldRequestChatResume(args);
+  const useLlm = shouldUseChatLlm(args, shouldRequestResume);
+  const configResolution = useLlm ? resolveBossScreeningConfig(workspaceRoot) : { ok: false };
+  const configFile = configResolution.ok ? readJsonFile(configResolution.config_path) : null;
+  return {
+    client: session.client,
+    targetUrl: CHAT_TARGET_URL,
+    job: normalized.job,
+    startFrom: normalized.startFrom,
+    criteria: normalized.criteria,
+    maxCandidates: processedLimit,
+    targetPassCount: isAllTarget ? null : normalized.targetCount,
+    processUntilListEnd: isAllTarget,
+    detailLimit: parseNonNegativeInteger(args.detail_limit, useLlm || shouldRequestResume ? processedLimit : 0),
+    detailSource: normalizeText(args.detail_source) || "cascade",
+    closeResume: true,
+    requestResumeForPassed: shouldRequestResume,
+    dryRunRequestCv: args.dry_run === true || args.dry_run_request_cv === true,
+    greetingText: normalized.greetingText || DEFAULT_CHAT_GREETING_TEXT,
+    delayMs: parseNonNegativeInteger(args.delay_ms, 0),
+    cardTimeoutMs: slowLive ? 180000 : 90000,
+    readyTimeoutMs: slowLive ? 120000 : 60000,
+    onlineResumeButtonTimeoutMs: parsePositiveInteger(
+      args.online_resume_button_timeout_ms,
+      slowLive ? 30000 : 15000
+    ),
+    resumeDomTimeoutMs: slowLive ? 120000 : 60000,
+    maxImagePages: parsePositiveInteger(args.max_image_pages, 8),
+    imageWheelDeltaY: parsePositiveInteger(args.image_wheel_delta_y, 650),
+    llmConfig: configResolution.ok ? {
+      ...configResolution.config,
+      apiKey: configFile?.apiKey || ""
+    } : null,
+    llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
+    llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
+    llmImageDetail: normalizeText(args.llm_image_detail) || "high",
+    listMaxScrolls: parsePositiveInteger(args.list_max_scrolls, 200),
+    listStableSignatureLimit: parsePositiveInteger(args.list_stable_signature_limit, 2),
+    listWheelDeltaY: parsePositiveInteger(args.list_wheel_delta_y, 850),
+    listSettleMs: parsePositiveInteger(args.list_settle_ms, slowLive ? 1800 : 1200),
+    listFallbackPoint: null,
+    name: "mcp-boss-chat-run"
+  };
+}
+
+async function closeChatRunSession(runId) {
+  const meta = chatRunMeta.get(runId);
+  if (!meta || meta.closed) return;
+  try {
+    try {
+      if (meta.session?.client) {
+        await closeChatResumeModal(meta.session.client, { attemptsLimit: 2 });
+      }
+    } catch {
+      // Cleanup is best-effort once the run has settled.
+    }
+    assertNoForbiddenCdpCalls(meta.methodLog || []);
+  } finally {
+    meta.closed = true;
+    try {
+      await meta.session?.close?.();
+    } catch {
+      // Nothing actionable for the caller once the run has settled.
+    }
+  }
+}
+
+async function waitForChatRunTerminal(runId) {
+  while (true) {
+    try {
+      const snapshot = chatRunService.getChatRun(runId);
+      if (TERMINAL_STATUSES.has(snapshot.status)) return snapshot;
+    } catch {
+      return null;
+    }
+    await sleep(1000);
+  }
+}
+
+function trackChatRun(runId) {
+  waitForChatRunTerminal(runId)
+    .then((terminal) => {
+      if (terminal) persistChatRunSnapshot(terminal);
+    })
+    .catch(() => null)
+    .finally(() => {
+      closeChatRunSession(runId).catch(() => {});
+    });
+}
+
+async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) {
+  const normalized = normalizeChatStartInput(args);
+  const missingFields = getMissingChatStartFields(args, normalized);
+  if (missingFields.length) {
+    return buildNeedInputResponse({
+      args,
+      missingFields,
+      normalized
+    });
+  }
+
+  const shouldRequestResume = shouldRequestChatResume(args);
+  const useLlm = shouldUseChatLlm(args, shouldRequestResume);
+  const configResolution = useLlm ? resolveBossScreeningConfig(workspaceRoot) : null;
+  if (useLlm && !configResolution?.ok) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: configResolution?.error?.message || "screening-config.json is required for chat LLM screening",
+        retryable: true
+      }
+    };
+  }
+
+  let session;
+  try {
+    session = await chatConnectorImpl({
+      host: normalized.host,
+      port: normalized.port,
+      targetUrlIncludes: normalized.targetUrlIncludes,
+      allowNavigate: normalized.allowNavigate,
+      slowLive: normalized.slowLive
+    });
+  } catch (error) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "BOSS_CHAT_PAGE_NOT_READY",
+        message: error?.message || "Boss chat page is not ready",
+        retryable: true
+      }
+    };
+  }
+
+  let started;
+  try {
+    started = chatRunService.startChatRun(getRunOptions(args, normalized, session, { workspaceRoot }));
+  } catch (error) {
+    await session.close?.();
+    return {
+      status: "FAILED",
+      error: {
+        code: "CHAT_RUN_START_FAILED",
+        message: error?.message || "Failed to start Boss chat run",
+        retryable: true
+      }
+    };
+  }
+
+  chatRunMeta.set(started.runId, {
+    session,
+    methodLog: session.methodLog || [],
+    workspaceRoot: normalizeText(workspaceRoot) || process.cwd(),
+    args: clonePlain(args, {}),
+    normalized,
+    chrome: {
+      host: normalized.host,
+      port: normalized.port,
+      target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
+      target_id: session.target?.id || null
+    },
+    health: session.health || null
+  });
+  trackChatRun(started.runId);
+  const persistedStarted = persistChatRunSnapshot(started);
+
+  return {
+    status: "ACCEPTED",
+    run_id: persistedStarted.run_id,
+    state: persistedStarted.state,
+    run: persistedStarted,
+    poll_after_sec: DEFAULT_CHAT_POLL_AFTER_SEC,
+    message: shouldRequestResume
+      ? "Boss chat run started through the shared CDP-only chat service. Passed candidates will follow the configured request-CV sequence."
+      : "Boss chat run started through the shared CDP-only chat service.",
+    target_count_semantics: TARGET_COUNT_SEMANTICS
+  };
+}
+
+export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } = {}) {
+  const normalized = normalizeChatStartInput(args);
+  let session;
+  try {
+    session = await chatConnectorImpl({
+      host: normalized.host,
+      port: normalized.port,
+      targetUrlIncludes: normalized.targetUrlIncludes,
+      allowNavigate: normalized.allowNavigate,
+      slowLive: normalized.slowLive
+    });
+  } catch (error) {
+    return {
+      status: "FAILED",
+      stage: "chat_run_setup",
+      error: {
+        code: "BOSS_CHAT_PAGE_NOT_READY",
+        message: error?.message || "Boss chat page is not ready",
+        retryable: true
+      },
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      chrome: {
+        host: normalized.host,
+        port: normalized.port,
+        target_url: CHAT_TARGET_URL
+      }
+    };
+  }
+
+  try {
+    const jobs = await chatJobReaderImpl(session, {
+      workspaceRoot: normalizeText(workspaceRoot) || process.cwd(),
+      args: clonePlain(args, {}),
+      normalized
+    });
+    const jobOptions = Array.isArray(jobs?.job_options) ? jobs.job_options : [];
+    const missingFields = getMissingChatStartFields(args, normalized);
+    const diagnostics = buildTargetCountDiagnostics(args, missingFields, normalized);
+    const nextCallExample = buildChatNextCallExample(args, missingFields, normalized);
+    const selectedJob = jobOptions.find((option) => {
+      const job = normalizeText(normalized.job).toLowerCase();
+      if (!job) return option.active === true;
+      return [option.value, option.label, option.title]
+        .map((value) => normalizeText(value).toLowerCase())
+        .includes(job);
+    }) || null;
+
+    assertNoForbiddenCdpCalls(session.methodLog || []);
+    return {
+      status: missingFields.length ? "NEED_INPUT" : "READY",
+      stage: "chat_run_setup",
+      page_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
+      required_fields: CHAT_REQUIRED_FIELDS.slice(),
+      missing_fields: missingFields,
+      job_options: jobOptions,
+      selected_job: selectedJob,
+      selected_job_label: jobs?.selected_label || selectedJob?.label || "",
+      job_options_source: jobs?.source || "",
+      job_options_selector: jobs?.selector || "",
+      pending_questions: buildPendingChatQuestions({
+        args,
+        missingFields,
+        normalized,
+        jobOptions
+      }),
+      ...diagnostics,
+      ...(nextCallExample ? { next_call_example: nextCallExample } : {}),
+      message: missingFields.length
+        ? "已通过 CDP-only 读取 Boss 聊天页岗位列表，请补齐 job / start_from / target_count / criteria。"
+        : "Boss chat CDP-only preflight is ready. Use start_boss_chat_run to start screening.",
+      runtime_evaluate_used: false,
+      method_summary: methodSummary(session.methodLog || []),
+      method_log: session.methodLog || [],
+      chrome: {
+        host: normalized.host,
+        port: normalized.port,
+        target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
+        target_id: session.target?.id || null
+      }
+    };
+  } catch (error) {
+    return {
+      status: "FAILED",
+      stage: "chat_run_setup",
+      error: {
+        code: "BOSS_CHAT_PREPARE_FAILED",
+        message: error?.message || "Boss chat CDP-only prepare failed",
+        retryable: true
+      },
+      runtime_evaluate_used: false,
+      method_summary: methodSummary(session.methodLog || []),
+      method_log: session.methodLog || [],
+      chrome: {
+        host: normalized.host,
+        port: normalized.port,
+        target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
+        target_id: session.target?.id || null
+      }
+    };
+  } finally {
+    try {
+      assertNoForbiddenCdpCalls(session.methodLog || []);
+    } finally {
+      await session.close?.();
+    }
+  }
+}
+
+export async function bossChatHealthCheckTool({ workspaceRoot = "", args = {} } = {}) {
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const runtimeLayout = resolveBossChatRuntimeLayout(workspaceRoot);
+  const host = normalizeText(args.host) || DEFAULT_CHAT_HOST;
+  const port = parsePositiveInteger(args.port, configResolution.ok ? configResolution.config.debugPort : DEFAULT_CHAT_PORT);
+  const targetUrlIncludes = normalizeText(args.target_url_includes) || CHAT_TARGET_URL;
+  const allowNavigate = args.allow_navigate !== false;
+  const slowLive = args.slow_live === true;
+  const basePayload = {
+    server: "boss-chat",
+    mode: "cdp-only",
+    cdp_only: true,
+    cli_dir: null,
+    cli_path: null,
+    config_path: configResolution.config_path || null,
+    config_dir: configResolution.config_dir || null,
+    debug_port: port,
+    shared_llm_config: configResolution.ok === true,
+    data_dir: runtimeLayout.data_dir,
+    data_dir_source: runtimeLayout.data_dir_source,
+    legacy_workspace_dir: runtimeLayout.legacy_workspace_dir,
+    migration_source_dir: runtimeLayout.migration_source_dir,
+    migration_pending: runtimeLayout.migration_pending
+  };
+
+  if (!configResolution.ok) {
+    return {
+      status: "FAILED",
+      ...basePayload,
+      error: configResolution.error,
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      chrome: {
+        host,
+        port,
+        target_url: targetUrlIncludes
+      }
+    };
+  }
+
+  let session;
+  try {
+    session = await chatConnectorImpl({
+      host,
+      port,
+      targetUrlIncludes,
+      allowNavigate,
+      slowLive
+    });
+    assertNoForbiddenCdpCalls(session.methodLog || []);
+    return {
+      status: "OK",
+      ...basePayload,
+      page_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
+      health: session.health || null,
+      runtime_evaluate_used: false,
+      method_summary: methodSummary(session.methodLog || []),
+      method_log: session.methodLog || [],
+      chrome: {
+        host,
+        port,
+        target_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
+        target_id: session.target?.id || null
+      },
+      message: "Boss chat CDP-only health check passed with shared self-heal probes."
+    };
+  } catch (error) {
+    return {
+      status: "FAILED",
+      ...basePayload,
+      error: {
+        code: "BOSS_CHAT_PAGE_NOT_READY",
+        message: error?.message || "Boss chat page is not ready",
+        retryable: true
+      },
+      runtime_evaluate_used: false,
+      method_summary: methodSummary(session?.methodLog || []),
+      method_log: session?.methodLog || [],
+      chrome: {
+        host,
+        port,
+        target_url: session?.navigation?.url || session?.target?.url || targetUrlIncludes,
+        target_id: session?.target?.id || null
+      }
+    };
+  } finally {
+    if (session?.methodLog) assertNoForbiddenCdpCalls(session.methodLog);
+    await session?.close?.();
+  }
+}
+
+export async function startBossChatRunTool({ workspaceRoot = "", args = {} } = {}) {
+  const started = await startBossChatRunInternal(args, { workspaceRoot });
+  if (started.status !== "ACCEPTED") return started;
+  return attachMethodEvidence(started, started.run_id);
+}
+
+export function getBossChatRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  if (!runId) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "INVALID_RUN_ID",
+        message: "run_id is required",
+        retryable: false
+      }
+    };
+  }
+  try {
+    const run = chatRunService.getChatRun(runId);
+    const normalizedRun = persistChatRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "RUN_STATUS",
+      run: normalizedRun
+    }, runId);
+  } catch {
+    const persisted = readChatRunState(runId);
+    if (persisted) {
+      return {
+        status: "RUN_STATUS",
+        run: persisted,
+        persistence: {
+          source: "disk",
+          active_control_available: false
+        },
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return {
+      status: "FAILED",
+      error: {
+        code: "RUN_NOT_FOUND",
+        message: `No Boss chat run found for run_id=${runId}`,
+        retryable: false
+      }
+    };
+  }
+}
+
+export function pauseBossChatRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  try {
+    const before = chatRunService.getChatRun(runId);
+    if (TERMINAL_STATUSES.has(before.status)) {
+      const normalizedBefore = persistChatRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "PAUSE_IGNORED",
+        run: normalizedBefore,
+        message: "目标任务已结束，无需暂停。"
+      }, runId);
+    }
+    if (before.status === RUN_STATUS_PAUSED) {
+      const normalizedBefore = persistChatRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "PAUSE_IGNORED",
+        run: normalizedBefore,
+        message: "目标任务已经处于 paused 状态。"
+      }, runId);
+    }
+    const run = chatRunService.pauseChatRun(runId);
+    const normalizedRun = persistChatRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "PAUSE_REQUESTED",
+      run: normalizedRun,
+      message: "暂停请求已接收，将在当前候选人处理完成后进入 paused。"
+    }, runId);
+  } catch {
+    const persisted = readChatRunState(runId);
+    if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
+      return {
+        status: "PAUSE_IGNORED",
+        run: persisted,
+        message: "目标任务已结束，无需暂停。",
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return getBossChatRunTool({ args });
+  }
+}
+
+export function resumeBossChatRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  try {
+    const before = chatRunService.getChatRun(runId);
+    if (TERMINAL_STATUSES.has(before.status)) {
+      const normalizedBefore = persistChatRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "FAILED",
+        error: {
+          code: "RUN_ALREADY_TERMINATED",
+          message: "目标任务已结束，无法继续。",
+          retryable: false
+        },
+        run: normalizedBefore
+      }, runId);
+    }
+    if (before.status !== RUN_STATUS_PAUSED) {
+      const normalizedBefore = persistChatRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "FAILED",
+        error: {
+          code: "RUN_NOT_PAUSED",
+          message: "仅 paused 状态的 run 才能继续。",
+          retryable: true
+        },
+        run: normalizedBefore
+      }, runId);
+    }
+    const run = chatRunService.resumeChatRun(runId);
+    const meta = getChatRunMeta(runId);
+    if (meta) {
+      meta.resumeCount = (meta.resumeCount || 0) + 1;
+      meta.lastResumedAt = new Date().toISOString();
+    }
+    const normalizedRun = persistChatRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "RESUME_REQUESTED",
+      run: normalizedRun,
+      poll_after_sec: DEFAULT_CHAT_POLL_AFTER_SEC,
+      message: "已恢复 Boss chat run，请使用 get_boss_chat_run 按需轮询。"
+    }, runId);
+  } catch {
+    const persisted = readChatRunState(runId);
+    if (persisted) {
+      return {
+        status: "FAILED",
+        error: {
+          code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
+          message: TERMINAL_STATUSES.has(persisted.state)
+            ? "目标任务已结束，无法继续。"
+            : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
+          retryable: !TERMINAL_STATUSES.has(persisted.state)
+        },
+        run: persisted,
+        persistence: {
+          source: "disk",
+          active_control_available: false
+        },
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return getBossChatRunTool({ args });
+  }
+}
+
+export function cancelBossChatRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  try {
+    const before = chatRunService.getChatRun(runId);
+    if (TERMINAL_STATUSES.has(before.status)) {
+      const normalizedBefore = persistChatRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "CANCEL_IGNORED",
+        run: normalizedBefore,
+        message: "目标任务已结束，无需取消。"
+      }, runId);
+    }
+    const run = chatRunService.cancelChatRun(runId);
+    const normalizedRun = persistChatRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "CANCEL_REQUESTED",
+      run: normalizedRun,
+      message: "已收到取消请求，将在当前候选人处理完成后安全停止。"
+    }, runId);
+  } catch {
+    const persisted = readChatRunState(runId);
+    if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
+      return {
+        status: "CANCEL_IGNORED",
+        run: persisted,
+        message: "目标任务已结束，无需取消。",
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return getBossChatRunTool({ args });
+  }
+}
+
+export function __setChatMcpConnectorForTests(nextConnector) {
+  chatConnectorImpl = typeof nextConnector === "function" ? nextConnector : connectChatChromeSession;
+}
+
+export function __setChatMcpJobReaderForTests(nextReader) {
+  chatJobReaderImpl = typeof nextReader === "function" ? nextReader : readChatJobOptionsFromSession;
+}
+
+export function __setChatMcpWorkflowForTests(nextWorkflow) {
+  chatWorkflowImpl = typeof nextWorkflow === "function" ? nextWorkflow : runChatWorkflow;
+  chatRunService = createChatRunService({
+    idPrefix: "mcp_chat",
+    workflow: (...args) => chatWorkflowImpl(...args)
+  });
+}
+
+export function __resetChatMcpStateForTests() {
+  for (const meta of chatRunMeta.values()) {
+    try {
+      meta.session?.close?.();
+    } catch {
+      // Best-effort test cleanup.
+    }
+  }
+  chatRunMeta.clear();
+  __setChatMcpConnectorForTests(null);
+  __setChatMcpJobReaderForTests(null);
+  __setChatMcpWorkflowForTests(null);
+}

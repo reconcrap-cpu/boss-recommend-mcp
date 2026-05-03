@@ -1,0 +1,1257 @@
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import {
+  assertNoForbiddenCdpCalls,
+  bringPageToFront,
+  connectToChromeTarget,
+  enableDomains,
+  sleep
+} from "./core/browser/index.js";
+import {
+  RUN_STATUS_CANCELING,
+  RUN_STATUS_CANCELED,
+  RUN_STATUS_COMPLETED,
+  RUN_STATUS_FAILED,
+  RUN_STATUS_PAUSED
+} from "./core/run/index.js";
+import {
+  buildLegacyScreenInputRows,
+  cloneReportInput,
+  writeLegacyScreenCsv
+} from "./core/reporting/legacy-csv.js";
+import {
+  buildRecommendSelfHealConfig,
+  HEALTH_STATUS,
+  resolveRecommendSelfHealRoots,
+  runSelfHealCheck
+} from "./core/self-heal/index.js";
+import {
+  closeRecommendJobDropdown,
+  closeRecommendDetail,
+  createRecommendRunService,
+  getRecommendRoots,
+  listRecommendJobOptions,
+  RECOMMEND_TARGET_URL,
+  runRecommendWorkflow
+} from "./domains/recommend/index.js";
+import {
+  parseRecommendInstruction
+} from "./parser.js";
+import { getRunsDir } from "./run-state.js";
+
+const DEFAULT_RECOMMEND_HOST = "127.0.0.1";
+const DEFAULT_RECOMMEND_PORT = 9222;
+const DEFAULT_RECOMMEND_POLL_AFTER_SEC = 10;
+const TARGET_COUNT_SEMANTICS = "target_count means processed recommend candidates, not passed candidates";
+const RUN_MODE_ASYNC = "async";
+
+const TERMINAL_STATUSES = new Set([
+  RUN_STATUS_COMPLETED,
+  RUN_STATUS_FAILED,
+  RUN_STATUS_CANCELED
+]);
+
+let recommendWorkflowImpl = runRecommendWorkflow;
+let recommendConnectorImpl = connectRecommendChromeSession;
+let recommendJobReaderImpl = readRecommendJobOptionsFromSession;
+let recommendRunService = createRecommendRunService({
+  idPrefix: "mcp_recommend",
+  workflow: (...args) => recommendWorkflowImpl(...args)
+});
+const recommendRunMeta = new Map();
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function parsePositiveInteger(raw, fallback) {
+  const parsed = Number.parseInt(String(raw || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseNonNegativeInteger(raw, fallback) {
+  const parsed = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function methodSummary(methodLog = []) {
+  const summary = {};
+  for (const entry of methodLog || []) {
+    summary[entry.method] = (summary[entry.method] || 0) + 1;
+  }
+  return summary;
+}
+
+function clonePlain(value, fallback = null) {
+  try {
+    return value === undefined ? fallback : JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeRunId(runId) {
+  const normalized = normalizeText(runId);
+  if (!normalized || normalized.includes("/") || normalized.includes("\\")) return "";
+  return normalized;
+}
+
+function getRecommendRunArtifacts(runId) {
+  const normalized = normalizeRunId(runId);
+  if (!normalized) return null;
+  const runsDir = getRunsDir();
+  return {
+    runs_dir: runsDir,
+    run_state_path: path.join(runsDir, `${normalized}.json`),
+    checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    output_csv: path.join(runsDir, `${normalized}.results.csv`),
+    report_json: path.join(runsDir, `${normalized}.report.json`)
+  };
+}
+
+function ensureDirectory(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function writeJsonAtomic(filePath, payload) {
+  ensureDirectory(path.dirname(filePath));
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.renameSync(tempPath, filePath);
+}
+
+function readJsonFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function recommendSearchParamsForCsv(searchParams = {}) {
+  return {
+    school_tag: Object.prototype.hasOwnProperty.call(searchParams, "school_tag") ? searchParams.school_tag : "不限",
+    degree: Object.prototype.hasOwnProperty.call(searchParams, "degree") ? searchParams.degree : "不限",
+    gender: Object.prototype.hasOwnProperty.call(searchParams, "gender") ? searchParams.gender : "不限",
+    recent_not_view: Object.prototype.hasOwnProperty.call(searchParams, "recent_not_view") ? searchParams.recent_not_view : "不限"
+  };
+}
+
+function selectedRecommendJobForCsv(meta = {}) {
+  const value = normalizeText(
+    meta.args?.confirmation?.job_value
+    || meta.normalized?.job
+    || meta.args?.overrides?.job
+    || ""
+  );
+  return {
+    value,
+    title: value,
+    label: value
+  };
+}
+
+function buildRecommendCsvInputRows(snapshot = {}, meta = {}) {
+  const searchParams = recommendSearchParamsForCsv(meta.parsed?.searchParams || {});
+  const screenParams = meta.parsed?.screenParams || {};
+  return buildLegacyScreenInputRows({
+    instruction: meta.args?.instruction || "",
+    selectedPage: "recommend",
+    selectedJob: selectedRecommendJobForCsv(meta),
+    userSearchParams: cloneReportInput(searchParams, {}),
+    effectiveSearchParams: cloneReportInput(searchParams, {}),
+    screenParams: {
+      criteria: screenParams.criteria || meta.normalized?.criteria || "",
+      target_count: screenParams.target_count || snapshot.progress?.target_count || meta.normalized?.targetCount || "",
+      post_action: screenParams.post_action || "none",
+      max_greet_count: screenParams.max_greet_count ?? ""
+    },
+    followUp: meta.args?.follow_up || meta.args?.overrides?.follow_up || null
+  });
+}
+
+function writeRecommendLegacyCsvAtomic(filePath, rows = [], snapshot = {}, meta = {}) {
+  writeLegacyScreenCsv(filePath, {
+    inputRows: buildRecommendCsvInputRows(snapshot, meta),
+    results: rows
+  });
+}
+
+function readRecommendRunState(runId) {
+  const artifacts = getRecommendRunArtifacts(runId);
+  if (!artifacts) return null;
+  return readJsonFile(artifacts.run_state_path);
+}
+
+function getRecommendRunMeta(runId) {
+  return recommendRunMeta.get(runId) || {};
+}
+
+function toIsoOrNull(value) {
+  const normalized = normalizeText(value);
+  return normalized || null;
+}
+
+function secondsBetween(startedAt, endedAt) {
+  const startMs = Date.parse(startedAt || "");
+  const endMs = Date.parse(endedAt || "") || Date.now();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return null;
+  return Math.max(1, Math.round((endMs - startMs) / 1000));
+}
+
+function normalizeLegacyProgress(progress = {}, summary = null) {
+  const processed = Number.isInteger(progress.processed)
+    ? progress.processed
+    : Number.isInteger(summary?.processed)
+      ? summary.processed
+      : 0;
+  const screened = Number.isInteger(progress.screened)
+    ? progress.screened
+    : Number.isInteger(summary?.screened)
+      ? summary.screened
+      : processed;
+  const passed = Number.isInteger(progress.passed)
+    ? progress.passed
+    : Number.isInteger(summary?.passed)
+      ? summary.passed
+      : 0;
+  return {
+    ...progress,
+    processed,
+    inspected: processed,
+    screened,
+    passed,
+    skipped: Number.isInteger(progress.skipped) ? progress.skipped : Math.max(processed - passed, 0),
+    greet_count: Number.isInteger(progress.greet_count) ? progress.greet_count : 0,
+    post_action_clicked: Number.isInteger(progress.post_action_clicked) ? progress.post_action_clicked : 0
+  };
+}
+
+function completionReason(status) {
+  if (status === RUN_STATUS_COMPLETED) return "completed";
+  if (status === RUN_STATUS_CANCELED) return "canceled_by_user";
+  if (status === RUN_STATUS_FAILED) return "failed";
+  if (status === RUN_STATUS_PAUSED) return "paused";
+  return null;
+}
+
+function ensureRecommendRunArtifacts(snapshot) {
+  const artifacts = getRecommendRunArtifacts(snapshot?.runId || snapshot?.run_id);
+  if (!artifacts) return null;
+
+  const meta = getRecommendRunMeta(snapshot?.runId || snapshot?.run_id);
+  const checkpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
+    ? snapshot.checkpoint
+    : {};
+  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  if (meta) meta.checkpointPath = artifacts.checkpoint_path;
+
+  const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  if (summary) {
+    const rows = Array.isArray(summary.results) ? summary.results : [];
+    writeRecommendLegacyCsvAtomic(artifacts.output_csv, rows, snapshot, meta);
+    writeJsonAtomic(artifacts.report_json, {
+      run_id: snapshot.runId || snapshot.run_id,
+      status: snapshot.status || snapshot.state,
+      phase: snapshot.phase || snapshot.stage,
+      progress: snapshot.progress || {},
+      context: snapshot.context || {},
+      checkpoint,
+      summary,
+      generated_at: new Date().toISOString()
+    });
+    if (meta) {
+      meta.outputCsvPath = artifacts.output_csv;
+      meta.reportJsonPath = artifacts.report_json;
+    }
+  }
+
+  return artifacts;
+}
+
+function buildLegacyRecommendResult(snapshot) {
+  if (!snapshot) return null;
+  const artifacts = ensureRecommendRunArtifacts(snapshot);
+  const meta = getRecommendRunMeta(snapshot.runId);
+  const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const progress = normalizeLegacyProgress(snapshot.progress, summary);
+  const targetCount = Number.isInteger(progress.target_count)
+    ? progress.target_count
+    : Number.isInteger(snapshot.context?.max_candidates)
+      ? snapshot.context.max_candidates
+      : meta.parsed?.screenParams?.target_count || null;
+  return {
+    status: snapshot.status === RUN_STATUS_COMPLETED
+      ? "COMPLETED"
+      : snapshot.status === RUN_STATUS_CANCELED
+        ? "CANCELED"
+        : snapshot.status === RUN_STATUS_PAUSED
+          ? "PAUSED"
+          : snapshot.status === RUN_STATUS_FAILED
+            ? "FAILED"
+            : snapshot.status,
+    run_id: snapshot.runId,
+    completion_reason: completionReason(snapshot.status),
+    requested_count: targetCount,
+    processed_count: progress.processed,
+    inspected_count: progress.processed,
+    screened_count: progress.screened,
+    passed_count: progress.passed,
+    skipped_count: progress.skipped,
+    detail_opened: progress.detail_opened || summary?.detail_opened || 0,
+    greet_count: progress.greet_count || 0,
+    post_action_clicked: progress.post_action_clicked || summary?.post_action_clicked || 0,
+    output_csv: artifacts?.output_csv || meta.outputCsvPath || null,
+    report_json: artifacts?.report_json || meta.reportJsonPath || null,
+    checkpoint_path: artifacts?.checkpoint_path || meta.checkpointPath || null,
+    started_at: snapshot.startedAt,
+    completed_at: snapshot.completedAt || null,
+    duration_sec: secondsBetween(snapshot.startedAt, snapshot.completedAt),
+    selected_job: {
+      title: meta.normalized?.job || meta.args?.confirmation?.job_value || meta.args?.overrides?.job || ""
+    },
+    selected_page_scope: summary?.page_scope || {
+      requested_scope: meta.normalized?.pageScope || meta.parsed?.page_scope || "recommend",
+      effective_scope: meta.normalized?.pageScope || meta.parsed?.page_scope || "recommend"
+    },
+    search_params: clonePlain(meta.parsed?.searchParams || {}, {}),
+    screen_params: clonePlain(meta.parsed?.screenParams || {}, {}),
+    target_count_semantics: TARGET_COUNT_SEMANTICS,
+    error: snapshot.error || null,
+    results: Array.isArray(summary?.results) ? summary.results : []
+  };
+}
+
+function normalizeRunSnapshot(snapshot) {
+  if (!snapshot) return null;
+  const meta = getRecommendRunMeta(snapshot.runId);
+  const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const progress = normalizeLegacyProgress(snapshot.progress, summary);
+  const legacyResult = (
+    TERMINAL_STATUSES.has(snapshot.status)
+    || snapshot.status === RUN_STATUS_PAUSED
+  ) ? buildLegacyRecommendResult({ ...snapshot, progress }) : null;
+  const oldContext = {
+    workspace_root: meta.workspaceRoot || null,
+    instruction: meta.args?.instruction || "",
+    confirmation: clonePlain(meta.args?.confirmation || {}, {}),
+    overrides: clonePlain(meta.args?.overrides || {}, {}),
+    follow_up: clonePlain(meta.args?.follow_up || {}, {}),
+    target_count_semantics: TARGET_COUNT_SEMANTICS
+  };
+  return {
+    ...snapshot,
+    progress,
+    run_id: snapshot.runId,
+    mode: RUN_MODE_ASYNC,
+    state: snapshot.status,
+    stage: snapshot.phase,
+    started_at: snapshot.startedAt,
+    updated_at: snapshot.updatedAt,
+    completed_at: toIsoOrNull(snapshot.completedAt),
+    heartbeat_at: snapshot.updatedAt,
+    pid: process.pid || null,
+    last_message: snapshot.error?.message || snapshot.phase || null,
+    context: {
+      ...(snapshot.context || {}),
+      ...oldContext,
+      shared_run_context: snapshot.context || {}
+    },
+    control: {
+      pause_requested: snapshot.status === RUN_STATUS_PAUSED,
+      pause_requested_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null,
+      pause_requested_by: snapshot.status === RUN_STATUS_PAUSED ? "pause_recommend_pipeline_run" : null,
+      cancel_requested: snapshot.status === RUN_STATUS_CANCELING
+    },
+    resume: {
+      checkpoint_path: legacyResult?.checkpoint_path || null,
+      pause_control_path: getRecommendRunArtifacts(snapshot.runId)?.run_state_path || null,
+      output_csv: legacyResult?.output_csv || null,
+      resume_count: meta.resumeCount || 0,
+      last_resumed_at: meta.lastResumedAt || null,
+      last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
+    },
+    result: legacyResult,
+    artifacts: getRecommendRunArtifacts(snapshot.runId)
+  };
+}
+
+function persistRecommendRunSnapshot(snapshot) {
+  const normalized = normalizeRunSnapshot(snapshot);
+  if (!normalized?.run_id) return normalized;
+  const artifacts = getRecommendRunArtifacts(normalized.run_id);
+  if (!artifacts) return normalized;
+  const payload = {
+    run_id: normalized.run_id,
+    mode: normalized.mode,
+    state: normalized.state,
+    status: normalized.status,
+    stage: normalized.stage,
+    started_at: normalized.started_at,
+    updated_at: normalized.updated_at,
+    heartbeat_at: normalized.heartbeat_at,
+    completed_at: normalized.completed_at,
+    pid: normalized.pid,
+    progress: normalized.progress,
+    last_message: normalized.last_message,
+    context: normalized.context,
+    control: normalized.control,
+    resume: normalized.resume,
+    error: normalized.error,
+    result: normalized.result,
+    summary: normalized.summary,
+    artifacts: normalized.artifacts
+  };
+  writeJsonAtomic(artifacts.run_state_path, payload);
+  return normalized;
+}
+
+function attachMethodEvidence(payload, runId) {
+  const meta = getRecommendRunMeta(runId);
+  assertNoForbiddenCdpCalls(meta.methodLog || []);
+  return {
+    ...payload,
+    runtime_evaluate_used: false,
+    method_summary: methodSummary(meta.methodLog || []),
+    method_log: meta.methodLog || [],
+    chrome: meta.chrome || null
+  };
+}
+
+function compactRecommendJobListOption(option, index) {
+  const label = normalizeText(option?.label);
+  const name = normalizeText(option?.label_without_salary || label);
+  return {
+    index,
+    name,
+    label,
+    label_without_salary: name,
+    current: Boolean(option?.current),
+    visible: Boolean(option?.visible)
+  };
+}
+
+async function readRecommendJobOptionsFromSession(session) {
+  const client = session?.client;
+  if (!client) throw new Error("Recommend Chrome session is missing a CDP client");
+  const rootState = await getRecommendRoots(client);
+  const frameNodeId = rootState?.iframe?.documentNodeId;
+  if (!frameNodeId) throw new Error("recommendFrame iframe document was not found");
+
+  let options = [];
+  try {
+    options = await listRecommendJobOptions(client, frameNodeId, {
+      openDropdown: true
+    });
+  } finally {
+    await closeRecommendJobDropdown(client).catch(() => {});
+  }
+
+  const compacted = [];
+  const seen = new Set();
+  for (const option of options) {
+    const compact = compactRecommendJobListOption(option, compacted.length);
+    if (!compact.name && !compact.label) continue;
+    const key = `${compact.name}\n${compact.label}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    compacted.push(compact);
+  }
+
+  return {
+    source: "recommend_job_dropdown",
+    selector: "recommend job selection dropdown",
+    job_options: compacted,
+    selected_job: compacted.find((option) => option.current) || null
+  };
+}
+
+export async function listRecommendJobsTool({ workspaceRoot = "", args = {} } = {}) {
+  const host = normalizeText(args.host) || DEFAULT_RECOMMEND_HOST;
+  const port = parsePositiveInteger(args.port, DEFAULT_RECOMMEND_PORT);
+  const targetUrlIncludes = normalizeText(args.target_url_includes) || RECOMMEND_TARGET_URL;
+  const allowNavigate = args.allow_navigate !== false;
+  const slowLive = args.slow_live === true;
+  let session;
+
+  try {
+    session = await recommendConnectorImpl({
+      host,
+      port,
+      targetUrlIncludes,
+      allowNavigate,
+      slowLive
+    });
+
+    const jobs = await recommendJobReaderImpl(session, {
+      workspaceRoot: normalizeText(workspaceRoot) || process.cwd(),
+      args: clonePlain(args, {}),
+      normalized: {
+        host,
+        port,
+        targetUrlIncludes,
+        allowNavigate,
+        slowLive
+      }
+    });
+    const jobOptions = Array.isArray(jobs?.job_options) ? jobs.job_options : [];
+    assertNoForbiddenCdpCalls(session.methodLog || []);
+    return {
+      status: "OK",
+      stage: "recommend_job_list",
+      cdp_only: true,
+      runtime_evaluate_used: false,
+      page_url: session.navigation?.url || session.target?.url || RECOMMEND_TARGET_URL,
+      job_count: jobOptions.length,
+      job_names: jobOptions.map((option) => option.name || option.label).filter(Boolean),
+      job_full_labels: jobOptions.map((option) => option.label || option.name).filter(Boolean),
+      job_options: jobOptions,
+      selected_job: jobs?.selected_job || jobOptions.find((option) => option.current) || null,
+      source: jobs?.source || "recommend_job_dropdown",
+      selector: jobs?.selector || "",
+      message: "已通过 CDP-only 从推荐页岗位下拉框读取可用岗位。Cron/一次性任务里的 job 参数优先使用 job_names 中的完整岗位名。",
+      chrome: {
+        host,
+        port,
+        target_url: session.navigation?.url || session.target?.url || RECOMMEND_TARGET_URL,
+        target_id: session.target?.id || null
+      },
+      method_summary: methodSummary(session.methodLog || []),
+      method_log: session.methodLog || []
+    };
+  } catch (error) {
+    const methodLog = session?.methodLog || [];
+    return {
+      status: "FAILED",
+      stage: "recommend_job_list",
+      cdp_only: true,
+      runtime_evaluate_used: methodLog.some((entry) => String(entry?.method || entry).startsWith("Runtime.")),
+      error: {
+        code: "RECOMMEND_JOB_LIST_FAILED",
+        message: error?.message || "Failed to read recommend job list",
+        retryable: true
+      },
+      chrome: {
+        host,
+        port,
+        target_url: targetUrlIncludes
+      },
+      method_summary: methodSummary(methodLog),
+      method_log: methodLog
+    };
+  } finally {
+    if (session) {
+      try {
+        await session.close?.();
+      } catch {
+        // Best-effort cleanup after a read-only helper.
+      }
+    }
+  }
+}
+
+function compactHealth(check) {
+  if (!check) return null;
+  return {
+    status: check.status,
+    summary: check.summary,
+    drift_report: check.drift_report,
+    probes: (check.probes || []).map((probe) => ({
+      id: probe.id,
+      type: probe.type,
+      status: probe.status,
+      count: probe.count,
+      required: probe.required
+    }))
+  };
+}
+
+async function waitForHealthyRecommend(client, config, {
+  timeoutMs = 90000,
+  intervalMs = 1000
+} = {}) {
+  const started = Date.now();
+  let lastCheck = null;
+  while (Date.now() - started <= timeoutMs) {
+    const roots = await resolveRecommendSelfHealRoots(client, config);
+    lastCheck = await runSelfHealCheck({
+      client,
+      domain: "recommend",
+      roots: roots.roots,
+      selectorProbes: config.selectorProbes,
+      accessibilityProbes: config.accessibilityProbes
+    });
+    if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
+    await sleep(intervalMs);
+  }
+  return lastCheck;
+}
+
+function shouldNavigateToRecommend(url) {
+  return !String(url || "").includes("/web/chat/recommend");
+}
+
+async function connectRecommendChromeSession({
+  host = DEFAULT_RECOMMEND_HOST,
+  port = DEFAULT_RECOMMEND_PORT,
+  targetUrlIncludes = RECOMMEND_TARGET_URL,
+  allowNavigate = true,
+  slowLive = false
+} = {}) {
+  let session;
+  try {
+    session = await connectToChromeTarget({
+      host,
+      port,
+      targetUrlIncludes
+    });
+  } catch (error) {
+    if (!allowNavigate) throw error;
+    session = await connectToChromeTarget({
+      host,
+      port,
+      targetPredicate: (target) => (
+        target?.type === "page"
+        && String(target?.url || "").includes("zhipin.com/web/chat")
+      )
+    });
+  }
+
+  const { client, target } = session;
+  await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
+  if (typeof client?.Network?.setCacheDisabled === "function") {
+    await client.Network.setCacheDisabled({ cacheDisabled: true });
+  }
+  await bringPageToFront(client);
+
+  const targetUrl = String(target?.url || "");
+  let navigation = {
+    navigated: false,
+    url: targetUrl
+  };
+  if (allowNavigate && shouldNavigateToRecommend(targetUrl)) {
+    await client.Page.navigate({ url: RECOMMEND_TARGET_URL });
+    const settleMs = slowLive ? 12000 : 5000;
+    await sleep(settleMs);
+    navigation = {
+      navigated: true,
+      url: RECOMMEND_TARGET_URL,
+      settle_ms: settleMs
+    };
+  }
+
+  const selfHealConfig = buildRecommendSelfHealConfig();
+  const health = await waitForHealthyRecommend(client, selfHealConfig, {
+    timeoutMs: slowLive ? 180000 : 90000,
+    intervalMs: slowLive ? 1200 : 800
+  });
+  if (!health || health.status !== HEALTH_STATUS.HEALTHY) {
+    throw new Error(`Boss recommend page is not healthy: ${health?.status || "missing"}`);
+  }
+
+  return {
+    ...session,
+    navigation,
+    health
+  };
+}
+
+function parseRecommendPipelineRequest(args = {}) {
+  return parseRecommendInstruction({
+    instruction: args.instruction,
+    confirmation: args.confirmation,
+    overrides: args.overrides
+  });
+}
+
+function buildRequiredConfirmations(parsed, args = {}) {
+  const required = [];
+  if (parsed.needs_page_confirmation) required.push("page_scope");
+  if (parsed.needs_filters_confirmation) required.push("filters");
+  if (parsed.needs_school_tag_confirmation) required.push("school_tag");
+  if (parsed.needs_degree_confirmation) required.push("degree");
+  if (parsed.needs_gender_confirmation) required.push("gender");
+  if (parsed.needs_recent_not_view_confirmation) required.push("recent_not_view");
+  if (parsed.needs_criteria_confirmation) required.push("criteria");
+  if (parsed.needs_target_count_confirmation) required.push("target_count");
+  if (parsed.needs_post_action_confirmation) required.push("post_action");
+  if (parsed.needs_max_greet_count_confirmation) required.push("max_greet_count");
+  if ((parsed.suspicious_fields || []).length) required.push("suspicious_fields");
+
+  const confirmation = args.confirmation || {};
+  const jobValue = normalizeText(confirmation.job_value || args.overrides?.job || "");
+  if (confirmation.job_confirmed !== true || !jobValue) required.push("job");
+  if (confirmation.final_confirmed !== true) required.push("final_review");
+  return Array.from(new Set(required));
+}
+
+function buildJobPendingQuestion(args = {}) {
+  const value = normalizeText(args.confirmation?.job_value || args.overrides?.job || "");
+  return {
+    field: "job",
+    question: "请确认推荐页岗位。CDP-only rewrite 会先切换到该岗位，再按所选页面范围执行筛选。",
+    value: value || null
+  };
+}
+
+function buildFinalReviewQuestion(parsed) {
+  return {
+    field: "final_review",
+    question: "请最终确认本次推荐页筛选参数无误，并明确 final_confirmed=true 后再启动。",
+    value: {
+      page_scope: parsed.page_scope,
+      search_params: parsed.searchParams,
+      screen_params: parsed.screenParams
+    }
+  };
+}
+
+function buildNeedInputResponse(parsed) {
+  return {
+    status: "NEED_INPUT",
+    missing_fields: parsed.missing_fields,
+    required_confirmations: buildRequiredConfirmations(parsed),
+    search_params: parsed.searchParams,
+    screen_params: parsed.screenParams,
+    pending_questions: parsed.pending_questions,
+    review: parsed.review,
+    error: {
+      code: "MISSING_REQUIRED_FIELDS",
+      message: "缺少必要字段。请补齐推荐页 criteria 等必填字段后再启动 CDP-only recommend run。",
+      retryable: true
+    }
+  };
+}
+
+function buildNeedConfirmationResponse(parsed, args, requiredConfirmations) {
+  const pending = [...(parsed.pending_questions || [])];
+  if (requiredConfirmations.includes("job") && !pending.some((item) => item.field === "job")) {
+    pending.push(buildJobPendingQuestion(args));
+  }
+  if (requiredConfirmations.includes("final_review") && !pending.some((item) => item.field === "final_review")) {
+    pending.push(buildFinalReviewQuestion(parsed));
+  }
+  return {
+    status: "NEED_CONFIRMATION",
+    required_confirmations: requiredConfirmations,
+    page_scope: parsed.page_scope,
+    search_params: parsed.searchParams,
+    screen_params: parsed.screenParams,
+    pending_questions: pending,
+    review: {
+      ...(parsed.review || {}),
+      required_confirmations: requiredConfirmations
+    }
+  };
+}
+
+function evaluateRecommendPipelineGate(parsed, args = {}) {
+  if (parsed.missing_fields?.length) return buildNeedInputResponse(parsed);
+  const requiredConfirmations = buildRequiredConfirmations(parsed, args);
+  if (requiredConfirmations.length) {
+    return buildNeedConfirmationResponse(parsed, args, requiredConfirmations);
+  }
+
+  if (args.follow_up?.chat || args.overrides?.follow_up?.chat) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "FOLLOW_UP_CHAT_NOT_CDP_REWRITTEN",
+        message: "recommend -> chat follow-up orchestration is legacy-only and intentionally fenced from the CDP-only MCP route. Run recommend first, then use the direct chat MCP route separately, or keep the old chained behavior in the archived legacy lane.",
+        retryable: true
+      },
+      review: parsed.review
+    };
+  }
+
+  return null;
+}
+
+function toArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === undefined || value === null) return [];
+  return [value];
+}
+
+function withoutUnlimited(values = []) {
+  return toArray(values)
+    .map((value) => normalizeText(value))
+    .filter((value) => value && value !== "不限" && value.toLowerCase() !== "all" && value !== "全部");
+}
+
+function buildRecommendFilter(parsed, args = {}) {
+  if (args.no_filter === true || args.filter_enabled === false) {
+    return { enabled: false };
+  }
+
+  const groups = [];
+  const recentNotView = withoutUnlimited(parsed.searchParams?.recent_not_view);
+  if (recentNotView.length) {
+    groups.push({
+      group: "recentNotView",
+      labels: recentNotView,
+      selectAllLabels: true
+    });
+  }
+
+  const degree = withoutUnlimited(parsed.searchParams?.degree);
+  if (degree.length) {
+    groups.push({
+      group: "degree",
+      labels: degree,
+      selectAllLabels: true
+    });
+  }
+
+  const gender = withoutUnlimited(parsed.searchParams?.gender);
+  if (gender.length) {
+    groups.push({
+      group: "gender",
+      labels: gender,
+      selectAllLabels: true
+    });
+  }
+
+  const school = withoutUnlimited(parsed.searchParams?.school_tag);
+  if (school.length) {
+    groups.push({
+      group: "school",
+      labels: school,
+      selectAllLabels: true
+    });
+  }
+
+  return groups.length ? { filterGroups: groups } : { enabled: false };
+}
+
+function normalizeRecommendStartInput(args = {}, parsed) {
+  const confirmation = args.confirmation || {};
+  const overrides = args.overrides || {};
+  const slowLive = args.slow_live === true;
+  const targetCount = parsePositiveInteger(
+    args.max_candidates,
+    parsed.screenParams?.target_count || parsePositiveInteger(confirmation.target_count_value, 5)
+  );
+  return {
+    host: normalizeText(args.host) || DEFAULT_RECOMMEND_HOST,
+    port: parsePositiveInteger(args.port, DEFAULT_RECOMMEND_PORT),
+    targetUrlIncludes: normalizeText(args.target_url_includes) || RECOMMEND_TARGET_URL,
+    allowNavigate: args.allow_navigate !== false,
+    slowLive,
+    criteria: parsed.screenParams?.criteria || normalizeText(overrides.criteria),
+    targetCount,
+    job: normalizeText(confirmation.job_value || overrides.job || ""),
+    pageScope: parsed.page_scope || "recommend",
+    filter: buildRecommendFilter(parsed, args),
+    postAction: parsed.screenParams?.post_action || "none",
+    maxGreetCount: Number.isInteger(parsed.screenParams?.max_greet_count)
+      ? parsed.screenParams.max_greet_count
+      : null
+  };
+}
+
+function getRunOptions(args, parsed, normalized, session) {
+  const slowLive = args.slow_live === true;
+  const executePostAction = args.dry_run_post_action === true
+    ? false
+    : args.execute_post_action !== false;
+  return {
+    client: session.client,
+    targetUrl: RECOMMEND_TARGET_URL,
+    criteria: normalized.criteria,
+    jobLabel: normalized.job,
+    pageScope: normalized.pageScope,
+    fallbackPageScope: "recommend",
+    filter: normalized.filter,
+    maxCandidates: normalized.targetCount,
+    detailLimit: parseNonNegativeInteger(args.detail_limit, 0),
+    closeDetail: true,
+    delayMs: parseNonNegativeInteger(args.delay_ms, 0),
+    cardTimeoutMs: slowLive ? 180000 : 90000,
+    maxImagePages: parsePositiveInteger(args.max_image_pages, 8),
+    imageWheelDeltaY: parsePositiveInteger(args.image_wheel_delta_y, 650),
+    cvAcquisitionMode: normalizeText(args.cv_acquisition_mode) || "unknown",
+    listMaxScrolls: parsePositiveInteger(args.list_max_scrolls, 20),
+    listStableSignatureLimit: parsePositiveInteger(args.list_stable_signature_limit, 2),
+    listWheelDeltaY: parsePositiveInteger(args.list_wheel_delta_y, 850),
+    listSettleMs: parsePositiveInteger(args.list_settle_ms, slowLive ? 1800 : 1200),
+    listFallbackPoint: null,
+    refreshOnEnd: args.refresh_on_end !== false,
+    maxRefreshRounds: parseNonNegativeInteger(args.max_refresh_rounds, 2),
+    refreshButtonSettleMs: parsePositiveInteger(args.refresh_button_settle_ms, slowLive ? 10000 : 8000),
+    refreshReloadSettleMs: parsePositiveInteger(args.refresh_reload_settle_ms, slowLive ? 12000 : 8000),
+    postAction: normalized.postAction,
+    maxGreetCount: normalized.maxGreetCount,
+    executePostAction,
+    actionTimeoutMs: parsePositiveInteger(args.action_timeout_ms, slowLive ? 12000 : 8000),
+    actionIntervalMs: parsePositiveInteger(args.action_interval_ms, 500),
+    actionAfterClickDelayMs: parseNonNegativeInteger(args.action_after_click_delay_ms, slowLive ? 1200 : 900),
+    name: "mcp-recommend-pipeline-run",
+    parsed
+  };
+}
+
+async function closeRecommendRunSession(runId) {
+  const meta = recommendRunMeta.get(runId);
+  if (!meta || meta.closed) return;
+  try {
+    try {
+      if (meta.session?.client) {
+        await closeRecommendDetail(meta.session.client, { attemptsLimit: 2 });
+      }
+    } catch {
+      // Cleanup is best-effort once the run has settled.
+    }
+    assertNoForbiddenCdpCalls(meta.methodLog || []);
+  } finally {
+    meta.closed = true;
+    try {
+      await meta.session?.close?.();
+    } catch {
+      // Nothing actionable for the caller once the run has settled.
+    }
+  }
+}
+
+async function waitForRecommendRunTerminal(runId) {
+  while (true) {
+    try {
+      const snapshot = recommendRunService.getRecommendRun(runId);
+      if (TERMINAL_STATUSES.has(snapshot.status)) return snapshot;
+    } catch {
+      return null;
+    }
+    await sleep(1000);
+  }
+}
+
+function trackRecommendRun(runId) {
+  waitForRecommendRunTerminal(runId)
+    .then((terminal) => {
+      if (terminal) persistRecommendRunSnapshot(terminal);
+    })
+    .catch(() => null)
+    .finally(() => {
+      closeRecommendRunSession(runId).catch(() => {});
+    });
+}
+
+async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = "" } = {}) {
+  const parsed = parseRecommendPipelineRequest(args);
+  const gate = evaluateRecommendPipelineGate(parsed, args);
+  if (gate) return gate;
+  const normalized = normalizeRecommendStartInput(args, parsed);
+
+  let session;
+  try {
+    session = await recommendConnectorImpl({
+      host: normalized.host,
+      port: normalized.port,
+      targetUrlIncludes: normalized.targetUrlIncludes,
+      allowNavigate: normalized.allowNavigate,
+      slowLive: normalized.slowLive
+    });
+  } catch (error) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "BOSS_RECOMMEND_PAGE_NOT_READY",
+        message: error?.message || "Boss recommend page is not ready",
+        retryable: true
+      }
+    };
+  }
+
+  let started;
+  try {
+    started = recommendRunService.startRecommendRun(getRunOptions(args, parsed, normalized, session));
+  } catch (error) {
+    await session.close?.();
+    return {
+      status: "FAILED",
+      error: {
+        code: "RECOMMEND_RUN_START_FAILED",
+        message: error?.message || "Failed to start recommend run",
+        retryable: true
+      }
+    };
+  }
+
+  recommendRunMeta.set(started.runId, {
+    session,
+    methodLog: session.methodLog || [],
+    workspaceRoot: normalizeText(workspaceRoot) || process.cwd(),
+    args: clonePlain(args, {}),
+    normalized,
+    parsed,
+    chrome: {
+      host: normalized.host,
+      port: normalized.port,
+      target_url: session.navigation?.url || session.target?.url || RECOMMEND_TARGET_URL,
+      target_id: session.target?.id || null
+    },
+    health: session.health || null
+  });
+  trackRecommendRun(started.runId);
+  const persistedStarted = persistRecommendRunSnapshot(started);
+
+  return {
+    status: "ACCEPTED",
+    run_id: persistedStarted.run_id,
+    state: persistedStarted.state,
+    run: persistedStarted,
+    poll_after_sec: DEFAULT_RECOMMEND_POLL_AFTER_SEC,
+    review: parsed.review,
+    message: normalized.postAction === "none"
+      ? "Recommend pipeline run started through the shared CDP-only recommend service. No post-action was requested."
+      : `Recommend pipeline run started through the shared CDP-only recommend service with post_action=${normalized.postAction}${args.dry_run_post_action === true ? " in dry-run mode" : ""}.`,
+    post_action: {
+      requested: normalized.postAction,
+      execute_post_action: args.dry_run_post_action === true ? false : args.execute_post_action !== false,
+      max_greet_count: normalized.maxGreetCount
+    },
+    target_count_semantics: TARGET_COUNT_SEMANTICS
+  };
+}
+
+export async function startRecommendPipelineRunTool({ workspaceRoot = "", args = {} } = {}) {
+  const started = await startRecommendPipelineRunInternal(args, { workspaceRoot });
+  if (started.status !== "ACCEPTED") return started;
+  return attachMethodEvidence(started, started.run_id);
+}
+
+export function getRecommendPipelineRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  if (!runId) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "INVALID_RUN_ID",
+        message: "run_id is required",
+        retryable: false
+      }
+    };
+  }
+  try {
+    const run = recommendRunService.getRecommendRun(runId);
+    const normalizedRun = persistRecommendRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "RUN_STATUS",
+      run: normalizedRun
+    }, runId);
+  } catch {
+    const persisted = readRecommendRunState(runId);
+    if (persisted) {
+      return {
+        status: "RUN_STATUS",
+        run: persisted,
+        persistence: {
+          source: "disk",
+          active_control_available: false
+        },
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return {
+      status: "FAILED",
+      error: {
+        code: "RUN_NOT_FOUND",
+        message: `No recommend run found for run_id=${runId}`,
+        retryable: false
+      }
+    };
+  }
+}
+
+export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  try {
+    const before = recommendRunService.getRecommendRun(runId);
+    if (TERMINAL_STATUSES.has(before.status)) {
+      const normalizedBefore = persistRecommendRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "PAUSE_IGNORED",
+        run: normalizedBefore,
+        message: "目标任务已结束，无需暂停。"
+      }, runId);
+    }
+    if (before.status === RUN_STATUS_PAUSED) {
+      const normalizedBefore = persistRecommendRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "PAUSE_IGNORED",
+        run: normalizedBefore,
+        message: "目标任务已经处于 paused 状态。"
+      }, runId);
+    }
+    const run = recommendRunService.pauseRecommendRun(runId);
+    const normalizedRun = persistRecommendRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "PAUSE_REQUESTED",
+      run: normalizedRun,
+      message: "暂停请求已接收，将在当前候选人处理完成后进入 paused。"
+    }, runId);
+  } catch {
+    const persisted = readRecommendRunState(runId);
+    if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
+      return {
+        status: "PAUSE_IGNORED",
+        run: persisted,
+        message: "目标任务已结束，无需暂停。",
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return getRecommendPipelineRunTool({ args });
+  }
+}
+
+export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  try {
+    const before = recommendRunService.getRecommendRun(runId);
+    if (TERMINAL_STATUSES.has(before.status)) {
+      const normalizedBefore = persistRecommendRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "FAILED",
+        error: {
+          code: "RUN_ALREADY_TERMINATED",
+          message: "目标任务已结束，无法继续。",
+          retryable: false
+        },
+        run: normalizedBefore
+      }, runId);
+    }
+    if (before.status !== RUN_STATUS_PAUSED) {
+      const normalizedBefore = persistRecommendRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "FAILED",
+        error: {
+          code: "RUN_NOT_PAUSED",
+          message: "仅 paused 状态的 run 才能继续。",
+          retryable: true
+        },
+        run: normalizedBefore
+      }, runId);
+    }
+    const run = recommendRunService.resumeRecommendRun(runId);
+    const meta = getRecommendRunMeta(runId);
+    if (meta) {
+      meta.resumeCount = (meta.resumeCount || 0) + 1;
+      meta.lastResumedAt = new Date().toISOString();
+    }
+    const normalizedRun = persistRecommendRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "RESUME_REQUESTED",
+      run: normalizedRun,
+      poll_after_sec: DEFAULT_RECOMMEND_POLL_AFTER_SEC,
+      message: "已恢复 Recommend run，请使用 get_recommend_pipeline_run 按需轮询。"
+    }, runId);
+  } catch {
+    const persisted = readRecommendRunState(runId);
+    if (persisted) {
+      return {
+        status: "FAILED",
+        error: {
+          code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
+          message: TERMINAL_STATUSES.has(persisted.state)
+            ? "目标任务已结束，无法继续。"
+            : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
+          retryable: !TERMINAL_STATUSES.has(persisted.state)
+        },
+        run: persisted,
+        persistence: {
+          source: "disk",
+          active_control_available: false
+        },
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return getRecommendPipelineRunTool({ args });
+  }
+}
+
+export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
+  const runId = normalizeRunId(args.run_id || args.runId);
+  try {
+    const before = recommendRunService.getRecommendRun(runId);
+    if (TERMINAL_STATUSES.has(before.status)) {
+      const normalizedBefore = persistRecommendRunSnapshot(before);
+      return attachMethodEvidence({
+        status: "CANCEL_IGNORED",
+        run: normalizedBefore,
+        message: "目标任务已结束，无需取消。"
+      }, runId);
+    }
+    const run = recommendRunService.cancelRecommendRun(runId);
+    const normalizedRun = persistRecommendRunSnapshot(run);
+    return attachMethodEvidence({
+      status: "CANCEL_REQUESTED",
+      run: normalizedRun,
+      message: "已收到取消请求，将在当前候选人处理完成后安全停止。"
+    }, runId);
+  } catch {
+    const persisted = readRecommendRunState(runId);
+    if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
+      return {
+        status: "CANCEL_IGNORED",
+        run: persisted,
+        message: "目标任务已结束，无需取消。",
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    return getRecommendPipelineRunTool({ args });
+  }
+}
+
+export function getRecommendMcpHealthSnapshot(runId) {
+  const meta = getRecommendRunMeta(runId);
+  return {
+    health: compactHealth(meta.health || null),
+    chrome: meta.chrome || null,
+    method_summary: methodSummary(meta.methodLog || [])
+  };
+}
+
+export function __setRecommendMcpConnectorForTests(nextConnector) {
+  recommendConnectorImpl = typeof nextConnector === "function" ? nextConnector : connectRecommendChromeSession;
+}
+
+export function __setRecommendMcpJobReaderForTests(nextReader) {
+  recommendJobReaderImpl = typeof nextReader === "function" ? nextReader : readRecommendJobOptionsFromSession;
+}
+
+export function __setRecommendMcpWorkflowForTests(nextWorkflow) {
+  recommendWorkflowImpl = typeof nextWorkflow === "function" ? nextWorkflow : runRecommendWorkflow;
+  recommendRunService = createRecommendRunService({
+    idPrefix: "mcp_recommend",
+    workflow: (...args) => recommendWorkflowImpl(...args)
+  });
+}
+
+export function __resetRecommendMcpStateForTests() {
+  for (const meta of recommendRunMeta.values()) {
+    try {
+      meta.session?.close?.();
+    } catch {
+      // Best-effort test cleanup.
+    }
+  }
+  recommendRunMeta.clear();
+  __setRecommendMcpConnectorForTests(null);
+  __setRecommendMcpJobReaderForTests(null);
+  __setRecommendMcpWorkflowForTests(null);
+}

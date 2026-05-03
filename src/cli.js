@@ -2,32 +2,33 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import {
+  assertNoForbiddenCdpCalls,
+  bringPageToFront,
+  connectToChromeTarget,
+  enableDomains,
+  getDocumentRoot,
+  querySelector,
+  sleep as sleepMs
+} from "./core/browser/index.js";
+import {
+  bossChatHealthCheckTool,
+  cancelBossChatRunTool,
+  getBossChatRunTool,
+  pauseBossChatRunTool,
+  prepareBossChatRunTool,
+  resumeBossChatRunTool
+} from "./chat-mcp.js";
+import { listRecommendJobsTool } from "./recommend-mcp.js";
+import {
+  getBossScreenConfigResolution,
+  resolveBossChatRuntimeLayout as resolveCdpBossChatRuntimeLayout,
+  resolveBossScreeningConfig
+} from "./chat-runtime-config.js";
 import { startServer } from "./index.js";
-import {
-  ensureBossRecommendPageReady,
-  getFeaturedCalibrationResolution,
-  getScreenConfigResolution,
-  inspectBossRecommendPageState,
-  runRecommendCalibration,
-  runPipelinePreflight,
-  switchRecommendTab,
-  waitRecommendFeaturedDetailReady
-} from "./adapters.js";
-import {
-  cancelBossChatRun,
-  ensureBossChatRuntimeReady,
-  getBossChatHealthCheck,
-  getBossChatRun,
-  pauseBossChatRun,
-  prepareBossChatRun,
-  resolveBossChatRuntimeLayout,
-  resumeBossChatRun,
-  startBossChatRun
-} from "./boss-chat.js";
-import { runRecommendPipeline } from "./pipeline.js";
 
 const require = createRequire(import.meta.url);
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -37,19 +38,26 @@ const skillName = "boss-recommend-pipeline";
 const bundledSkillNames = [skillName, "boss-chat"];
 const exampleConfigPath = path.join(packageRoot, "config", "screening-config.example.json");
 const bossUrl = "https://www.zhipin.com/web/chat/recommend";
+const bossLoginUrl = "https://www.zhipin.com/web/user/?ka=bticket";
 const chromeOnboardingUrlPattern = /^chrome:\/\/(welcome|intro|newtab|signin|history-sync|settings\/syncSetup)/i;
+const bossLoginUrlPattern = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhipin\.com)/i;
+const bossLoginTitlePattern = /登录|signin|扫码登录|BOSS直聘登录/i;
 const supportedMcpClients = ["generic", "cursor", "trae", "claudecode", "openclaw"];
 const defaultMcpServerName = "boss-recommend";
 const defaultMcpCommand = "npx";
 const recommendMcpPackageName = "@reconcrap/boss-recommend-mcp";
 const recommendMcpBinaryName = "boss-recommend-mcp";
-const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h"]);
+const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h", "list-jobs", "jobs", "recommend-jobs"]);
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
 const installConfigDefaults = Object.freeze({
   llmThinkingLevel: "low",
   humanRestEnabled: false
 });
+const bossChatRuntimeChildDirs = ["logs", "runs", "profiles", "reports", "artifacts", "state"];
+const bossChatCliUnsupportedStartCode = "CHAT_CLI_ASYNC_UNSUPPORTED_CDP_ONLY";
+const calibrateUnsupportedCode = "CALIBRATE_UNSUPPORTED_CDP_ONLY";
+const recommendCliRunUnsupportedCode = "RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY";
 
 function getSkillSourceDir(name = skillName) {
   return path.join(packageRoot, "skills", name);
@@ -111,6 +119,125 @@ function pathExists(targetPath) {
   } catch {
     return false;
   }
+}
+
+function normalizeText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function isUnsafeRuntimeDirectory(targetPath) {
+  const resolved = path.resolve(String(targetPath || ""));
+  if (!resolved) return true;
+  if (path.parse(resolved).root.toLowerCase() === resolved.toLowerCase()) return true;
+  const normalized = resolved.replace(/\\/g, "/").toLowerCase();
+  if (process.platform === "win32") {
+    return (
+      normalized.endsWith("/windows")
+      || normalized.endsWith("/windows/system32")
+      || normalized.endsWith("/windows/syswow64")
+      || normalized.endsWith("/program files")
+      || normalized.endsWith("/program files (x86)")
+    );
+  }
+  return ["/system", "/usr", "/bin", "/sbin"].some((prefix) => (
+    normalized === prefix || normalized.startsWith(`${prefix}/`)
+  ));
+}
+
+function getBossChatRuntimeDirectories(runtime) {
+  return [
+    runtime.data_dir,
+    ...bossChatRuntimeChildDirs.map((name) => path.join(runtime.data_dir, name))
+  ];
+}
+
+function ensureBossChatRuntimeReadyLocal(workspaceRoot) {
+  const runtime = resolveCdpBossChatRuntimeLayout(workspaceRoot);
+  const runtimeDirectories = getBossChatRuntimeDirectories(runtime);
+  const created = [];
+  const existed = [];
+  const failed = [];
+  let migration = {
+    attempted: false,
+    performed: false,
+    source: runtime.migration_source_dir,
+    target: runtime.data_dir,
+    message: runtime.migration_source_dir
+      ? `Pending legacy boss-chat migration from ${runtime.migration_source_dir}`
+      : ""
+  };
+
+  if (isUnsafeRuntimeDirectory(runtime.data_dir)) {
+    return {
+      ...runtime,
+      directories: runtimeDirectories,
+      created,
+      existed,
+      failed: [
+        {
+          path: runtime.data_dir,
+          message: `Refusing unsafe boss-chat runtime path: ${runtime.data_dir}. Please use BOSS_CHAT_HOME in a writable user directory.`
+        }
+      ],
+      migration,
+      blocked_reason: "UNSAFE_DATA_DIR"
+    };
+  }
+
+  if (runtime.migration_source_dir) {
+    try {
+      fs.cpSync(runtime.migration_source_dir, runtime.data_dir, {
+        recursive: true,
+        force: false,
+        errorOnExist: false
+      });
+      migration = {
+        attempted: true,
+        performed: true,
+        source: runtime.migration_source_dir,
+        target: runtime.data_dir,
+        message: `Migrated legacy boss-chat runtime from ${runtime.migration_source_dir} to ${runtime.data_dir}. Legacy source was preserved.`
+      };
+    } catch (error) {
+      migration = {
+        attempted: true,
+        performed: false,
+        source: runtime.migration_source_dir,
+        target: runtime.data_dir,
+        message: error?.message || "Legacy boss-chat migration failed."
+      };
+      failed.push({
+        path: runtime.data_dir,
+        message: `Legacy migration failed: ${migration.message}`
+      });
+    }
+  }
+
+  for (const directory of runtimeDirectories) {
+    try {
+      const existedBefore = pathExists(directory);
+      ensureDir(directory);
+      if (existedBefore) {
+        existed.push(directory);
+      } else {
+        created.push(directory);
+      }
+    } catch (error) {
+      failed.push({
+        path: directory,
+        message: error?.message || String(error)
+      });
+    }
+  }
+
+  return {
+    ...runtime,
+    directories: runtimeDirectories,
+    created,
+    existed,
+    failed,
+    migration
+  };
 }
 
 function readJsonObjectFileSafe(filePath) {
@@ -178,6 +305,235 @@ function getLegacyUserConfigPath() {
   return path.join(getCodexHome(), "boss-recommend-mcp", "screening-config.json");
 }
 
+function getUserCalibrationPath() {
+  return path.join(getCodexHome(), "boss-recommend-mcp", "favorite-calibration.json");
+}
+
+function isUsableCalibrationFile(filePath) {
+  if (!filePath || !pathExists(filePath)) return false;
+  const parsed = readJsonObjectFileSafe(filePath);
+  return Boolean(
+    parsed
+    && parsed.favoritePosition
+    && Number.isFinite(parsed.favoritePosition.pageX)
+    && Number.isFinite(parsed.favoritePosition.pageY)
+  );
+}
+
+function resolveFavoriteCalibrationPath(workspaceRoot) {
+  const fromEnv = normalizeText(process.env.BOSS_RECOMMEND_CALIBRATION_FILE || "");
+  if (fromEnv) return path.resolve(fromEnv);
+
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const screenConfigPath = configResolution.config_path || getUserConfigPath();
+  const screenConfig = readJsonObjectFileSafe(screenConfigPath);
+  const calibrationFile = normalizeText(screenConfig?.calibrationFile || "");
+  if (calibrationFile && screenConfigPath) {
+    return path.resolve(path.dirname(screenConfigPath), calibrationFile);
+  }
+  return getUserCalibrationPath();
+}
+
+function resolveRecruitCalibrationScriptPath(workspaceRoot) {
+  const fromEnv = normalizeText(process.env.BOSS_RECOMMEND_RECRUIT_CALIBRATION_SCRIPT || "");
+  const workspaceResolved = path.resolve(String(workspaceRoot || process.cwd()));
+  const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  const candidates = [
+    fromEnv,
+    path.join(workspaceResolved, "..", "..", "boss recruit pipeline", "boss-recruit-mcp", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs"),
+    path.join(packageRoot, "..", "..", "boss recruit pipeline", "boss-recruit-mcp", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs"),
+    path.join(appData, "npm", "node_modules", "@reconcrap", "boss-recruit-mcp", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs"),
+    path.join(workspaceResolved, "..", "boss-recruit-mcp-main", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs"),
+    path.join(packageRoot, "..", "boss-recruit-mcp-main", "vendor", "boss-screen-cli", "calibrate-favorite-position-v2.cjs")
+  ].filter(Boolean).map((item) => path.resolve(item));
+
+  for (const candidate of new Set(candidates)) {
+    if (pathExists(candidate)) return candidate;
+  }
+  return null;
+}
+
+function getFeaturedCalibrationResolutionLocal(workspaceRoot) {
+  const calibrationPath = resolveFavoriteCalibrationPath(workspaceRoot);
+  return {
+    calibration_path: calibrationPath,
+    calibration_exists: pathExists(calibrationPath),
+    calibration_usable: isUsableCalibrationFile(calibrationPath),
+    calibration_script_path: resolveRecruitCalibrationScriptPath(workspaceRoot)
+  };
+}
+
+function runProcessSyncLocal({ command, args = [], cwd = process.cwd() } = {}) {
+  try {
+    const result = spawnSync(command, args, {
+      cwd,
+      encoding: "utf8",
+      env: process.env,
+      shell: false,
+      windowsHide: true
+    });
+    const stdout = String(result.stdout || "").trim();
+    const stderr = String(result.stderr || "").trim();
+    const output = [stdout, stderr].filter(Boolean).join("\n").trim();
+    return {
+      ok: result.status === 0 && !result.error,
+      status: Number.isInteger(result.status) ? result.status : -1,
+      stdout,
+      stderr,
+      output,
+      error_code: result.error?.code || null,
+      error_message: result.error?.message || ""
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: -1,
+      stdout: "",
+      stderr: "",
+      output: "",
+      error_code: error.code || "SPAWN_FAILED",
+      error_message: error.message || String(error)
+    };
+  }
+}
+
+function parseMajorVersion(raw) {
+  const match = String(raw || "").match(/v?(\d+)(?:\.\d+){0,2}/);
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) ? major : null;
+}
+
+function buildNodeCommandCheckLocal() {
+  const probe = runProcessSyncLocal({
+    command: "node",
+    args: ["--version"]
+  });
+  const major = parseMajorVersion(probe.output);
+  const versionOk = Number.isInteger(major) && major >= 18;
+  return {
+    key: "node_cli",
+    ok: probe.ok && versionOk,
+    path: "node --version",
+    message: probe.ok
+      ? (versionOk
+        ? `Node 命令可用 (${probe.output || "unknown version"})`
+        : `Node 版本过低 (${probe.output || "unknown version"})，要求 >= 18`)
+      : `未找到 node 命令，请先安装 Node.js >= 18。${probe.error_message ? ` (${probe.error_message})` : ""}`
+  };
+}
+
+function buildNodePackageCheckLocal({ key, moduleName, cwd, missingMessage }) {
+  if (!cwd || !pathExists(cwd)) {
+    return {
+      key,
+      ok: false,
+      path: moduleName,
+      module: moduleName,
+      install_cwd: null,
+      message: missingMessage
+    };
+  }
+  const probe = runProcessSyncLocal({
+    command: "node",
+    args: ["-e", `require.resolve(${JSON.stringify(moduleName)});`],
+    cwd
+  });
+  return {
+    key,
+    ok: probe.ok,
+    path: moduleName,
+    module: moduleName,
+    install_cwd: cwd,
+    message: probe.ok
+      ? `${moduleName} npm 依赖可用`
+      : `缺少 npm 依赖 ${moduleName}，请在 boss-recommend-mcp 目录执行 npm install。`
+  };
+}
+
+function buildRuntimeDependencyChecksLocal({ dependencyDir = packageRoot } = {}) {
+  return [
+    buildNodeCommandCheckLocal(),
+    buildNodePackageCheckLocal({
+      key: "npm_dep_chrome_remote_interface",
+      moduleName: "chrome-remote-interface",
+      cwd: dependencyDir,
+      missingMessage: "无法校验 chrome-remote-interface：boss-recommend-mcp package 目录不存在。"
+    }),
+    buildNodePackageCheckLocal({
+      key: "npm_dep_ws",
+      moduleName: "ws",
+      cwd: dependencyDir,
+      missingMessage: "无法校验 ws：boss-recommend-mcp package 目录不存在。"
+    }),
+    buildNodePackageCheckLocal({
+      key: "npm_dep_sharp",
+      moduleName: "sharp",
+      cwd: dependencyDir,
+      missingMessage: "无法校验 sharp：boss-recommend-mcp package 目录不存在。"
+    })
+  ];
+}
+
+function resolveWorkspaceDebugPortLocal(workspaceRoot) {
+  const fromEnv = parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT);
+  if (fromEnv) return fromEnv;
+  const configResolution = getBossScreenConfigResolution(workspaceRoot);
+  const config = readJsonObjectFileSafe(configResolution.resolved_path);
+  return parsePositivePort(config?.debugPort) || 9222;
+}
+
+function buildScreenConfigCheckLocal(workspaceRoot, configResolution) {
+  const screenConfig = resolveBossScreeningConfig(workspaceRoot);
+  const pathForMessage = screenConfig.config_path || configResolution.resolved_path || configResolution.writable_path;
+  return {
+    key: "screen_config",
+    ok: screenConfig.ok,
+    path: pathForMessage,
+    reason: screenConfig.ok ? "OK" : (screenConfig.error?.code || "SCREEN_CONFIG_ERROR"),
+    message: screenConfig.ok ? "screening-config.json 可用" : (screenConfig.error?.message || "screening-config.json 不可用")
+  };
+}
+
+function runPipelinePreflightLocal(workspaceRoot, options = {}) {
+  const pageScope = normalizePageScope(options.pageScope) || "recommend";
+  const configResolution = getBossScreenConfigResolution(workspaceRoot);
+  const calibrationResolution = getFeaturedCalibrationResolutionLocal(workspaceRoot);
+  const checks = [
+    buildScreenConfigCheckLocal(workspaceRoot, configResolution),
+    {
+      key: "favorite_calibration",
+      ok: calibrationResolution.calibration_usable,
+      path: calibrationResolution.calibration_path,
+      optional: pageScope !== "featured",
+      message: calibrationResolution.calibration_usable
+        ? "favorite-calibration.json 可用"
+        : "favorite-calibration.json 不存在或无效（精选页收藏仅支持校准坐标点击）"
+    }
+  ];
+  checks.push(...buildRuntimeDependencyChecksLocal({ dependencyDir: packageRoot }));
+
+  const requiredCheckKeys = new Set([
+    "screen_config",
+    "node_cli",
+    "npm_dep_chrome_remote_interface",
+    "npm_dep_ws",
+    "npm_dep_sharp"
+  ]);
+  if (pageScope === "featured") {
+    requiredCheckKeys.add("favorite_calibration");
+  }
+
+  return {
+    ok: checks.every((item) => !requiredCheckKeys.has(item.key) || item.ok),
+    checks,
+    debug_port: resolveWorkspaceDebugPortLocal(workspaceRoot),
+    config_resolution: configResolution,
+    calibration_path: calibrationResolution.calibration_path,
+    page_scope: pageScope
+  };
+}
+
 function getSkillTargetDir(name = skillName) {
   return path.join(getCodexHome(), "skills", name);
 }
@@ -222,6 +578,12 @@ function parseOptions(args) {
 function parsePositivePort(raw) {
   const port = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(port) && port > 0 ? port : null;
+}
+
+function parseNonNegativeInteger(raw, fallback = undefined) {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const parsed = Number.parseInt(String(raw), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function parseBossChatTargetCountOption(raw) {
@@ -670,9 +1032,9 @@ function pathStartsWith(filePath, rootPath) {
   return file.startsWith(root);
 }
 
-function resolveCliConfigTarget(options = {}) {
+async function resolveCliConfigTarget(options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
-  const resolution = getScreenConfigResolution(workspaceRoot);
+  const resolution = getBossScreenConfigResolution(workspaceRoot);
   const workspacePreferred = (resolution.candidate_paths || []).find((item) => pathStartsWith(item, workspaceRoot)) || null;
   const configPath = resolution.writable_path || resolution.resolved_path || workspacePreferred || getUserConfigPath();
   return {
@@ -698,8 +1060,8 @@ function applyMissingInstallConfigDefaults(config = {}) {
   };
 }
 
-function ensureUserConfig(options = {}) {
-  const { configPath, workspacePreferred } = resolveCliConfigTarget(options);
+async function ensureUserConfig(options = {}) {
+  const { configPath, workspacePreferred } = await resolveCliConfigTarget(options);
   const writeTargets = dedupePaths([configPath, workspacePreferred]).filter(Boolean);
   let lastError = null;
   for (const targetPath of writeTargets) {
@@ -744,16 +1106,16 @@ function ensureUserConfig(options = {}) {
   throw lastError || new Error("No writable target for screening-config.json");
 }
 
-function collectRuntimeDirectories(options = {}) {
+async function collectRuntimeDirectories(options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
   const stateHome = getStateHome();
-  const runtime = resolveBossChatRuntimeLayout(workspaceRoot);
+  const runtime = resolveCdpBossChatRuntimeLayout(workspaceRoot);
   const bossChatRoot = runtime.data_dir;
   const recommendRuntimeDirs = [
     stateHome,
     path.join(stateHome, "runs")
   ];
-  const bossChatRuntimeDirs = runtime.directories || [bossChatRoot];
+  const bossChatRuntimeDirs = getBossChatRuntimeDirectories(runtime);
   return {
     workspaceRoot,
     stateHome,
@@ -767,9 +1129,9 @@ function collectRuntimeDirectories(options = {}) {
   };
 }
 
-function ensureRuntimeDirectories(options = {}) {
-  const { workspaceRoot, stateHome } = collectRuntimeDirectories(options);
-  const runtime = ensureBossChatRuntimeReady(workspaceRoot);
+async function ensureRuntimeDirectories(options = {}) {
+  const { workspaceRoot, stateHome } = await collectRuntimeDirectories(options);
+  const runtime = ensureBossChatRuntimeReadyLocal(workspaceRoot);
   const recommendCreated = [];
   const recommendExisted = [];
   const failed = [...runtime.failed];
@@ -813,8 +1175,8 @@ function readJsonObjectFile(filePath) {
   return parsed;
 }
 
-function loadBestExistingUserConfig(options = {}) {
-  const { resolution, configPath, workspacePreferred } = resolveCliConfigTarget(options);
+async function loadBestExistingUserConfig(options = {}) {
+  const { resolution, configPath, workspacePreferred } = await resolveCliConfigTarget(options);
   const candidates = dedupePaths([
     ...(resolution.candidate_paths || []),
     configPath,
@@ -837,8 +1199,8 @@ function loadBestExistingUserConfig(options = {}) {
   return { path: configPath, config: {} };
 }
 
-function writeConfigWithFallback(nextConfig, options = {}) {
-  const { configPath, workspacePreferred } = resolveCliConfigTarget(options);
+async function writeConfigWithFallback(nextConfig, options = {}) {
+  const { configPath, workspacePreferred } = await resolveCliConfigTarget(options);
   const targets = dedupePaths([configPath, workspacePreferred]).filter(Boolean);
   let lastError = null;
   for (const target of targets) {
@@ -860,14 +1222,14 @@ function writeConfigWithFallback(nextConfig, options = {}) {
   throw lastError || new Error("No writable target for screening-config.json");
 }
 
-function persistDebugPortSelection(port, options = {}) {
-  const { config } = loadBestExistingUserConfig(options);
+async function persistDebugPortSelection(port, options = {}) {
+  const { config } = await loadBestExistingUserConfig(options);
   config.debugPort = port;
-  const configPath = writeConfigWithFallback(config, options);
+  const configPath = await writeConfigWithFallback(config, options);
   return { port, configPath };
 }
 
-function setDebugPort(options = {}) {
+async function setDebugPort(options = {}) {
   const selected = parsePositivePort(options.port);
   if (!selected) {
     throw new Error("Missing required --port <number> for set-port.");
@@ -876,7 +1238,7 @@ function setDebugPort(options = {}) {
   return persistDebugPortSelection(selected, options);
 }
 
-function setScreeningConfig(options = {}) {
+async function setScreeningConfig(options = {}) {
   const baseUrl = String(options["base-url"] || options.baseUrl || "").trim();
   const apiKey = String(options["api-key"] || options.apiKey || "").trim();
   const model = String(options.model || "").trim();
@@ -884,7 +1246,7 @@ function setScreeningConfig(options = {}) {
     throw new Error("Missing required fields: --base-url, --api-key, --model");
   }
 
-  const { config: existing } = loadBestExistingUserConfig(options);
+  const { config: existing } = await loadBestExistingUserConfig(options);
   const nextConfig = {
     ...existing,
     baseUrl,
@@ -909,7 +1271,7 @@ function setScreeningConfig(options = {}) {
   if (debugPort) {
     nextConfig.debugPort = debugPort;
   }
-  const configPath = writeConfigWithFallback(nextConfig, options);
+  const configPath = await writeConfigWithFallback(nextConfig, options);
   return { path: configPath, updated: true };
 }
 
@@ -926,6 +1288,20 @@ async function listChromeTabs(port) {
   return Array.isArray(data) ? data : [];
 }
 
+function buildBossPageState(payload) {
+  return {
+    key: "boss_page_state",
+    ...payload
+  };
+}
+
+function extractSampleUrls(tabs, limit = 5) {
+  return tabs
+    .map((tab) => tab?.url)
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
 function findChromeOnboardingUrl(tabs) {
   for (const tab of tabs) {
     if (typeof tab?.url === "string" && chromeOnboardingUrlPattern.test(tab.url)) {
@@ -933,6 +1309,383 @@ function findChromeOnboardingUrl(tabs) {
     }
   }
   return null;
+}
+
+function isBossRecommendTab(tab) {
+  return typeof tab?.url === "string" && tab.url.includes("/web/chat/recommend");
+}
+
+function findBossRecommendTab(tabs = []) {
+  return tabs.find((tab) => isBossRecommendTab(tab)) || null;
+}
+
+function isBossLoginTab(tab) {
+  const url = String(tab?.url || "");
+  const title = String(tab?.title || "");
+  return (
+    url === bossLoginUrl
+    || bossLoginUrlPattern.test(url)
+    || bossLoginTitlePattern.test(title)
+  );
+}
+
+function findBossPageTab(tabs = []) {
+  return tabs.find((tab) => typeof tab?.url === "string" && tab.url.includes("zhipin.com")) || null;
+}
+
+function getNodeAttribute(node, name) {
+  const attributes = node?.attributes || [];
+  for (let index = 0; index < attributes.length; index += 2) {
+    if (attributes[index] === name) return attributes[index + 1] || "";
+  }
+  return "";
+}
+
+function uniqueMethodNames(methodLog = []) {
+  return Array.from(new Set(methodLog.map((entry) => entry?.method).filter(Boolean)));
+}
+
+async function inspectBossRecommendPageStateCdp(port, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 1000;
+  const expectedUrl = options.expectedUrl || bossUrl;
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  let lastTabs = [];
+
+  while (Date.now() <= deadline) {
+    try {
+      const tabs = await listChromeTabs(port);
+      lastTabs = tabs;
+      const recommendTab = findBossRecommendTab(tabs);
+      if (recommendTab) {
+        if (isBossLoginTab(recommendTab)) {
+          return buildBossPageState({
+            ok: false,
+            state: "LOGIN_REQUIRED",
+            path: recommendTab.url || bossLoginUrl,
+            current_url: recommendTab.url || bossLoginUrl,
+            title: recommendTab.title || null,
+            requires_login: true,
+            expected_url: expectedUrl,
+            login_url: bossLoginUrl,
+            message: "当前标签页虽在 recommend 路径，但检测到登录态页面特征，请先完成 Boss 登录。"
+          });
+        }
+        return buildBossPageState({
+          ok: true,
+          state: "RECOMMEND_READY",
+          path: recommendTab.url,
+          current_url: recommendTab.url,
+          title: recommendTab.title || null,
+          requires_login: false,
+          expected_url: expectedUrl,
+          message: "Boss 推荐页已打开，且当前仍停留在 recommend 页面。"
+        });
+      }
+
+      const loginTab = tabs.find((tab) => isBossLoginTab(tab));
+      if (loginTab) {
+        return buildBossPageState({
+          ok: false,
+          state: "LOGIN_REQUIRED",
+          path: loginTab.url || bossLoginUrl,
+          current_url: loginTab.url || bossLoginUrl,
+          title: loginTab.title || null,
+          requires_login: true,
+          expected_url: expectedUrl,
+          login_url: bossLoginUrl,
+          message: "Boss 页面未登录，需先完成登录后再进入 recommend 页面。"
+        });
+      }
+
+      const bossTab = findBossPageTab(tabs);
+      if (bossTab) {
+        const requiresLogin = bossLoginUrlPattern.test(bossTab.url);
+        return buildBossPageState({
+          ok: false,
+          state: requiresLogin ? "LOGIN_REQUIRED" : "BOSS_NOT_ON_RECOMMEND",
+          path: bossTab.url,
+          current_url: bossTab.url,
+          title: bossTab.title || null,
+          requires_login: requiresLogin,
+          expected_url: expectedUrl,
+          login_url: requiresLogin ? bossLoginUrl : undefined,
+          message: requiresLogin
+            ? "Boss 页面未登录，需先完成登录后再进入 recommend 页面。"
+            : "Boss 已登录但当前不在 recommend 页面，将尝试自动跳转。"
+        });
+      }
+    } catch (error) {
+      lastError = error;
+    }
+
+    await sleepMs(pollMs);
+  }
+
+  if (lastError) {
+    return buildBossPageState({
+      ok: false,
+      state: "DEBUG_PORT_UNREACHABLE",
+      path: `http://127.0.0.1:${port}`,
+      current_url: null,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: `无法连接到 Chrome DevTools 端口 ${port}。请确认 Chrome 已以远程调试模式启动。`,
+      error: lastError.message
+    });
+  }
+
+  const onboardingUrl = findChromeOnboardingUrl(lastTabs);
+  if (onboardingUrl) {
+    return buildBossPageState({
+      ok: false,
+      state: "CHROME_ONBOARDING_INTERCEPTED",
+      path: onboardingUrl,
+      current_url: onboardingUrl,
+      title: null,
+      requires_login: false,
+      expected_url: expectedUrl,
+      message: "Chrome 当前停留在登录或引导页，尚未稳定到 Boss 推荐页。",
+      sample_urls: extractSampleUrls(lastTabs)
+    });
+  }
+
+  return buildBossPageState({
+    ok: false,
+    state: "BOSS_TAB_NOT_FOUND",
+    path: expectedUrl,
+    current_url: null,
+    title: null,
+    requires_login: false,
+    expected_url: expectedUrl,
+    message: "未检测到 Boss 推荐页标签页。",
+    sample_urls: extractSampleUrls(lastTabs)
+  });
+}
+
+async function withRecommendTargetCdp(port, callback) {
+  const connection = await connectToChromeTarget({
+    port,
+    targetPredicate: (target) => isBossRecommendTab(target)
+  });
+  try {
+    return await callback(connection);
+  } finally {
+    await connection.close();
+  }
+}
+
+async function bringBossRecommendTabToFrontCdp(port) {
+  try {
+    return await withRecommendTargetCdp(port, async ({ client, methodLog }) => {
+      await enableDomains(client, ["Page"]);
+      await bringPageToFront(client);
+      assertNoForbiddenCdpCalls(methodLog);
+      return {
+        ok: true,
+        method_log: uniqueMethodNames(methodLog)
+      };
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message || String(error)
+    };
+  }
+}
+
+async function probeRecommendIframeStateCdp(port, options = {}) {
+  const expectedUrl = options.expectedUrl || bossUrl;
+  try {
+    return await withRecommendTargetCdp(port, async ({ client, target, methodLog }) => {
+      await enableDomains(client, ["Page", "DOM"]);
+      const root = await getDocumentRoot(client, { depth: 1, pierce: true });
+      const iframeNodeId = await querySelector(client, root.nodeId, 'iframe[name="recommendFrame"]');
+      if (!iframeNodeId) {
+        assertNoForbiddenCdpCalls(methodLog);
+        return buildBossPageState({
+          ok: false,
+          state: "NO_RECOMMEND_IFRAME",
+          path: target.url || expectedUrl,
+          current_url: target.url || null,
+          title: target.title || null,
+          expected_url: expectedUrl,
+          message: "recommend iframe 尚未挂载。",
+          method_log: uniqueMethodNames(methodLog)
+        });
+      }
+
+      const described = await client.DOM.describeNode({
+        nodeId: iframeNodeId,
+        depth: 1,
+        pierce: true
+      });
+      const iframeNode = described.node || {};
+      const frameDocument = iframeNode.contentDocument || null;
+      const frameUrl = frameDocument?.documentURL || getNodeAttribute(iframeNode, "src") || null;
+      assertNoForbiddenCdpCalls(methodLog);
+      if (!frameDocument?.nodeId) {
+        return buildBossPageState({
+          ok: false,
+          state: "RECOMMEND_IFRAME_DOCUMENT_PENDING",
+          path: target.url || expectedUrl,
+          current_url: target.url || null,
+          title: target.title || null,
+          expected_url: expectedUrl,
+          frame_url: frameUrl,
+          message: "recommend iframe 已挂载但文档尚未就绪。",
+          method_log: uniqueMethodNames(methodLog)
+        });
+      }
+
+      return buildBossPageState({
+        ok: true,
+        state: "RECOMMEND_IFRAME_READY",
+        path: target.url || expectedUrl,
+        current_url: target.url || null,
+        title: target.title || null,
+        expected_url: expectedUrl,
+        frame_url: frameUrl,
+        iframe_node_id: iframeNodeId,
+        frame_document_node_id: frameDocument.nodeId,
+        message: "recommend iframe 已通过 CDP DOM 检测就绪。",
+        method_log: uniqueMethodNames(methodLog)
+      });
+    });
+  } catch (error) {
+    return buildBossPageState({
+      ok: false,
+      state: "RECOMMEND_IFRAME_PROBE_FAILED",
+      path: expectedUrl,
+      current_url: null,
+      title: null,
+      expected_url: expectedUrl,
+      message: "recommend iframe CDP DOM 检测失败。",
+      error: error.message || String(error)
+    });
+  }
+}
+
+async function waitForRecommendIframeReadyCdp(port, options = {}) {
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 800;
+  const deadline = Date.now() + timeoutMs;
+  let lastState = null;
+
+  while (Date.now() <= deadline) {
+    lastState = await probeRecommendIframeStateCdp(port, options);
+    if (lastState?.state === "RECOMMEND_IFRAME_READY") return lastState;
+    await sleepMs(pollMs);
+  }
+
+  return lastState || buildBossPageState({
+    ok: false,
+    state: "NO_RECOMMEND_IFRAME",
+    path: options.expectedUrl || bossUrl,
+    current_url: null,
+    title: null,
+    expected_url: options.expectedUrl || bossUrl,
+    message: "recommend iframe 尚未就绪。"
+  });
+}
+
+async function verifyRecommendPageStableCdp(port, options = {}) {
+  const settleMs = Number.isFinite(options.settleMs) ? options.settleMs : 1000;
+  const recheckTimeoutMs = Number.isFinite(options.recheckTimeoutMs) ? options.recheckTimeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 800;
+
+  await sleepMs(settleMs);
+  const recheck = await inspectBossRecommendPageStateCdp(port, {
+    timeoutMs: recheckTimeoutMs,
+    pollMs
+  });
+  if (recheck.state !== "RECOMMEND_READY") return recheck;
+
+  const iframeState = await waitForRecommendIframeReadyCdp(port, {
+    timeoutMs: recheckTimeoutMs,
+    pollMs
+  });
+  if (iframeState.state === "RECOMMEND_IFRAME_READY") {
+    return buildBossPageState({
+      ...recheck,
+      ok: true,
+      state: "RECOMMEND_READY",
+      frame_url: iframeState.frame_url || null,
+      iframe_state: iframeState,
+      method_log: iframeState.method_log || []
+    });
+  }
+
+  return buildBossPageState({
+    ...iframeState,
+    state: iframeState.state || "NO_RECOMMEND_IFRAME",
+    message: iframeState.message || "Boss recommend 页面已打开，但 iframe 尚未就绪。"
+  });
+}
+
+async function navigateExistingTargetToBossRecommendCdp(port) {
+  let connection = null;
+  try {
+    connection = await connectToChromeTarget({
+      port,
+      targetPredicate: (target) => target?.type === "page"
+    });
+    await enableDomains(connection.client, ["Page"]);
+    await connection.client.Page.navigate({ url: bossUrl });
+    assertNoForbiddenCdpCalls(connection.methodLog);
+    return {
+      ok: true,
+      via: "cdp_page_navigate",
+      target_id: connection.target?.id || null,
+      method_log: uniqueMethodNames(connection.methodLog)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      via: "cdp_page_navigate",
+      error: error.message || String(error)
+    };
+  } finally {
+    if (connection) await connection.close();
+  }
+}
+
+async function openBossRecommendTabCdp(port) {
+  const endpoint = `http://127.0.0.1:${port}/json/new?${encodeURIComponent(bossUrl)}`;
+  const attempts = ["PUT", "GET"];
+  let lastError = null;
+
+  for (const method of attempts) {
+    try {
+      const response = await fetch(endpoint, { method });
+      if (response.ok) {
+        let payload = null;
+        try {
+          payload = await response.json();
+        } catch {}
+        return {
+          ok: true,
+          via: "devtools_http_new_tab",
+          method,
+          target_id: payload?.id || null,
+          current_url: payload?.url || bossUrl
+        };
+      }
+      lastError = new Error(`DevTools /json/new returned ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const fallback = await navigateExistingTargetToBossRecommendCdp(port);
+  if (fallback.ok) return fallback;
+  return {
+    ok: false,
+    via: "devtools_http_new_tab",
+    error: lastError?.message || fallback.error || "Failed to open Boss recommend tab via DevTools"
+  };
 }
 
 function getDefaultChromeExecutableCandidates() {
@@ -997,16 +1750,118 @@ function resolveDefaultChromeUserDataDir(port) {
   return legacyExisting || sharedPath;
 }
 
+function getLaunchChromeTiming(options = {}) {
+  if (options["slow-live"] || options.slowLive) {
+    return {
+      initialTimeoutMs: 5000,
+      inspectTimeoutMs: 20000,
+      pollMs: 1000,
+      settleMs: 2000
+    };
+  }
+  return {
+    initialTimeoutMs: 1500,
+    inspectTimeoutMs: 6000,
+    pollMs: 800,
+    settleMs: 1000
+  };
+}
+
+async function ensureBossRecommendPageReadyCdp(port, options = {}) {
+  const attempts = Number.isFinite(options.attempts) ? Math.max(0, options.attempts) : 3;
+  const inspectTimeoutMs = Number.isFinite(options.inspectTimeoutMs) ? options.inspectTimeoutMs : 6000;
+  const pollMs = Number.isFinite(options.pollMs) ? options.pollMs : 800;
+  const settleMs = Number.isFinite(options.settleMs) ? options.settleMs : 1000;
+
+  let pageState = await inspectBossRecommendPageStateCdp(port, {
+    timeoutMs: inspectTimeoutMs,
+    pollMs
+  });
+  if (pageState.state === "RECOMMEND_READY") {
+    const stableState = await verifyRecommendPageStableCdp(port, {
+      settleMs,
+      recheckTimeoutMs: inspectTimeoutMs,
+      pollMs
+    });
+    return {
+      ok: stableState.state === "RECOMMEND_READY",
+      debug_port: port,
+      state: stableState.state,
+      page_state: stableState
+    };
+  }
+
+  if (pageState.state === "LOGIN_REQUIRED") {
+    return {
+      ok: false,
+      debug_port: port,
+      state: pageState.state,
+      page_state: pageState
+    };
+  }
+
+  let openAttempt = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (pageState.state === "DEBUG_PORT_UNREACHABLE" || pageState.state === "LOGIN_REQUIRED") break;
+    openAttempt = await openBossRecommendTabCdp(port);
+    await sleepMs(settleMs);
+    pageState = await inspectBossRecommendPageStateCdp(port, {
+      timeoutMs: inspectTimeoutMs,
+      pollMs
+    });
+    if (pageState.state === "RECOMMEND_READY") {
+      const stableState = await verifyRecommendPageStableCdp(port, {
+        settleMs,
+        recheckTimeoutMs: inspectTimeoutMs,
+        pollMs
+      });
+      return {
+        ok: stableState.state === "RECOMMEND_READY",
+        debug_port: port,
+        state: stableState.state,
+        page_state: {
+          ...stableState,
+          open_attempt: openAttempt
+        }
+      };
+    }
+    if (pageState.state === "LOGIN_REQUIRED") break;
+  }
+
+  return {
+    ok: false,
+    debug_port: port,
+    state: pageState.state || "UNKNOWN",
+    page_state: {
+      ...pageState,
+      open_attempt: openAttempt
+    }
+  };
+}
+
 async function launchChrome(options = {}) {
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
   process.env.BOSS_RECOMMEND_CHROME_PORT = String(port);
+  const timing = getLaunchChromeTiming(options);
 
-  const initialState = await inspectBossRecommendPageState(port, { timeoutMs: 1500, pollMs: 400 });
+  const initialState = await inspectBossRecommendPageStateCdp(port, {
+    timeoutMs: timing.initialTimeoutMs,
+    pollMs: timing.pollMs
+  });
   if (initialState.state !== "DEBUG_PORT_UNREACHABLE") {
     console.log(`Reusing existing Chrome debug instance on port ${port}`);
-    const pageState = await ensureBossRecommendPageReady(getWorkspaceRoot(options), { port, attempts: 2 });
+    const pageState = await ensureBossRecommendPageReadyCdp(port, {
+      attempts: 2,
+      inspectTimeoutMs: timing.inspectTimeoutMs,
+      pollMs: timing.pollMs,
+      settleMs: timing.settleMs
+    });
     if (pageState.ok) {
       console.log("Boss recommend page is ready.");
+      const frontResult = await bringBossRecommendTabToFrontCdp(port);
+      if (frontResult.ok) {
+        console.log(`CDP methods: ${frontResult.method_log.join(", ") || "none"}`);
+      }
     } else {
       console.log(pageState.page_state?.message || "Boss recommend page is not ready.");
     }
@@ -1037,9 +1892,19 @@ async function launchChrome(options = {}) {
   child.unref();
   console.log(`Chrome launched with remote debugging port ${port}`);
   console.log(`User data dir: ${userDataDir}`);
-  const pageState = await ensureBossRecommendPageReady(getWorkspaceRoot(options), { port, attempts: 6 });
+  await sleepMs(timing.settleMs + 1200);
+  const pageState = await ensureBossRecommendPageReadyCdp(port, {
+    attempts: 6,
+    inspectTimeoutMs: timing.inspectTimeoutMs,
+    pollMs: timing.pollMs,
+    settleMs: timing.settleMs
+  });
   if (pageState.ok) {
     console.log("Boss recommend page is ready.");
+    const frontResult = await bringBossRecommendTabToFrontCdp(port);
+    if (frontResult.ok) {
+      console.log(`CDP methods: ${frontResult.method_log.join(", ") || "none"}`);
+    }
   } else {
     console.log(pageState.page_state?.message || "Boss recommend page is not ready.");
   }
@@ -1051,99 +1916,37 @@ function getCalibrationTimeoutMs(options = {}) {
   return Math.max(5000, parsed);
 }
 
-async function calibrate(options = {}) {
+function buildUnsupportedCalibrateResponse(options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
-  process.env.BOSS_RECOMMEND_CHROME_PORT = String(port);
-  persistDebugPortSelection(port, options);
   const timeoutMs = getCalibrationTimeoutMs(options);
   const outputPath = String(options.output || "").trim()
     ? path.resolve(String(options.output))
     : null;
-
-  console.log("Calibration checklist:");
-  console.log("0. 本校准仅用于推荐页“精选(tab)”的收藏点击定位。");
-  console.log("1. 工具会优先复用当前调试端口 Chrome，并确保 recommend 页面可访问。");
-  console.log("2. 工具会尝试自动切换到推荐页“精选”tab；校准过程中请不要再切换 tab。");
-  console.log("3. 先点一次收藏，再点一次取消收藏。");
-  console.log("4. 关闭详情页。");
-  console.log(`5. 校准监听窗口约 ${Math.round(timeoutMs / 1000)} 秒。`);
-  console.log("");
-
-  const preState = await inspectBossRecommendPageState(port, { timeoutMs: 2000, pollMs: 500 });
-  if (preState.state === "DEBUG_PORT_UNREACHABLE") {
-    await launchChrome({ ...options, port: String(port) });
-    if (process.exitCode && process.exitCode !== 0) {
-      return;
-    }
-  } else {
-    console.log(`Detected existing Chrome debug instance on port ${port}; calibration will reuse it.`);
-  }
-
-  const pageReady = await ensureBossRecommendPageReady(workspaceRoot, {
+  return {
+    status: "FAILED",
+    error: {
+      code: calibrateUnsupportedCode,
+      message: "boss-recommend-mcp calibrate is fenced during the CDP-only rewrite because the old calibration route delegated to page-JS/Runtime-based adapter behavior and an external calibration script. A replacement must use CDP DOM/Input only and pass a live safe calibration gate before this command is re-enabled.",
+      retryable: false
+    },
+    cdp_only: true,
+    runtime_evaluate_used: false,
+    method_summary: {},
+    method_log: [],
     port,
-    attempts: 4
-  });
-  if (pageReady.ok) {
-    const switchResult = await switchRecommendTab(workspaceRoot, {
-      port,
-      target_status: "3"
-    });
-    if (switchResult?.ok) {
-      console.log("已自动切换到推荐页“精选”tab，请直接在当前页面打开人选详情并完成收藏/取消收藏。");
-    } else {
-      console.log("未能自动切换到“精选”tab，请手动切换到精选后再执行收藏/取消收藏。");
-    }
-  } else {
-    console.log("未能确认 recommend 页面就绪，请手动进入推荐页并切换到精选 tab 后再继续校准操作。");
-  }
-
-  console.log(`等待你打开“精选”候选人详情页（最多 ${Math.round(timeoutMs / 1000)} 秒），检测到后自动开始校准监听...`);
-  const detailReady = await waitRecommendFeaturedDetailReady(workspaceRoot, {
-    port,
-    timeoutMs,
-    pollMs: 400
-  });
-  if (!detailReady.ok) {
-    console.error(detailReady.message || "未检测到可校准的精选详情页。");
-    console.error("请先打开任意精选候选人详情页并保持在前台，然后重新运行 calibrate。");
-    process.exitCode = 1;
-    return;
-  }
-  const detailSource = detailReady.detail_state?.source || "unknown";
-  const detailSelector = detailReady.detail_state?.selector || "unknown";
-  console.log(`已检测到详情页（source=${detailSource}, selector=${detailSelector}），即将启动校准脚本。`);
-  await new Promise((resolve) => setTimeout(resolve, 600));
-
-  const result = await runRecommendCalibration(workspaceRoot, {
-    port,
+    timeout_ms: timeoutMs,
     output: outputPath,
-    timeoutMs,
-    runtime: {
-      onOutput: (event) => {
-        const text = String(event?.text || "");
-        if (!text) return;
-        if (event?.stream === "stderr") {
-          process.stderr.write(text);
-        } else {
-          process.stdout.write(text);
-        }
-      }
+    calibration_resolution: getFeaturedCalibrationResolutionLocal(workspaceRoot),
+    guidance: {
+      current_workaround: "Use an existing favorite-calibration.json if present; `doctor --page-scope featured` will report whether it is usable.",
+      next_development_task: "Implement CDP-only featured detail/action discovery and a user-approved live calibration gate before restoring this command."
     }
-  });
-  if (result.ok) {
-    console.log(`Calibration saved: ${result.calibration_path}`);
-    return;
-  }
+  };
+}
 
-  console.error(result.error?.message || "Calibration failed.");
-  console.error("如果你在校准开始后才从推荐切到精选，请先切到精选 tab 后重新运行 calibrate。");
-  if (result.calibration_script_path) {
-    console.error(`Calibration script: ${result.calibration_script_path}`);
-  }
-  if (result.calibration_path) {
-    console.error(`Calibration target: ${result.calibration_path}`);
-  }
+async function calibrate(options = {}) {
+  printJson(buildUnsupportedCalibrateResponse(options));
   process.exitCode = 1;
 }
 
@@ -1215,11 +2018,22 @@ async function printDoctor(options = {}) {
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
   const workspaceRoot = getWorkspaceRoot(options);
   const pageScope = normalizePageScope(options["page-scope"] || options.pageScope) || "recommend";
-  const preflight = runPipelinePreflight(workspaceRoot, { pageScope });
+  const preflight = runPipelinePreflightLocal(workspaceRoot, { pageScope });
   const checks = preflight.checks.slice();
-  const configResolution = getScreenConfigResolution(workspaceRoot);
-  const calibrationResolution = getFeaturedCalibrationResolution(workspaceRoot);
-  const pageState = await inspectBossRecommendPageState(port, { timeoutMs: 2000, pollMs: 500 });
+  const configResolution = getBossScreenConfigResolution(workspaceRoot);
+  const calibrationResolution = getFeaturedCalibrationResolutionLocal(workspaceRoot);
+  const timing = getLaunchChromeTiming(options);
+  let pageState = await inspectBossRecommendPageStateCdp(port, {
+    timeoutMs: options["slow-live"] || options.slowLive ? timing.initialTimeoutMs : 2000,
+    pollMs: options["slow-live"] || options.slowLive ? timing.pollMs : 500
+  });
+  if (pageState.state === "RECOMMEND_READY") {
+    pageState = await verifyRecommendPageStableCdp(port, {
+      settleMs: options["slow-live"] || options.slowLive ? timing.settleMs : 800,
+      recheckTimeoutMs: options["slow-live"] || options.slowLive ? timing.inspectTimeoutMs : 3000,
+      pollMs: options["slow-live"] || options.slowLive ? timing.pollMs : 500
+    });
+  }
   const resolvedConfigPath = configResolution.resolved_path || configResolution.writable_path;
   const userConfigExists = (
     (resolvedConfigPath && fs.existsSync(resolvedConfigPath))
@@ -1245,10 +2059,11 @@ async function printDoctor(options = {}) {
   checks.push({
     key: "featured_calibration_script",
     ok: Boolean(calibrationResolution.calibration_script_path),
+    optional: true,
     path: calibrationResolution.calibration_script_path,
     message: calibrationResolution.calibration_script_path
       ? "已检测到 boss-recruit-mcp 校准脚本。"
-      : "未检测到 boss-recruit-mcp 校准脚本，精选页自动校准不可用。"
+      : "未检测到 boss-recruit-mcp 校准脚本；CDP-only package 已禁用旧精选页自动校准。"
   });
   checks.push({
     key: "featured_calibration_file",
@@ -1322,7 +2137,7 @@ async function printDoctor(options = {}) {
   }
 
   printJson({
-    ok: checks.every((item) => item.ok),
+    ok: checks.every((item) => item.ok || item.optional),
     port,
     checks,
     config_resolution: configResolution,
@@ -1340,8 +2155,8 @@ async function printDoctor(options = {}) {
 function printPaths() {
   const codexHome = getCodexHome();
   const stateHome = getStateHome();
-  const calibrationResolution = getFeaturedCalibrationResolution(process.cwd());
-  const bossChatRuntime = resolveBossChatRuntimeLayout(getWorkspaceRoot({}));
+  const calibrationResolution = getFeaturedCalibrationResolutionLocal(process.cwd());
+  const bossChatRuntime = resolveCdpBossChatRuntimeLayout(getWorkspaceRoot({}));
   console.log(`package_root=${packageRoot}`);
   console.log(`skill_sources=${bundledSkillNames.map((name) => getSkillSourceDir(name)).join(" | ")}`);
   console.log(`codex_home=${codexHome}`);
@@ -1362,8 +2177,9 @@ function printHelp() {
   console.log("Usage:");
   console.log("  boss-recommend-mcp              Start the MCP server");
   console.log("  boss-recommend-mcp start        Start the MCP server");
-  console.log("  boss-recommend-mcp run          Run the recommend pipeline once via CLI and print JSON");
-  console.log("  boss-recommend-mcp chat <subcommand>  Run bundled boss-chat commands via the recommend package");
+  console.log("  boss-recommend-mcp run          Disabled until the one-shot CLI has a CDP-only async replacement");
+  console.log("  boss-recommend-mcp list-jobs    CDP-only list of exact recommend job names for cron/one-shot inputs");
+  console.log("  boss-recommend-mcp chat <subcommand>  Run CDP-only boss-chat health/prepare/status commands");
   console.log("  boss-recommend-mcp install      Install skill/MCP templates and auto-init screening-config.json (supports --agent trae-cn/cursor/...)");
   console.log("  boss-recommend-mcp install-skill Install bundled Codex skills");
   console.log("  boss-recommend-mcp init-config  Create screening-config.json if missing (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
@@ -1371,17 +2187,18 @@ function printHelp() {
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
   console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae(含 trae-cn)/Claude Code/OpenClaw");
   console.log("  boss-recommend-mcp doctor       Check config/runtime/calibration prerequisites (supports --agent trae-cn/cursor/...)");
-  console.log("  boss-recommend-mcp calibrate    Run featured favorite calibration via recruit calibration script");
+  console.log("  boss-recommend-mcp calibrate    Disabled until CDP-only featured calibration is live-verified");
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("");
   console.log("Run command:");
-  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" [--confirmation-json '{...}'] [--overrides-json '{...}'] [--follow-up-json '{...}']");
-  console.log("  boss-recommend-mcp chat run --job \"算法工程师\" --start-from unread --criteria \"有 AI Agent 经验\" --targetCount 20 [--greeting-text \"你好，方便发下简历吗？\"]    # 后台启动，不自动轮询");
+  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\"    # returns RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY during rewrite; use MCP start_recommend_pipeline_run");
+  console.log("  boss-recommend-mcp list-jobs --slow-live --port 9222");
+  console.log("  boss-recommend-mcp chat prepare-run --slow-live --port 9222    # CDP-only preflight; start runs through MCP start_boss_chat_run");
   console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
   console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");
-  console.log("  boss-recommend-mcp calibrate --port 9222 [--timeout-ms 60000] [--output <path>]");
+  console.log("  boss-recommend-mcp calibrate --port 9222    # returns CALIBRATE_UNSUPPORTED_CDP_ONLY during rewrite");
 }
 
 function printMcpConfig(options = {}) {
@@ -1397,10 +2214,10 @@ function printMcpConfig(options = {}) {
   }
 }
 
-function installAll(options = {}) {
-  const runtimeDirsResult = ensureRuntimeDirectories(options);
+async function installAll(options = {}) {
+  const runtimeDirsResult = await ensureRuntimeDirectories(options);
   const skillResults = installSkill();
-  const configResult = ensureUserConfig(options);
+  const configResult = await ensureUserConfig(options);
   const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
   const externalMcpResult = installExternalMcpConfigs(options);
   const externalSkillResult = mirrorSkillToExternalDirs(options);
@@ -1458,26 +2275,78 @@ function installAll(options = {}) {
   }
 }
 
-async function runPipelineOnce(options) {
+function buildUnsupportedRecommendCliRunResponse({
+  instruction,
+  confirmation,
+  overrides,
+  followUp,
+  workspaceRoot,
+  port
+} = {}) {
+  return {
+    status: "FAILED",
+    error: {
+      code: recommendCliRunUnsupportedCode,
+      message: "boss-recommend-mcp run is fenced during the CDP-only rewrite because the old one-shot CLI route can reach page-JS/Runtime-based orchestration. Use the MCP tool start_recommend_pipeline_run for CDP-only recommend runs until a live-verified one-shot CLI replacement exists.",
+      retryable: false
+    },
+    cdp_only: true,
+    runtime_evaluate_used: false,
+    method_summary: {},
+    method_log: [],
+    run_mode: "mcp_async_required",
+    port,
+    target_url: bossUrl,
+    input: {
+      workspace_root: workspaceRoot,
+      instruction,
+      confirmation: confirmation ?? null,
+      overrides: overrides ?? null,
+      follow_up: followUp ?? null
+    },
+    guidance: {
+      recommended_tool: "start_recommend_pipeline_run",
+      next_development_task: "Implement a CDP-only CLI wrapper that starts a durable shared run-service session, persists run state, and exits only after its live gate proves no Runtime.* methods are reachable."
+    }
+  };
+}
+
+async function runPipelineOnce(options = {}) {
   const instruction = getRunInstruction(options);
   const confirmation = getRunConfirmation(options);
   const overrides = getRunOverrides(options);
   const followUp = getRunFollowUp(options);
   const workspaceRoot = getWorkspaceRoot(options);
-  const explicitPort = parsePositivePort(options.port);
-  if (explicitPort) {
-    process.env.BOSS_RECOMMEND_CHROME_PORT = String(explicitPort);
-    persistDebugPortSelection(explicitPort, options);
-  }
+  const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
 
-  const result = await runRecommendPipeline({
+  printJson(buildUnsupportedRecommendCliRunResponse({
     workspaceRoot,
     instruction,
     confirmation,
     overrides,
-    followUp
-  });
-  printJson(result);
+    followUp,
+    port
+  }));
+  process.exitCode = 1;
+}
+
+function buildRecommendJobListCliInput(options = {}) {
+  const targetUrlIncludes = String(options["target-url-includes"] || options.target_url_includes || "").trim();
+  const host = String(options.host || "").trim();
+  return {
+    host: host || undefined,
+    port: parsePositivePort(options.port),
+    target_url_includes: targetUrlIncludes || undefined,
+    allow_navigate: !(options["no-navigate"] === true || options.noNavigate === true || options.allow_navigate === false),
+    slow_live: options["slow-live"] === true || options.slowLive === true || options.slow_live === true
+  };
+}
+
+async function listRecommendJobsCli(options = {}) {
+  printJson(await listRecommendJobsTool({
+    workspaceRoot: getWorkspaceRoot(options),
+    args: buildRecommendJobListCliInput(options)
+  }));
 }
 
 function buildBossChatCliInput(options = {}) {
@@ -1487,6 +2356,8 @@ function buildBossChatCliInput(options = {}) {
     ?? options.greetingText
     ?? options.greeting;
   const greetingText = typeof greetingTextRaw === "string" ? greetingTextRaw.trim() : undefined;
+  const targetUrlIncludes = String(options["target-url-includes"] || options.target_url_includes || "").trim();
+  const host = String(options.host || "").trim();
   return {
     profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
     job: typeof options.job === "string" ? options.job.trim() : undefined,
@@ -1494,7 +2365,14 @@ function buildBossChatCliInput(options = {}) {
     criteria: typeof options.criteria === "string" ? options.criteria.trim() : undefined,
     greeting_text: greetingText || undefined,
     target_count: parseBossChatTargetCountOption(options.targetCount || options["target-count"] || options.target_count),
+    host: host || undefined,
     port: parsePositivePort(options.port),
+    target_url_includes: targetUrlIncludes || undefined,
+    allow_navigate: !(options["no-navigate"] === true || options.noNavigate === true || options.allow_navigate === false),
+    slow_live: options["slow-live"] === true || options.slowLive === true || options.slow_live === true,
+    detail_limit: parseNonNegativeInteger(options["detail-limit"] ?? options.detail_limit),
+    delay_ms: parseNonNegativeInteger(options["delay-ms"] ?? options.delay_ms),
+    max_candidates: parseNonNegativeInteger(options["max-candidates"] ?? options.max_candidates),
     dry_run: options["dry-run"] === true || options.dryRun === true,
     no_state: options["no-state"] === true || options.noState === true,
     safe_pacing: parseBooleanOption(options["safe-pacing"] ?? options.safe_pacing),
@@ -1509,67 +2387,69 @@ function getBossChatCliRunTarget(options = {}) {
   };
 }
 
+function buildUnsupportedBossChatCliStartResponse(subcommand) {
+  return {
+    status: "FAILED",
+    error: {
+      code: bossChatCliUnsupportedStartCode,
+      message: `boss-recommend-mcp chat ${subcommand} is fenced during the CDP-only rewrite because a one-shot CLI process cannot keep the live CDP session and run lifecycle alive after it exits. Use the MCP tool start_boss_chat_run, or the live chat harness, for CDP-only chat runs.`,
+      retryable: false
+    },
+    cdp_only: true,
+    runtime_evaluate_used: false,
+    method_summary: {},
+    method_log: []
+  };
+}
+
 async function runBossChatCliCommand(subcommand, options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
+  const input = buildBossChatCliInput(options);
   if (subcommand === "health-check") {
-    printJson(getBossChatHealthCheck(workspaceRoot, {
-      port: parsePositivePort(options.port)
+    printJson(await bossChatHealthCheckTool({
+      workspaceRoot,
+      args: input
     }));
     return;
   }
 
   if (subcommand === "prepare-run") {
-    printJson(await prepareBossChatRun({
+    printJson(await prepareBossChatRunTool({
       workspaceRoot,
-      input: buildBossChatCliInput(options)
+      args: input
     }));
     return;
   }
 
-  if (subcommand === "run") {
-    printJson(await startBossChatRun({
-      workspaceRoot,
-      input: buildBossChatCliInput(options)
-    }));
-    return;
-  }
-
-  if (subcommand === "start-run") {
-    printJson(await startBossChatRun({
-      workspaceRoot,
-      input: buildBossChatCliInput(options)
-    }));
+  if (subcommand === "run" || subcommand === "start-run") {
+    printJson(buildUnsupportedBossChatCliStartResponse(subcommand));
     return;
   }
 
   if (subcommand === "get-run") {
-    printJson(await getBossChatRun({
-      workspaceRoot,
-      input: getBossChatCliRunTarget(options)
+    printJson(getBossChatRunTool({
+      args: getBossChatCliRunTarget(options)
     }));
     return;
   }
 
   if (subcommand === "pause-run") {
-    printJson(await pauseBossChatRun({
-      workspaceRoot,
-      input: getBossChatCliRunTarget(options)
+    printJson(pauseBossChatRunTool({
+      args: getBossChatCliRunTarget(options)
     }));
     return;
   }
 
   if (subcommand === "resume-run") {
-    printJson(await resumeBossChatRun({
-      workspaceRoot,
-      input: getBossChatCliRunTarget(options)
+    printJson(resumeBossChatRunTool({
+      args: getBossChatCliRunTarget(options)
     }));
     return;
   }
 
   if (subcommand === "cancel-run") {
-    printJson(await cancelBossChatRun({
-      workspaceRoot,
-      input: getBossChatCliRunTarget(options)
+    printJson(cancelBossChatRunTool({
+      args: getBossChatCliRunTarget(options)
     }));
     return;
   }
@@ -1601,6 +2481,23 @@ export async function runCli(argv = process.argv) {
         process.exitCode = 1;
       }
       break;
+    case "list-jobs":
+    case "jobs":
+    case "recommend-jobs":
+      try {
+        await listRecommendJobsCli(options);
+      } catch (error) {
+        printJson({
+          status: "FAILED",
+          error: {
+            code: "RECOMMEND_JOB_LIST_CLI_FAILED",
+            message: error.message || "Failed to list recommend jobs",
+            retryable: true
+          }
+        });
+        process.exitCode = 1;
+      }
+      break;
     case "chat":
       try {
         const chatSubcommand = String(argv[3] || "").trim().toLowerCase();
@@ -1620,7 +2517,7 @@ export async function runCli(argv = process.argv) {
       break;
     case "install":
       try {
-        installAll(options);
+        await installAll(options);
       } catch (error) {
         console.error(error.message || "Install failed.");
         process.exitCode = 1;
@@ -1632,8 +2529,8 @@ export async function runCli(argv = process.argv) {
       }
       break;
     case "init-config": {
-      const runtimeDirsResult = ensureRuntimeDirectories(options);
-      const result = ensureUserConfig(options);
+      const runtimeDirsResult = await ensureRuntimeDirectories(options);
+      const result = await ensureUserConfig(options);
       console.log(
         `Runtime directories prepared: created=${runtimeDirsResult.created.length}, existing=${runtimeDirsResult.existed.length}, failed=${runtimeDirsResult.failed.length}`
       );
@@ -1657,7 +2554,7 @@ export async function runCli(argv = process.argv) {
     }
     case "set-port": {
       try {
-        const result = setDebugPort(options);
+        const result = await setDebugPort(options);
         console.log(`Preferred debug port saved: ${result.port}`);
         console.log(`Updated config: ${result.configPath}`);
         console.log("Port priority for runtime commands: --port > BOSS_RECOMMEND_CHROME_PORT > screening-config.json.debugPort > 9222");
@@ -1668,8 +2565,8 @@ export async function runCli(argv = process.argv) {
       break;
     }
     case "set-config": {
-      try {
-        const result = setScreeningConfig(options);
+        try {
+          const result = await setScreeningConfig(options);
         console.log(`screening-config.json updated: ${result.path}`);
       } catch (error) {
         console.error(error.message || "Failed to write screening-config.json.");
@@ -1682,7 +2579,7 @@ export async function runCli(argv = process.argv) {
       if (!sub || sub.startsWith("--") || sub === "set") {
         const configOptions = sub === "set" ? parseOptions(argv.slice(4)) : options;
         try {
-          const result = setScreeningConfig(configOptions);
+          const result = await setScreeningConfig(configOptions);
           console.log(`screening-config.json updated: ${result.path}`);
         } catch (error) {
           console.error(error.message || "Failed to write screening-config.json.");
@@ -1712,7 +2609,7 @@ export async function runCli(argv = process.argv) {
       await launchChrome(options);
       break;
     case "where":
-      printPaths();
+      await printPaths();
       break;
     case "help":
     case "--help":
@@ -1727,18 +2624,20 @@ export async function runCli(argv = process.argv) {
 }
 
 export const __testables = {
+  buildRecommendJobListCliInput,
   buildBossChatCliInput,
   buildDefaultMcpArgs,
   buildMcpLaunchConfig,
+  buildUnsupportedRecommendCliRunResponse,
   collectRuntimeDirectories,
-  ensureBossChatRuntimeReady,
+  ensureBossChatRuntimeReady: ensureBossChatRuntimeReadyLocal,
   ensureRuntimeDirectories,
   getBossChatCliRunTarget,
   getDefaultMcpPackageSpecifier,
   getRunFollowUp,
   installSkill,
   isInstalledPackageRoot,
-  resolveBossChatRuntimeLayout,
+  resolveBossChatRuntimeLayout: resolveCdpBossChatRuntimeLayout,
   runBossChatCliCommand,
   runPipelineOnce
 };

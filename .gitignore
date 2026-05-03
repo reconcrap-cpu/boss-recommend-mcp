@@ -12,3 +12,4 @@ request.test.txt
 confirmation.test.json
 overrides.test.json
 .boss-chat/
+.live-artifacts/
