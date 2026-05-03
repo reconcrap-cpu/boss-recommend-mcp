@@ -75,6 +75,15 @@ function parseNonNegativeInteger(raw, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function resolveRecommendDetailLimit(args = {}, normalized = {}) {
+  const fallback = parsePositiveInteger(normalized.targetCount, 5);
+  const requested = parseNonNegativeInteger(args.detail_limit, fallback);
+  if (requested === 0 && args.allow_card_only_screening !== true) {
+    return fallback;
+  }
+  return requested;
+}
+
 function methodSummary(methodLog = []) {
   const summary = {};
   for (const entry of methodLog || []) {
@@ -867,7 +876,7 @@ function getRunOptions(args, parsed, normalized, session) {
     fallbackPageScope: "recommend",
     filter: normalized.filter,
     maxCandidates: normalized.targetCount,
-    detailLimit: parseNonNegativeInteger(args.detail_limit, 0),
+    detailLimit: resolveRecommendDetailLimit(args, normalized),
     closeDetail: true,
     delayMs: parseNonNegativeInteger(args.delay_ms, 0),
     cardTimeoutMs: slowLive ? 180000 : 90000,

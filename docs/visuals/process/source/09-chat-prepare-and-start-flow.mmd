@@ -1,0 +1,14 @@
+flowchart TD
+  A["prepare_boss_chat_run"] --> B["Resolve config/runtime dirs"]
+  B --> C["Connect to chat target"]
+  C --> D["Self-heal/health probes"]
+  D --> E["Read chat job options"]
+  E --> F["Return job_options and pending missing fields"]
+
+  G["start_boss_chat_run"] --> H["Validate job/start_from/target_count/criteria"]
+  H --> I{"Missing required field?"}
+  I -- "yes" --> J["Return NEED_INPUT with missing_fields and next_call_example"]
+  I -- "no" --> K["Normalize target_count; all/全部/扫到底 means process until list end"]
+  K --> L["Create chat async run"]
+  L --> M["Persist run meta/artifact paths"]
+  M --> N["Return ACCEPTED with run_id"]

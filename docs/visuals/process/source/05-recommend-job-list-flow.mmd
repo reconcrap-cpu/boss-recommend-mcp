@@ -1,0 +1,11 @@
+flowchart TD
+  A["list_recommend_jobs or CLI list-jobs"] --> B["Connect to recommend Chrome target"]
+  B --> C["Enable Page, DOM, Input"]
+  C --> D["Bring page to front"]
+  D --> E["Find recommend iframe document"]
+  E --> F["Open recommend job dropdown via DOM box center + Input click"]
+  F --> G["Read all job option nodes"]
+  G --> H["Normalize labels and current state"]
+  H --> I["Close dropdown"]
+  I --> J["Return job_options and job_names"]
+  J --> K["Assert no Runtime.*"]

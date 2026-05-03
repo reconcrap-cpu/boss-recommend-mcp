@@ -86,7 +86,6 @@ function readyArgs(extra = {}) {
       post_action: "none",
       job: "算法工程师"
     },
-    detail_limit: 0,
     delay_ms: 120,
     no_filter: true,
     ...extra
@@ -210,6 +209,56 @@ async function testRecommendGateBeforeBrowserConnect() {
   }, 2);
   assert.equal(["NEED_INPUT", "NEED_CONFIRMATION"].includes(payload.status), true);
   assert.equal(connectorCalled, false);
+}
+
+async function observeRecommendWorkflowOptions(args, id) {
+  installFakeConnector();
+  let observedOptions = null;
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recommend:test-options");
+    runControl.updateProgress({
+      card_count: options.maxCandidates,
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      detail_opened: Math.min(1, options.detailLimit)
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: Math.min(1, options.detailLimit),
+      passed: 0,
+      results: []
+    };
+  });
+
+  const started = await callTool(TOOL_START, args, id);
+  assert.equal(started.status, "ACCEPTED");
+  await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(Boolean(observedOptions), true);
+  return observedOptions;
+}
+
+async function testRecommendDetailLimitDefaultsToTargetCount() {
+  const observedOptions = await observeRecommendWorkflowOptions(readyArgs(), 12);
+  assert.equal(observedOptions.maxCandidates, 3);
+  assert.equal(observedOptions.detailLimit, 3);
+}
+
+async function testRecommendDetailLimitZeroRequiresDebugFlag() {
+  let observedOptions = await observeRecommendWorkflowOptions(readyArgs({
+    detail_limit: 0
+  }), 13);
+  assert.equal(observedOptions.detailLimit, 3);
+
+  resetRecommendMcpStateForTests();
+  observedOptions = await observeRecommendWorkflowOptions(readyArgs({
+    detail_limit: 0,
+    allow_card_only_screening: true
+  }), 14);
+  assert.equal(observedOptions.detailLimit, 0);
 }
 
 async function testRecommendAsyncPauseResumeCancel() {
@@ -446,6 +495,10 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendJobListTool();
     await testRecommendGateBeforeBrowserConnect();
+    resetRecommendMcpStateForTests();
+    await testRecommendDetailLimitDefaultsToTargetCount();
+    resetRecommendMcpStateForTests();
+    await testRecommendDetailLimitZeroRequiresDebugFlag();
     resetRecommendMcpStateForTests();
     await testRecommendAsyncPauseResumeCancel();
     resetRecommendMcpStateForTests();

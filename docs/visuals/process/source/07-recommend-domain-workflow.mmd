@@ -1,0 +1,29 @@
+flowchart TD
+  A["runRecommendWorkflow"] --> B["Close any open recommend detail"]
+  B --> C["getRecommendRoots iframe/root nodes"]
+  C --> D["Select requested job if provided"]
+  D --> E["Select requested page scope; fallback to 推荐 if missing"]
+  E --> F["Open filter panel"]
+  F --> G["Apply multi-select filter groups"]
+  G --> H["Confirm filter panel"]
+  H --> I["Wait for candidate cards"]
+  I --> J["Create infinite-list state"]
+  J --> K{"Processed target count reached?"}
+  K -- "yes" --> Z["Finalize summary, CSV, report"]
+  K -- "no" --> L["Get next unseen visible/scroll candidate"]
+  L --> M{"No next candidate and end reached?"}
+  M -- "yes" --> N{"Refresh rounds remain?"}
+  N -- "yes" --> O["Click 刷新 if present or refresh page; force recent_not_view"]
+  O --> P["Reapply job/scope/filters and reset infinite-list round"]
+  P --> L
+  N -- "no" --> Z
+  M -- "no" --> Q["Read card candidate"]
+  Q --> R{"detailLimit allows detail?"}
+  R -- "no" --> S["Screen from card data only"]
+  R -- "yes" --> T["Open detail by CDP click"]
+  T --> U["Acquire CV via network primary and image fallback"]
+  U --> V["Normalize candidate profile"]
+  V --> W["LLM/basic screenCandidate"]
+  W --> X["If passed, resolve post action favorite/greet"]
+  X --> Y["Mark candidate processed, update progress/checkpoint"]
+  Y --> K

@@ -1,0 +1,92 @@
+flowchart LR
+  subgraph Agents["AI Agents / MCP Clients"]
+    Codex["Codex Skills"]
+    Trae["Trae / Trae CN"]
+    OpenClaw["OpenClaw"]
+    Other["Other MCP Clients"]
+  end
+
+  subgraph Package["@reconcrap/boss-recommend-mcp 2.x"]
+    Installer["Installer / Migration
+src/cli.js"]
+    MCP["MCP Server
+src/index.js"]
+    RecommendMcp["Recommend MCP Wrapper
+src/recommend-mcp.js"]
+    RecruitMcp["Recruit/Search MCP Wrapper
+src/recruit-mcp.js"]
+    ChatMcp["Chat MCP Wrapper
+src/chat-mcp.js"]
+    Config["Runtime Config
+src/chat-runtime-config.js"]
+  end
+
+  subgraph Shared["Shared Core Layers"]
+    Browser["CDP-only Browser Guard
+DOM / Input / Page / Network / Accessibility"]
+    Run["Run Lifecycle
+start / pause / resume / cancel"]
+    Screening["Screening + LLM
+pass/fail + CoT capture"]
+    CV["CV Acquisition
+Network primary + image fallback"]
+    Infinite["Infinite List
+dedupe + scroll end"]
+    Reporting["Legacy-compatible CSV"]
+    SelfHeal["Self-heal Probes"]
+  end
+
+  subgraph Domains["Domain Services"]
+    Recommend["Recommend Domain
+jobs / scopes / filters / cards / detail / actions"]
+    Recruit["Recruit/Search Domain
+keyword / job / city / filters / detail / refresh"]
+    Chat["Chat Domain
+job / unread-all / online resume / CV request"]
+  end
+
+  Chrome["Logged-in Chrome
+remote debugging port 9222"]
+  Boss["Boss Zhipin Pages
+recommend / search / chat"]
+  State["User State
+~/.boss-recommend-mcp"]
+  Skills["Bundled Skills
+recommend / recruit / chat"]
+
+  Codex --> MCP
+  Trae --> MCP
+  OpenClaw --> MCP
+  Other --> MCP
+  Installer --> Skills
+  Installer --> MCP
+  MCP --> RecommendMcp
+  MCP --> RecruitMcp
+  MCP --> ChatMcp
+  MCP --> SelfHeal
+  RecommendMcp --> Recommend
+  RecruitMcp --> Recruit
+  ChatMcp --> Chat
+  Recommend --> Browser
+  Recruit --> Browser
+  Chat --> Browser
+  Recommend --> Run
+  Recruit --> Run
+  Chat --> Run
+  Recommend --> CV
+  Recruit --> CV
+  Chat --> CV
+  Recommend --> Infinite
+  Recruit --> Infinite
+  Chat --> Infinite
+  Recommend --> Screening
+  Recruit --> Screening
+  Chat --> Screening
+  Recommend --> Reporting
+  Recruit --> Reporting
+  Chat --> Reporting
+  Browser --> Chrome
+  Chrome --> Boss
+  Config --> State
+  Run --> State
+  Reporting --> State

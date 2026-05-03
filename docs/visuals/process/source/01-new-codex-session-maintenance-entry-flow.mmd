@@ -1,0 +1,17 @@
+flowchart TD
+  A["New Codex instance starts"] --> B["Read docs/SESSION_START.md"]
+  B --> C["Read CDP_ONLY_CONTRACT.md"]
+  C --> D["Read this status/process guide"]
+  D --> E["Read TOOL_FUNCTION_DICTIONARY.md"]
+  E --> F["Check git status"]
+  F --> G["Identify requested domain: recommend, recruit/search, chat, installer, shared core"]
+  G --> H["Inspect relevant source and tests"]
+  H --> I["Make smallest scoped change"]
+  I --> J["Run focused unit/mock tests"]
+  J --> K["Run static guards if browser/runtime touched"]
+  K --> L{"Behavioral live impact?"}
+  L -- "yes" --> M["Run or schedule live CDP-only validation and record result"]
+  L -- "no" --> N["Document mock-only scope clearly"]
+  M --> O["Update docs/status if contract changed"]
+  N --> O
+  O --> P["Final summary with tests and residual risk"]

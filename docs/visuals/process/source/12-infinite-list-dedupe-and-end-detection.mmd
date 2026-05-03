@@ -1,0 +1,14 @@
+flowchart TD
+  A["read visible card nodes"] --> B["Build candidate key from id/name/text/source"]
+  B --> C{"Any unseen visible candidate?"}
+  C -- "yes" --> D["Return first unseen candidate"]
+  C -- "no" --> E["Update visible signature"]
+  E --> F{"Visible signature stable enough?"}
+  F -- "no" --> G["Scroll by visible item box or fallback wheel"]
+  G --> A
+  F -- "yes" --> H["Try final scroll attempts"]
+  H --> I{"No position change / no new signature?"}
+  I -- "yes" --> J["end_reached=true"]
+  I -- "no" --> A
+  D --> K["Domain opens/processes candidate"]
+  K --> L["markInfiniteListCandidateProcessed"]

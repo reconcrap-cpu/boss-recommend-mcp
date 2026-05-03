@@ -1,0 +1,9 @@
+flowchart TD
+  A["Candidate card/detail/profile/image evidence"] --> B["normalizeCandidateProfile / buildScreeningCandidateFromDetail"]
+  B --> C["Build LLM messages from criteria and candidate evidence"]
+  C --> D["Ask LLM for pass/fail JSON, no user-facing reasons required"]
+  D --> E["Parse passed decision"]
+  E --> F["Capture full CoT/reasoning/raw output for CSV/report"]
+  F --> G["Build domain result row"]
+  G --> H["writeLegacyScreenCsv"]
+  H --> I["CSV includes input rows plus result rows"]

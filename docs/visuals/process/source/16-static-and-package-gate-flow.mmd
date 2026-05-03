@@ -1,0 +1,9 @@
+flowchart TD
+  A["Code change"] --> B["npm run test:runtime-scan"]
+  B --> C["scan:runtime:strict"]
+  C --> D["scan:runtime:package:strict"]
+  D --> E["scan:legacy-boundary"]
+  E --> F["scan:package-boundary uses npm pack --dry-run --json"]
+  F --> G{"Any active Runtime/page-JS/legacy/package leakage?"}
+  G -- "yes" --> H["Fail gate; fix before release"]
+  G -- "no" --> I["Static gate pass"]

@@ -1,0 +1,13 @@
+flowchart TD
+  A["Open candidate detail/resume"] --> B["Start domain network recorder"]
+  B --> C["Wait based on cv-acquisition state"]
+  C --> D{"Parsed network profile exists?"}
+  D -- "yes" --> E["recordCvNetworkHit; mode trends network"]
+  D -- "no" --> F["recordCvNetworkMiss"]
+  F --> G{"Prior attempts indicate image mode?"}
+  G -- "yes" --> H["Use shorter network grace wait"]
+  G -- "no" --> I["Use normal network wait/retry"]
+  H --> J["Capture full-scroll screenshot sequence"]
+  I --> J
+  J --> K["recordCvImageFallback; mode trends image"]
+  K --> L["Pass image evidence to multimodal screening if needed"]

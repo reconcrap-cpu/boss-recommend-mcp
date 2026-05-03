@@ -1,0 +1,14 @@
+flowchart TD
+  A["start_recommend_pipeline_run"] --> B["Validate instruction exists"]
+  B --> C["parseRecommendInstruction"]
+  C --> D{"Missing required filters/criteria/action/target confirmations?"}
+  D -- "yes" --> E["Return NEED_CONFIRMATION with pending_questions"]
+  D -- "no" --> F["Connect to Chrome recommend target"]
+  F --> G["Health/page readiness through CDP"]
+  G --> H{"Need job list / job not confirmed?"}
+  H -- "yes" --> I["Read job options and return NEED_CONFIRMATION"]
+  H -- "no" --> J{"final_confirmed true?"}
+  J -- "no" --> K["Return final review NEED_CONFIRMATION"]
+  J -- "yes" --> L["Create async run in recommend run service"]
+  L --> M["Persist run meta, output paths, checkpoint paths"]
+  M --> N["Return ACCEPTED with run_id"]

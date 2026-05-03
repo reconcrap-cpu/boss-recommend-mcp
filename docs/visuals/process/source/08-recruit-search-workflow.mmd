@@ -1,0 +1,34 @@
+flowchart TD
+  A["run_recruit_pipeline or start_recruit_pipeline_run"] --> B["validateRecruitPipelineArgs"]
+  B --> C["parseRecruitInstruction"]
+  C --> D{"Missing job/keyword/criteria/target/action confirmations?"}
+  D -- "yes" --> E["Return NEED_INPUT or NEED_CONFIRMATION"]
+  D -- "no" --> F["Connect to Chrome search target"]
+  F --> G["Close existing detail"]
+  G --> H["getRecruitRoots iframe/root nodes"]
+  H --> I{"Has search params?"}
+  I -- "yes" --> J["applyRecruitSearchParams"]
+  I -- "no" --> K["Use current search page state"]
+  J --> L["Reset page if requested"]
+  L --> M["Set keyword"]
+  M --> N["Set job title from selector next to keyword input"]
+  N --> O["Set city; illegal city defaults to 全国 under 城市 -> 热门 -> 全国"]
+  O --> P["Set degree multi-select"]
+  P --> Q["Set school tags multi-select"]
+  Q --> R["Set recent-viewed filter"]
+  R --> S["Click search and wait for cards/no-data"]
+  K --> T["Create infinite-list state"]
+  S --> T
+  T --> U["Loop unseen candidates"]
+  U --> V["Open detail if detailLimit allows"]
+  V --> W["Acquire CV: network primary, image fallback"]
+  W --> X["Screen candidate"]
+  X --> Y["Run post action if passed and configured"]
+  Y --> Z{"Target processed count reached?"}
+  Z -- "yes" --> END["Finalize CSV/report"]
+  Z -- "no" --> AA{"List end reached?"}
+  AA -- "no" --> U
+  AA -- "yes" --> AB{"Refresh rounds remain?"}
+  AB -- "yes" --> AC["Refresh page and reapply exact search; force recently viewed filter"]
+  AC --> T
+  AB -- "no" --> END

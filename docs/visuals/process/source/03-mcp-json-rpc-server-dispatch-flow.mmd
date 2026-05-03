@@ -1,0 +1,15 @@
+flowchart TD
+  A["stdin JSON-RPC message"] --> B{"method"}
+  B -- "initialize" --> C["Return protocolVersion and serverInfo"]
+  B -- "notifications/initialized" --> D["No response"]
+  B -- "tools/list" --> E["Return createToolsSchema()"]
+  B -- "tools/call" --> F["Validate tool-specific arguments"]
+  F --> G{"Known tool?"}
+  G -- "no" --> H["JSON-RPC error -32602"]
+  G -- "yes" --> I["Call recommend/recruit/chat/self-heal handler"]
+  I --> J["Payload returned"]
+  J --> K{"payload.status == FAILED?"}
+  K -- "yes" --> L["Return tool result with isError=true"]
+  K -- "no" --> M["Return structuredContent payload"]
+  B -- "ping" --> N["Return empty result"]
+  B -- "other" --> O["JSON-RPC error -32601"]

@@ -332,7 +332,7 @@ export async function runRecommendWorkflow({
   fallbackPageScope = "recommend",
   filter = {},
   maxCandidates = 5,
-  detailLimit = 0,
+  detailLimit,
   closeDetail = true,
   delayMs = 0,
   cardTimeoutMs = 10000,
@@ -362,7 +362,7 @@ export async function runRecommendWorkflow({
   const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
   const postActionEnabled = normalizedPostAction !== "none";
   const limit = Math.max(1, Number(maxCandidates) || 1);
-  const detailCountLimit = Math.max(0, Number(detailLimit) || 0);
+  const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
   const effectiveDetailLimit = postActionEnabled ? limit : detailCountLimit;
   const networkRecorder = effectiveDetailLimit > 0
     ? createRecommendDetailNetworkRecorder(client)
@@ -785,7 +785,7 @@ export function createRecommendRunService({
     fallbackPageScope = "recommend",
     filter = {},
     maxCandidates = 5,
-    detailLimit = 0,
+    detailLimit,
     closeDetail = true,
     delayMs = 0,
     cardTimeoutMs = 10000,
@@ -814,6 +814,8 @@ export function createRecommendRunService({
     const normalizedPostAction = normalizeRecommendPostAction(postAction) || "none";
     const requestedPageScope = normalizeRecommendPageScope(pageScope) || "recommend";
     const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
+    const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
+    const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
       name,
       context: {
@@ -825,7 +827,7 @@ export function createRecommendRunService({
         fallback_page_scope: normalizedFallbackPageScope,
         filter: normalizedFilter,
         max_candidates: maxCandidates,
-        detail_limit: detailLimit,
+        detail_limit: normalizedDetailLimit,
         close_detail: closeDetail,
         cv_acquisition_mode: cvAcquisitionMode,
         max_image_pages: maxImagePages,
@@ -846,7 +848,7 @@ export function createRecommendRunService({
       },
       progress: {
         card_count: 0,
-        target_count: Math.max(1, Number(maxCandidates) || 1),
+        target_count: candidateLimit,
         processed: 0,
         screened: 0,
         detail_opened: 0,
@@ -864,7 +866,7 @@ export function createRecommendRunService({
         fallbackPageScope: normalizedFallbackPageScope,
         filter: normalizedFilter,
         maxCandidates,
-        detailLimit,
+        detailLimit: normalizedDetailLimit,
         closeDetail,
         delayMs,
         cardTimeoutMs,

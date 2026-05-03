@@ -1,0 +1,121 @@
+[
+  {
+    "number": "00",
+    "heading": "Architecture Overview",
+    "slug": "architecture-overview",
+    "source": "docs/visuals/process/source/00-architecture-overview.mmd",
+    "svg": "docs/visuals/process/00-architecture-overview.svg"
+  },
+  {
+    "number": "01",
+    "heading": "1. New Codex Session / Maintenance Entry Flow",
+    "slug": "new-codex-session-maintenance-entry-flow",
+    "source": "docs/visuals/process/source/01-new-codex-session-maintenance-entry-flow.mmd",
+    "svg": "docs/visuals/process/01-new-codex-session-maintenance-entry-flow.svg"
+  },
+  {
+    "number": "02",
+    "heading": "2. Installer And Legacy Migration Flow",
+    "slug": "installer-and-legacy-migration-flow",
+    "source": "docs/visuals/process/source/02-installer-and-legacy-migration-flow.mmd",
+    "svg": "docs/visuals/process/02-installer-and-legacy-migration-flow.svg"
+  },
+  {
+    "number": "03",
+    "heading": "3. MCP JSON-RPC Server Dispatch Flow",
+    "slug": "mcp-json-rpc-server-dispatch-flow",
+    "source": "docs/visuals/process/source/03-mcp-json-rpc-server-dispatch-flow.mmd",
+    "svg": "docs/visuals/process/03-mcp-json-rpc-server-dispatch-flow.svg"
+  },
+  {
+    "number": "04",
+    "heading": "4. CDP-Only Browser Session Flow",
+    "slug": "cdp-only-browser-session-flow",
+    "source": "docs/visuals/process/source/04-cdp-only-browser-session-flow.mmd",
+    "svg": "docs/visuals/process/04-cdp-only-browser-session-flow.svg"
+  },
+  {
+    "number": "05",
+    "heading": "5. Recommend Job List Flow",
+    "slug": "recommend-job-list-flow",
+    "source": "docs/visuals/process/source/05-recommend-job-list-flow.mmd",
+    "svg": "docs/visuals/process/05-recommend-job-list-flow.svg"
+  },
+  {
+    "number": "06",
+    "heading": "6. Recommend Start Tool Confirmation Flow",
+    "slug": "recommend-start-tool-confirmation-flow",
+    "source": "docs/visuals/process/source/06-recommend-start-tool-confirmation-flow.mmd",
+    "svg": "docs/visuals/process/06-recommend-start-tool-confirmation-flow.svg"
+  },
+  {
+    "number": "07",
+    "heading": "7. Recommend Domain Workflow",
+    "slug": "recommend-domain-workflow",
+    "source": "docs/visuals/process/source/07-recommend-domain-workflow.mmd",
+    "svg": "docs/visuals/process/07-recommend-domain-workflow.svg"
+  },
+  {
+    "number": "08",
+    "heading": "8. Recruit/Search Workflow",
+    "slug": "recruit-search-workflow",
+    "source": "docs/visuals/process/source/08-recruit-search-workflow.mmd",
+    "svg": "docs/visuals/process/08-recruit-search-workflow.svg"
+  },
+  {
+    "number": "09",
+    "heading": "9. Chat Prepare And Start Flow",
+    "slug": "chat-prepare-and-start-flow",
+    "source": "docs/visuals/process/source/09-chat-prepare-and-start-flow.mmd",
+    "svg": "docs/visuals/process/09-chat-prepare-and-start-flow.svg"
+  },
+  {
+    "number": "10",
+    "heading": "10. Chat Domain Workflow And CV Request Flow",
+    "slug": "chat-domain-workflow-and-cv-request-flow",
+    "source": "docs/visuals/process/source/10-chat-domain-workflow-and-cv-request-flow.mmd",
+    "svg": "docs/visuals/process/10-chat-domain-workflow-and-cv-request-flow.svg"
+  },
+  {
+    "number": "11",
+    "heading": "11. CV Acquisition Cascade",
+    "slug": "cv-acquisition-cascade",
+    "source": "docs/visuals/process/source/11-cv-acquisition-cascade.mmd",
+    "svg": "docs/visuals/process/11-cv-acquisition-cascade.svg"
+  },
+  {
+    "number": "12",
+    "heading": "12. Infinite List Dedupe And End Detection",
+    "slug": "infinite-list-dedupe-and-end-detection",
+    "source": "docs/visuals/process/source/12-infinite-list-dedupe-and-end-detection.mmd",
+    "svg": "docs/visuals/process/12-infinite-list-dedupe-and-end-detection.svg"
+  },
+  {
+    "number": "13",
+    "heading": "13. Lifecycle Control Flow",
+    "slug": "lifecycle-control-flow",
+    "source": "docs/visuals/process/source/13-lifecycle-control-flow.mmd",
+    "svg": "docs/visuals/process/13-lifecycle-control-flow.svg"
+  },
+  {
+    "number": "14",
+    "heading": "14. Self-Heal Flow",
+    "slug": "self-heal-flow",
+    "source": "docs/visuals/process/source/14-self-heal-flow.mmd",
+    "svg": "docs/visuals/process/14-self-heal-flow.svg"
+  },
+  {
+    "number": "15",
+    "heading": "15. Screening And CSV Flow",
+    "slug": "screening-and-csv-flow",
+    "source": "docs/visuals/process/source/15-screening-and-csv-flow.mmd",
+    "svg": "docs/visuals/process/15-screening-and-csv-flow.svg"
+  },
+  {
+    "number": "16",
+    "heading": "16. Static And Package Gate Flow",
+    "slug": "static-and-package-gate-flow",
+    "source": "docs/visuals/process/source/16-static-and-package-gate-flow.mmd",
+    "svg": "docs/visuals/process/16-static-and-package-gate-flow.svg"
+  }
+]

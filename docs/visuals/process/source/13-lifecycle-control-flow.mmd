@@ -1,0 +1,14 @@
+flowchart TD
+  A["start run"] --> B["Lifecycle manager creates queued/running entry"]
+  B --> C["Workflow periodically calls waitIfPaused and throwIfCanceled"]
+  C --> D{"pause requested?"}
+  D -- "yes" --> E["Status becomes paused after current candidate checkpoint"]
+  E --> F["resume resolves pause promise"]
+  F --> C
+  D -- "no" --> G{"cancel requested?"}
+  G -- "yes" --> H["throw RunCanceledError"]
+  H --> I["Status canceled, artifacts finalized"]
+  G -- "no" --> J["Continue work"]
+  J --> K{"Workflow success/failure?"}
+  K -- "success" --> L["Status completed"]
+  K -- "failure" --> M["Status failed with error"]

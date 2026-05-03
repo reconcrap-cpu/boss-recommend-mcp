@@ -31,6 +31,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - `criteria` 必须是用户开放式自然语言；禁止“严格/宽松执行”等预设替代。
   - `post_action=greet` 时，必须确认 `max_greet_count`；禁止自动默认为 `target_count`。
   - 正式执行前必须 `final_confirmed=true`。
+  - 真实筛选禁止传 `detail_limit: 0`；recommend 默认必须打开候选人详情/CV。只有用户明确要求“卡片-only 调试”时，才允许同时传 `detail_limit: 0` 和 `allow_card_only_screening: true`。
 
 - **Instruction 原文锁定**
   - 首次用户需求原文锁定为 `locked_instruction_raw`。

@@ -540,7 +540,11 @@ function createRunInputSchema() {
       detail_limit: {
         type: "integer",
         minimum: 0,
-        description: "打开详情的人数上限；默认 0，0 表示只用卡片信息"
+        description: "打开详情/CV 的人数上限；默认跟随 target_count/max_candidates。生产筛选不应传 0；只有 allow_card_only_screening=true 时才会接受 0 作为调试卡片-only 模式"
+      },
+      allow_card_only_screening: {
+        type: "boolean",
+        description: "高级调试开关；默认 false。只有显式为 true 时，recommend 才会尊重 detail_limit=0 并只用卡片信息筛选"
       },
       delay_ms: {
         type: "integer",

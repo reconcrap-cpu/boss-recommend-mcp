@@ -1,0 +1,11 @@
+flowchart TD
+  A["connectToChromeTarget host/port/target matcher"] --> B["chrome-remote-interface connects"]
+  B --> C["createGuardedCdpClient wraps raw client"]
+  C --> D["Every domain method call is recorded"]
+  D --> E{"Method domain Runtime?"}
+  E -- "yes" --> F["Throw forbidden CDP method error"]
+  E -- "no" --> G["Forward call to CDP"]
+  G --> H["enableDomains Page/DOM/Input/Network/Accessibility as needed"]
+  H --> I["DOM roots, frames, selectors, box models, AX tree"]
+  I --> J["Input.dispatchMouseEvent / key / text / wheel"]
+  J --> K["assertNoForbiddenCdpCalls before returning"]

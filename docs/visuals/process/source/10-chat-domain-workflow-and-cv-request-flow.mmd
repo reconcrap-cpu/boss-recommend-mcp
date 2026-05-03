@@ -1,0 +1,31 @@
+flowchart TD
+  A["runChatWorkflow"] --> B["Recover chat shell if top-level page is wrong"]
+  B --> C["getChatRoots"]
+  C --> D["Select primary label 全部"]
+  D --> E["Select requested job"]
+  E --> F["Select start filter unread/all"]
+  F --> G["Create infinite-list state"]
+  G --> H["Get next unseen chat candidate"]
+  H --> I{"No candidate and list end reached?"}
+  I -- "yes" --> END["Complete run, even if pass target unmet"]
+  I -- "no" --> J["Select fresh card node by candidate id"]
+  J --> K["Open online resume via UI button, never direct c-resume URL"]
+  K --> L["Network/profile capture primary"]
+  L --> M{"Usable network profile?"}
+  M -- "yes" --> N["Build candidate from network/detail"]
+  M -- "no" --> O["Full-scroll screenshot sequence"]
+  O --> P["Multimodal LLM pass/fail screening from images"]
+  N --> Q["Text LLM/basic pass/fail screening"]
+  P --> R{"Passed?"}
+  Q --> R
+  R -- "no" --> S["Close resume/modal, mark processed"]
+  R -- "yes" --> T["Check 附件简历 / already requested state"]
+  T --> U{"Already has/asked CV?"}
+  U -- "yes" --> S
+  U -- "no" --> V["Send greeting/chat message if needed to activate 求简历"]
+  V --> W["Click 求简历/request CV button"]
+  W --> X["Verify request sent or state changed"]
+  X --> S
+  S --> Y{"Pass target reached?"}
+  Y -- "yes" --> END
+  Y -- "no" --> H

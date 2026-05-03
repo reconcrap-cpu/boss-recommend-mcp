@@ -1,0 +1,12 @@
+flowchart TD
+  A["run_recommend_self_heal scan"] --> B["Connect to target page"]
+  B --> C["Resolve domain roots"]
+  C --> D["Run selector probes"]
+  D --> E["Run accessibility probes"]
+  E --> F["Run network probes if events supplied"]
+  F --> G["summarizeProbeResults"]
+  G --> H["buildDriftReport"]
+  H --> I["Return health status and repair_session_id if applicable"]
+  J["run_recommend_self_heal apply"] --> K{"confirm_apply true and repair_session_id valid?"}
+  K -- "no" --> L["FAILED / no mutation"]
+  K -- "yes" --> M["Currently fail closed for unsupported high-risk apply paths unless explicitly implemented"]

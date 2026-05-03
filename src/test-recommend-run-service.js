@@ -157,7 +157,43 @@ async function testPostActionOptionDelegation() {
   assert.equal(observedOptions.actionAfterClickDelayMs, 345);
 }
 
+async function testDetailLimitDefaultsToMaxCandidates() {
+  let observedOptions = null;
+  const service = createRecommendRunService({
+    idPrefix: "test_recommend_detail_default",
+    workflow: async (options, runControl) => {
+      observedOptions = options;
+      runControl.setPhase("test:detail-default");
+      runControl.updateProgress({
+        processed: 1,
+        screened: 1,
+        detail_opened: 1
+      });
+      return {
+        processed: 1,
+        screened: 1,
+        detail_opened: 1,
+        results: []
+      };
+    }
+  });
+
+  const started = service.startRecommendRun({
+    client: {},
+    targetUrl: "https://www.zhipin.com/web/chat/recommend",
+    criteria: "算法",
+    filter: { enabled: false },
+    maxCandidates: 4
+  });
+
+  assert.equal(started.context.detail_limit, 4);
+  const final = await service.waitForRecommendRun(started.runId);
+  assert.equal(final.status, "completed");
+  assert.equal(observedOptions.detailLimit, 4);
+}
+
 await testLifecycleDelegation();
 await testPostActionOptionDelegation();
+await testDetailLimitDefaultsToMaxCandidates();
 
 console.log("recommend run service tests passed");

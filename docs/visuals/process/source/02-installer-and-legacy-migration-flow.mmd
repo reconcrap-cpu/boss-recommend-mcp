@@ -1,0 +1,18 @@
+flowchart TD
+  A["npm install -g @reconcrap/boss-recommend-mcp"] --> B["scripts/postinstall.cjs"]
+  B --> C{"Global install?"}
+  C -- "yes" --> D["node src/cli.js install"]
+  C -- "no" --> E["node src/cli.js init-config"]
+  D --> F["ensureRuntimeDirectories"]
+  F --> G["install bundled skills into CODEX_HOME"]
+  G --> H["ensure screening-config.json"]
+  H --> I["write MCP config templates under state home"]
+  I --> J["resolve external MCP config targets"]
+  J --> K["For each target mcp.json: read current JSON"]
+  K --> L["Remove existing Boss MCP entries: old recommend, recruit, chat, local legacy paths"]
+  L --> M["Write boss-recommend server with npx -y package@installed-version start"]
+  M --> N["Backup old file as .boss-mcp-migration-*.bak if changed"]
+  N --> O["resolve external skill dirs"]
+  O --> P["Mirror boss-recommend-pipeline, boss-recruit-pipeline, boss-chat"]
+  P --> Q["Print changed targets, backups, warnings"]
+  E --> H
