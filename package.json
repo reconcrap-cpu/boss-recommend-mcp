@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -31,6 +31,7 @@
     "test:core-run": "node src/test-core-run.js",
     "test:core-screening": "node src/test-core-screening.js",
     "test:core-self-heal": "node src/test-core-self-heal.js",
+    "test:installer-migration": "node src/test-installer-migration.js",
     "test:recommend-actions": "node src/test-recommend-actions.js",
     "test:recommend-domain": "node src/test-recommend-domain.js",
     "test:recommend-run-service": "node src/test-recommend-run-service.js",

@@ -9,7 +9,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 
 当用户要在 Boss 聊天页单独跑筛选/沟通任务时，必须走内置的 chat 工具，而不是要求用户单独安装 `boss-chat`。
 
-适用范围是“chat-only 会话”。若用户意图包含推荐页找人（尤其是“先推荐再沟通”），必须让 `boss-recommend-pipeline` 接管，并通过 `follow_up.chat` 完成联动。
+适用范围是“chat-only 会话”。若用户意图包含推荐页找人（尤其是“先推荐再沟通”），必须先让 `boss-recommend-pipeline` 完成推荐页任务；推荐完成后如用户仍要聊天页处理，再显式走本 skill。
 
 ## Tool Routing
 
@@ -55,7 +55,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - LLM 配置必须复用 `boss-recommend-mcp` 的 `screening-config.json`；不要再向用户单独要 `baseUrl/apiKey/model`。
 - 路由护栏（强制）：
   - 只在用户明确是 chat-only 任务时使用本 skill。
-  - 只要用户提到推荐页、先找人后沟通、或需要推荐筛选阶段，禁止调用 `start_boss_chat_run`；必须交给 `boss-recommend-pipeline` 并走 `follow_up.chat`。
+  - 只要用户提到推荐页、先找人后沟通、或需要推荐筛选阶段，禁止直接调用 `start_boss_chat_run`；必须先交给 `boss-recommend-pipeline` 完成推荐页任务。
   - 不得在 recommend 任务尚未完成时并行启动独立 chat run。
 - `job` / `start_from` / `criteria` 缺一不可；缺参时只补缺口。
 - `target_count` 在 chat-only 启动前也是必填项，不能默认省略。
@@ -78,8 +78,9 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 ## Handoff Rule (Recommend -> Chat)
 
 - 若用户先运行了 recommend 流水线，并在手动状态检查时确认 recommend 已完成，且用户目标是“立即进入聊天沟通”：
-  - 若该 recommend run **未配置** `follow_up.chat`：应立即调用 `start_boss_chat_run` 启动 chat（不要等下一次 30 分钟轮询）。
-  - 若该 recommend run **已配置** `follow_up.chat`：不要再重复新开 chat run，改为查询同一父 run / 子 run 状态。
+  - 先调用 `prepare_boss_chat_run` 获取聊天页岗位列表与缺参。
+  - 显式确认 `job/start_from/target_count/criteria` 后再调用 `start_boss_chat_run`。
+  - 不要查找或依赖 `follow_up.chat`；该自动衔接路径属于 legacy-only 行为。
 
 ## Response Style
 

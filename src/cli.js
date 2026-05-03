@@ -35,7 +35,9 @@ const currentFilePath = fileURLToPath(import.meta.url);
 const packageRoot = path.resolve(path.dirname(currentFilePath), "..");
 const packageJsonPath = path.join(packageRoot, "package.json");
 const skillName = "boss-recommend-pipeline";
-const bundledSkillNames = [skillName, "boss-chat"];
+const recruitSkillName = "boss-recruit-pipeline";
+const chatSkillName = "boss-chat";
+const bundledSkillNames = [skillName, recruitSkillName, chatSkillName];
 const exampleConfigPath = path.join(packageRoot, "config", "screening-config.example.json");
 const bossUrl = "https://www.zhipin.com/web/chat/recommend";
 const bossLoginUrl = "https://www.zhipin.com/web/user/?ka=bticket";
@@ -724,7 +726,7 @@ function buildMcpLaunchConfig(options = {}) {
     ? args
     : command === "boss-recommend-mcp"
       ? ["start"]
-      : buildDefaultMcpArgs();
+      : buildDefaultMcpArgs(options);
   const launchConfig = { command, args: launchArgs };
   if (env && typeof env === "object" && !Array.isArray(env) && Object.keys(env).length > 0) {
     launchConfig.env = env;
@@ -793,24 +795,56 @@ function parseAgentTargets(rawValue) {
   return unique;
 }
 
+function getExternalAppSupportBaseDirs() {
+  const home = os.homedir();
+  if (process.platform === "win32") {
+    return dedupePaths([
+      process.env.APPDATA || "",
+      path.join(home, "AppData", "Roaming")
+    ]);
+  }
+  if (process.platform === "darwin") {
+    return dedupePaths([
+      path.join(home, "Library", "Application Support")
+    ]);
+  }
+  return dedupePaths([
+    process.env.XDG_CONFIG_HOME || "",
+    path.join(home, ".config")
+  ]);
+}
+
+function buildAppUserPaths({ dirNames = [], tail = [] } = {}) {
+  const paths = [];
+  for (const baseDir of getExternalAppSupportBaseDirs()) {
+    const discovered = discoverAppDataDirsByPattern(baseDir, /^trae(?:[\s\-_]?cn)?$/i);
+    const names = dedupeLower([...dirNames, ...discovered]);
+    for (const dirName of names) {
+      paths.push(path.join(baseDir, dirName, "User", ...tail));
+    }
+  }
+  return dedupePaths(paths);
+}
+
 function getKnownExternalMcpConfigPathsByAgent() {
   const home = os.homedir();
-  const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-  const traeDirNames = dedupeLower([
+  const appBases = getExternalAppSupportBaseDirs();
+  const traeDirNames = [
     "Trae",
     "Trae CN",
     "TraeCN",
     "trae-cn",
-    "trae_cn",
-    ...discoverAppDataDirsByPattern(appData, /^trae(?:[\s\-_]?cn)?$/i)
-  ]);
-  const traeConfigPaths = traeDirNames.map((dir) => path.join(appData, dir, "User", "mcp.json"));
+    "trae_cn"
+  ];
+  const traeConfigPaths = buildAppUserPaths({ dirNames: traeDirNames, tail: ["mcp.json"] });
+  const cursorConfigPaths = appBases.map((baseDir) => path.join(baseDir, "Cursor", "User", "mcp.json"));
+  const openClawConfigPaths = appBases.map((baseDir) => path.join(baseDir, "OpenClaw", "User", "mcp.json"));
   return {
-    cursor: [path.join(appData, "Cursor", "User", "mcp.json"), path.join(home, ".cursor", "mcp.json")],
+    cursor: [...cursorConfigPaths, path.join(home, ".cursor", "mcp.json")],
     trae: [...traeConfigPaths, path.join(home, ".trae", "mcp.json"), path.join(home, ".trae-cn", "mcp.json")],
     "trae-cn": [...traeConfigPaths, path.join(home, ".trae-cn", "mcp.json"), path.join(home, ".trae", "mcp.json")],
     claude: [path.join(home, ".claude", "mcp.json")],
-    openclaw: [path.join(home, ".openclaw", "mcp.json")]
+    openclaw: [path.join(home, ".openclaw", "mcp.json"), ...openClawConfigPaths]
   };
 }
 
@@ -837,21 +871,40 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
       ? current.mcpServers
       : {};
   const existingEntry = existingServers[serverName];
+  const retainedServers = {};
+  const migratedLegacyServers = [];
+  for (const [name, config] of Object.entries(existingServers)) {
+    if (name === serverName) continue;
+    if (isBossMcpServerEntry(name, config)) {
+      migratedLegacyServers.push(name);
+      continue;
+    }
+    retainedServers[name] = config;
+  }
   const merged = {
     ...current,
     mcpServers: {
-      ...existingServers,
+      ...retainedServers,
       [serverName]: launchConfig
     }
   };
 
   ensureDir(path.dirname(filePath));
+  const before = pathExists(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  const next = JSON.stringify(merged, null, 2);
+  let backupFile = null;
+  if (before && before.trim() !== next.trim()) {
+    backupFile = `${filePath}.boss-mcp-migration-${new Date().toISOString().replace(/[:.]/g, "-")}.bak`;
+    fs.writeFileSync(backupFile, before, "utf8");
+  }
   fs.writeFileSync(filePath, JSON.stringify(merged, null, 2), "utf8");
-  const updated = JSON.stringify(existingEntry || null) !== JSON.stringify(launchConfig);
+  const updated = before.trim() !== next.trim() || JSON.stringify(existingEntry || null) !== JSON.stringify(launchConfig);
   return {
     file: filePath,
     server: serverName,
-    updated
+    updated,
+    migrated_legacy_servers: migratedLegacyServers,
+    backup_file: backupFile
   };
 }
 
@@ -867,7 +920,9 @@ function installExternalMcpConfigs(options = {}) {
         file: target,
         server: merged.server,
         created: !existed,
-        updated: merged.updated
+        updated: merged.updated,
+        migrated_legacy_servers: merged.migrated_legacy_servers,
+        backup_file: merged.backup_file
       });
     } catch (error) {
       skipped.push({
@@ -881,23 +936,28 @@ function installExternalMcpConfigs(options = {}) {
 
 function getKnownExternalSkillBaseDirsByAgent() {
   const home = os.homedir();
-  const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
-  const traeDirNames = dedupeLower([
+  const appBases = getExternalAppSupportBaseDirs();
+  const traeDirNames = [
     "Trae",
     "Trae CN",
     "TraeCN",
     "trae-cn",
-    "trae_cn",
-    ...discoverAppDataDirsByPattern(appData, /^trae(?:[\s\-_]?cn)?$/i)
-  ]);
-  const traeSkillDirs = traeDirNames.map((dir) => path.join(appData, dir, "User", "skills"));
+    "trae_cn"
+  ];
+  const traeSkillDirs = buildAppUserPaths({ dirNames: traeDirNames, tail: ["skills"] });
+  const cursorSkillDirs = appBases.map((baseDir) => path.join(baseDir, "Cursor", "User", "skills"));
+  const openClawSkillDirs = appBases.map((baseDir) => path.join(baseDir, "OpenClaw", "User", "skills"));
   return {
-    cursor: [path.join(home, ".cursor", "skills"), path.join(appData, "Cursor", "User", "skills")],
+    cursor: [path.join(home, ".cursor", "skills"), ...cursorSkillDirs],
     trae: [path.join(home, ".trae", "skills"), path.join(home, ".trae-cn", "skills"), ...traeSkillDirs],
     "trae-cn": [path.join(home, ".trae-cn", "skills"), path.join(home, ".trae", "skills"), ...traeSkillDirs],
     claude: [path.join(home, ".claude", "skills")],
-    openclaw: [path.join(home, ".openclaw", "skills"), path.join(appData, "OpenClaw", "User", "skills")]
+    openclaw: [path.join(home, ".openclaw", "skills"), ...openClawSkillDirs]
   };
+}
+
+function serializeMcpLaunchConfig(launchConfig) {
+  return JSON.stringify(launchConfig || {}).toLowerCase().replace(/\\/g, "/");
 }
 
 function isRecommendMcpLaunchConfig(launchConfig) {
@@ -913,14 +973,33 @@ function isRecommendMcpLaunchConfig(launchConfig) {
   );
 }
 
+function isBossMcpServerEntry(name, launchConfig) {
+  const lowerName = String(name || "").toLowerCase();
+  const serialized = serializeMcpLaunchConfig(launchConfig);
+  return (
+    /boss[-_\s]?(recommend|recruit|chat)/i.test(lowerName)
+    || serialized.includes(recommendMcpPackageName.toLowerCase())
+    || serialized.includes("@reconcrap/boss-recruit-mcp")
+    || serialized.includes("@reconcrap/boss-chat")
+    || serialized.includes("boss-recommend-mcp")
+    || serialized.includes("boss-recruit-mcp")
+    || serialized.includes("boss-chat")
+    || serialized.includes("boss recommend pipeline")
+    || serialized.includes("boss recruit pipeline")
+  );
+}
+
 function inspectMcpServerEntries(filePath) {
   if (!pathExists(filePath)) {
     return {
       exists: false,
       has_boss_recommend: false,
       has_boss_recruit: false,
+      has_boss_chat: false,
       recommend_server_names: [],
-      recruit_server_names: []
+      recruit_server_names: [],
+      chat_server_names: [],
+      boss_server_names: []
     };
   }
   const parsed = readJsonObjectFileSafe(filePath);
@@ -929,8 +1008,13 @@ function inspectMcpServerEntries(filePath) {
     : {};
   const recommendNames = [];
   const recruitNames = [];
+  const chatNames = [];
+  const bossNames = [];
   for (const [name, config] of Object.entries(servers)) {
     const lowerName = String(name || "").toLowerCase();
+    if (isBossMcpServerEntry(name, config)) {
+      bossNames.push(name);
+    }
     if (isRecommendMcpLaunchConfig(config) || lowerName.includes("boss-recommend")) {
       recommendNames.push(name);
     }
@@ -942,13 +1026,23 @@ function inspectMcpServerEntries(filePath) {
     ) {
       recruitNames.push(name);
     }
+    if (
+      lowerName.includes("boss-chat")
+      || serialized.includes("@reconcrap/boss-chat")
+      || serialized.includes("boss-chat")
+    ) {
+      chatNames.push(name);
+    }
   }
   return {
     exists: true,
     has_boss_recommend: recommendNames.length > 0,
     has_boss_recruit: recruitNames.length > 0,
+    has_boss_chat: chatNames.length > 0,
     recommend_server_names: recommendNames,
-    recruit_server_names: recruitNames
+    recruit_server_names: recruitNames,
+    chat_server_names: chatNames,
+    boss_server_names: bossNames
   };
 }
 
@@ -972,15 +1066,39 @@ function mirrorSkillToExternalDirs(options = {}) {
     for (const bundledSkillName of bundledSkillNames) {
       try {
         const targetDir = path.join(baseDir, bundledSkillName);
+        const legacyBeforeCopy = isLegacyBossSkillDir(targetDir);
         ensureDir(path.dirname(targetDir));
         fs.cpSync(getSkillSourceDir(bundledSkillName), targetDir, { recursive: true, force: true });
-        mirrored.push({ base_dir: baseDir, target_dir: targetDir, skill: bundledSkillName });
+        fs.writeFileSync(path.join(targetDir, ".installed-version"), `${packageVersion}\n`, "utf8");
+        mirrored.push({
+          base_dir: baseDir,
+          target_dir: targetDir,
+          skill: bundledSkillName,
+          replaced_legacy: legacyBeforeCopy
+        });
       } catch (error) {
         skipped.push({ base_dir: baseDir, skill: bundledSkillName, reason: error.message });
       }
     }
   }
   return { baseDirs, mirrored, skipped };
+}
+
+function isLegacyBossSkillDir(targetDir) {
+  const skillFile = path.join(targetDir, "SKILL.md");
+  if (!pathExists(skillFile)) return false;
+  try {
+    const content = fs.readFileSync(skillFile, "utf8").toLowerCase();
+    return (
+      content.includes("@reconcrap/boss-recruit-mcp")
+      || content.includes("@reconcrap/boss-chat")
+      || content.includes("boss-screen-cli")
+      || content.includes(`runtime.${"evaluate"}`)
+      || content.includes("page js")
+    );
+  } catch {
+    return false;
+  }
 }
 
 function syncSkillAssets(options = {}) {
@@ -2180,8 +2298,8 @@ function printHelp() {
   console.log("  boss-recommend-mcp run          Disabled until the one-shot CLI has a CDP-only async replacement");
   console.log("  boss-recommend-mcp list-jobs    CDP-only list of exact recommend job names for cron/one-shot inputs");
   console.log("  boss-recommend-mcp chat <subcommand>  Run CDP-only boss-chat health/prepare/status commands");
-  console.log("  boss-recommend-mcp install      Install skill/MCP templates and auto-init screening-config.json (supports --agent trae-cn/cursor/...)");
-  console.log("  boss-recommend-mcp install-skill Install bundled Codex skills");
+  console.log("  boss-recommend-mcp install      Install/migrate skills and MCP configs; replaces legacy Boss MCP routes (supports --agent trae-cn/openclaw/...)");
+  console.log("  boss-recommend-mcp install-skill Install bundled Codex skills (recommend/recruit/chat)");
   console.log("  boss-recommend-mcp init-config  Create screening-config.json if missing (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp config set   Write baseUrl/apiKey/model (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
@@ -2257,7 +2375,14 @@ async function installAll(options = {}) {
     console.log(`Auto-configured external MCP files: ${externalMcpResult.applied.length}`);
     for (const item of externalMcpResult.applied) {
       const action = item.created ? "created" : item.updated ? "updated" : "unchanged";
-      console.log(`- ${item.file} (${action})`);
+      const migrated = Array.isArray(item.migrated_legacy_servers) && item.migrated_legacy_servers.length > 0
+        ? `; migrated legacy servers: ${item.migrated_legacy_servers.join(", ")}`
+        : "";
+      const backup = item.backup_file ? `; backup: ${item.backup_file}` : "";
+      console.log(`- ${item.file} (${action}${migrated}${backup})`);
+    }
+    for (const item of externalMcpResult.skipped) {
+      console.warn(`External MCP warning: ${item.file} -> ${item.reason}`);
     }
   } else {
     console.log("No external MCP config target detected. Set BOSS_RECOMMEND_MCP_CONFIG_TARGETS to auto-configure custom agents.");
@@ -2265,7 +2390,10 @@ async function installAll(options = {}) {
   if (externalSkillResult.baseDirs.length > 0) {
     console.log(`Mirrored skill to external dirs: ${externalSkillResult.mirrored.length}`);
     for (const item of externalSkillResult.mirrored) {
-      console.log(`- ${item.target_dir}`);
+      console.log(`- ${item.target_dir}${item.replaced_legacy ? " (replaced legacy skill)" : ""}`);
+    }
+    for (const item of externalSkillResult.skipped) {
+      console.warn(`External skill warning: ${item.base_dir} / ${item.skill} -> ${item.reason}`);
     }
   } else {
     console.log("No external skill dir detected. Set BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS to mirror skill for non-Codex agents.");
@@ -2635,8 +2763,10 @@ export const __testables = {
   getBossChatCliRunTarget,
   getDefaultMcpPackageSpecifier,
   getRunFollowUp,
+  inspectMcpServerEntries,
   installSkill,
   isInstalledPackageRoot,
+  mergeMcpServerConfigFile,
   resolveBossChatRuntimeLayout: resolveCdpBossChatRuntimeLayout,
   runBossChatCliCommand,
   runPipelineOnce

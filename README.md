@@ -85,6 +85,8 @@ boss-recommend-mcp list-jobs --slow-live --port 9222
 - 页面就绪（已登录且在 recommend 页）后，会先提取岗位栏全部岗位并要求用户确认本次岗位；确认后先点击岗位，再执行 search/screen
 - 在真正开始 search/screen 前，会进行最后一轮全参数总确认（岗位 + 全部筛选参数 + criteria + target_count + post_action + max_greet_count）
 - npm 全局安装后会自动执行 install：生成 skill、导出 MCP 模板，并自动尝试写入已检测到的外部 agent MCP 配置（含 Trae / trae-cn / Cursor / Claude / OpenClaw）
+- 2.x installer 会迁移已存在的 legacy Boss MCP 配置：把 `boss-recommend` 指向统一 `@reconcrap/boss-recommend-mcp`，并从同一个 `mcp.json` 中移除旧 `boss-recruit-mcp` / standalone `boss-chat` / 本地 legacy Boss 路径；写入前会生成 `.boss-mcp-migration-*.bak` 备份
+- 2.x installer 会刷新外部 agent skills：`boss-recommend-pipeline`、`boss-recruit-pipeline`、`boss-chat` 都来自当前包，旧 recruit/chat skill 会被覆盖为统一 MCP 路由
 - npm / npx 安装后会自动初始化 `screening-config.json` 模板（优先写入 workspace 的 `config/`，不可写时回退到用户目录）
 - npm 安装流程会预创建运行目录（跨平台）：`~/.boss-recommend-mcp`、`~/.boss-recommend-mcp/runs`、`~/.boss-recommend-mcp/boss-chat` 及其 `logs/runs/profiles/reports/artifacts/state`
 - `post_action` 必须在每次完整运行开始时确认一次
@@ -124,6 +126,37 @@ git clone https://github.com/reconcrap-cpu/boss-recommend-mcp.git
 cd boss-recommend-mcp
 npm install
 node src/cli.js start
+```
+
+### 迁移 legacy MCP / skills
+
+全局 npm 安装会自动运行 `boss-recommend-mcp install`。该安装器会在 Windows 和 macOS 上自动检测 Trae / Trae CN / OpenClaw 的常见配置目录：
+
+- Windows: `%APPDATA%\Trae*\User\mcp.json`、`%USERPROFILE%\.trae*\mcp.json`、`%USERPROFILE%\.openclaw\mcp.json`、`%APPDATA%\OpenClaw\User\mcp.json`
+- macOS: `~/Library/Application Support/Trae*/User/mcp.json`、`~/.trae*/mcp.json`、`~/.openclaw/mcp.json`、`~/Library/Application Support/OpenClaw/User/mcp.json`
+
+如果检测到 legacy Boss server entries，installer 会：
+
+- 保留非 Boss MCP server。
+- 写入统一 server：`boss-recommend -> npx -y @reconcrap/boss-recommend-mcp@<installed-version> start`
+- 从同一个 `mcp.json` 删除旧 `boss-recruit-mcp`、standalone `boss-chat`、旧本地 Boss repo 路径，避免 agent 继续调用 legacy 包。
+- 在原文件旁生成 `mcp.json.boss-mcp-migration-*.bak`。
+- 同步外部 skills 目录里的 `boss-recommend-pipeline`、`boss-recruit-pipeline`、`boss-chat`。
+
+手动指定 agent：
+
+```bash
+boss-recommend-mcp install --agent trae-cn
+boss-recommend-mcp install --agent openclaw
+boss-recommend-mcp doctor --agent trae-cn
+boss-recommend-mcp doctor --agent openclaw
+```
+
+自定义路径：
+
+```bash
+BOSS_RECOMMEND_MCP_CONFIG_TARGETS="/path/to/mcp.json" boss-recommend-mcp install
+BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS="/path/to/skills" boss-recommend-mcp install
 ```
 
 可选环境变量（用于跨 agent 自动配置）：

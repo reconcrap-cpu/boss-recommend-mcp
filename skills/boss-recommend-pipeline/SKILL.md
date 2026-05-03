@@ -7,20 +7,20 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 ## Goal
 
-当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`，并按“两阶段确认 -> 页面就绪 -> 岗位确认 -> 最终确认 -> 执行”的顺序完成。若用户还要求筛完后自动进入聊天页 follow-up，则必须把 chat 要求放进同一个 recommend run 的 `follow_up.chat`，不要要求单独再安装 `boss-chat`。
+当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`，并按“两阶段确认 -> 页面就绪 -> 岗位确认 -> 最终确认 -> 执行”的顺序完成。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
 
 ## Hard Rules (Must Follow)
 
 - **路由**
   - 语义是推荐页（`recommend/推荐页/recommend page//web/chat/recommend`）时，只能走本 skill。
-  - 语义是“推荐页找人 + 结束后沟通/聊天”时，仍然只能走本 skill；必须通过 `follow_up.chat` 挂到同一个 recommend run。
+  - 语义是“推荐页找人 + 结束后沟通/聊天”时，先完成 recommend run；不得配置 `follow_up.chat`，后续聊天任务必须显式交给 `boss-chat`。
   - 只有用户**明确**说搜索页（`search/搜索页//web/chat/search`）时，才可转 `boss-recruit-pipeline`。
   - recommend 失败时（如 `JOB_TRIGGER_NOT_FOUND/NO_RECOMMEND_IFRAME/BOSS_LOGIN_REQUIRED`）禁止降级到 recruit；先修 recommend 页面就绪/登录态。
 
 - **确认不可代填（强制）**
   - 禁止 agent 自行“设置合理参数”并代替用户确认。
   - 禁止在用户未明确回复前，把任意 `*_confirmed` 字段设为 `true`。
-  - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job/follow_up.chat.*`。
+  - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job`。
   - 若工具返回 `pending_questions`，必须逐项向用户提问并等待用户回复；不得跳过提问直接执行。
 
 - **岗位确认时机**
@@ -59,27 +59,16 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 必须确认：
 
 - `job`（来自 `job_options`，必须全量展示）
-- `final_review`（岗位 + 全参数总确认；若有 `follow_up.chat`，必须把 chat summary 一并展示）
+- `final_review`（岗位 + 全参数总确认）
 
-## Follow-up Chat
+## Chat Handoff
 
-当用户要求“推荐页跑完后自动开始聊天页任务”时：
+当用户要求“推荐页跑完后继续聊天页任务”时：
 
-- 仍然只走 `start_recommend_pipeline_run`
-- 把 chat 配置放入顶层 `follow_up.chat`
-- `follow_up.chat` 必填：
-  - `criteria`
-  - `start_from`: `unread|all`
-  - `target_count`
-- `follow_up.chat` 可选：
-  - `greeting_text`（兼容 `greetingText`，自定义首条打招呼消息）
-  - `profile`（默认 `default`）
-  - `dry_run/no_state/safe_pacing/batch_rest_enabled`
-- `greeting_text` 未传时，boss-chat 会自动按默认优先级回退：本次显式值 > profile 历史值 > 内置默认招呼语
-- `job` / `port` 继承 recommend run 上下文；不要单独向用户再要一份
-- LLM 配置固定复用 recommend 的 `screening-config.json`；不要单独向用户再要 `baseUrl/apiKey/model`
-- 缺少 `follow_up.chat` 必填项时，按 `pending_questions` 补缺口；不要额外发起一轮独立的 chat 确认流程
-- 不允许提前调用 `start_boss_chat_run`；必须等 recommend run 完成并由 `follow_up.chat` 自动衔接
+- 本次 recommend run 只提交 recommend 参数，不要写 `follow_up.chat`。
+- recommend 完成并由用户确认要继续后，切换到 `boss-chat` skill。
+- `boss-chat` 会重新调用 `prepare_boss_chat_run` 获取聊天页岗位列表，并显式确认 `job/start_from/target_count/criteria`。
+- 不得在 recommend run 尚未完成时并行启动 `start_boss_chat_run`。
 
 ## Closed vs Open Questions
 
@@ -104,7 +93,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - 关键输入：
   - `confirmation`：`page_confirmed/page_value/filters_confirmed/school_tag_confirmed.../job_confirmed/job_value/final_confirmed`
   - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/criteria/job/target_count/post_action/max_greet_count`
-  - `follow_up.chat`：仅在“recommend 完成后自动进入 boss-chat”场景传入
+  - 不要传 `follow_up.chat`；该路径属于 legacy-only 行为
 
 最小策略：
 
@@ -116,16 +105,13 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 ## Async Run Policy
 
 - 用户未明确要求“持续跟进”时，不自动 `sleep + get_recommend_pipeline_run`。
-- 若 run 已进入 `chat_followup`，默认也不得自动轮询子 chat 状态；除非用户明确指定轮询频率/间隔。
 - 用户要求查进度时，再用 `get_recommend_pipeline_run`。
 - **长任务轮询节奏（强制）**：
-  - 推荐+聊天联动任务可能运行数小时，禁止高频轮询。
+  - 推荐任务可能运行数小时，禁止高频轮询。
   - 默认最小轮询间隔为 **30 分钟**（除非用户明确要求更频繁）。
   - 若刚启动 run（拿到 `ACCEPTED + run_id`），不得立即进入连续轮询。
 - `pause/resume/cancel` 必须复用同一 `run_id`，不要重复 `start`。
-- **完成后衔接（强制）**：
-  - 若本次 run 已带 `follow_up.chat`：chat 由同一 run 自动衔接，禁止再单独重复启动 chat run。
-  - 若用户手动触发 `get_recommend_pipeline_run` 且发现 recommend 已完成、而当前会话目标是“继续聊天沟通”且尚未启动 chat：应立即启动 chat（无需等待下一轮 30 分钟轮询）。
+- **完成后衔接（强制）**：若用户手动触发 `get_recommend_pipeline_run` 且发现 recommend 已完成、而当前会话目标是“继续聊天沟通”且尚未启动 chat：切换到 `boss-chat` 并重新走 chat-only 参数确认。
 
 ## Preflight and Recovery
 
@@ -150,7 +136,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 MCP 不可用时：
 
-`npx -y @reconcrap/boss-recommend-mcp@latest run --instruction "..." [--confirmation-json '{...}'] [--overrides-json '{...}'] [--follow-up-json '{...}']`
+`npx -y @reconcrap/boss-recommend-mcp@latest run --instruction "..." [--confirmation-json '{...}'] [--overrides-json '{...}']`
 
 禁止错误回退：
 
