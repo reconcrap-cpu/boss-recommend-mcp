@@ -308,8 +308,15 @@ function ensureChatRunArtifacts(snapshot) {
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  if (summary) {
-    const rows = Array.isArray(summary.results) ? summary.results : [];
+  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const artifactSummary = summary || (checkpointResults.length ? {
+    domain: "chat",
+    partial: true,
+    partial_reason: snapshot?.status || snapshot?.state || "non_terminal",
+    results: checkpointResults
+  } : null);
+  if (artifactSummary) {
+    const rows = Array.isArray(artifactSummary.results) ? artifactSummary.results : [];
     writeChatLegacyCsvAtomic(artifacts.output_csv, rows, snapshot, meta);
     writeJsonAtomic(artifacts.report_json, {
       run_id: snapshot.runId || snapshot.run_id,
@@ -318,7 +325,7 @@ function ensureChatRunArtifacts(snapshot) {
       progress: snapshot.progress || {},
       context: snapshot.context || {},
       checkpoint,
-      summary,
+      summary: artifactSummary,
       generated_at: new Date().toISOString()
     });
     if (meta) {
@@ -335,6 +342,12 @@ function buildLegacyChatResult(snapshot) {
   const artifacts = ensureChatRunArtifacts(snapshot);
   const meta = getChatRunMeta(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const checkpoint = snapshot.checkpoint && typeof snapshot.checkpoint === "object" ? snapshot.checkpoint : {};
+  const resultRows = Array.isArray(summary?.results)
+    ? summary.results
+    : Array.isArray(checkpoint.results)
+      ? checkpoint.results
+      : [];
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   return {
     run_id: snapshot.runId,
@@ -358,7 +371,7 @@ function buildLegacyChatResult(snapshot) {
     completed_at: snapshot.completedAt || null,
     duration_sec: secondsBetween(snapshot.startedAt, snapshot.completedAt),
     error: snapshot.error || null,
-    results: Array.isArray(summary?.results) ? summary.results : []
+    results: resultRows
   };
 }
 
@@ -788,16 +801,31 @@ function shouldRequestChatResume(args = {}) {
   );
 }
 
-function shouldUseChatLlm(args = {}, shouldRequestResume = false) {
-  if (args.use_llm === false) return false;
-  return (
-    args.use_llm === true
-    || shouldRequestResume
-    || parseNonNegativeInteger(args.detail_limit, 0) > 0
-  );
+function isDebugTestMode(args = {}) {
+  return args.debug_test_mode === true || args.allow_debug_test_mode === true;
 }
 
-function getRunOptions(args, normalized, session, { workspaceRoot = "" } = {}) {
+function normalizeScreeningModeArg(args = {}) {
+  const raw = normalizeText(args.screening_mode || args.screeningMode || "");
+  if (args.use_llm === false) return "deterministic";
+  return ["deterministic", "local", "local_scorer"].includes(raw.toLowerCase())
+    ? "deterministic"
+    : "llm";
+}
+
+function collectChatDebugTestOptions(args = {}) {
+  const reasons = [];
+  if (normalizeScreeningModeArg(args) === "deterministic") reasons.push("deterministic_screening");
+  if (parseNonNegativeInteger(args.detail_limit, null) === 0) reasons.push("detail_limit=0");
+  if (args.dry_run === true || args.dry_run_request_cv === true) reasons.push("dry_run_request_cv");
+  return reasons;
+}
+
+function shouldUseChatLlm(args = {}) {
+  return normalizeScreeningModeArg(args) !== "deterministic";
+}
+
+function getRunOptions(args, normalized, session, { workspaceRoot = "", configResolution = null } = {}) {
   const slowLive = args.slow_live === true;
   const isAllTarget = normalized.publicTargetCount === "all";
   const processedLimit = parsePositiveInteger(
@@ -805,8 +833,8 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "" } = {}) {
     isAllTarget ? CHAT_ALL_MAX_CANDIDATES : CHAT_ALL_MAX_CANDIDATES
   );
   const shouldRequestResume = shouldRequestChatResume(args);
-  const useLlm = shouldUseChatLlm(args, shouldRequestResume);
-  const configResolution = useLlm ? resolveBossScreeningConfig(workspaceRoot) : { ok: false };
+  const useLlm = shouldUseChatLlm(args);
+  const resolvedConfig = configResolution || (useLlm ? resolveBossScreeningConfig(workspaceRoot) : { ok: false });
   return {
     client: session.client,
     targetUrl: CHAT_TARGET_URL,
@@ -832,12 +860,13 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "" } = {}) {
     resumeDomTimeoutMs: slowLive ? 120000 : 60000,
     maxImagePages: parsePositiveInteger(args.max_image_pages, 8),
     imageWheelDeltaY: parsePositiveInteger(args.image_wheel_delta_y, 650),
-    llmConfig: configResolution.ok ? {
-      ...configResolution.config
+    llmConfig: resolvedConfig.ok ? {
+      ...resolvedConfig.config
     } : null,
     llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
     llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
     llmImageDetail: normalizeText(args.llm_image_detail) || "high",
+    screeningMode: normalizeScreeningModeArg(args),
     listMaxScrolls: parsePositiveInteger(args.list_max_scrolls, 200),
     listStableSignatureLimit: parsePositiveInteger(args.list_stable_signature_limit, 2),
     listWheelDeltaY: parsePositiveInteger(args.list_wheel_delta_y, 850),
@@ -905,7 +934,19 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) 
   }
 
   const shouldRequestResume = shouldRequestChatResume(args);
-  const useLlm = shouldUseChatLlm(args, shouldRequestResume);
+  const useLlm = shouldUseChatLlm(args);
+  const debugTestOptions = collectChatDebugTestOptions(args);
+  if (debugTestOptions.length && !isDebugTestMode(args)) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "DEBUG_TEST_MODE_REQUIRED",
+        message: `这些参数属于调试/测试路径，正式 live run 不会默认启用：${debugTestOptions.join(", ")}。如确需测试，请显式传 debug_test_mode=true。`,
+        retryable: false
+      },
+      debug_test_options: debugTestOptions
+    };
+  }
   const configResolution = useLlm ? resolveBossScreeningConfig(workspaceRoot) : null;
   if (useLlm && !configResolution?.ok) {
     return {
@@ -948,7 +989,7 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "" } = {}) 
 
   let started;
   try {
-    started = chatRunService.startChatRun(getRunOptions(args, normalized, session, { workspaceRoot }));
+    started = chatRunService.startChatRun(getRunOptions(args, normalized, session, { workspaceRoot, configResolution }));
   } catch (error) {
     await session.close?.();
     return {

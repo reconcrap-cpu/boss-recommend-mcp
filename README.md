@@ -98,6 +98,8 @@ boss-recommend-mcp list-jobs --slow-live --port 9222
 - 不会对每位候选人重复确认
 - 推荐页详情处理完成后，会强制关闭详情页并确认已关闭
 - 简历提取优先使用 Network 响应；没有可解析 Network CV 时，回退到完整滚动截图序列再交给多模态模型判断
+- recommend / search / chat 正式运行默认全部使用 `screening-config.json` 配置的 LLM 筛选；deterministic/local scorer 只保留给明确测试场景，必须显式传 `debug_test_mode=true` 且 `screening_mode=deterministic` 或 `use_llm=false`。
+- `detail_limit=0`、`no_filter`、`filter_enabled=false`、后置动作 dry-run、chat 求简历 dry-run 等调试路径不会在正式 live run 默认启用；需要测试时必须显式传 `debug_test_mode=true`。
 - 提供显式运维自愈工具：只在手动调用 `run_recommend_self_heal` 时运行，不会接入正常 run / doctor / preflight 自动链路
 - 运行前会自动做依赖体检（Node.js、Python、Pillow、`chrome-remote-interface`、`ws`），缺失时会在 `doctor` 与流水线失败诊断中明确提示
 - 若 preflight 失败，返回 `diagnostics.recovery`（含有序修复步骤与 `agent_prompt`），可直接交给 AI agent 自动按顺序安装依赖

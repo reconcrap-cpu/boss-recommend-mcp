@@ -58,7 +58,6 @@ function readyArgs(extra = {}) {
     start_from: "all",
     target_count: 3,
     criteria: "候选人具备算法、数据、机器学习或软件开发相关经历",
-    detail_limit: 0,
     delay_ms: 120,
     ...extra
   };
@@ -218,7 +217,9 @@ async function testChatAsyncPauseResumeCancel() {
     assert.equal(options.targetPassCount, 3);
     assert.equal(options.processUntilListEnd, false);
     assert.equal(options.maxCandidates, 100000);
-    assert.equal(options.detailLimit, 0);
+    assert.equal(options.detailLimit, 100000);
+    assert.equal(options.screeningMode, "llm");
+    assert.equal(options.llmConfig.apiKey, "sk-test-key");
     for (let index = 0; index < 4; index += 1) {
       await runControl.waitIfPaused();
       runControl.throwIfCanceled();

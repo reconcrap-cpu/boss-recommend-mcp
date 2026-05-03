@@ -1,6 +1,6 @@
 # Rewrite Status
 
-Last updated: 2026-05-03 20:30 Asia/Shanghai
+Last updated: 2026-05-03 21:52 Asia/Shanghai
 
 ## Current phase
 
@@ -1602,3 +1602,20 @@ Latest chat Phase 10 rerun: FAILED / STOPPED on 2026-05-03 08:26 Asia/Shanghai. 
 ## Next exact task
 
 Next task: run the remaining product polish/static package checks for the current dirty working tree before any next npm publish, then decide whether to publish the viewport-collapse guard as the next patch release. New Codex instances should start by reading this status, `docs/REWRITE_PLAN.md`, `docs/LIVE_TEST_MATRIX.md`, `docs/CDP_ONLY_CONTRACT.md`, and `docs/LEGACY_RUNTIME_INVENTORY.md`.
+## 2026-05-03 21:52 Asia/Shanghai - LLM-Default Screening Guard And CSV Artifact Fix
+
+- Current phase: Phase 10 hardening / Trae-CN regression follow-up.
+- Active workstream: shared screening defaults, debug/test fencing, and CSV auditability.
+- Status: live-verified for recommend smoke; dev-ready for shared search/chat MCP defaults pending the next full live domain runs.
+- Problem investigated: latest Trae-CN recommend run `mcp_recommend_mopsxj38_4345c11h` processed/greeted 19 candidates too quickly because recommend MCP was still using deterministic `screenCandidate()` instead of configured LLM screening. That canceled run did not write CSV because the artifact writer only emitted final CSV/report when `summary` existed.
+- Fix implemented: recommend, search/recruit, and chat MCP runs now default to LLM screening. Deterministic/local scorer is only reachable when the caller explicitly sets `debug_test_mode=true` plus `screening_mode=deterministic` or `use_llm=false`.
+- Debug/test guard: `detail_limit=0`, `allow_card_only_screening`, `no_filter`, `filter_enabled=false`, dry-run post actions, and chat dry-run CV request paths are rejected from normal MCP starts unless `debug_test_mode=true`.
+- Artifact fix: recommend/search/chat checkpoints now persist `results` after every candidate, and terminal/paused artifact writers can create partial CSV/report files from checkpointed rows when a run is canceled or fails before a final summary.
+- LLM CSV fix: legacy-compatible CSV rows now surface LLM `error` into the error columns and continue to store available provider reasoning/CoT/raw model output in `判断依据(CoT)`.
+- Live test date/time: 2026-05-03 21:51 Asia/Shanghai.
+- Chrome target used: `127.0.0.1:9222`, Boss recommend page.
+- Exact live command: `npm run live:recommend-mcp -- --slow-live --complete-without-cancel --target-count 1 --detail-limit 1 --delay-ms 0 --filter --job "算法工程师 23-27届实习/校招/早期职业 _ 杭州" --timeout-ms 600000 --save-report .live-artifacts\recommend-llm-default-csv-live.json`
+- Observed result: PASS; run `mcp_recommend_moptwzwz_9sbmo5dl` completed with `processed=1`, `screened=1`, `detail_opened=1`, `llm_screened=1`, `screening_mode=llm`, `llm_configured=true`, no `Runtime.*`.
+- CSV/report output: `C:\Users\yaolin\Desktop\screen_csv\mcp_recommend_moptwzwz_9sbmo5dl.results.csv` and `C:\Users\yaolin\Desktop\screen_csv\mcp_recommend_moptwzwz_9sbmo5dl.report.json`.
+- Remaining blocker: the original Trae-CN canceled run cannot be fully reconstructed because earlier code only checkpointed `last_candidate`; future canceled/failed runs will emit partial CSV from checkpointed `results`.
+- Next exact task: run full recommend/search/chat live gates after publishing the patch into the Trae-CN installed version.

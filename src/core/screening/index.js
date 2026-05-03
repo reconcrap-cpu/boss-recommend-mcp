@@ -1003,6 +1003,54 @@ export function screenCandidate(candidateInput, criteria = {}) {
   };
 }
 
+export function compactScreeningLlmResult(llmResult) {
+  if (!llmResult) return null;
+  return {
+    ok: Boolean(llmResult.ok),
+    provider: llmResult.provider || null,
+    passed: llmResult.passed,
+    cot: llmResult.cot || llmResult.decision_cot || "",
+    reasoning_content: llmResult.reasoning_content || "",
+    raw_model_output: llmResult.raw_model_output || "",
+    evidence_count: Array.isArray(llmResult.evidence) ? llmResult.evidence.length : 0,
+    usage: llmResult.usage || null,
+    finish_reason: llmResult.finish_reason || null,
+    image_input_count: llmResult.image_input_count || 0,
+    error: llmResult.error || null,
+    screened_at: llmResult.screened_at || null
+  };
+}
+
+export function llmResultToScreening(llmResult, candidate) {
+  return {
+    status: llmResult?.passed ? "pass" : "fail",
+    passed: Boolean(llmResult?.passed),
+    score: llmResult?.passed ? 100 : 0,
+    reasons: llmResult?.error ? ["llm_invalid_response"] : [],
+    candidate
+  };
+}
+
+export function isRecoverableLlmScreeningError(error) {
+  return /(?:LLM response missing boolean passed decision|LLM response was not valid JSON)/i
+    .test(String(error?.message || error || ""));
+}
+
+export function createFailedLlmScreeningResult(error) {
+  return {
+    ok: false,
+    passed: false,
+    reason: "",
+    evidence: [],
+    cot: "",
+    decision_cot: "",
+    reasoning_content: "",
+    raw_model_output: "",
+    error: error?.message || String(error || "unknown"),
+    screened_at: nowIso()
+  };
+}
+
 export function buildScreeningLlmMessages({
   candidate,
   criteria,

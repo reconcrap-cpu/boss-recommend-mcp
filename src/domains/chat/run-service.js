@@ -167,6 +167,17 @@ function createFailedLlmResult(error) {
   };
 }
 
+function normalizeScreeningMode(value) {
+  const normalized = String(value || "llm").trim().toLowerCase();
+  return ["deterministic", "local", "local_scorer"].includes(normalized)
+    ? "deterministic"
+    : "llm";
+}
+
+function createMissingLlmConfigResult() {
+  return createFailedLlmResult(new Error("LLM screening config is required for production chat runs"));
+}
+
 function createSkippedDetailResult(cardCandidate, reason, error = null) {
   return {
     candidate: cardCandidate,
@@ -334,7 +345,7 @@ export async function runChatWorkflow({
   maxCandidates = 5,
   targetPassCount = null,
   processUntilListEnd = false,
-  detailLimit = 0,
+  detailLimit = null,
   detailSource = "cascade",
   closeResume = true,
   requestResumeForPassed = false,
@@ -353,6 +364,7 @@ export async function runChatWorkflow({
   llmTimeoutMs = 120000,
   llmImageLimit = 8,
   llmImageDetail = "high",
+  screeningMode = "llm",
   listMaxScrolls = 20,
   listStableSignatureLimit = 2,
   listWheelDeltaY = 850,
@@ -361,12 +373,14 @@ export async function runChatWorkflow({
 } = {}, runControl) {
   if (!client) throw new Error("runChatWorkflow requires a guarded CDP client");
   const normalizedDetailSource = normalizeDetailSource(detailSource);
+  const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+  const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const processedLimit = Math.max(1, Number(maxCandidates) || 1);
   const passTarget = Number.isFinite(Number(targetPassCount)) && Number(targetPassCount) > 0
     ? Number(targetPassCount)
     : null;
   const normalizedStartFrom = normalizeText(startFrom).toLowerCase() === "unread" ? "unread" : "all";
-  const detailCountLimit = Math.max(0, Number(detailLimit) || 0);
+  const detailCountLimit = detailLimit == null ? processedLimit : Math.max(0, Number(detailLimit) || 0);
   const networkRecorder = detailCountLimit > 0
     ? createChatProfileNetworkRecorder(client)
     : null;
@@ -556,6 +570,7 @@ export async function runChatWorkflow({
     requested: 0,
     request_satisfied: 0,
     request_skipped: 0,
+    screening_mode: normalizedScreeningMode,
     unique_seen: compactInfiniteListState(listState).seen_count,
     scroll_count: 0,
     viewport_checks: viewportGuard.getStats().checks,
@@ -799,21 +814,23 @@ export async function runChatWorkflow({
                 imageEvidence
               });
               if (callLlmOnImage) {
-                if (!llmConfig) throw new Error("callLlmOnImage requires llmConfig");
                 detailStep = "llm_image_screening";
-                try {
-                  llmResult = await callScreeningLlm({
-                    candidate: detailResult.candidate,
-                    criteria,
-                    config: llmConfig,
-                    timeoutMs: llmTimeoutMs,
-                    imageEvidence,
-                    maxImages: llmImageLimit,
-                    imageDetail: llmImageDetail
-                  });
-                } catch (error) {
-                  if (!isRecoverableLlmScreeningError(error)) throw error;
-                  llmResult = createFailedLlmResult(error);
+                if (!llmConfig) {
+                  llmResult = createMissingLlmConfigResult();
+                } else {
+                  try {
+                    llmResult = await callScreeningLlm({
+                      candidate: detailResult.candidate,
+                      criteria,
+                      config: llmConfig,
+                      timeoutMs: llmTimeoutMs,
+                      imageEvidence,
+                      maxImages: llmImageLimit,
+                      imageDetail: llmImageDetail
+                    });
+                  } catch (error) {
+                    llmResult = createFailedLlmResult(error);
+                  }
                 }
               }
             } else {
@@ -838,21 +855,24 @@ export async function runChatWorkflow({
             });
           }
 
-          if (llmConfig && !llmResult) {
+          if (useLlmScreening && !llmResult) {
             detailStep = "llm_screening";
-            try {
-              llmResult = await callScreeningLlm({
-                candidate: detailResult.candidate,
-                criteria,
-                config: llmConfig,
-                timeoutMs: llmTimeoutMs,
-                imageEvidence,
-                maxImages: llmImageLimit,
-                imageDetail: llmImageDetail
-              });
-            } catch (error) {
-              if (!isRecoverableLlmScreeningError(error)) throw error;
-              llmResult = createFailedLlmResult(error);
+            if (!llmConfig) {
+              llmResult = createMissingLlmConfigResult();
+            } else {
+              try {
+                llmResult = await callScreeningLlm({
+                  candidate: detailResult.candidate,
+                  criteria,
+                  config: llmConfig,
+                  timeoutMs: llmTimeoutMs,
+                  imageEvidence,
+                  maxImages: llmImageLimit,
+                  imageDetail: llmImageDetail
+                });
+              } catch (error) {
+                llmResult = createFailedLlmResult(error);
+              }
             }
           }
 
@@ -901,6 +921,26 @@ export async function runChatWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("chat:screening");
+    let cardOnlyLlmResult = null;
+    if (useLlmScreening && !detailUnavailableReason && !detailResult?.llm_result) {
+      if (!llmConfig) {
+        cardOnlyLlmResult = createMissingLlmConfigResult();
+      } else {
+        try {
+          cardOnlyLlmResult = await callScreeningLlm({
+            candidate: screeningCandidate,
+            criteria,
+            config: llmConfig,
+            timeoutMs: llmTimeoutMs,
+            maxImages: llmImageLimit,
+            imageDetail: llmImageDetail
+          });
+        } catch (error) {
+          cardOnlyLlmResult = createFailedLlmResult(error);
+        }
+      }
+    }
+    const effectiveLlmResult = detailResult?.llm_result || cardOnlyLlmResult;
     const screening = detailUnavailableReason
       ? {
           status: "skip",
@@ -909,8 +949,8 @@ export async function runChatWorkflow({
           reasons: [detailUnavailableReason],
           candidate: screeningCandidate
         }
-      : detailResult?.llm_result
-        ? llmToScreening(detailResult.llm_result, screeningCandidate)
+      : useLlmScreening
+        ? llmToScreening(effectiveLlmResult, screeningCandidate)
         : screenCandidate(screeningCandidate, { criteria });
     let postAction = null;
     if (requestResumeForPassed && screening.passed) {
@@ -931,6 +971,7 @@ export async function runChatWorkflow({
       card_node_id: effectiveCardNodeId,
       candidate: compactCandidate(screeningCandidate),
       detail: compactDetail(detailResult),
+      llm_screening: detailResult ? null : compactLlmResult(cardOnlyLlmResult),
       screening: compactScreening(screening),
       post_action: postAction,
       pre_action_state: preActionState
@@ -951,7 +992,7 @@ export async function runChatWorkflow({
       processed: results.length,
       screened: results.length,
       detail_opened: results.filter(resultOpenedDetail).length,
-      llm_screened: results.filter((item) => item.detail?.llm_screening).length,
+      llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
       passed: results.filter((item) => item.screening.passed).length,
       requested: requestedCount,
       request_satisfied: requestSatisfiedCount,
@@ -966,6 +1007,7 @@ export async function runChatWorkflow({
       last_score: screening.score
     });
     runControl.checkpoint({
+      results,
       last_candidate: {
         id: screeningCandidate.id || null,
         key: candidateKey,
@@ -974,7 +1016,8 @@ export async function runChatWorkflow({
           status: screening.status,
           passed: screening.passed,
           score: screening.score
-        }
+        },
+        llm_screening: compactLlmResult(effectiveLlmResult)
       }
     });
 
@@ -1002,7 +1045,7 @@ export async function runChatWorkflow({
     processed: results.length,
     screened: results.length,
     detail_opened: results.filter(resultOpenedDetail).length,
-    llm_screened: results.filter((item) => item.detail?.llm_screening).length,
+    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
     passed: results.filter((item) => item.screening.passed).length,
     requested: requestedCount,
     request_satisfied: requestSatisfiedCount,
@@ -1027,7 +1070,7 @@ export function createChatRunService({
     maxCandidates = 5,
     targetPassCount = null,
     processUntilListEnd = false,
-    detailLimit = 0,
+    detailLimit = null,
     detailSource = "cascade",
     closeResume = true,
     requestResumeForPassed = false,
@@ -1046,6 +1089,7 @@ export function createChatRunService({
     llmTimeoutMs = 120000,
     llmImageLimit = 8,
     llmImageDetail = "high",
+    screeningMode = "llm",
     listMaxScrolls = 20,
     listStableSignatureLimit = 2,
     listWheelDeltaY = 850,
@@ -1055,6 +1099,9 @@ export function createChatRunService({
   } = {}) {
     if (!client) throw new Error("startChatRun requires a guarded CDP client");
     const normalizedDetailSource = normalizeDetailSource(detailSource);
+    const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+    const processedLimit = Math.max(1, Number(maxCandidates) || 1);
+    const normalizedDetailLimit = detailLimit == null ? processedLimit : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
       name,
       context: {
@@ -1066,11 +1113,16 @@ export function createChatRunService({
         max_candidates: maxCandidates,
         target_pass_count: targetPassCount,
         process_until_list_end: Boolean(processUntilListEnd),
-        detail_limit: detailLimit,
+        detail_limit: normalizedDetailLimit,
         detail_source: normalizedDetailSource,
         close_resume: closeResume,
         cv_acquisition_mode: cvAcquisitionMode,
         call_llm_on_image: Boolean(callLlmOnImage),
+        screening_mode: normalizedScreeningMode,
+        llm_configured: Boolean(llmConfig),
+        llm_timeout_ms: llmTimeoutMs,
+        llm_image_limit: llmImageLimit,
+        llm_image_detail: llmImageDetail,
         max_image_pages: maxImagePages,
         image_wheel_delta_y: imageWheelDeltaY,
         list_max_scrolls: listMaxScrolls,
@@ -1082,9 +1134,9 @@ export function createChatRunService({
       },
       progress: {
         card_count: 0,
-        target_count: targetPassCount || (processUntilListEnd ? "all" : Math.max(1, Number(maxCandidates) || 1)),
+        target_count: targetPassCount || (processUntilListEnd ? "all" : processedLimit),
         target_pass_count: targetPassCount,
-        processed_limit: Math.max(1, Number(maxCandidates) || 1),
+        processed_limit: processedLimit,
         processed: 0,
         screened: 0,
         detail_opened: 0,
@@ -1104,7 +1156,7 @@ export function createChatRunService({
         maxCandidates,
         targetPassCount,
         processUntilListEnd,
-        detailLimit,
+        detailLimit: normalizedDetailLimit,
         detailSource: normalizedDetailSource,
         closeResume,
         requestResumeForPassed,
@@ -1123,6 +1175,7 @@ export function createChatRunService({
         llmTimeoutMs,
         llmImageLimit,
         llmImageDetail,
+        screeningMode: normalizedScreeningMode,
         listMaxScrolls,
         listStableSignatureLimit,
         listWheelDeltaY,

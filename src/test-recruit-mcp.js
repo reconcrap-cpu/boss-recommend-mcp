@@ -64,7 +64,6 @@ function readyArgs(extra = {}) {
       filter_recent_viewed: false,
       target_count: 3
     },
-    detail_limit: 0,
     reset_search: false,
     ...extra
   };
@@ -127,12 +126,14 @@ async function testRecruitGateBeforeBrowserConnect() {
 
 async function testRecruitDefaultsUseScreeningConfig() {
   let connectOptions = null;
+  let observedOptions = null;
   installFakeConnector({
     onConnect(options) {
       connectOptions = options;
     }
   });
-  setRecruitMcpWorkflowForTests(async (_options, runControl) => {
+  setRecruitMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
     runControl.setPhase("recruit:test-config-port");
     runControl.updateProgress({ processed: 1, screened: 1, passed: 0 });
     return {
@@ -152,6 +153,11 @@ async function testRecruitDefaultsUseScreeningConfig() {
   assert.equal(payload.status, "COMPLETED");
   assert.equal(connectOptions.port, 9444);
   assert.equal(payload.chrome.port, 9444);
+  assert.equal(observedOptions.screeningMode, "llm");
+  assert.equal(observedOptions.detailLimit, 3);
+  assert.equal(observedOptions.llmConfig.apiKey, "sk-test-key");
+  assert.equal(observedOptions.llmConfig.baseUrl, "https://api.example.com/v1");
+  assert.equal(observedOptions.llmConfig.model, "gpt-4.1-mini");
 }
 
 async function testRecruitSyncRun() {

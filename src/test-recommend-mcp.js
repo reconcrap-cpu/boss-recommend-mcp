@@ -87,7 +87,7 @@ function readyArgs(extra = {}) {
       job: "算法工程师"
     },
     delay_ms: 120,
-    no_filter: true,
+    no_filter: false,
     ...extra
   };
 }
@@ -271,17 +271,33 @@ async function testRecommendDetailLimitDefaultsToTargetCount() {
 }
 
 async function testRecommendDetailLimitZeroRequiresDebugFlag() {
-  let observedOptions = await observeRecommendWorkflowOptions(readyArgs({
+  const blocked = await callTool(TOOL_START, readyArgs({
     detail_limit: 0
   }), 13);
-  assert.equal(observedOptions.detailLimit, 3);
+  assert.equal(blocked.status, "FAILED");
+  assert.equal(blocked.error.code, "DEBUG_TEST_MODE_REQUIRED");
 
   resetRecommendMcpStateForTests();
-  observedOptions = await observeRecommendWorkflowOptions(readyArgs({
+  const observedOptions = await observeRecommendWorkflowOptions(readyArgs({
     detail_limit: 0,
+    debug_test_mode: true,
     allow_card_only_screening: true
   }), 14);
   assert.equal(observedOptions.detailLimit, 0);
+}
+
+async function testRecommendLoadsLlmConfigByDefault() {
+  const observedOptions = await observeRecommendWorkflowOptions(readyArgs({ delay_ms: 0 }), 15);
+  assert.equal(observedOptions.screeningMode, "llm");
+  assert.equal(observedOptions.llmConfig.apiKey, "sk-test-key");
+  assert.equal(observedOptions.llmConfig.baseUrl, "https://api.example.com/v1");
+  assert.equal(observedOptions.llmConfig.model, "gpt-4.1-mini");
+  assert.equal(observedOptions.llmConfig.llmThinkingLevel, "low");
+  assert.equal(observedOptions.llmConfig.outputDir, outputDirForTests());
+}
+
+function outputDirForTests() {
+  return process.env.TEST_BOSS_OUTPUT_DIR;
 }
 
 async function testRecommendAsyncPauseResumeCancel() {
@@ -413,6 +429,7 @@ async function testRecommendPostActionWiresIntoRunService() {
 
   const base = readyArgs();
   const started = await callTool(TOOL_START, readyArgs({
+    debug_test_mode: true,
     dry_run_post_action: true,
     confirmation: {
       ...base.confirmation,
@@ -541,10 +558,12 @@ async function testRecommendArtifactsUseConfiguredOutputDir(outputDir) {
 async function main() {
   const previousHome = process.env.BOSS_RECOMMEND_HOME;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+  const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-mcp-test-"));
   const outputDir = path.join(tempHome, "configured-output");
   const configPath = path.join(tempHome, "screening-config.json");
   process.env.BOSS_RECOMMEND_HOME = tempHome;
+  process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
   fs.writeFileSync(configPath, JSON.stringify({
     baseUrl: "https://api.example.com/v1",
     apiKey: "sk-test-key",
@@ -566,6 +585,8 @@ async function main() {
     await testRecommendDetailLimitDefaultsToTargetCount();
     resetRecommendMcpStateForTests();
     await testRecommendDetailLimitZeroRequiresDebugFlag();
+    resetRecommendMcpStateForTests();
+    await testRecommendLoadsLlmConfigByDefault();
     resetRecommendMcpStateForTests();
     await testRecommendAsyncPauseResumeCancel();
     resetRecommendMcpStateForTests();
@@ -590,6 +611,11 @@ async function main() {
       delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
     } else {
       process.env.BOSS_RECOMMEND_SCREEN_CONFIG = previousScreenConfig;
+    }
+    if (previousOutputDir === undefined) {
+      delete process.env.TEST_BOSS_OUTPUT_DIR;
+    } else {
+      process.env.TEST_BOSS_OUTPUT_DIR = previousOutputDir;
     }
     fs.rmSync(tempHome, { recursive: true, force: true });
   }

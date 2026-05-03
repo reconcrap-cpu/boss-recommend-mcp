@@ -21,7 +21,13 @@ import {
   resetInfiniteListForRefreshRound
 } from "../../core/infinite-list/index.js";
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
-import { screenCandidate } from "../../core/screening/index.js";
+import {
+  callScreeningLlm,
+  compactScreeningLlmResult,
+  createFailedLlmScreeningResult,
+  llmResultToScreening,
+  screenCandidate
+} from "../../core/screening/index.js";
 import {
   closeRecommendDetail,
   createRecommendDetailNetworkRecorder,
@@ -165,8 +171,20 @@ function compactDetail(detailResult) {
     parsed_network_profile_count: detailResult.parsed_network_profiles?.filter((item) => item.ok).length || 0,
     cv_acquisition: detailResult.cv_acquisition || null,
     image_evidence: summarizeImageEvidence(detailResult.image_evidence),
+    llm_screening: compactScreeningLlmResult(detailResult.llm_result),
     close_result: detailResult.close_result
   };
+}
+
+function normalizeScreeningMode(value) {
+  const normalized = String(value || "llm").trim().toLowerCase();
+  return ["deterministic", "local", "local_scorer"].includes(normalized)
+    ? "deterministic"
+    : "llm";
+}
+
+function createMissingLlmConfigResult() {
+  return createFailedLlmScreeningResult(new Error("LLM screening config is required for production recommend runs"));
 }
 
 function compactActionDiscovery(discovery) {
@@ -354,13 +372,20 @@ export async function runRecommendWorkflow({
   executePostAction = true,
   actionTimeoutMs = 8000,
   actionIntervalMs = 500,
-  actionAfterClickDelayMs = 900
+  actionAfterClickDelayMs = 900,
+  screeningMode = "llm",
+  llmConfig = null,
+  llmTimeoutMs = 120000,
+  llmImageLimit = 8,
+  llmImageDetail = "high"
 } = {}, runControl) {
   if (!client) throw new Error("runRecommendWorkflow requires a guarded CDP client");
   const normalizedFilter = normalizeFilter(filter);
   const normalizedPostAction = normalizeRecommendPostAction(postAction) || "none";
   const requestedPageScope = normalizeRecommendPageScope(pageScope) || "recommend";
   const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
+  const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+  const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const postActionEnabled = normalizedPostAction !== "none";
   const limit = Math.max(1, Number(maxCandidates) || 1);
   const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
@@ -484,6 +509,8 @@ export async function runRecommendWorkflow({
     passed: 0,
     greet_count: 0,
     post_action_clicked: 0,
+    screening_mode: normalizedScreeningMode,
+    llm_screened: 0,
     unique_seen: compactInfiniteListState(listState).seen_count,
     scroll_count: 0,
     refresh_rounds: 0,
@@ -562,6 +589,7 @@ export async function runRecommendWorkflow({
           screened: results.length,
           detail_opened: results.filter((item) => item.detail).length,
           passed: results.filter((item) => item.screening.passed).length,
+          llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
           unique_seen: compactInfiniteListState(listState).seen_count,
           scroll_count: compactInfiniteListState(listState).scroll_count,
           refresh_rounds: refreshRounds,
@@ -696,7 +724,30 @@ export async function runRecommendWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recommend:screening");
-    const screening = screenCandidate(screeningCandidate, { criteria });
+    let llmResult = null;
+    if (useLlmScreening) {
+      if (!llmConfig) {
+        llmResult = createMissingLlmConfigResult();
+      } else {
+        try {
+          llmResult = await callScreeningLlm({
+            candidate: screeningCandidate,
+            criteria,
+            config: llmConfig,
+            timeoutMs: llmTimeoutMs,
+            imageEvidence: detailResult?.image_evidence || null,
+            maxImages: llmImageLimit,
+            imageDetail: llmImageDetail
+          });
+        } catch (error) {
+          llmResult = createFailedLlmScreeningResult(error);
+        }
+      }
+      if (detailResult) detailResult.llm_result = llmResult;
+    }
+    const screening = useLlmScreening
+      ? llmResultToScreening(llmResult, screeningCandidate)
+      : screenCandidate(screeningCandidate, { criteria });
     let actionDiscovery = null;
     let postActionResult = null;
     if (postActionEnabled && detailResult) {
@@ -731,6 +782,7 @@ export async function runRecommendWorkflow({
       card_node_id: cardNodeId,
       candidate: compactCandidate(screeningCandidate),
       detail: compactDetail(detailResult),
+      llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
       screening: compactScreening(screening),
       action_discovery: compactActionDiscovery(actionDiscovery),
       post_action: postActionResult
@@ -750,6 +802,7 @@ export async function runRecommendWorkflow({
       screened: results.length,
       detail_opened: results.filter((item) => item.detail).length,
       passed: results.filter((item) => item.screening.passed).length,
+      llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
       greet_count: greetCount,
       post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
       unique_seen: compactInfiniteListState(listState).seen_count,
@@ -764,6 +817,7 @@ export async function runRecommendWorkflow({
       last_score: screening.score
     });
     runControl.checkpoint({
+      results,
       last_candidate: {
         id: screeningCandidate.id || null,
         key: candidateKey,
@@ -773,6 +827,7 @@ export async function runRecommendWorkflow({
           passed: screening.passed,
           score: screening.score
         },
+        llm_screening: compactScreeningLlmResult(llmResult),
         post_action: postActionResult
       }
     });
@@ -806,6 +861,7 @@ export async function runRecommendWorkflow({
     processed: results.length,
     screened: results.length,
     detail_opened: results.filter((item) => item.detail).length,
+    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
     passed: results.filter((item) => item.screening.passed).length,
     greet_count: greetCount,
     post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
@@ -851,6 +907,11 @@ export function createRecommendRunService({
     actionTimeoutMs = 8000,
     actionIntervalMs = 500,
     actionAfterClickDelayMs = 900,
+    screeningMode = "llm",
+    llmConfig = null,
+    llmTimeoutMs = 120000,
+    llmImageLimit = 8,
+    llmImageDetail = "high",
     name = "recommend-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecommendRun requires a guarded CDP client");
@@ -858,6 +919,7 @@ export function createRecommendRunService({
     const normalizedPostAction = normalizeRecommendPostAction(postAction) || "none";
     const requestedPageScope = normalizeRecommendPageScope(pageScope) || "recommend";
     const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
+    const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
@@ -888,7 +950,12 @@ export function createRecommendRunService({
         post_action: normalizedPostAction,
         max_greet_count: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
         execute_post_action: Boolean(executePostAction),
-        action_timeout_ms: actionTimeoutMs
+        action_timeout_ms: actionTimeoutMs,
+        screening_mode: normalizedScreeningMode,
+        llm_configured: Boolean(llmConfig),
+        llm_timeout_ms: llmTimeoutMs,
+        llm_image_limit: llmImageLimit,
+        llm_image_detail: llmImageDetail
       },
       progress: {
         card_count: 0,
@@ -896,6 +963,7 @@ export function createRecommendRunService({
         processed: 0,
         screened: 0,
         detail_opened: 0,
+        llm_screened: 0,
         passed: 0,
         greet_count: 0,
         post_action_clicked: 0
@@ -931,7 +999,12 @@ export function createRecommendRunService({
         executePostAction,
         actionTimeoutMs,
         actionIntervalMs,
-        actionAfterClickDelayMs
+        actionAfterClickDelayMs,
+        screeningMode: normalizedScreeningMode,
+        llmConfig,
+        llmTimeoutMs,
+        llmImageLimit,
+        llmImageDetail
       }, runControl)
     });
   }

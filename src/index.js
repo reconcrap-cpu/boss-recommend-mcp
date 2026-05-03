@@ -541,11 +541,38 @@ function createRunInputSchema() {
       detail_limit: {
         type: "integer",
         minimum: 0,
-        description: "打开详情/CV 的人数上限；默认跟随 target_count/max_candidates。生产筛选不应传 0；只有 allow_card_only_screening=true 时才会接受 0 作为调试卡片-only 模式"
+        description: "打开详情/CV 的人数上限；默认跟随 target_count/max_candidates。生产筛选不应传 0；detail_limit=0 需要 debug_test_mode=true 且 allow_card_only_screening=true"
       },
       allow_card_only_screening: {
         type: "boolean",
-        description: "高级调试开关；默认 false。只有显式为 true 时，recommend 才会尊重 detail_limit=0 并只用卡片信息筛选"
+        description: "高级调试开关；默认 false。只有同时显式 debug_test_mode=true 时，recommend 才会尊重 detail_limit=0"
+      },
+      debug_test_mode: {
+        type: "boolean",
+        description: "高级测试开关；默认 false。只有显式为 true 时才允许 deterministic/local scorer、跳过筛选器、card-only、dry-run 后置动作等调试路径"
+      },
+      screening_mode: {
+        type: "string",
+        enum: ["llm", "deterministic"],
+        description: "筛选引擎；默认 llm。deterministic 仅限 debug_test_mode=true 的明确测试场景"
+      },
+      use_llm: {
+        type: "boolean",
+        description: "兼容字段；默认 true。use_llm=false 等同 deterministic，仅限 debug_test_mode=true"
+      },
+      llm_timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，单个候选人的 LLM 调用超时"
+      },
+      llm_image_limit: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，传给 LLM 的图片简历截图页数上限"
+      },
+      llm_image_detail: {
+        type: "string",
+        description: "可选，图片输入 detail，默认 high"
       },
       delay_ms: {
         type: "integer",
@@ -577,11 +604,11 @@ function createRunInputSchema() {
       },
       no_filter: {
         type: "boolean",
-        description: "开发/live gate 专用：跳过本次筛选器点击，默认 false"
+        description: "开发/live gate 专用：跳过本次筛选器点击，默认 false；正式 run 需要 debug_test_mode=true 才允许"
       },
       filter_enabled: {
         type: "boolean",
-        description: "开发/live gate 专用：false 时跳过本次筛选器点击"
+        description: "开发/live gate 专用：false 时跳过本次筛选器点击；正式 run 需要 debug_test_mode=true 才允许"
       },
       refresh_on_end: {
         type: "boolean",
@@ -672,7 +699,16 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       },
       use_llm: {
         type: "boolean",
-        description: "可选，是否使用 screening-config.json 中的 LLM 配置筛选；求简历任务默认使用"
+        description: "可选，默认 true。use_llm=false 等同 deterministic/local scorer，仅限 debug_test_mode=true 的明确测试场景"
+      },
+      screening_mode: {
+        type: "string",
+        enum: ["llm", "deterministic"],
+        description: "筛选引擎；默认 llm。deterministic 仅限 debug_test_mode=true"
+      },
+      debug_test_mode: {
+        type: "boolean",
+        description: "高级测试开关；默认 false。只有显式为 true 时才允许 deterministic/local scorer、detail_limit=0、dry-run 求简历等调试路径"
       },
       request_cv: {
         type: "boolean",
@@ -702,6 +738,15 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
         type: "integer",
         minimum: 1000,
         description: "可选，单个候选人的 LLM 调用超时"
+      },
+      llm_image_limit: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，传给 LLM 的图片简历截图页数上限"
+      },
+      llm_image_detail: {
+        type: "string",
+        description: "可选，图片输入 detail，默认 high"
       },
       online_resume_button_timeout_ms: {
         type: "integer",

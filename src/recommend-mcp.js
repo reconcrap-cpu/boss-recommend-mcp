@@ -84,9 +84,38 @@ function parseNonNegativeInteger(raw, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function isDebugTestMode(args = {}) {
+  return args.debug_test_mode === true || args.allow_debug_test_mode === true;
+}
+
+function normalizeScreeningModeArg(args = {}) {
+  const raw = normalizeText(args.screening_mode || args.screeningMode || "");
+  if (args.use_llm === false) return "deterministic";
+  return ["deterministic", "local", "local_scorer"].includes(raw.toLowerCase())
+    ? "deterministic"
+    : "llm";
+}
+
+function collectRecommendDebugTestOptions(args = {}, normalized = {}) {
+  const reasons = [];
+  if (normalizeScreeningModeArg(args) === "deterministic") reasons.push("deterministic_screening");
+  if (args.allow_card_only_screening === true) reasons.push("allow_card_only_screening");
+  if (parseNonNegativeInteger(args.detail_limit, null) === 0) reasons.push("detail_limit=0");
+  if (args.no_filter === true) reasons.push("no_filter");
+  if (args.filter_enabled === false) reasons.push("filter_enabled=false");
+  if (args.dry_run_post_action === true) reasons.push("dry_run_post_action");
+  if (args.execute_post_action === false && normalized.postAction && normalized.postAction !== "none") {
+    reasons.push("execute_post_action=false");
+  }
+  return reasons;
+}
+
 function resolveRecommendDetailLimit(args = {}, normalized = {}) {
   const fallback = parsePositiveInteger(normalized.targetCount, 5);
   const requested = parseNonNegativeInteger(args.detail_limit, fallback);
+  if (requested === 0 && !isDebugTestMode(args)) {
+    return fallback;
+  }
   if (requested === 0 && args.allow_card_only_screening !== true) {
     return fallback;
   }
@@ -270,8 +299,15 @@ function ensureRecommendRunArtifacts(snapshot) {
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  if (summary) {
-    const rows = Array.isArray(summary.results) ? summary.results : [];
+  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const artifactSummary = summary || (checkpointResults.length ? {
+    domain: "recommend",
+    partial: true,
+    partial_reason: snapshot?.status || snapshot?.state || "non_terminal",
+    results: checkpointResults
+  } : null);
+  if (artifactSummary) {
+    const rows = Array.isArray(artifactSummary.results) ? artifactSummary.results : [];
     writeRecommendLegacyCsvAtomic(artifacts.output_csv, rows, snapshot, meta);
     writeJsonAtomic(artifacts.report_json, {
       run_id: snapshot.runId || snapshot.run_id,
@@ -280,7 +316,7 @@ function ensureRecommendRunArtifacts(snapshot) {
       progress: snapshot.progress || {},
       context: snapshot.context || {},
       checkpoint,
-      summary,
+      summary: artifactSummary,
       generated_at: new Date().toISOString()
     });
     if (meta) {
@@ -297,6 +333,12 @@ function buildLegacyRecommendResult(snapshot) {
   const artifacts = ensureRecommendRunArtifacts(snapshot);
   const meta = getRecommendRunMeta(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const checkpoint = snapshot.checkpoint && typeof snapshot.checkpoint === "object" ? snapshot.checkpoint : {};
+  const resultRows = Array.isArray(summary?.results)
+    ? summary.results
+    : Array.isArray(checkpoint.results)
+      ? checkpoint.results
+      : [];
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   const targetCount = Number.isInteger(progress.target_count)
     ? progress.target_count
@@ -341,7 +383,7 @@ function buildLegacyRecommendResult(snapshot) {
     screen_params: clonePlain(meta.parsed?.screenParams || {}, {}),
     target_count_semantics: TARGET_COUNT_SEMANTICS,
     error: snapshot.error || null,
-    results: Array.isArray(summary?.results) ? summary.results : []
+    results: resultRows
   };
 }
 
@@ -958,11 +1000,12 @@ function normalizeRecommendStartInput(args = {}, parsed, configResolution = null
     postAction: parsed.screenParams?.post_action || "none",
     maxGreetCount: Number.isInteger(parsed.screenParams?.max_greet_count)
       ? parsed.screenParams.max_greet_count
-      : null
+      : null,
+    screeningMode: normalizeScreeningModeArg(args)
   };
 }
 
-function getRunOptions(args, parsed, normalized, session) {
+function getRunOptions(args, parsed, normalized, session, configResolution = null) {
   const slowLive = args.slow_live === true;
   const executePostAction = args.dry_run_post_action === true
     ? false
@@ -998,6 +1041,13 @@ function getRunOptions(args, parsed, normalized, session) {
     actionTimeoutMs: parsePositiveInteger(args.action_timeout_ms, slowLive ? 12000 : 8000),
     actionIntervalMs: parsePositiveInteger(args.action_interval_ms, 500),
     actionAfterClickDelayMs: parseNonNegativeInteger(args.action_after_click_delay_ms, slowLive ? 1200 : 900),
+    screeningMode: normalized.screeningMode,
+    llmConfig: normalized.screeningMode === "llm" && configResolution?.ok ? {
+      ...configResolution.config
+    } : null,
+    llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
+    llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
+    llmImageDetail: normalizeText(args.llm_image_detail) || "high",
     name: "mcp-recommend-pipeline-run",
     parsed
   };
@@ -1054,6 +1104,30 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
   if (gate) return gate;
   const configResolution = resolveBossScreeningConfig(workspaceRoot);
   const normalized = normalizeRecommendStartInput(args, parsed, configResolution);
+  const debugTestOptions = collectRecommendDebugTestOptions(args, normalized);
+  if (debugTestOptions.length && !isDebugTestMode(args)) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "DEBUG_TEST_MODE_REQUIRED",
+        message: `这些参数属于调试/测试路径，正式 live run 不会默认启用：${debugTestOptions.join(", ")}。如确需测试，请显式传 debug_test_mode=true。`,
+        retryable: false
+      },
+      debug_test_options: debugTestOptions
+    };
+  }
+  if (normalized.screeningMode === "llm" && !configResolution.ok) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: configResolution.error?.message || "screening-config.json is required for LLM screening.",
+        retryable: true
+      },
+      config_path: configResolution.config_path || null,
+      candidate_paths: configResolution.candidate_paths || []
+    };
+  }
 
   let session;
   try {
@@ -1085,7 +1159,7 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
 
   let started;
   try {
-    started = recommendRunService.startRecommendRun(getRunOptions(args, parsed, normalized, session));
+    started = recommendRunService.startRecommendRun(getRunOptions(args, parsed, normalized, session, configResolution));
   } catch (error) {
     await session.close?.();
     return {

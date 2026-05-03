@@ -73,6 +73,27 @@ function parseNonNegativeInteger(raw, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function isDebugTestMode(args = {}) {
+  return args.debug_test_mode === true || args.allow_debug_test_mode === true;
+}
+
+function normalizeScreeningModeArg(args = {}) {
+  const raw = normalizeText(args.screening_mode || args.screeningMode || "");
+  if (args.use_llm === false) return "deterministic";
+  return ["deterministic", "local", "local_scorer"].includes(raw.toLowerCase())
+    ? "deterministic"
+    : "llm";
+}
+
+function collectRecruitDebugTestOptions(args = {}) {
+  const reasons = [];
+  if (normalizeScreeningModeArg(args) === "deterministic") reasons.push("deterministic_screening");
+  if (parseNonNegativeInteger(args.detail_limit, null) === 0) reasons.push("detail_limit=0");
+  if (args.dry_run_post_action === true) reasons.push("dry_run_post_action");
+  if (args.execute_post_action === false) reasons.push("execute_post_action=false");
+  return reasons;
+}
+
 function methodSummary(methodLog = []) {
   const summary = {};
   for (const entry of methodLog || []) {
@@ -203,8 +224,15 @@ function ensureRecruitRunArtifacts(snapshot) {
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  if (summary) {
-    const rows = Array.isArray(summary.results) ? summary.results : [];
+  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const artifactSummary = summary || (checkpointResults.length ? {
+    domain: "recruit",
+    partial: true,
+    partial_reason: snapshot?.status || snapshot?.state || "non_terminal",
+    results: checkpointResults
+  } : null);
+  if (artifactSummary) {
+    const rows = Array.isArray(artifactSummary.results) ? artifactSummary.results : [];
     writeRecruitLegacyCsvAtomic(artifacts.output_csv, rows, snapshot, meta);
     writeJsonAtomic(artifacts.report_json, {
       run_id: snapshot.runId || snapshot.run_id,
@@ -213,7 +241,7 @@ function ensureRecruitRunArtifacts(snapshot) {
       progress: snapshot.progress || {},
       context: snapshot.context || {},
       checkpoint,
-      summary,
+      summary: artifactSummary,
       generated_at: new Date().toISOString()
     });
     if (meta) {
@@ -270,6 +298,12 @@ function buildLegacyRunResult(snapshot) {
   const artifacts = ensureRecruitRunArtifacts(snapshot);
   const meta = getRecruitRunMeta(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
+  const checkpoint = snapshot.checkpoint && typeof snapshot.checkpoint === "object" ? snapshot.checkpoint : {};
+  const resultRows = Array.isArray(summary?.results)
+    ? summary.results
+    : Array.isArray(checkpoint.results)
+      ? checkpoint.results
+      : [];
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   const targetCount = Number.isInteger(progress.target_count)
     ? progress.target_count
@@ -302,7 +336,8 @@ function buildLegacyRunResult(snapshot) {
       || null,
     completion_reason: completionReason(snapshot.status),
     target_count_semantics: TARGET_COUNT_SEMANTICS,
-    run_id: snapshot.runId
+    run_id: snapshot.runId,
+    results: resultRows
   };
 }
 
@@ -387,7 +422,34 @@ export function createRecruitPipelineInputSchema() {
       detail_limit: {
         type: "integer",
         minimum: 0,
-        description: "打开详情的人数上限；默认 1，0 表示只用卡片信息"
+        description: "打开详情/CV 的人数上限；默认跟随 max_candidates。detail_limit=0 属于调试路径，需要 debug_test_mode=true"
+      },
+      debug_test_mode: {
+        type: "boolean",
+        description: "高级测试开关；默认 false。只有显式为 true 时才允许 deterministic/local scorer、detail_limit=0 等调试路径"
+      },
+      screening_mode: {
+        type: "string",
+        enum: ["llm", "deterministic"],
+        description: "筛选引擎；默认 llm。deterministic 仅限 debug_test_mode=true"
+      },
+      use_llm: {
+        type: "boolean",
+        description: "兼容字段；默认 true。use_llm=false 等同 deterministic，仅限 debug_test_mode=true"
+      },
+      llm_timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，单个候选人的 LLM 调用超时"
+      },
+      llm_image_limit: {
+        type: "integer",
+        minimum: 1,
+        description: "可选，传给 LLM 的图片简历截图页数上限"
+      },
+      llm_image_detail: {
+        type: "string",
+        description: "可选，图片输入 detail，默认 high"
       },
       delay_ms: {
         type: "integer",
@@ -751,22 +813,30 @@ async function connectRecruitChromeSession({
   };
 }
 
-function getRunOptions(args, parsed, session) {
+function getRunOptions(args, parsed, session, configResolution = null) {
   const slowLive = args.slow_live === true;
   const targetCount = parsePositiveInteger(args.max_candidates, parsed.screenParams.target_count || 10);
+  const screeningMode = normalizeScreeningModeArg(args);
   return {
     client: session.client,
     targetUrl: RECRUIT_TARGET_URL,
     criteria: parsed.screenParams.criteria,
     searchParams: parsed.searchParams,
     maxCandidates: targetCount,
-    detailLimit: parseNonNegativeInteger(args.detail_limit, 1),
+    detailLimit: parseNonNegativeInteger(args.detail_limit, targetCount),
     closeDetail: true,
     delayMs: Math.max(0, parsePositiveInteger(args.delay_ms, 0)),
     cardTimeoutMs: slowLive ? 180000 : 90000,
     resetBeforeSearch: args.reset_search !== false,
     resetTimeoutMs: slowLive ? 300000 : 180000,
     cityOptionTimeoutMs: slowLive ? 60000 : 30000,
+    screeningMode,
+    llmConfig: screeningMode === "llm" && configResolution?.ok ? {
+      ...configResolution.config
+    } : null,
+    llmTimeoutMs: parsePositiveInteger(args.llm_timeout_ms, slowLive ? 180000 : 120000),
+    llmImageLimit: parsePositiveInteger(args.llm_image_limit, 8),
+    llmImageDetail: normalizeText(args.llm_image_detail) || "high",
     name: "mcp-recruit-pipeline-run"
   };
 }
@@ -814,6 +884,31 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
   const gate = evaluateRecruitPipelineGate(parsed);
   if (gate) return gate;
   const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const screeningMode = normalizeScreeningModeArg(args);
+  const debugTestOptions = collectRecruitDebugTestOptions(args);
+  if (debugTestOptions.length && !isDebugTestMode(args)) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "DEBUG_TEST_MODE_REQUIRED",
+        message: `这些参数属于调试/测试路径，正式 live run 不会默认启用：${debugTestOptions.join(", ")}。如确需测试，请显式传 debug_test_mode=true。`,
+        retryable: false
+      },
+      debug_test_options: debugTestOptions
+    };
+  }
+  if (screeningMode === "llm" && !configResolution.ok) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: configResolution.error?.message || "screening-config.json is required for LLM screening.",
+        retryable: true
+      },
+      config_path: configResolution.config_path || null,
+      candidate_paths: configResolution.candidate_paths || []
+    };
+  }
   const host = normalizeText(args.host) || DEFAULT_RECRUIT_HOST;
   const port = parsePositiveInteger(
     args.port,
@@ -850,7 +945,7 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
 
   let started;
   try {
-    started = recruitRunService.startRecruitRun(getRunOptions(args, parsed, session));
+    started = recruitRunService.startRecruitRun(getRunOptions(args, parsed, session, configResolution));
   } catch (error) {
     await session.close?.();
     return {

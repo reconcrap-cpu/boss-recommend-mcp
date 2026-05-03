@@ -19,7 +19,13 @@ import {
   resetInfiniteListForRefreshRound
 } from "../../core/infinite-list/index.js";
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
-import { screenCandidate } from "../../core/screening/index.js";
+import {
+  callScreeningLlm,
+  compactScreeningLlmResult,
+  createFailedLlmScreeningResult,
+  llmResultToScreening,
+  screenCandidate
+} from "../../core/screening/index.js";
 import {
   closeRecruitDetail,
   createRecruitDetailNetworkRecorder,
@@ -72,8 +78,20 @@ function compactDetail(detailResult) {
     parsed_network_profile_count: detailResult.parsed_network_profiles?.filter((item) => item.ok).length || 0,
     cv_acquisition: detailResult.cv_acquisition || null,
     image_evidence: summarizeImageEvidence(detailResult.image_evidence),
+    llm_screening: compactScreeningLlmResult(detailResult.llm_result),
     close_result: detailResult.close_result
   };
+}
+
+function normalizeScreeningMode(value) {
+  const normalized = String(value || "llm").trim().toLowerCase();
+  return ["deterministic", "local", "local_scorer"].includes(normalized)
+    ? "deterministic"
+    : "llm";
+}
+
+function createMissingLlmConfigResult() {
+  return createFailedLlmScreeningResult(new Error("LLM screening config is required for production search runs"));
 }
 
 function normalizeSearchParams(searchParams = {}) {
@@ -110,7 +128,7 @@ export async function runRecruitWorkflow({
   criteria = "",
   searchParams = {},
   maxCandidates = 5,
-  detailLimit = 1,
+  detailLimit = null,
   closeDetail = true,
   delayMs = 0,
   cardTimeoutMs = 90000,
@@ -127,12 +145,19 @@ export async function runRecruitWorkflow({
   listFallbackPoint = null,
   refreshOnEnd = true,
   maxRefreshRounds = 2,
-  refreshResetSettleMs = 5000
+  refreshResetSettleMs = 5000,
+  screeningMode = "llm",
+  llmConfig = null,
+  llmTimeoutMs = 120000,
+  llmImageLimit = 8,
+  llmImageDetail = "high"
 } = {}, runControl) {
   if (!client) throw new Error("runRecruitWorkflow requires a guarded CDP client");
   const normalizedSearchParams = normalizeSearchParams(searchParams);
+  const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+  const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const limit = Math.max(1, Number(maxCandidates) || 1);
-  const detailCountLimit = Math.max(0, Number(detailLimit) || 0);
+  const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
   const networkRecorder = detailCountLimit > 0
     ? createRecruitDetailNetworkRecorder(client)
     : null;
@@ -222,6 +247,8 @@ export async function runRecruitWorkflow({
     screened: 0,
     detail_opened: 0,
     passed: 0,
+    screening_mode: normalizedScreeningMode,
+    llm_screened: 0,
     unique_seen: compactInfiniteListState(listState).seen_count,
     scroll_count: 0,
     refresh_rounds: 0,
@@ -298,6 +325,7 @@ export async function runRecruitWorkflow({
           screened: results.length,
           detail_opened: results.filter((item) => item.detail).length,
           passed: results.filter((item) => item.screening.passed).length,
+          llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
           unique_seen: compactInfiniteListState(listState).seen_count,
           scroll_count: compactInfiniteListState(listState).scroll_count,
           refresh_rounds: refreshRounds,
@@ -426,13 +454,37 @@ export async function runRecruitWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recruit:screening");
-    const screening = screenCandidate(screeningCandidate, { criteria });
+    let llmResult = null;
+    if (useLlmScreening) {
+      if (!llmConfig) {
+        llmResult = createMissingLlmConfigResult();
+      } else {
+        try {
+          llmResult = await callScreeningLlm({
+            candidate: screeningCandidate,
+            criteria,
+            config: llmConfig,
+            timeoutMs: llmTimeoutMs,
+            imageEvidence: detailResult?.image_evidence || null,
+            maxImages: llmImageLimit,
+            imageDetail: llmImageDetail
+          });
+        } catch (error) {
+          llmResult = createFailedLlmScreeningResult(error);
+        }
+      }
+      if (detailResult) detailResult.llm_result = llmResult;
+    }
+    const screening = useLlmScreening
+      ? llmResultToScreening(llmResult, screeningCandidate)
+      : screenCandidate(screeningCandidate, { criteria });
     const compactResult = {
       index,
       candidate_key: candidateKey,
       card_node_id: cardNodeId,
       candidate: compactCandidate(screeningCandidate),
       detail: compactDetail(detailResult),
+      llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
       screening: compactScreening(screening)
     };
     results.push(compactResult);
@@ -450,6 +502,7 @@ export async function runRecruitWorkflow({
       screened: results.length,
       detail_opened: results.filter((item) => item.detail).length,
       passed: results.filter((item) => item.screening.passed).length,
+      llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
       refresh_rounds: refreshRounds,
@@ -462,6 +515,7 @@ export async function runRecruitWorkflow({
       last_score: screening.score
     });
     runControl.checkpoint({
+      results,
       last_candidate: {
         id: screeningCandidate.id || null,
         key: candidateKey,
@@ -470,7 +524,8 @@ export async function runRecruitWorkflow({
           status: screening.status,
           passed: screening.passed,
           score: screening.score
-        }
+        },
+        llm_screening: compactScreeningLlmResult(llmResult)
       }
     });
 
@@ -496,6 +551,7 @@ export async function runRecruitWorkflow({
     processed: results.length,
     screened: results.length,
     detail_opened: results.filter((item) => item.detail).length,
+    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
     passed: results.filter((item) => item.screening.passed).length,
     results
   };
@@ -514,7 +570,7 @@ export function createRecruitRunService({
     criteria = "",
     searchParams = {},
     maxCandidates = 5,
-    detailLimit = 1,
+    detailLimit = null,
     closeDetail = true,
     delayMs = 0,
     cardTimeoutMs = 90000,
@@ -532,10 +588,18 @@ export function createRecruitRunService({
     refreshOnEnd = true,
     maxRefreshRounds = 2,
     refreshResetSettleMs = 5000,
+    screeningMode = "llm",
+    llmConfig = null,
+    llmTimeoutMs = 120000,
+    llmImageLimit = 8,
+    llmImageDetail = "high",
     name = "recruit-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecruitRun requires a guarded CDP client");
     const normalizedSearchParams = normalizeSearchParams(searchParams);
+    const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+    const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
+    const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
       name,
       context: {
@@ -544,7 +608,7 @@ export function createRecruitRunService({
         criteria_present: Boolean(criteria),
         search_params: normalizedSearchParams,
         max_candidates: maxCandidates,
-        detail_limit: detailLimit,
+        detail_limit: normalizedDetailLimit,
         close_detail: closeDetail,
         reset_before_search: resetBeforeSearch,
         reset_timeout_ms: resetTimeoutMs,
@@ -559,14 +623,20 @@ export function createRecruitRunService({
         list_fallback_point: listFallbackPoint,
         refresh_on_end: refreshOnEnd,
         max_refresh_rounds: maxRefreshRounds,
-        refresh_reset_settle_ms: refreshResetSettleMs
+        refresh_reset_settle_ms: refreshResetSettleMs,
+        screening_mode: normalizedScreeningMode,
+        llm_configured: Boolean(llmConfig),
+        llm_timeout_ms: llmTimeoutMs,
+        llm_image_limit: llmImageLimit,
+        llm_image_detail: llmImageDetail
       },
       progress: {
         card_count: 0,
-        target_count: Math.max(1, Number(maxCandidates) || 1),
+        target_count: candidateLimit,
         processed: 0,
         screened: 0,
         detail_opened: 0,
+        llm_screened: 0,
         passed: 0
       },
       checkpoint: {},
@@ -576,7 +646,7 @@ export function createRecruitRunService({
         criteria,
         searchParams: normalizedSearchParams,
         maxCandidates,
-        detailLimit,
+        detailLimit: normalizedDetailLimit,
         closeDetail,
         delayMs,
         cardTimeoutMs,
@@ -593,7 +663,12 @@ export function createRecruitRunService({
         listFallbackPoint,
         refreshOnEnd,
         maxRefreshRounds,
-        refreshResetSettleMs
+        refreshResetSettleMs,
+        screeningMode: normalizedScreeningMode,
+        llmConfig,
+        llmTimeoutMs,
+        llmImageLimit,
+        llmImageDetail
       }, runControl)
     });
   }
