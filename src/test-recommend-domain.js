@@ -4,13 +4,16 @@ import {
   chooseFilterOptionByLabels,
   chooseFilterOptionsByLabels,
   chooseFirstSafeFilterOption,
+  findRecommendCardNodeForCandidateKey,
   getRecommendPageScopeStatus,
   isActiveOption,
   isSafeFilterOptionLabel,
+  isStaleRecommendNodeError,
   listRecommendPageScopeTabs,
   matchesRecommendDetailNetwork,
   normalizeFilterOptionLabel,
   normalizeRecommendPageScope,
+  readRecommendDetailHtml,
   readRecommendCardCandidate,
   selectRecommendPageScope
 } from "./domains/recommend/index.js";
@@ -104,6 +107,72 @@ async function testCardCandidateReader() {
   assert.equal(candidate.id, "abc123");
   assert.equal(candidate.identity.degree, "本科");
   assert.match(candidate.text.raw, /算法工程师/);
+}
+
+async function testFindFreshRecommendCardNodeByKey() {
+  const nodes = {
+    101: {
+      attrs: ["data-geek", "stale-1", "class", "candidate-card-wrap"],
+      html: '<div class="candidate-card-wrap" data-geek="stale-1"><span>候选人A</span><span>本科</span></div>'
+    },
+    102: {
+      attrs: ["data-geek", "fresh-2", "class", "candidate-card-wrap"],
+      html: '<div class="candidate-card-wrap" data-geek="fresh-2"><span>候选人B</span><span>硕士</span></div>'
+    }
+  };
+  const client = {
+    DOM: {
+      async querySelectorAll() {
+        return { nodeIds: [101, 102] };
+      },
+      async getAttributes({ nodeId }) {
+        return { attributes: nodes[nodeId].attrs };
+      },
+      async getOuterHTML({ nodeId }) {
+        return { outerHTML: nodes[nodeId].html };
+      }
+    }
+  };
+
+  assert.equal(isStaleRecommendNodeError(new Error("Could not find node with given id")), true);
+  const result = await findRecommendCardNodeForCandidateKey(client, {
+    candidateKey: "recommend:id:fresh-2",
+    rootState: {
+      iframe: { documentNodeId: 9 }
+    },
+    timeoutMs: 20,
+    intervalMs: 0
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.node_id, 102);
+  assert.equal(result.candidate.id, "fresh-2");
+}
+
+async function testStaleResumeIframeDetailHtmlReadIsNonFatal() {
+  const client = {
+    DOM: {
+      async getOuterHTML({ nodeId }) {
+        assert.equal(nodeId, 201);
+        return {
+          outerHTML: '<div class="dialog-wrap"><span>候选人详情</span></div>'
+        };
+      },
+      async describeNode() {
+        throw new Error("Could not find node with given id");
+      }
+    }
+  };
+
+  const html = await readRecommendDetailHtml(client, {
+    popup: { node_id: 201 },
+    resumeIframe: { node_id: 202 }
+  });
+  assert.match(html.popupText, /候选人详情/);
+  assert.equal(html.resumeHTML, "");
+  assert.equal(html.resumeIframeDocumentNodeId, null);
+  assert.equal(html.errors.length, 1);
+  assert.equal(html.errors[0].source, "resume_iframe");
+  assert.equal(html.errors[0].stale_node, true);
 }
 
 async function testPageScopeHelpers() {
@@ -218,6 +287,8 @@ testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
 await testCardCandidateReader();
+await testFindFreshRecommendCardNodeByKey();
+await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();
 await testPageScopeFallbackToRecommend();
 

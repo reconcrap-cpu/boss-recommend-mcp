@@ -26,7 +26,7 @@ import {
   closeRecommendDetail,
   createRecommendDetailNetworkRecorder,
   extractRecommendDetailCandidate,
-  openRecommendCardDetail,
+  openRecommendCardDetailWithFreshRetry,
   waitForRecommendDetailNetworkEvents
 } from "./detail.js";
 import {
@@ -596,9 +596,9 @@ export async function runRecommendWorkflow({
     }
 
     const index = results.length;
-    const cardNodeId = nextCandidateResult.item.node_id;
+    let cardNodeId = nextCandidateResult.item.node_id;
     const candidateKey = nextCandidateResult.item.key;
-    const cardCandidate = nextCandidateResult.item.candidate;
+    let cardCandidate = nextCandidateResult.item.candidate;
 
     let screeningCandidate = cardCandidate;
     let detailResult = null;
@@ -608,7 +608,17 @@ export async function runRecommendWorkflow({
       runControl.setPhase("recommend:detail");
       rootState = await ensureRecommendViewport(rootState, "detail");
       networkRecorder.clear();
-      const openedDetail = await openRecommendCardDetail(client, cardNodeId);
+      const openedDetail = await openRecommendCardDetailWithFreshRetry(client, {
+        cardNodeId,
+        candidateKey,
+        cardCandidate,
+        rootState,
+        targetUrl,
+        maxAttempts: 2
+      });
+      cardNodeId = openedDetail.card_node_id || cardNodeId;
+      cardCandidate = openedDetail.card_candidate || cardCandidate;
+      screeningCandidate = cardCandidate;
       const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
       const networkWait = await waitForCvNetworkEvents(
         waitForRecommendDetailNetworkEvents,
