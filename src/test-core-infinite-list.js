@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import {
   candidateKeyFromProfile,
+  classifyInfiniteListBottomMarker,
   compactInfiniteListState,
   createInfiniteListState,
   getNextInfiniteListCandidate,
@@ -82,6 +83,23 @@ function testCandidateKeys() {
   assert.match(textKey, /^recommend:text:[a-f0-9]{16}$/);
 }
 
+function testClassifiesLegacyBottomMarkers() {
+  const noMore = classifyInfiniteListBottomMarker({ text: "没有更多人选" });
+  assert.equal(noMore.is_bottom, true);
+  assert.equal(noMore.matched_bottom_keyword, "没有更多");
+
+  const loading = classifyInfiniteListBottomMarker({ text: "下滑加载更多" });
+  assert.equal(loading.is_bottom, false);
+  assert.equal(loading.matched_load_more_keyword, "下滑加载更多");
+
+  const refreshOnly = classifyInfiniteListBottomMarker({
+    text: "刷新",
+    refreshButtonVisible: true
+  });
+  assert.equal(refreshOnly.is_bottom, true);
+  assert.equal(refreshOnly.reason, "refresh_button_visible");
+}
+
 async function testTraversesAfterVisibleBatchWithoutDuplicates() {
   let pageIndex = 0;
   const pages = [
@@ -150,12 +168,70 @@ async function testDetectsStableEndOfList() {
     readCandidate: async () => ({ domain: "chat", id: "a", attributes: {} }),
     maxScrolls: 3,
     stableSignatureLimit: 1,
+    minScrollsBeforeEnd: 1,
     settleMs: 0
   });
   assert.equal(result.ok, false);
   assert.equal(result.end_reached, true);
   assert.equal(result.reason, "stable_visible_signature");
   assert.equal(compactInfiniteListState(state).scroll_count, 1);
+}
+
+async function testDoesNotTreatSlowAppendAsEndAfterOneStableSignature() {
+  let wheelCount = 0;
+  const { client } = createFakeScrollClient({
+    onWheel: () => {
+      wheelCount += 1;
+    }
+  });
+  const state = createInfiniteListState({ domain: "recommend", listName: "recommend-candidates" });
+  state.processed_keys.add("recommend:id:a");
+  state.processed_keys.add("recommend:id:b");
+  const candidates = new Map([
+    [1, { domain: "recommend", id: "a", attributes: {} }],
+    [2, { domain: "recommend", id: "b", attributes: {} }],
+    [3, { domain: "recommend", id: "c", attributes: {} }]
+  ]);
+  const result = await getNextInfiniteListCandidate({
+    client,
+    state,
+    findNodeIds: async () => (wheelCount >= 2 ? [1, 2, 3] : [1, 2]),
+    readCandidate: async (nodeId) => candidates.get(nodeId),
+    maxScrolls: 4,
+    stableSignatureLimit: 1,
+    minScrollsBeforeEnd: 3,
+    settleMs: 0
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.item.key, "recommend:id:c");
+  assert.equal(wheelCount >= 2, true);
+  assert.equal(result.attempts.some((attempt) => attempt.stable_end_deferred), true);
+}
+
+async function testBottomMarkerStopsBeforeStableFallback() {
+  const { client } = createFakeScrollClient();
+  const state = createInfiniteListState({ domain: "recommend", listName: "recommend-candidates" });
+  state.processed_keys.add("recommend:id:a");
+  const result = await getNextInfiniteListCandidate({
+    client,
+    state,
+    findNodeIds: async () => [1],
+    readCandidate: async () => ({ domain: "recommend", id: "a", attributes: {} }),
+    detectBottomMarker: async () => ({
+      found: true,
+      reason: "没有更多",
+      source: "text_scan",
+      marker: { text: "没有更多人选" }
+    }),
+    maxScrolls: 3,
+    stableSignatureLimit: 5,
+    settleMs: 0
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.end_reached, true);
+  assert.equal(result.reason, "bottom_marker");
+  assert.equal(result.bottom_marker.reason, "没有更多");
+  assert.equal(compactInfiniteListState(state).scroll_count, 0);
 }
 
 async function testSkipsReadErrors() {
@@ -177,8 +253,11 @@ async function testSkipsReadErrors() {
 }
 
 testCandidateKeys();
+testClassifiesLegacyBottomMarkers();
 await testTraversesAfterVisibleBatchWithoutDuplicates();
 await testDetectsStableEndOfList();
+await testDoesNotTreatSlowAppendAsEndAfterOneStableSignature();
+await testBottomMarkerStopsBeforeStableFallback();
 await testSkipsReadErrors();
 
 console.log("core infinite list tests passed");

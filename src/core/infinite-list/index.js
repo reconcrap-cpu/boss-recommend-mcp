@@ -1,9 +1,67 @@
 import crypto from "node:crypto";
 import {
   getNodeBox,
+  getOuterHTML,
+  querySelectorAll,
   scrollNodeIntoView,
   sleep
 } from "../browser/index.js";
+
+export const DEFAULT_BOTTOM_HINT_KEYWORDS = Object.freeze([
+  "没有更多",
+  "已显示全部",
+  "已经到底",
+  "暂无更多",
+  "推荐完了",
+  "没有更多人选",
+  "没有更多了",
+  "已到底"
+]);
+
+export const DEFAULT_LOAD_MORE_HINT_KEYWORDS = Object.freeze([
+  "滚动加载更多",
+  "下滑加载更多",
+  "继续下滑",
+  "继续滑动",
+  "滑动加载",
+  "正在加载",
+  "加载中"
+]);
+
+export const DEFAULT_BOTTOM_MARKER_SELECTORS = Object.freeze([
+  ".finished-wrap",
+  ".load-tips",
+  "div[role=\"tfoot\"] .load-tips",
+  ".no-data-refresh",
+  ".empty-tip",
+  ".empty-text",
+  ".no-data",
+  ".tip-nodata",
+  "[class*=\"finished\"]",
+  "[class*=\"load-tips\"]",
+  "[class*=\"no-more\"]",
+  "[class*=\"no_more\"]"
+]);
+
+export const DEFAULT_BOTTOM_TEXT_SCAN_SELECTORS = Object.freeze([
+  "div",
+  "span",
+  "p",
+  "li",
+  "button",
+  "a"
+]);
+
+export const DEFAULT_BOTTOM_REFRESH_SELECTORS = Object.freeze([
+  ".finished-wrap .btn-refresh",
+  ".finished-wrap .btn",
+  ".no-data-refresh .btn-refresh",
+  ".no-data-refresh .btn",
+  "[class*=\"refresh\"]",
+  "[ka*=\"refresh\"]",
+  "button",
+  "a"
+]);
 
 function nowIso() {
   return new Date().toISOString();
@@ -11,6 +69,31 @@ function nowIso() {
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function uniqueValues(values = []) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function decodeBasicHtmlEntities(value = "") {
+  return String(value || "")
+    .replace(/&nbsp;|&#160;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;|&apos;/gi, "'");
+}
+
+function plainTextFromHtml(html = "") {
+  return normalizeText(decodeBasicHtmlEntities(String(html || "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")));
+}
+
+function isUsableBox(box) {
+  return Number(box?.rect?.width || 0) > 2 && Number(box?.rect?.height || 0) > 2;
 }
 
 function shortHash(value) {
@@ -174,6 +257,220 @@ export function resetInfiniteListForRefreshRound(state, {
   return compactInfiniteListState(state);
 }
 
+export function classifyInfiniteListBottomMarker({
+  text = "",
+  refreshButtonVisible = false,
+  bottomKeywords = DEFAULT_BOTTOM_HINT_KEYWORDS,
+  loadMoreKeywords = DEFAULT_LOAD_MORE_HINT_KEYWORDS
+} = {}) {
+  const normalizedText = normalizeText(text);
+  const matchedBottomKeyword = bottomKeywords.find((keyword) => normalizedText.includes(keyword)) || null;
+  if (matchedBottomKeyword) {
+    return {
+      is_bottom: true,
+      reason: matchedBottomKeyword,
+      matched_bottom_keyword: matchedBottomKeyword,
+      matched_load_more_keyword: null
+    };
+  }
+
+  const matchedLoadMoreKeyword = loadMoreKeywords.find((keyword) => normalizedText.includes(keyword)) || null;
+  if (matchedLoadMoreKeyword) {
+    return {
+      is_bottom: false,
+      reason: null,
+      matched_bottom_keyword: null,
+      matched_load_more_keyword: matchedLoadMoreKeyword
+    };
+  }
+
+  if (refreshButtonVisible) {
+    return {
+      is_bottom: true,
+      reason: "refresh_button_visible",
+      matched_bottom_keyword: null,
+      matched_load_more_keyword: null
+    };
+  }
+
+  return {
+    is_bottom: false,
+    reason: null,
+    matched_bottom_keyword: null,
+    matched_load_more_keyword: null
+  };
+}
+
+async function safeQuerySelectorAll(client, rootNodeId, selector) {
+  try {
+    return await querySelectorAll(client, rootNodeId, selector);
+  } catch {
+    return [];
+  }
+}
+
+async function readVisibleMarkerNode(client, nodeId) {
+  let box = null;
+  try {
+    box = await getNodeBox(client, nodeId);
+  } catch {
+    return null;
+  }
+  if (!isUsableBox(box)) return null;
+  let outerHTML = "";
+  try {
+    outerHTML = await getOuterHTML(client, nodeId);
+  } catch {
+    return null;
+  }
+  return {
+    node_id: nodeId,
+    text: plainTextFromHtml(outerHTML),
+    box
+  };
+}
+
+function looksLikeRefreshLabel(text = "") {
+  const normalized = normalizeText(text).replace(/\s+/g, "");
+  return Boolean(normalized) && normalized.length <= 80 && /刷新|refresh/i.test(normalized);
+}
+
+export async function detectInfiniteListBottomMarker(client, {
+  rootNodeId,
+  markerSelectors = DEFAULT_BOTTOM_MARKER_SELECTORS,
+  textScanSelectors = DEFAULT_BOTTOM_TEXT_SCAN_SELECTORS,
+  refreshSelectors = DEFAULT_BOTTOM_REFRESH_SELECTORS,
+  bottomKeywords = DEFAULT_BOTTOM_HINT_KEYWORDS,
+  loadMoreKeywords = DEFAULT_LOAD_MORE_HINT_KEYWORDS,
+  maxMarkerNodes = 300,
+  maxTextScanNodes = 800,
+  textMaxLength = 80
+} = {}) {
+  if (!client || !rootNodeId) {
+    return {
+      found: false,
+      reason: "missing_client_or_root"
+    };
+  }
+
+  const selectorCounts = {};
+  const markerNodeIds = [];
+  for (const selector of markerSelectors || []) {
+    const nodeIds = await safeQuerySelectorAll(client, rootNodeId, selector);
+    selectorCounts[selector] = nodeIds.length;
+    markerNodeIds.push(...nodeIds);
+  }
+
+  const visibleMarkers = [];
+  const markerIds = uniqueValues(markerNodeIds).slice(0, Math.max(0, Number(maxMarkerNodes) || 0));
+  for (const nodeId of markerIds) {
+    const marker = await readVisibleMarkerNode(client, nodeId);
+    if (!marker?.text) continue;
+    const classified = classifyInfiniteListBottomMarker({
+      text: marker.text,
+      bottomKeywords,
+      loadMoreKeywords
+    });
+    const summary = {
+      node_id: marker.node_id,
+      text: marker.text.slice(0, 160),
+      y: marker.box?.rect?.y || null,
+      matched_bottom_keyword: classified.matched_bottom_keyword,
+      matched_load_more_keyword: classified.matched_load_more_keyword
+    };
+    visibleMarkers.push(summary);
+    if (classified.is_bottom) {
+      return {
+        found: true,
+        reason: classified.reason,
+        source: "marker_selector",
+        marker: summary,
+        selector_counts: selectorCounts,
+        visible_marker_count: visibleMarkers.length,
+        refresh_button_visible: false
+      };
+    }
+  }
+
+  const hasLoadMoreMarker = visibleMarkers.some((marker) => marker.matched_load_more_keyword);
+
+  const refreshNodeIds = [];
+  for (const selector of refreshSelectors || []) {
+    const nodeIds = await safeQuerySelectorAll(client, rootNodeId, selector);
+    selectorCounts[selector] = (selectorCounts[selector] || 0) + nodeIds.length;
+    refreshNodeIds.push(...nodeIds);
+  }
+  const refreshButtons = [];
+  for (const nodeId of uniqueValues(refreshNodeIds).slice(0, 300)) {
+    const marker = await readVisibleMarkerNode(client, nodeId);
+    if (!marker?.text || !looksLikeRefreshLabel(marker.text)) continue;
+    refreshButtons.push({
+      node_id: marker.node_id,
+      text: marker.text.slice(0, 120),
+      y: marker.box?.rect?.y || null
+    });
+  }
+  if (refreshButtons.length && !hasLoadMoreMarker) {
+    return {
+      found: true,
+      reason: "refresh_button_visible",
+      source: "refresh_button",
+      marker: refreshButtons[0],
+      selector_counts: selectorCounts,
+      visible_marker_count: visibleMarkers.length,
+      refresh_button_visible: true,
+      refresh_button_count: refreshButtons.length
+    };
+  }
+
+  const scanNodeIds = [];
+  for (const selector of textScanSelectors || []) {
+    const nodeIds = await safeQuerySelectorAll(client, rootNodeId, selector);
+    selectorCounts[selector] = (selectorCounts[selector] || 0) + nodeIds.length;
+    scanNodeIds.push(...nodeIds);
+  }
+  let checkedTextNodeCount = 0;
+  for (const nodeId of uniqueValues(scanNodeIds).slice(0, Math.max(0, Number(maxTextScanNodes) || 0))) {
+    const marker = await readVisibleMarkerNode(client, nodeId);
+    if (!marker?.text || marker.text.length > textMaxLength) continue;
+    checkedTextNodeCount += 1;
+    const classified = classifyInfiniteListBottomMarker({
+      text: marker.text,
+      bottomKeywords,
+      loadMoreKeywords
+    });
+    if (classified.is_bottom) {
+      return {
+        found: true,
+        reason: classified.reason,
+        source: "text_scan",
+        marker: {
+          node_id: marker.node_id,
+          text: marker.text.slice(0, 160),
+          y: marker.box?.rect?.y || null,
+          matched_bottom_keyword: classified.matched_bottom_keyword
+        },
+        selector_counts: selectorCounts,
+        visible_marker_count: visibleMarkers.length,
+        checked_text_node_count: checkedTextNodeCount,
+        refresh_button_visible: refreshButtons.length > 0,
+        refresh_button_count: refreshButtons.length
+      };
+    }
+  }
+
+  return {
+    found: false,
+    reason: hasLoadMoreMarker ? "load_more_marker_visible" : "bottom_marker_not_found",
+    selector_counts: selectorCounts,
+    visible_markers: visibleMarkers.slice(0, 20),
+    visible_marker_count: visibleMarkers.length,
+    checked_text_node_count: checkedTextNodeCount,
+    refresh_button_visible: refreshButtons.length > 0,
+    refresh_button_count: refreshButtons.length
+  };
+}
+
 export async function readVisibleInfiniteListItems({
   nodeIds = [],
   readCandidate,
@@ -333,9 +630,11 @@ export async function getNextInfiniteListCandidate({
   state,
   findNodeIds,
   readCandidate,
+  detectBottomMarker = null,
   keyForCandidate = candidateKeyFromProfile,
   maxScrolls = 20,
   stableSignatureLimit = 2,
+  minScrollsBeforeEnd = 3,
   wheelDeltaY = 850,
   settleMs = 1200,
   fallbackPoint = null
@@ -383,6 +682,54 @@ export async function getNextInfiniteListCandidate({
       return result;
     }
 
+    if (typeof detectBottomMarker === "function") {
+      let bottomMarker = null;
+      try {
+        bottomMarker = await detectBottomMarker({
+          scrollAttempt,
+          items,
+          signature,
+          state: compactInfiniteListState(state)
+        });
+      } catch (error) {
+        bottomMarker = {
+          found: false,
+          reason: "bottom_marker_probe_failed",
+          error: error?.message || String(error)
+        };
+      }
+      attempts[attempts.length - 1].bottom_marker = bottomMarker;
+      if (bottomMarker?.found) {
+        state.ledger?.push({
+          at: nowIso(),
+          event: "bottom_marker_detected",
+          reason: bottomMarker.reason || "bottom_marker",
+          source: bottomMarker.source || "",
+          marker: bottomMarker.marker || null
+        });
+        const result = {
+          ok: false,
+          end_reached: true,
+          reason: "bottom_marker",
+          bottom_marker: bottomMarker,
+          attempts,
+          state: compactInfiniteListState(state)
+        };
+        state.last_result = {
+          at: nowIso(),
+          ok: false,
+          end_reached: true,
+          reason: result.reason,
+          bottom_marker: {
+            reason: bottomMarker.reason || null,
+            source: bottomMarker.source || null,
+            marker: bottomMarker.marker || null
+          }
+        };
+        return result;
+      }
+    }
+
     if (!items.length) {
       const result = {
         ok: false,
@@ -400,7 +747,9 @@ export async function getNextInfiniteListCandidate({
       return result;
     }
 
-    if (signature.stable_signature_count >= Math.max(1, Number(stableSignatureLimit) || 1)) {
+    const stableLimit = Math.max(1, Number(stableSignatureLimit) || 1);
+    const minStableScrolls = Math.max(0, Number(minScrollsBeforeEnd) || 0);
+    if (signature.stable_signature_count >= stableLimit && scrollAttempt >= minStableScrolls) {
       const result = {
         ok: false,
         end_reached: true,
@@ -415,6 +764,10 @@ export async function getNextInfiniteListCandidate({
         reason: result.reason
       };
       return result;
+    }
+    if (signature.stable_signature_count >= stableLimit) {
+      attempts[attempts.length - 1].stable_end_deferred = true;
+      attempts[attempts.length - 1].min_scrolls_before_end = minStableScrolls;
     }
 
     const scrollResult = await scrollInfiniteListByVisibleItems(client, items, {

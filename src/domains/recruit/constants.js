@@ -24,6 +24,29 @@ export const RECRUIT_NO_DATA_SELECTORS = Object.freeze([
   '[class*="empty"]'
 ]);
 
+export const RECRUIT_BOTTOM_MARKER_SELECTORS = Object.freeze([
+  ".finished-wrap",
+  ".load-tips",
+  ".tip-nodata",
+  ".empty-tip",
+  ".empty-text",
+  ".no-data",
+  "[class*=\"finished\"]",
+  "[class*=\"load-tips\"]",
+  "[class*=\"empty\"]"
+]);
+
+export const RECRUIT_BOTTOM_REFRESH_SELECTORS = Object.freeze([
+  ".finished-wrap .btn-refresh",
+  ".finished-wrap .btn",
+  ".no-data-refresh .btn-refresh",
+  ".no-data-refresh .btn",
+  "[class*=\"refresh\"]",
+  "[ka*=\"refresh\"]",
+  "button",
+  "a"
+]);
+
 export const RECRUIT_SEARCH_SELECTORS = Object.freeze({
   keywordInput: [
     "input.search-input",

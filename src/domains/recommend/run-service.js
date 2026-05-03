@@ -21,6 +21,7 @@ import {
 import {
   compactInfiniteListState,
   createInfiniteListState,
+  detectInfiniteListBottomMarker,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed,
   resetInfiniteListForRefreshRound
@@ -55,6 +56,10 @@ import {
   selectRecommendPageScope
 } from "./scopes.js";
 import {
+  RECOMMEND_BOTTOM_MARKER_SELECTORS,
+  RECOMMEND_END_REFRESH_SELECTOR
+} from "./constants.js";
+import {
   clickRecommendActionControl,
   normalizeRecommendPostAction,
   resolveRecommendPostAction,
@@ -64,6 +69,15 @@ import { getRecommendRoots } from "./roots.js";
 
 function normalizeLabels(labels = []) {
   return labels.map((label) => String(label || "").trim()).filter(Boolean);
+}
+
+function isRefreshableListStall(reason = "") {
+  return new Set([
+    "stable_visible_signature",
+    "max_scrolls_exhausted",
+    "scroll_failed",
+    "scroll_anchor_unavailable"
+  ]).has(String(reason || ""));
 }
 
 function normalizeFilter(filter = {}) {
@@ -364,9 +378,9 @@ export async function runRecommendWorkflow({
   imageWheelDeltaY = 650,
   cvAcquisitionMode = "unknown",
   listMaxScrolls = 20,
-  listStableSignatureLimit = 2,
+  listStableSignatureLimit = 5,
   listWheelDeltaY = 850,
-  listSettleMs = 1200,
+  listSettleMs = 2200,
   listFallbackPoint = null,
   refreshOnEnd = true,
   maxRefreshRounds = 2,
@@ -559,15 +573,22 @@ export async function runRecommendWorkflow({
           run_candidate_index: results.length,
           visible_index: visibleIndex
         }
+      }),
+      detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => detectInfiniteListBottomMarker(client, {
+        rootNodeId: rootState?.iframe?.documentNodeId,
+        markerSelectors: RECOMMEND_BOTTOM_MARKER_SELECTORS,
+        refreshSelectors: [RECOMMEND_END_REFRESH_SELECTOR],
+        textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
+        maxTextScanNodes: 500
       })
     }));
     if (!nextCandidateResult.ok) {
       listEndReason = nextCandidateResult.reason || "list_exhausted";
       if (
-        nextCandidateResult.end_reached
-        && refreshOnEnd
-        && results.length < limit
-        && refreshRounds < Math.max(0, Number(maxRefreshRounds) || 0)
+          (nextCandidateResult.end_reached || isRefreshableListStall(nextCandidateResult.reason))
+          && refreshOnEnd
+          && results.length < limit
+          && refreshRounds < Math.max(0, Number(maxRefreshRounds) || 0)
       ) {
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
@@ -939,9 +960,9 @@ export function createRecommendRunService({
     imageWheelDeltaY = 650,
     cvAcquisitionMode = "unknown",
     listMaxScrolls = 20,
-    listStableSignatureLimit = 2,
+    listStableSignatureLimit = 5,
     listWheelDeltaY = 850,
-    listSettleMs = 1200,
+    listSettleMs = 2200,
     listFallbackPoint = null,
     refreshOnEnd = true,
     maxRefreshRounds = 2,

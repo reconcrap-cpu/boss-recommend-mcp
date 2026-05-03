@@ -19,6 +19,7 @@ import {
 import {
   compactInfiniteListState,
   createInfiniteListState,
+  detectInfiniteListBottomMarker,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed,
   resetInfiniteListForRefreshRound
@@ -49,6 +50,10 @@ import {
 } from "./search.js";
 import { refreshRecruitSearchAtEnd } from "./refresh.js";
 import { getRecruitRoots } from "./roots.js";
+import {
+  RECRUIT_BOTTOM_MARKER_SELECTORS,
+  RECRUIT_BOTTOM_REFRESH_SELECTORS
+} from "./constants.js";
 
 function compactScreening(screening) {
   return {
@@ -144,9 +149,9 @@ export async function runRecruitWorkflow({
   imageWheelDeltaY = 650,
   cvAcquisitionMode = "unknown",
   listMaxScrolls = 20,
-  listStableSignatureLimit = 2,
+  listStableSignatureLimit = 5,
   listWheelDeltaY = 850,
-  listSettleMs = 1200,
+  listSettleMs = 2200,
   listFallbackPoint = null,
   refreshOnEnd = true,
   maxRefreshRounds = 2,
@@ -298,6 +303,13 @@ export async function runRecruitWorkflow({
           visible_index: visibleIndex,
           search_params: normalizedSearchParams
         }
+      }),
+      detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => detectInfiniteListBottomMarker(client, {
+        rootNodeId: rootState?.iframe?.documentNodeId,
+        markerSelectors: RECRUIT_BOTTOM_MARKER_SELECTORS,
+        refreshSelectors: RECRUIT_BOTTOM_REFRESH_SELECTORS,
+        textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
+        maxTextScanNodes: 500
       })
     }));
     if (!nextCandidateResult.ok) {
@@ -625,9 +637,9 @@ export function createRecruitRunService({
     imageWheelDeltaY = 650,
     cvAcquisitionMode = "unknown",
     listMaxScrolls = 20,
-    listStableSignatureLimit = 2,
+    listStableSignatureLimit = 5,
     listWheelDeltaY = 850,
-    listSettleMs = 1200,
+    listSettleMs = 2200,
     listFallbackPoint = null,
     refreshOnEnd = true,
     maxRefreshRounds = 2,

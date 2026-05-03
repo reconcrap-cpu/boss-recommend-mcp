@@ -8,6 +8,17 @@ export const CHAT_CARD_SELECTORS = Object.freeze([
   "div[role=\"listitem\"]"
 ]);
 
+export const CHAT_BOTTOM_MARKER_SELECTORS = Object.freeze([
+  "div[role=\"tfoot\"] .load-tips",
+  "p.load-tips",
+  ".load-tips",
+  ".empty-tip",
+  ".empty-text",
+  ".no-data",
+  "[class*=\"load-tips\"]",
+  "[class*=\"empty\"]"
+]);
+
 export const CHAT_JOB_LABEL_SELECTORS = Object.freeze([
   ".chat-job .chat-select-job",
   ".chat-job .dropmenu-label",

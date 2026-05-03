@@ -67,6 +67,17 @@ export const RECOMMEND_END_REFRESH_SELECTOR = [
   "a"
 ].join(", ");
 
+export const RECOMMEND_BOTTOM_MARKER_SELECTORS = Object.freeze([
+  ".finished-wrap",
+  ".no-data-refresh",
+  ".load-tips",
+  ".empty-tip",
+  ".empty-text",
+  ".no-data",
+  "[class*=\"finished\"]",
+  "[class*=\"load-tips\"]"
+]);
+
 export const DETAIL_POPUP_SELECTORS = Object.freeze([
   ".dialog-wrap.active",
   ".boss-popup__wrapper",

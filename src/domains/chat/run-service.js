@@ -19,6 +19,7 @@ import {
 import {
   compactInfiniteListState,
   createInfiniteListState,
+  detectInfiniteListBottomMarker,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed
 } from "../../core/infinite-list/index.js";
@@ -34,7 +35,10 @@ import {
   normalizeText,
   screenCandidate
 } from "../../core/screening/index.js";
-import { CHAT_TARGET_URL } from "./constants.js";
+import {
+  CHAT_BOTTOM_MARKER_SELECTORS,
+  CHAT_TARGET_URL
+} from "./constants.js";
 import {
   chatCandidateKeyFromProfile,
   findChatCandidateNodeIdById,
@@ -372,9 +376,9 @@ export async function runChatWorkflow({
   llmImageDetail = "high",
   screeningMode = "llm",
   listMaxScrolls = 20,
-  listStableSignatureLimit = 2,
+  listStableSignatureLimit = 5,
   listWheelDeltaY = 850,
-  listSettleMs = 1200,
+  listSettleMs = 2200,
   listFallbackPoint = null,
   imageOutputDir = ""
 } = {}, runControl) {
@@ -631,6 +635,13 @@ export async function runChatWorkflow({
           run_candidate_index: results.length,
           visible_index: visibleIndex
         }
+      }),
+      detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => detectInfiniteListBottomMarker(client, {
+        rootNodeId: rootState?.rootNodes?.top,
+        markerSelectors: CHAT_BOTTOM_MARKER_SELECTORS,
+        refreshSelectors: [],
+        textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
+        maxTextScanNodes: 500
       })
     }));
     if (!nextCandidateResult.ok) {
@@ -1137,9 +1148,9 @@ export function createChatRunService({
     llmImageDetail = "high",
     screeningMode = "llm",
     listMaxScrolls = 20,
-    listStableSignatureLimit = 2,
+    listStableSignatureLimit = 5,
     listWheelDeltaY = 850,
-    listSettleMs = 1200,
+    listSettleMs = 2200,
     listFallbackPoint = null,
     imageOutputDir = "",
     name = "chat-domain-run"
