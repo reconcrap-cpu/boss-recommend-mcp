@@ -1422,7 +1422,7 @@ export async function callScreeningLlm({
   applyChatCompletionThinking(payload, {
     baseUrl,
     model,
-    thinkingLevel: config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "off"
+    thinkingLevel: config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "low"
   });
 
   const controller = new AbortController();

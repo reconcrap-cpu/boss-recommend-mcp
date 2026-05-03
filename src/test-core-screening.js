@@ -6,6 +6,7 @@ import {
   buildScreeningLlmImageInputs,
   buildScreeningCandidateFromDetail,
   buildScreeningLlmMessages,
+  callScreeningLlm,
   extractBossProfileFromNetworkBody,
   htmlToText,
   normalizeCandidateFromHtml,
@@ -459,6 +460,51 @@ function testBuildScreeningLlmMessagesWithImages() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testCallScreeningLlmDefaultsThinkingLow() {
+  const originalFetch = globalThis.fetch;
+  let payload = null;
+  globalThis.fetch = async (_url, options) => {
+    payload = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: { content: "{\"passed\": true}" },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 12 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "thinking-default",
+        text: "张三\n算法工程师\n本科"
+      }),
+      criteria: "算法经验",
+      config: {
+        baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+        apiKey: "test-key",
+        model: "doubao-seed-2.0-lite"
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(result.passed, true);
+    assert.deepEqual(payload.thinking, { type: "enabled" });
+    assert.equal(payload.max_tokens, 64);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 testHtmlToText();
 testNormalizeFromHtml();
 testNormalizeFromHtmlSkipsSalaryAsName();
@@ -474,5 +520,6 @@ testBossChatHistoryResumeExtraction();
 testBuildScreeningCandidateFromDetailUsesCleanNetworkText();
 testBuildScreeningLlmMessages();
 testBuildScreeningLlmMessagesWithImages();
+await testCallScreeningLlmDefaultsThinkingLow();
 
 console.log("Core screening tests passed");
