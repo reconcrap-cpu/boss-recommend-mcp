@@ -328,12 +328,25 @@ function isRequestedResumeText(text = "") {
   return Boolean(
     normalized === "已求简历"
     || normalized === "已索要简历"
-    || normalized === "已申请"
-    || normalized === "已发送"
     || normalized.includes("已求简历")
     || normalized.includes("已索要简历")
-    || normalized.includes("已申请")
-    || normalized.includes("已发送")
+    || normalized.includes("简历请求已发送")
+    || normalized.includes("已发送简历")
+    || (normalized.includes("已申请") && normalized.includes("简历"))
+  );
+}
+
+function isRequestedResumeControlTarget(target = {}) {
+  const label = normalizeDetailText(target.label);
+  const className = String(target.attributes?.class || "");
+  const selector = String(target.selector || "");
+  const controlLike = /\boperate-btn\b|operate|resume|button|btn/i.test(`${selector} ${className}`);
+  if (isRequestedResumeText(label)) return true;
+  return controlLike && Boolean(
+    label === "已申请"
+    || label === "已发送"
+    || label.includes("已申请")
+    || label.includes("已发送")
   );
 }
 
@@ -861,7 +874,7 @@ export async function readChatConversationReadyState(client) {
     client,
     rootState.roots,
     CHAT_ASK_RESUME_BUTTON_SELECTORS,
-    (target) => isRequestedResumeText(target.label)
+    (target) => isRequestedResumeControlTarget(target)
   );
   const editor = await findVisibleMatchingTarget(
     client,

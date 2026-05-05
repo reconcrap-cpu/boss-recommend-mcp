@@ -619,6 +619,57 @@ async function testDisabledAskResumeIsNotAlreadyRequested() {
   assert.equal(requestedAsk.already_requested_resume, true);
 }
 
+async function testGenericSentMessageIsNotAlreadyRequestedResume() {
+  const client = {
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        if (selector.includes("resume-btn-online")) return { nodeIds: [20] };
+        if (selector.includes("resume-btn-file")) return { nodeIds: [21] };
+        if (selector === "span.operate-btn" || selector === ".operate-btn") return { nodeIds: [30] };
+        if (selector === "span") return { nodeIds: [31] };
+        if (selector.includes("boss-chat-editor-input")) return { nodeIds: [40] };
+        if (selector.includes("submit")) return { nodeIds: [41] };
+        return { nodeIds: [] };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === 20) return { attributes: ["class", "btn resume-btn-online"] };
+        if (params.nodeId === 21) return { attributes: ["class", "btn resume-btn-file disabled"] };
+        if (params.nodeId === 30) return { attributes: ["class", "operate-btn"] };
+        if (params.nodeId === 31) return { attributes: ["class", "push-text"] };
+        if (params.nodeId === 40) return { attributes: ["id", "boss-chat-editor-input", "contenteditable", "true"] };
+        if (params.nodeId === 41) return { attributes: ["class", "submit"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        if (params.nodeId === 20) return { outerHTML: '<a class="btn resume-btn-online">在线简历</a>' };
+        if (params.nodeId === 21) return { outerHTML: '<a class="btn resume-btn-file disabled">附件简历</a>' };
+        if (params.nodeId === 30) return { outerHTML: '<span class="operate-btn">求简历</span>' };
+        if (params.nodeId === 31) return { outerHTML: '<span class="push-text">您好，已发送</span>' };
+        if (params.nodeId === 40) return { outerHTML: '<div id="boss-chat-editor-input" contenteditable="true"></div>' };
+        if (params.nodeId === 41) return { outerHTML: '<button class="submit">发送</button>' };
+        return { outerHTML: "" };
+      },
+      async getBoxModel() {
+        return {
+          model: {
+            border: [0, 0, 100, 0, 100, 30, 0, 30]
+          }
+        };
+      }
+    }
+  };
+
+  const state = await readChatConversationReadyState(client);
+  assert.equal(state.has_ask_resume, true);
+  assert.equal(state.ask_resume.disabled, false);
+  assert.equal(state.already_requested_resume, false);
+  assert.equal(state.requested_resume, null);
+}
+
 async function testPlainAttachmentResumeIsNotAskResumeControl() {
   const client = {
     DOM: {
@@ -834,6 +885,7 @@ await testChatJobSelectionClosesOpenDropdownWhenAlreadyCurrent();
 await testChatJobSelectionFailsWhenUiStaysOnWrongJob();
 await testOnlineResumeButtonRequiresExpectedActiveCandidate();
 await testDisabledAskResumeIsNotAlreadyRequested();
+await testGenericSentMessageIsNotAlreadyRequestedResume();
 await testPlainAttachmentResumeIsNotAskResumeControl();
 await testActiveAttachmentResumeSkipsRequest();
 await testChatResumeRequestSendsMessageBeforeAskResume();
