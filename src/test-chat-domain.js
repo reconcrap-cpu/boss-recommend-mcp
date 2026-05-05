@@ -872,6 +872,119 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
   assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [41, 30, 60]);
 }
 
+async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserved() {
+  const state = {
+    editorText: "",
+    messageSent: false,
+    askClicks: 0,
+    confirmClicks: 0,
+    confirmVisible: false,
+    requestSent: false,
+    lastBoxNodeId: 0,
+    clicks: [],
+    boxCenters: {}
+  };
+  const nodeHtml = (nodeId) => {
+    if (nodeId === 20) return '<a class="btn resume-btn-online">在线简历</a>';
+    if (nodeId === 21) return '<a class="btn resume-btn-file disabled">附件简历</a>';
+    if (nodeId === 30) return '<span class="operate-btn">求简历</span>';
+    if (nodeId === 31) return '<span class="push-text">您好，已发送</span>';
+    if (nodeId === 40) return `<div id="boss-chat-editor-input" contenteditable="true">${state.editorText}</div>`;
+    if (nodeId === 41) return '<button class="submit active">发送</button>';
+    if (nodeId === 50) {
+      return [
+        '<div class="chat-message-list">',
+        '<span class="push-text">您好，已发送</span>',
+        state.requestSent ? '<div>简历请求已发送</div>' : '',
+        '</div>'
+      ].join("");
+    }
+    if (nodeId === 60) return '<span class="boss-btn-primary boss-btn">确定</span>';
+    return "";
+  };
+  const client = {
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        if (selector.includes("resume-btn-online")) return { nodeIds: [20] };
+        if (selector.includes("resume-btn-file")) return { nodeIds: [21] };
+        if (selector === "span.operate-btn" || selector === ".operate-btn") return { nodeIds: [30] };
+        if (selector === "span") return { nodeIds: [30, 31] };
+        if (selector.includes("boss-chat-editor-input")) return { nodeIds: [40] };
+        if (selector.includes("submit")) return { nodeIds: [41] };
+        if (selector.includes("chat-message-list")) return { nodeIds: [50] };
+        if (state.confirmVisible && selector.includes("boss-btn-primary")) return { nodeIds: [60] };
+        return { nodeIds: [] };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === 20) return { attributes: ["class", "btn resume-btn-online"] };
+        if (params.nodeId === 21) return { attributes: ["class", "btn resume-btn-file disabled"] };
+        if (params.nodeId === 30) return { attributes: ["class", "operate-btn"] };
+        if (params.nodeId === 31) return { attributes: ["class", "push-text"] };
+        if (params.nodeId === 40) return { attributes: ["id", "boss-chat-editor-input", "contenteditable", "true"] };
+        if (params.nodeId === 41) return { attributes: ["class", "submit active"] };
+        if (params.nodeId === 50) return { attributes: ["class", "chat-message-list"] };
+        if (params.nodeId === 60) return { attributes: ["class", "boss-btn-primary boss-btn"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        return { outerHTML: nodeHtml(params.nodeId) };
+      },
+      async getBoxModel(params) {
+        state.lastBoxNodeId = params.nodeId;
+        const left = params.nodeId * 10;
+        const right = left + 100;
+        const center = left + 50;
+        state.boxCenters[center] = params.nodeId;
+        return {
+          model: {
+            border: [left, 0, right, 0, right, 30, left, 30]
+          }
+        };
+      },
+      async scrollIntoViewIfNeeded() {}
+    },
+    Input: {
+      async dispatchMouseEvent(params) {
+        if (params.type !== "mouseReleased") return {};
+        const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
+        state.clicks.push(clickedNodeId);
+        if (clickedNodeId === 41) state.messageSent = true;
+        if (clickedNodeId === 30) {
+          state.askClicks += 1;
+          state.confirmVisible = true;
+        }
+        if (clickedNodeId === 60 && state.confirmVisible) {
+          state.confirmClicks += 1;
+          state.confirmVisible = false;
+          if (state.confirmClicks >= 2) state.requestSent = true;
+        }
+        return {};
+      },
+      async dispatchKeyEvent() {
+        return {};
+      },
+      async insertText(params) {
+        state.editorText = params.text;
+        return {};
+      }
+    }
+  };
+
+  const result = await requestChatResumeForPassedCandidate(client, {
+    maxAttempts: 2
+  });
+  assert.equal(result.requested, true);
+  assert.equal(result.skipped, false);
+  assert.equal(state.askClicks, 2);
+  assert.equal(state.confirmClicks, 2);
+  assert.equal(result.attempts.length, 2);
+  assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [41, 30, 60, 30, 60]);
+}
+
 testNetworkPatterns();
 await testQuickChatResumeModalOpenProbe();
 testNetworkRecorder();
@@ -889,5 +1002,6 @@ await testGenericSentMessageIsNotAlreadyRequestedResume();
 await testPlainAttachmentResumeIsNotAskResumeControl();
 await testActiveAttachmentResumeSkipsRequest();
 await testChatResumeRequestSendsMessageBeforeAskResume();
+await testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserved();
 
 console.log("chat domain tests passed");

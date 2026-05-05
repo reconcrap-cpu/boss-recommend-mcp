@@ -336,6 +336,39 @@ function isRequestedResumeText(text = "") {
   );
 }
 
+function isResumeRequestSentMessageText(text = "") {
+  const normalized = normalizeDetailText(text);
+  return Boolean(
+    normalized.includes("简历请求已发送")
+    || normalized.includes("已发送简历")
+    || normalized.includes("已求简历")
+    || normalized.includes("已索要简历")
+    || normalized.includes("已发送")
+  );
+}
+
+function countTextOccurrences(text = "", needle = "") {
+  if (!needle) return 0;
+  let count = 0;
+  let index = 0;
+  while (index < text.length) {
+    const found = text.indexOf(needle, index);
+    if (found < 0) break;
+    count += 1;
+    index = found + needle.length;
+  }
+  return count;
+}
+
+function countResumeRequestSentMessageMarkers(lines = []) {
+  const markers = ["简历请求已发送", "已发送简历", "已求简历", "已索要简历", "已发送"];
+  return lines.reduce((total, line) => (
+    total + markers.reduce((lineTotal, marker) => (
+      lineTotal + countTextOccurrences(line, marker)
+    ), 0)
+  ), 0);
+}
+
 function isRequestedResumeControlTarget(target = {}) {
   const label = normalizeDetailText(target.label);
   const className = String(target.attributes?.class || "");
@@ -1034,13 +1067,6 @@ export async function clickChatAskResume(client, {
         control: state.attachment_resume
       };
     }
-    if (state.already_requested_resume) {
-      return {
-        ok: true,
-        already_requested: true,
-        control: state.requested_resume
-      };
-    }
     if (state.ask_resume?.node_id && !state.ask_resume.disabled) {
       try {
         if (state.ask_resume.center) {
@@ -1062,6 +1088,13 @@ export async function clickChatAskResume(client, {
           recoverable_phase: "ask_resume_click"
         };
       }
+    }
+    if (state.already_requested_resume) {
+      return {
+        ok: true,
+        already_requested: true,
+        control: state.requested_resume
+      };
     }
     await sleep(250);
   }
@@ -1151,11 +1184,12 @@ export async function getChatResumeRequestMessageState(client) {
     text = htmlToText(await getOuterHTML(client, nodeId));
   } catch {}
   const lines = text.split(/\r?\n/).map(normalizeDetailText).filter(Boolean);
-  const matching = lines.filter((line) => line.includes("简历请求已发送"));
+  const matching = lines.filter((line) => isResumeRequestSentMessageText(line));
+  const count = countResumeRequestSentMessageMarkers(lines);
   return {
     ok: Boolean(text),
     selector: messageRoot?.selector || "top",
-    count: matching.length,
+    count,
     last_text: matching[matching.length - 1] || lines[lines.length - 1] || "",
     recent: lines.slice(-12)
   };
@@ -1170,9 +1204,7 @@ export async function waitForChatResumeRequestMessage(client, {
   let state = null;
   while (Date.now() - started <= timeoutMs) {
     state = await getChatResumeRequestMessageState(client);
-    const observed = state.count > baselineCount
-      || state.last_text.includes("简历请求已发送")
-      || state.recent.some((item) => item.includes("简历请求已发送"));
+    const observed = state.count > baselineCount;
     if (observed) {
       return {
         observed: true,
@@ -1201,14 +1233,6 @@ export async function requestChatResumeForPassedCandidate(client, {
       requested: false,
       skipped: true,
       reason: "attachment_resume_already_available",
-      initial_state: initialState
-    };
-  }
-  if (initialState.already_requested_resume) {
-    return {
-      requested: true,
-      skipped: true,
-      reason: "resume_already_requested",
       initial_state: initialState
     };
   }
