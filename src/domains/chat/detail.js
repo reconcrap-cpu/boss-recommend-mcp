@@ -46,6 +46,33 @@ import {
 
 export const CHAT_UNSAFE_ONLINE_RESUME_LINK_CODE = "CHAT_UNSAFE_ONLINE_RESUME_LINK";
 
+const CHAT_CONVERSATION_CONTROL_SCOPE_SELECTORS = Object.freeze([
+  ".conversation-main",
+  ".conversation-editor",
+  ".chat-message-list",
+  ".toolbar-box-right",
+  ".operate-exchange-left",
+  ".operate-icon-item",
+  ".exchange-tooltip",
+  ".boss-popup__wrapper",
+  ".boss-dialog",
+  ".dialog-wrap.active",
+  ".geek-detail-modal"
+]);
+
+const CHAT_REQUESTED_RESUME_SCOPE_SELECTORS = Object.freeze([
+  ".chat-message-list",
+  ".conversation-editor",
+  ".conversation-main",
+  ".toolbar-box-right",
+  ".operate-exchange-left",
+  ".operate-icon-item",
+  ".exchange-tooltip",
+  ".boss-popup__wrapper",
+  ".boss-dialog",
+  ".dialog-wrap.active"
+]);
+
 export function matchesChatProfileNetwork(url) {
   return CHAT_PROFILE_NETWORK_PATTERNS.some((pattern) => pattern.test(String(url || "")));
 }
@@ -369,6 +396,20 @@ function countResumeRequestSentMessageMarkers(lines = []) {
   ), 0);
 }
 
+function isResumeAttachmentMessageText(text = "") {
+  const normalized = normalizeDetailText(text);
+  return Boolean(
+    /点击.*附件简历/.test(normalized)
+    || /预览附件简历/.test(normalized)
+    || /查看附件简历/.test(normalized)
+    || /(?:简历|resume)[^\s]*\.(?:pdf|docx?|jpg|jpeg|png)\b/i.test(normalized)
+  );
+}
+
+function countResumeAttachmentMessageMarkers(lines = []) {
+  return lines.reduce((total, line) => total + (isResumeAttachmentMessageText(line) ? 1 : 0), 0);
+}
+
 function isRequestedResumeControlTarget(target = {}) {
   const label = normalizeDetailText(target.label);
   const className = String(target.attributes?.class || "");
@@ -402,7 +443,6 @@ function isConfirmText(text = "") {
     normalized === "确定"
     || normalized === "确认"
     || normalized === "提交"
-    || normalized === "发送"
     || normalized === "继续"
     || normalized.includes("确定")
     || normalized.includes("确认")
@@ -466,6 +506,35 @@ async function findVisibleMatchingTarget(client, roots, selectors, predicate) {
     }
   }
   return null;
+}
+
+async function resolveScopedRoots(client, roots = [], selectors = [], {
+  fallbackToRoots = true
+} = {}) {
+  const scoped = [];
+  const seen = new Set();
+  for (const root of roots) {
+    if (!root?.nodeId) continue;
+    for (const selector of selectors) {
+      let nodeIds = [];
+      try {
+        nodeIds = await querySelectorAll(client, root.nodeId, selector);
+      } catch {
+        nodeIds = [];
+      }
+      for (const nodeId of nodeIds) {
+        const key = `${root.name}:${nodeId}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        scoped.push({
+          name: `${root.name}:${selector}`,
+          nodeId
+        });
+      }
+    }
+  }
+  if (scoped.length || !fallbackToRoots) return scoped;
+  return roots;
 }
 
 export async function selectChatPrimaryLabel(client, {
@@ -885,39 +954,53 @@ export async function openChatOnlineResume(client, {
 
 export async function readChatConversationReadyState(client) {
   const rootState = await getChatRoots(client);
-  const onlineResume = await findVisibleMatchingTarget(
+  const scopedControlRoots = await resolveScopedRoots(
     client,
     rootState.roots,
+    CHAT_CONVERSATION_CONTROL_SCOPE_SELECTORS,
+    { fallbackToRoots: false }
+  );
+  const scopedRequestedRoots = await resolveScopedRoots(
+    client,
+    rootState.roots,
+    CHAT_REQUESTED_RESUME_SCOPE_SELECTORS,
+    { fallbackToRoots: false }
+  );
+  const controlRoots = scopedControlRoots.length ? scopedControlRoots : rootState.roots;
+  const requestedRoots = scopedRequestedRoots.length ? scopedRequestedRoots : rootState.roots;
+  const onlineResume = await findVisibleMatchingTarget(
+    client,
+    controlRoots,
     CHAT_ONLINE_RESUME_BUTTON_SELECTORS,
     (target) => target.label.includes("在线简历") && !target.disabled
   );
   const attachmentResume = await findVisibleMatchingTarget(
     client,
-    rootState.roots,
+    controlRoots,
     CHAT_ATTACHMENT_RESUME_BUTTON_SELECTORS,
     (target) => isAttachmentResumeText(target.label)
   );
   const askResume = await findVisibleMatchingTarget(
     client,
-    rootState.roots,
+    controlRoots,
     CHAT_ASK_RESUME_BUTTON_SELECTORS,
     (target) => isAskResumeText(target.label) && !isAttachmentResumeTarget(target)
   );
   const requestedResume = await findVisibleMatchingTarget(
     client,
-    rootState.roots,
+    requestedRoots,
     CHAT_ASK_RESUME_BUTTON_SELECTORS,
     (target) => isRequestedResumeControlTarget(target)
   );
   const editor = await findVisibleMatchingTarget(
     client,
-    rootState.roots,
+    controlRoots,
     CHAT_EDITOR_SELECTORS,
     () => true
   );
   const sendButton = await findVisibleMatchingTarget(
     client,
-    rootState.roots,
+    controlRoots,
     CHAT_SEND_BUTTON_SELECTORS,
     (target) => isSendText(target.label) || /submit/i.test(String(target.attributes?.class || ""))
   );
@@ -1111,19 +1194,18 @@ export async function clickChatConfirmRequestResume(client, {
 } = {}) {
   const started = Date.now();
   let lastTarget = null;
+  let lastState = null;
   while (Date.now() - started <= timeoutMs) {
-    const state = await readChatConversationReadyState(client);
-    if (state.already_requested_resume) {
-      return {
-        confirmed: true,
-        assumed_requested: true,
-        state
-      };
-    }
+    lastState = await readChatConversationReadyState(client);
     const rootState = await getChatRoots(client);
-    const target = await findVisibleMatchingTarget(
+    const confirmRoots = await resolveScopedRoots(
       client,
       rootState.roots,
+      CHAT_CONVERSATION_CONTROL_SCOPE_SELECTORS
+    );
+    const target = await findVisibleMatchingTarget(
+      client,
+      confirmRoots,
       CHAT_CONFIRM_REQUEST_RESUME_SELECTORS,
       (item) => isConfirmText(item.label) && !item.disabled
     );
@@ -1157,7 +1239,8 @@ export async function clickChatConfirmRequestResume(client, {
   return {
     confirmed: false,
     error: "CONFIRM_BUTTON_NOT_FOUND",
-    control: lastTarget
+    control: lastTarget,
+    state: lastState
   };
 }
 
@@ -1185,18 +1268,25 @@ export async function getChatResumeRequestMessageState(client) {
   } catch {}
   const lines = text.split(/\r?\n/).map(normalizeDetailText).filter(Boolean);
   const matching = lines.filter((line) => isResumeRequestSentMessageText(line));
+  const attachmentMatching = lines.filter((line) => isResumeAttachmentMessageText(line));
   const count = countResumeRequestSentMessageMarkers(lines);
+  const resumeAttachmentCount = countResumeAttachmentMessageMarkers(lines);
   return {
     ok: Boolean(text),
     selector: messageRoot?.selector || "top",
     count,
+    resume_attachment_count: resumeAttachmentCount,
+    success_count: count + resumeAttachmentCount,
     last_text: matching[matching.length - 1] || lines[lines.length - 1] || "",
+    last_resume_attachment_text: attachmentMatching[attachmentMatching.length - 1] || "",
+    last_success_text: matching[matching.length - 1] || attachmentMatching[attachmentMatching.length - 1] || "",
     recent: lines.slice(-12)
   };
 }
 
 export async function waitForChatResumeRequestMessage(client, {
   baselineCount = 0,
+  baselineResumeAttachmentCount = 0,
   timeoutMs = 6500,
   intervalMs = 260
 } = {}) {
@@ -1204,7 +1294,10 @@ export async function waitForChatResumeRequestMessage(client, {
   let state = null;
   while (Date.now() - started <= timeoutMs) {
     state = await getChatResumeRequestMessageState(client);
-    const observed = state.count > baselineCount;
+    const observed = (
+      state.count > baselineCount
+      || state.resume_attachment_count > baselineResumeAttachmentCount
+    );
     if (observed) {
       return {
         observed: true,
@@ -1305,7 +1398,8 @@ export async function requestChatResumeForPassedCandidate(client, {
       confirmResult = await clickChatConfirmRequestResume(client);
     }
     const messageCheck = await waitForChatResumeRequestMessage(client, {
-      baselineCount: before.count
+      baselineCount: before.count,
+      baselineResumeAttachmentCount: before.resume_attachment_count
     });
     const messageObserved = Boolean(messageCheck.observed);
     attempts.push({
@@ -1314,8 +1408,10 @@ export async function requestChatResumeForPassedCandidate(client, {
       confirm_result: confirmResult,
       message_before_count: before.count,
       message_after_count: messageCheck.state?.count || 0,
+      resume_attachment_before_count: before.resume_attachment_count || 0,
+      resume_attachment_after_count: messageCheck.state?.resume_attachment_count || 0,
       message_observed: messageObserved,
-      message_last_text: messageCheck.state?.last_text || ""
+      message_last_text: messageCheck.state?.last_success_text || messageCheck.state?.last_text || ""
     });
     if (messageObserved) {
       return {
