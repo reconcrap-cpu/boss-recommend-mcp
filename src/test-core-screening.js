@@ -527,7 +527,69 @@ async function testCallScreeningLlmDefaultsThinkingLow() {
     });
     assert.equal(result.passed, true);
     assert.deepEqual(payload.thinking, { type: "enabled" });
-    assert.equal(payload.max_tokens, 64);
+    assert.equal(payload.max_tokens, 512);
+    assert.equal(result.provider.thinking_level, "low");
+    assert.deepEqual(result.provider.thinking, { type: "enabled" });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmUsesConfigThinkingAndBudget() {
+  const originalFetch = globalThis.fetch;
+  let payload = null;
+  globalThis.fetch = async (_url, options) => {
+    payload = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": false}",
+                reasoning_content: "configured reasoning"
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 20 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "chat",
+        source: "fixture",
+        id: "thinking-configured",
+        text: "李四\n视觉算法\n硕士"
+      }),
+      criteria: "算法经验",
+      config: {
+        baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
+        apiKey: "test-key",
+        model: "doubao-seed-2.0-lite",
+        llmThinkingLevel: "off",
+        llmMaxTokens: 128,
+        llmMaxCompletionTokens: 256,
+        temperature: 0,
+        topP: 0.2
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(result.passed, false);
+    assert.deepEqual(payload.thinking, { type: "disabled" });
+    assert.equal(payload.max_tokens, 256);
+    assert.equal(payload.max_completion_tokens, 256);
+    assert.equal(payload.temperature, 0);
+    assert.equal(payload.top_p, 0.2);
+    assert.equal(result.provider.thinking_level, "off");
+    assert.deepEqual(result.provider.thinking, { type: "disabled" });
+    assert.equal(result.provider.max_tokens, 256);
+    assert.equal(result.provider.max_completion_tokens, 256);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -599,6 +661,7 @@ testBuildScreeningLlmMessages();
 testBuildScreeningLlmMessagesWithImages();
 testBuildScreeningLlmImageInputsPrefersComposedFullCvImages();
 await testCallScreeningLlmDefaultsThinkingLow();
+await testCallScreeningLlmUsesConfigThinkingAndBudget();
 await testCallScreeningLlmRetriesTransientFailure();
 
 console.log("Core screening tests passed");

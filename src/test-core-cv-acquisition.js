@@ -81,8 +81,12 @@ function testProfileCountingAndEvidenceSummary() {
     llm_file_paths: ["page-llm-01.jpg"],
     llm_screenshot_count: 1,
     llm_total_byte_length: 123,
-    llm_original_total_byte_length: 456
+    llm_original_total_byte_length: 456,
+    scroll_anchor_plan: { ok: true, anchor_count: 2 },
+    stop_boundary_checks: [{ capture_index: 1, match_count: 1 }],
+    stop_boundary_result: { action: "capture_then_stop" }
   }), {
+    ok: true,
     source: "image-scroll-sequence",
     elapsed_ms: 0,
     capture_count: 2,
@@ -96,6 +100,12 @@ function testProfileCountingAndEvidenceSummary() {
     llm_original_total_byte_length: 456,
     llm_composition_error: null,
     optimization: null,
+    scroll_anchor_plan: { ok: true, anchor_count: 2 },
+    stop_boundary_plan: null,
+    stop_boundary_checks: [{ capture_index: 1, match_count: 1 }],
+    stop_boundary_result: { action: "capture_then_stop" },
+    error_code: null,
+    error: null,
     file_paths: ["page-01.png"],
     llm_file_paths: ["page-llm-01.jpg"],
     first_clip: null

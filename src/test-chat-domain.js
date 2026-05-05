@@ -12,11 +12,15 @@ import {
   getChatTopLevelState,
   isChatShellUrl,
   isForbiddenChatResumeTopLevelUrl,
+  isUnsafeChatOnlineResumeLinkError,
+  isUnsafeChatOnlineResumeTarget,
   matchesChatProfileNetwork,
+  openChatOnlineResume,
   readChatConversationReadyState,
   readChatCardCandidate,
   recoverChatShell,
   requestChatResumeForPassedCandidate,
+  selectChatJob,
   waitForChatOnlineResumeButton
 } from "./domains/chat/index.js";
 import { inspectEmptyChatListVisually } from "../scripts/live-helpers/chat-empty-list-visual.js";
@@ -201,6 +205,260 @@ async function testChatTopLevelPageGuard() {
   assert.equal(recovery.recovered, true);
   assert.deepEqual(navigations, ["https://www.zhipin.com/web/chat/index"]);
   assert.equal(recovery.after.is_chat_shell, true);
+}
+
+async function testUnsafeOnlineResumeLinkIsBlockedBeforeClick() {
+  assert.equal(
+    isUnsafeChatOnlineResumeTarget(
+      {},
+      '<a class="btn resume-btn-online" href="/web/frame/c-resume/?source=chat-resume-online">在线简历</a>'
+    ),
+    true
+  );
+  assert.equal(
+    isUnsafeChatOnlineResumeTarget(
+      {},
+      '<a class="btn resume-btn-online" href="javascript:;">在线简历</a>'
+    ),
+    false
+  );
+
+  let clickCount = 0;
+  const client = {
+    Page: {
+      async getFrameTree() {
+        return {
+          frameTree: {
+            frame: { url: "https://www.zhipin.com/web/chat/index" }
+          }
+        };
+      }
+    },
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        if (selector === "a.btn.resume-btn-online" || selector === "a.resume-btn-online") {
+          return { nodeIds: [20] };
+        }
+        return { nodeIds: [] };
+      },
+      async querySelector() {
+        return { nodeId: 0 };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === 20) {
+          return {
+            attributes: [
+              "class", "btn resume-btn-online",
+              "href", "/web/frame/c-resume/?source=chat-resume-online"
+            ]
+          };
+        }
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        if (params.nodeId === 20) {
+          return {
+            outerHTML:
+              '<a class="btn resume-btn-online" href="/web/frame/c-resume/?source=chat-resume-online">在线简历</a>'
+          };
+        }
+        return { outerHTML: "" };
+      },
+      async getBoxModel(params) {
+        if (params.nodeId !== 20) throw new Error("no box");
+        return {
+          model: {
+            border: [0, 0, 100, 0, 100, 30, 0, 30]
+          }
+        };
+      },
+      async scrollIntoViewIfNeeded() {}
+    },
+    Input: {
+      async dispatchMouseEvent() {
+        clickCount += 1;
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => openChatOnlineResume(client, {
+      timeoutMs: 50,
+      attemptsLimit: 1,
+      settleMs: 0
+    }),
+    (error) => isUnsafeChatOnlineResumeLinkError(error)
+  );
+  assert.equal(clickCount, 0);
+}
+
+function createFakeChatJobClient({ selectionChanges = true, initialSelectedLabel = "" , initialMenuOpen = false } = {}) {
+  const requestedLabel = "算法工程师 23-27届实习/校招/早期职业 _ 杭州 25-50K";
+  const wrongLabel = "大模型高招岗位 _ 杭州 50-80K";
+  const state = {
+    selectedLabel: initialSelectedLabel || wrongLabel,
+    menuOpen: Boolean(initialMenuOpen),
+    clicks: [],
+    keyEvents: []
+  };
+  const optionLabels = {
+    101: "全部职位",
+    102: wrongLabel,
+    103: requestedLabel
+  };
+  const optionValues = {
+    101: "-1",
+    102: "535092691",
+    103: "534000582"
+  };
+  const centers = {
+    20: { x: 50, y: 20 },
+    101: { x: 50, y: 60 },
+    102: { x: 50, y: 90 },
+    103: { x: 50, y: 120 }
+  };
+  const boxFor = (nodeId) => {
+    const center = centers[nodeId];
+    if (!center) throw new Error(`no box for ${nodeId}`);
+    if ([101, 102, 103].includes(nodeId) && !state.menuOpen) {
+      throw new Error("option hidden");
+    }
+    return {
+      model: {
+        border: [
+          center.x - 20, center.y - 10,
+          center.x + 20, center.y - 10,
+          center.x + 20, center.y + 10,
+          center.x - 20, center.y + 10
+        ]
+      }
+    };
+  };
+  return {
+    state,
+    client: {
+      DOM: {
+        async getDocument() {
+          return { root: { nodeId: 1 } };
+        },
+        async querySelector(params) {
+          const selector = String(params.selector || "");
+          if (selector === ".chat-job .chat-select-job" || selector === ".chat-job .dropmenu-label") {
+            return { nodeId: selector === ".chat-job .chat-select-job" ? 20 : 10 };
+          }
+          if (selector === ".chat-job") return { nodeId: 20 };
+          return { nodeId: 0 };
+        },
+        async querySelectorAll(params) {
+          const selector = String(params.selector || "");
+          if (selector === ".chat-job .ui-dropmenu-list li") return { nodeIds: [101, 102, 103] };
+          if (selector === ".chat-job .chat-select-job" || selector === ".chat-job" || selector === ".chat-job .dropmenu-label") {
+            return { nodeIds: [20] };
+          }
+          return { nodeIds: [] };
+        },
+        async getAttributes(params) {
+          if (params.nodeId === 20) return { attributes: ["class", "chat-select-job"] };
+          if (params.nodeId === 10) return { attributes: ["class", "dropmenu-label"] };
+          const label = optionLabels[params.nodeId];
+          if (label) {
+            const active = label === state.selectedLabel ? "active" : "";
+            return {
+              attributes: ["title", label, "value", optionValues[params.nodeId], "class", active]
+            };
+          }
+          return { attributes: [] };
+        },
+        async getOuterHTML(params) {
+          if (params.nodeId === 20 || params.nodeId === 10) {
+            return { outerHTML: `<div class="chat-select-job">${state.selectedLabel}</div>` };
+          }
+          const label = optionLabels[params.nodeId];
+          if (label) {
+            const active = label === state.selectedLabel ? "active" : "";
+            return { outerHTML: `<li class="${active}" value="${optionValues[params.nodeId]}">${label}</li>` };
+          }
+          return { outerHTML: "" };
+        },
+        async getBoxModel(params) {
+          return boxFor(params.nodeId);
+        },
+        async scrollIntoViewIfNeeded() {}
+      },
+      Input: {
+        async dispatchMouseEvent(event) {
+          if (event.type !== "mouseReleased") return;
+          state.clicks.push({ x: event.x, y: event.y });
+          if (Math.abs(event.x - centers[20].x) < 1 && Math.abs(event.y - centers[20].y) < 1) {
+            state.menuOpen = true;
+            return;
+          }
+          if (Math.abs(event.x - centers[103].x) < 1 && Math.abs(event.y - centers[103].y) < 1) {
+            if (selectionChanges) state.selectedLabel = requestedLabel;
+            state.menuOpen = false;
+          }
+        },
+        async dispatchKeyEvent(event) {
+          state.keyEvents.push(event);
+          if (event.type === "keyUp" && event.key === "Escape") {
+            state.menuOpen = false;
+          }
+        }
+      }
+    }
+  };
+}
+
+async function testChatJobSelectionVerifiesRequestedJob() {
+  const { client, state } = createFakeChatJobClient();
+  const result = await selectChatJob(client, 1, {
+    jobLabel: "算法工程师 23-27届实习/校招/早期职业 _ 杭州",
+    timeoutMs: 100,
+    intervalMs: 1,
+    settleMs: 0
+  });
+  assert.equal(result.selected, true);
+  assert.equal(result.verified, true);
+  assert.match(result.selected_label, /算法工程师 23-27届/);
+  assert.match(state.selectedLabel, /算法工程师 23-27届/);
+}
+
+async function testChatJobSelectionClosesOpenDropdownWhenAlreadyCurrent() {
+  const requestedLabel = "算法工程师 23-27届实习/校招/早期职业 _ 杭州 25-50K";
+  const { client, state } = createFakeChatJobClient({
+    initialSelectedLabel: requestedLabel,
+    initialMenuOpen: true
+  });
+  const result = await selectChatJob(client, 1, {
+    jobLabel: "534000582",
+    timeoutMs: 100,
+    intervalMs: 1,
+    settleMs: 0
+  });
+  assert.equal(result.selected, true);
+  assert.equal(result.verified, true);
+  assert.equal(result.already_current, true);
+  assert.equal(result.menu_close.closed, true);
+  assert.equal(state.menuOpen, false);
+  assert.equal(state.keyEvents.some((event) => event.key === "Escape"), true);
+}
+
+async function testChatJobSelectionFailsWhenUiStaysOnWrongJob() {
+  const { client, state } = createFakeChatJobClient({ selectionChanges: false });
+  const result = await selectChatJob(client, 1, {
+    jobLabel: "算法工程师 23-27届实习/校招/早期职业 _ 杭州",
+    timeoutMs: 100,
+    intervalMs: 1,
+    settleMs: 0
+  });
+  assert.equal(result.selected, false);
+  assert.equal(result.verified, false);
+  assert.equal(result.reason, "job_selection_not_verified");
+  assert.match(state.selectedLabel, /大模型高招岗位/);
 }
 
 async function testOnlineResumeButtonRequiresExpectedActiveCandidate() {
@@ -535,6 +793,10 @@ await testCardCandidateReader();
 await testChatSelfHealConfig();
 await testEmptyChatListVisualInspection();
 await testChatTopLevelPageGuard();
+await testUnsafeOnlineResumeLinkIsBlockedBeforeClick();
+await testChatJobSelectionVerifiesRequestedJob();
+await testChatJobSelectionClosesOpenDropdownWhenAlreadyCurrent();
+await testChatJobSelectionFailsWhenUiStaysOnWrongJob();
 await testOnlineResumeButtonRequiresExpectedActiveCandidate();
 await testDisabledAskResumeIsNotAlreadyRequested();
 await testPlainAttachmentResumeIsNotAskResumeControl();

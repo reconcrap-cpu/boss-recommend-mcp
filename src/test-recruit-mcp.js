@@ -158,6 +158,17 @@ async function testRecruitDefaultsUseScreeningConfig() {
   assert.equal(observedOptions.llmConfig.apiKey, "sk-test-key");
   assert.equal(observedOptions.llmConfig.baseUrl, "https://api.example.com/v1");
   assert.equal(observedOptions.llmConfig.model, "gpt-4.1-mini");
+  assert.equal(observedOptions.llmConfig.llmThinkingLevel, "low");
+  assert.equal(observedOptions.llmConfig.llmMaxTokens, 384);
+  assert.equal(observedOptions.llmConfig.llmMaxRetries, 2);
+  assert.equal(observedOptions.llmConfig.llmTimeoutMs, 70000);
+  assert.equal(observedOptions.llmConfig.llmImageLimit, 6);
+  assert.equal(observedOptions.llmConfig.llmImageDetail, "high");
+  assert.equal(observedOptions.llmConfig.openaiOrganization, "org-test");
+  assert.equal(observedOptions.llmConfig.openaiProject, "proj-test");
+  assert.equal(observedOptions.llmConfig.temperature, 0);
+  assert.equal(observedOptions.llmConfig.topP, 0.2);
+  assert.equal(observedOptions.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
 }
 
 async function testRecruitSyncRun() {
@@ -276,6 +287,15 @@ async function main() {
     debugPort: 9444,
     outputDir,
     llmThinkingLevel: "low",
+    llmMaxTokens: 384,
+    llmMaxRetries: 2,
+    llmTimeoutMs: 70000,
+    llmImageLimit: 6,
+    llmImageDetail: "high",
+    openaiOrganization: "org-test",
+    openaiProject: "proj-test",
+    temperature: 0,
+    topP: 0.2,
     humanRestEnabled: false
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;

@@ -10,6 +10,7 @@ const SCREEN_CONFIG_TEMPLATE_DEFAULTS = Object.freeze({
   apiKey: "replace-with-your-api-key",
   model: "gpt-4.1-mini"
 });
+const LLM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "auto", "current"]);
 
 export const TARGET_COUNT_CANONICAL_ALL = "all";
 export const TARGET_COUNT_ACCEPTED_EXAMPLES = [TARGET_COUNT_CANONICAL_ALL, -1, 20, "全部候选人"];
@@ -223,12 +224,23 @@ function parsePositiveInteger(raw, fallback = null) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseConfigNumber(raw, fallback = null) {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 function parseConfigBoolean(raw, fallback = false) {
   if (typeof raw === "boolean") return raw;
   const normalized = normalizeText(raw).toLowerCase();
   if (["true", "1", "yes", "y", "on", "enabled"].includes(normalized)) return true;
   if (["false", "0", "no", "n", "off", "disabled"].includes(normalized)) return false;
   return fallback;
+}
+
+function normalizeLlmThinkingLevel(raw, fallback = "low") {
+  const normalized = normalizeText(raw).toLowerCase();
+  return LLM_THINKING_LEVELS.has(normalized) ? normalized : fallback;
 }
 
 function resolveConfigPathValue(raw, configDir) {
@@ -387,8 +399,18 @@ export function resolveBossScreeningConfig(workspaceRoot) {
       baseUrl: normalizeText(parsed.baseUrl).replace(/\/+$/, ""),
       apiKey: normalizeText(parsed.apiKey),
       model: normalizeText(parsed.model),
+      openaiOrganization: normalizeText(parsed.openaiOrganization || parsed.organization),
+      openaiProject: normalizeText(parsed.openaiProject || parsed.project),
       debugPort: parsePositiveInteger(parsed.debugPort, 9222),
-      llmThinkingLevel: normalizeText(parsed.llmThinkingLevel || parsed.thinkingLevel || parsed.reasoningEffort),
+      llmThinkingLevel: normalizeLlmThinkingLevel(parsed.llmThinkingLevel || parsed.thinkingLevel || parsed.reasoningEffort, "low"),
+      llmTimeoutMs: parsePositiveInteger(parsed.llmTimeoutMs || parsed.timeoutMs, null),
+      llmMaxRetries: parsePositiveInteger(parsed.llmMaxRetries || parsed.maxRetries, null),
+      llmMaxTokens: parsePositiveInteger(parsed.llmMaxTokens || parsed.maxTokens, null),
+      llmMaxCompletionTokens: parsePositiveInteger(parsed.llmMaxCompletionTokens || parsed.maxCompletionTokens, null),
+      llmImageLimit: parsePositiveInteger(parsed.llmImageLimit || parsed.imageLimit, null),
+      llmImageDetail: normalizeText(parsed.llmImageDetail || parsed.imageDetail),
+      temperature: parseConfigNumber(parsed.temperature, null),
+      topP: parseConfigNumber(parsed.topP || parsed.top_p, null),
       outputDir: resolveConfigPathValue(parsed.outputDir, configDir),
       humanRestEnabled: parseConfigBoolean(parsed.humanRestEnabled, false)
     },

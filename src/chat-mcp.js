@@ -34,6 +34,7 @@ import {
 import {
   CHAT_TARGET_URL,
   closeChatResumeModal,
+  closeChatJobDropdown,
   createChatRunService,
   getChatRoots,
   isForbiddenChatResumeTopLevelUrl,
@@ -69,6 +70,43 @@ const TERMINAL_STATUSES = new Set([
   RUN_STATUS_COMPLETED,
   RUN_STATUS_FAILED,
   RUN_STATUS_CANCELED
+]);
+
+const ARTIFACT_STATUSES = new Set([
+  RUN_STATUS_COMPLETED,
+  RUN_STATUS_FAILED,
+  RUN_STATUS_CANCELED,
+  RUN_STATUS_PAUSED
+]);
+
+const STALE_PROCESS_STATUSES = new Set([
+  "queued",
+  "running",
+  RUN_STATUS_CANCELING
+]);
+
+const CHAT_REQUEST_RESUME_ACTIONS = new Set([
+  "request_cv",
+  "ask_cv",
+  "request_resume",
+  "求简历",
+  "索要简历"
+]);
+
+const CHAT_DISABLE_REQUEST_RESUME_ACTIONS = new Set([
+  "none",
+  "no",
+  "false",
+  "off",
+  "skip",
+  "do_nothing",
+  "nothing",
+  "不做",
+  "什么都不做",
+  "无",
+  "不用",
+  "不求简历",
+  "不请求简历"
 ]);
 
 let chatWorkflowImpl = runChatWorkflow;
@@ -156,8 +194,13 @@ function readJsonFile(filePath) {
   }
 }
 
-function selectedChatJobForCsv(meta = {}) {
-  const job = normalizeText(meta.normalized?.job || meta.args?.job || "");
+function selectedChatJobForCsv(meta = {}, snapshot = {}) {
+  const job = normalizeText(
+    meta.normalized?.job
+    || meta.args?.job
+    || snapshot.context?.job
+    || ""
+  );
   return {
     value: job,
     title: job,
@@ -167,31 +210,32 @@ function selectedChatJobForCsv(meta = {}) {
 
 function buildChatCsvInputRows(snapshot = {}, meta = {}) {
   const normalized = meta.normalized || {};
-  const postAction = shouldRequestChatResume(meta.args)
+  const context = snapshot.context || {};
+  const postAction = shouldRequestChatResume(meta.args, context)
     ? "request_cv"
     : normalizeText(meta.args?.post_action || meta.args?.action || "") || "none";
   const searchParams = {
-    job: normalized.job || meta.args?.job || "",
-    start_from: normalized.startFrom || meta.args?.start_from || "",
+    job: normalized.job || meta.args?.job || context.job || "",
+    start_from: normalized.startFrom || meta.args?.start_from || context.start_from || "",
     target_count: normalized.publicTargetCount ?? normalized.targetCount ?? snapshot.progress?.target_count ?? "",
-    detail_source: meta.args?.detail_source || snapshot.summary?.detail_source || snapshot.context?.detail_source || ""
+    detail_source: meta.args?.detail_source || snapshot.summary?.detail_source || context.detail_source || ""
   };
   return buildLegacyScreenInputRows({
     instruction: meta.args?.instruction || "启动boss聊天任务",
     selectedPage: "chat",
-    selectedJob: selectedChatJobForCsv(meta),
+    selectedJob: selectedChatJobForCsv(meta, snapshot),
     userSearchParams: cloneReportInput(searchParams, {}),
     effectiveSearchParams: cloneReportInput(searchParams, {}),
     screenParams: {
-      criteria: normalized.criteria || meta.args?.criteria || "",
+      criteria: normalized.criteria || meta.args?.criteria || context.criteria || "",
       target_count: searchParams.target_count,
       post_action: postAction,
       max_greet_count: meta.args?.max_greet_count ?? ""
     },
     followUp: meta.args?.follow_up || null,
     extraRows: [
-      ["chat_params.greeting_text", normalized.greetingText || meta.args?.greeting_text || meta.args?.greetingText || DEFAULT_CHAT_GREETING_TEXT],
-      ["chat_params.profile", normalized.profile || meta.args?.profile || "default"]
+      ["chat_params.greeting_text", normalized.greetingText || meta.args?.greeting_text || meta.args?.greetingText || context.greeting_text || DEFAULT_CHAT_GREETING_TEXT],
+      ["chat_params.profile", normalized.profile || meta.args?.profile || context.profile || "default"]
     ]
   });
 }
@@ -314,6 +358,12 @@ function ensureChatRunArtifacts(snapshot) {
     partial: true,
     partial_reason: snapshot?.status || snapshot?.state || "non_terminal",
     results: checkpointResults
+  } : ARTIFACT_STATUSES.has(snapshot?.status || snapshot?.state) ? {
+    domain: "chat",
+    partial: (snapshot?.status || snapshot?.state) !== RUN_STATUS_COMPLETED,
+    partial_reason: snapshot?.status || snapshot?.state || "unknown",
+    completion_reason: completionReason(snapshot?.status || snapshot?.state),
+    results: []
   } : null);
   if (artifactSummary) {
     const rows = Array.isArray(artifactSummary.results) ? artifactSummary.results : [];
@@ -335,6 +385,143 @@ function ensureChatRunArtifacts(snapshot) {
   }
 
   return artifacts;
+}
+
+function isPidAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  if (numericPid === process.pid) return true;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function snapshotFromPersistedChatRun(persisted = {}) {
+  return {
+    runId: persisted.run_id || persisted.runId,
+    name: persisted.name || persisted.run_id || persisted.runId,
+    status: persisted.status || persisted.state,
+    phase: persisted.stage || persisted.phase,
+    progress: persisted.progress || {},
+    context: persisted.context || {},
+    checkpoint: persisted.checkpoint || {},
+    startedAt: persisted.started_at || persisted.startedAt,
+    updatedAt: persisted.updated_at || persisted.updatedAt,
+    completedAt: persisted.completed_at || persisted.completedAt || null,
+    error: persisted.error || null,
+    summary: persisted.summary || null
+  };
+}
+
+function persistDiskChatRun(runId, payload) {
+  const artifacts = getChatRunArtifacts(runId);
+  if (!artifacts) return payload;
+  writeJsonAtomic(artifacts.run_state_path, payload);
+  return payload;
+}
+
+function attachLegacyArtifactsToPersistedChatRun(persisted = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  if (!runId) return persisted;
+  const snapshot = snapshotFromPersistedChatRun(persisted);
+  const result = buildLegacyChatResult(snapshot);
+  const artifacts = getChatRunArtifacts(runId);
+  const next = {
+    ...persisted,
+    result,
+    resume: {
+      ...(persisted.resume || {}),
+      checkpoint_path: result?.checkpoint_path || persisted.resume?.checkpoint_path || artifacts?.checkpoint_path || null,
+      output_csv: result?.output_csv || persisted.resume?.output_csv || artifacts?.output_csv || null
+    },
+    artifacts: artifacts || persisted.artifacts || null
+  };
+  return persistDiskChatRun(runId, next);
+}
+
+function finalizePersistedChatRun(persisted = {}, {
+  status = RUN_STATUS_FAILED,
+  error = null,
+  message = ""
+} = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  if (!runId) return persisted;
+  const now = new Date().toISOString();
+  const normalizedError = status === RUN_STATUS_FAILED
+    ? {
+        name: error?.name || "Error",
+        code: error?.code || "STALE_RUN_PROCESS_EXITED",
+        message: error?.message || message || "Boss chat run process exited before it wrote a terminal state."
+      }
+    : null;
+  const next = {
+    ...persisted,
+    run_id: runId,
+    state: status,
+    status,
+    stage: persisted.stage || persisted.phase || "chat:stale",
+    updated_at: now,
+    heartbeat_at: now,
+    completed_at: persisted.completed_at || now,
+    last_message: normalizedError?.message || message || status,
+    control: {
+      ...(persisted.control || {}),
+      cancel_requested: false
+    },
+    error: normalizedError,
+    summary: persisted.summary || null
+  };
+  return attachLegacyArtifactsToPersistedChatRun(next);
+}
+
+function persistedChatRunArtifactMissing(persisted = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  const artifacts = getChatRunArtifacts(runId);
+  const outputCsv = persisted.result?.output_csv
+    || persisted.resume?.output_csv
+    || persisted.artifacts?.output_csv
+    || artifacts?.output_csv;
+  const reportJson = persisted.result?.report_json
+    || persisted.artifacts?.report_json
+    || artifacts?.report_json;
+  return Boolean(
+    !outputCsv
+    || !reportJson
+    || !fs.existsSync(outputCsv)
+    || !fs.existsSync(reportJson)
+  );
+}
+
+function reconcilePersistedChatRun(persisted = {}, { cancelStale = false } = {}) {
+  const status = persisted.status || persisted.state;
+  if (STALE_PROCESS_STATUSES.has(status) && !isPidAlive(persisted.pid)) {
+    const shouldCancel = cancelStale || status === RUN_STATUS_CANCELING || persisted.control?.cancel_requested === true;
+    return {
+      run: finalizePersistedChatRun(persisted, {
+        status: shouldCancel ? RUN_STATUS_CANCELED : RUN_STATUS_FAILED,
+        error: shouldCancel ? null : {
+          code: "STALE_RUN_PROCESS_EXITED",
+          message: `Boss chat run process is no longer alive for pid=${persisted.pid || "unknown"}.`
+        },
+        message: shouldCancel
+          ? "Boss chat run was canceled after its worker process was no longer active."
+          : `Boss chat run process is no longer alive for pid=${persisted.pid || "unknown"}.`
+      }),
+      stale_finalized: true
+    };
+  }
+  if (ARTIFACT_STATUSES.has(status) && persistedChatRunArtifactMissing(persisted)) {
+    return {
+      run: attachLegacyArtifactsToPersistedChatRun(persisted),
+      artifacts_repaired: true
+    };
+  }
+  return {
+    run: persisted
+  };
 }
 
 function buildLegacyChatResult(snapshot) {
@@ -647,7 +834,18 @@ async function connectChatChromeSession({
 
 async function readChatJobOptionsFromSession(session) {
   const roots = await getChatRoots(session.client);
-  return readChatJobOptions(session.client, roots.rootNodes.top);
+  const result = await readChatJobOptions(session.client, roots.rootNodes.top);
+  try {
+    result.menu_close = await closeChatJobDropdown(session.client, roots.rootNodes.top);
+  } catch (error) {
+    result.menu_close = {
+      ok: false,
+      closed: false,
+      reason: "close_failed",
+      error: error?.message || String(error)
+    };
+  }
+  return result;
 }
 
 function normalizeChatStartInput(args = {}, configResolution = null) {
@@ -791,14 +989,32 @@ async function buildNeedInputResponse({ args, missingFields, normalized }) {
   };
 }
 
-function shouldRequestChatResume(args = {}) {
-  return (
+function shouldRequestChatResume(args = {}, context = {}) {
+  const action = normalizeText(args.post_action || args.action).toLowerCase();
+  if (
+    args.request_cv === false
+    || args.request_resume === false
+    || args.ask_cv === false
+    || args.execute_post_action === false
+    || args.no_request_cv === true
+    || args.no_request_resume === true
+    || CHAT_DISABLE_REQUEST_RESUME_ACTIONS.has(action)
+  ) {
+    return false;
+  }
+  if (
     args.request_cv === true
     || args.request_resume === true
     || args.ask_cv === true
     || args.execute_post_action === true
-    || ["request_cv", "ask_cv", "request_resume", "求简历", "索要简历"].includes(normalizeText(args.post_action || args.action))
-  );
+    || CHAT_REQUEST_RESUME_ACTIONS.has(action)
+  ) {
+    return true;
+  }
+  if (typeof context.request_resume_for_passed === "boolean") {
+    return context.request_resume_for_passed;
+  }
+  return true;
 }
 
 function isDebugTestMode(args = {}) {
@@ -1300,12 +1516,15 @@ export function getBossChatRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readChatRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedChatRun(persisted);
       return {
         status: "RUN_STATUS",
-        run: persisted,
+        run: reconciled.run,
         persistence: {
           source: "disk",
-          active_control_available: false
+          active_control_available: false,
+          stale_finalized: reconciled.stale_finalized === true,
+          artifacts_repaired: reconciled.artifacts_repaired === true
         },
         runtime_evaluate_used: false,
         method_summary: {},
@@ -1354,9 +1573,10 @@ export function pauseBossChatRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readChatRunState(runId);
     if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
+      const reconciled = reconcilePersistedChatRun(persisted);
       return {
         status: "PAUSE_IGNORED",
-        run: persisted,
+        run: reconciled.run,
         message: "目标任务已结束，无需暂停。",
         runtime_evaluate_used: false,
         method_summary: {},
@@ -1412,19 +1632,23 @@ export function resumeBossChatRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readChatRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedChatRun(persisted);
+      const reconciledStatus = reconciled.run?.status || reconciled.run?.state;
       return {
         status: "FAILED",
         error: {
-          code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
-          message: TERMINAL_STATUSES.has(persisted.state)
+          code: TERMINAL_STATUSES.has(reconciledStatus) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
+          message: TERMINAL_STATUSES.has(reconciledStatus)
             ? "目标任务已结束，无法继续。"
             : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
-          retryable: !TERMINAL_STATUSES.has(persisted.state)
+          retryable: !TERMINAL_STATUSES.has(reconciledStatus)
         },
-        run: persisted,
+        run: reconciled.run,
         persistence: {
           source: "disk",
-          active_control_available: false
+          active_control_available: false,
+          stale_finalized: reconciled.stale_finalized === true,
+          artifacts_repaired: reconciled.artifacts_repaired === true
         },
         runtime_evaluate_used: false,
         method_summary: {},
@@ -1458,15 +1682,36 @@ export function cancelBossChatRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readChatRunState(runId);
     if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
+      const reconciled = reconcilePersistedChatRun(persisted);
       return {
         status: "CANCEL_IGNORED",
-        run: persisted,
+        run: reconciled.run,
         message: "目标任务已结束，无需取消。",
         runtime_evaluate_used: false,
         method_summary: {},
         method_log: [],
         chrome: null
       };
+    }
+    if (persisted) {
+      const reconciled = reconcilePersistedChatRun(persisted, { cancelStale: true });
+      if (reconciled.stale_finalized) {
+        return {
+          status: "CANCEL_REQUESTED",
+          run: reconciled.run,
+          message: "该 run 的后台进程已经不在，已将磁盘状态安全标记为 canceled 并生成结果文件。",
+          persistence: {
+            source: "disk",
+            active_control_available: false,
+            stale_finalized: true,
+            artifacts_repaired: reconciled.artifacts_repaired === true
+          },
+          runtime_evaluate_used: false,
+          method_summary: {},
+          method_log: [],
+          chrome: null
+        };
+      }
     }
     return getBossChatRunTool({ args });
   }

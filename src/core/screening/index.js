@@ -77,6 +77,31 @@ function applyChatCompletionThinking(payload, { baseUrl = "", model = "", thinki
   return payload;
 }
 
+function parsePositiveNumber(value, fallback = null) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseFiniteNumber(value, fallback = null) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function resolveLlmOutputTokenBudget(config = {}, thinkingLevel = "") {
+  const explicit = parsePositiveNumber(
+    config.llmMaxCompletionTokens
+    ?? config.maxCompletionTokens
+    ?? config.llmMaxTokens
+    ?? config.maxTokens,
+    null
+  );
+  if (explicit) return Math.max(1, Math.floor(explicit));
+  const normalizedThinking = normalizeLlmThinkingLevel(thinkingLevel || "low") || "low";
+  return normalizedThinking === "off" || normalizedThinking === "minimal" ? 64 : 512;
+}
+
 export function normalizeText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
 }
@@ -1436,20 +1461,31 @@ export async function callScreeningLlm({
     throw new Error("Candidate text and image evidence are empty");
   }
 
+  const thinkingLevel = config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "low";
+  const outputTokenBudget = resolveLlmOutputTokenBudget(config, thinkingLevel);
   const payload = {
     model,
-    temperature: 0.1,
-    max_tokens: Math.max(1, Number(config.maxTokens || config.llmMaxTokens) || 64),
+    temperature: parseFiniteNumber(config.temperature, 0.1),
+    max_tokens: outputTokenBudget,
     messages: buildScreeningLlmMessages({
       candidate,
       criteria,
       imageInputs
     })
   };
+  const topP = parseFiniteNumber(config.topP ?? config.top_p, null);
+  if (topP !== null) payload.top_p = topP;
+  const maxCompletionTokens = parsePositiveNumber(
+    config.llmMaxCompletionTokens ?? config.maxCompletionTokens,
+    null
+  );
+  if (maxCompletionTokens !== null) {
+    payload.max_completion_tokens = Math.max(1, Math.floor(maxCompletionTokens));
+  }
   applyChatCompletionThinking(payload, {
     baseUrl,
     model,
-    thinkingLevel: config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "low"
+    thinkingLevel
   });
 
   const maxRetries = normalizeLlmMaxRetries(config.llmMaxRetries ?? config.maxRetries);
@@ -1504,7 +1540,12 @@ export async function callScreeningLlm({
       ok: true,
       provider: {
         baseUrl: baseUrl.replace(/\/\/[^/]+/, "//[redacted-host]"),
-        model
+        model,
+        thinking_level: normalizeLlmThinkingLevel(thinkingLevel) || "low",
+        thinking: payload.thinking || null,
+        reasoning_effort: payload.reasoning_effort || null,
+        max_tokens: payload.max_tokens,
+        max_completion_tokens: payload.max_completion_tokens || null
       },
       passed,
       reason: "",

@@ -39,11 +39,63 @@ import {
 import {
   assertChatShellNotResumeTopLevel,
   getChatTopLevelState,
+  isForbiddenChatResumeTopLevelUrl,
   makeForbiddenChatResumeNavigationError
 } from "./page-guard.js";
 
+export const CHAT_UNSAFE_ONLINE_RESUME_LINK_CODE = "CHAT_UNSAFE_ONLINE_RESUME_LINK";
+
 export function matchesChatProfileNetwork(url) {
   return CHAT_PROFILE_NETWORK_PATTERNS.some((pattern) => pattern.test(String(url || "")));
+}
+
+function looksLikeForbiddenChatResumePath(value = "") {
+  const normalized = String(value || "");
+  return isForbiddenChatResumeTopLevelUrl(normalized)
+    || /(?:^|["'\s=])(?:https?:\/\/[^"'\s>]*zhipin\.com)?\/web\/frame\/c-resume(?:[/?#"' >]|$)/i
+      .test(normalized);
+}
+
+function extractFirstHtmlAttribute(html = "", names = []) {
+  const source = String(html || "");
+  for (const name of names) {
+    const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i");
+    const match = source.match(regex);
+    if (match) return match[1] ?? match[2] ?? match[3] ?? "";
+  }
+  return "";
+}
+
+export function isUnsafeChatOnlineResumeTarget(target = {}, buttonHTML = "") {
+  const attributes = target?.attributes || {};
+  const href = attributes.href
+    || attributes["data-href"]
+    || attributes["data-url"]
+    || attributes.url
+    || extractFirstHtmlAttribute(buttonHTML, ["href", "data-href", "data-url", "url"]);
+  return looksLikeForbiddenChatResumePath(href)
+    || looksLikeForbiddenChatResumePath(buttonHTML);
+}
+
+export function makeUnsafeChatOnlineResumeLinkError(target = {}, buttonHTML = "") {
+  const href = target?.attributes?.href
+    || target?.attributes?.["data-href"]
+    || target?.attributes?.["data-url"]
+    || extractFirstHtmlAttribute(buttonHTML, ["href", "data-href", "data-url", "url"])
+    || null;
+  const error = new Error("CHAT_UNSAFE_ONLINE_RESUME_LINK: refusing to click an online resume link that can navigate the chat tab to /web/frame/c-resume/");
+  error.code = CHAT_UNSAFE_ONLINE_RESUME_LINK_CODE;
+  error.href = href;
+  error.button_selector = target?.selector || null;
+  error.button_text = htmlToText(buttonHTML).slice(0, 120);
+  error.button_html_length = String(buttonHTML || "").length;
+  return error;
+}
+
+export function isUnsafeChatOnlineResumeLinkError(error) {
+  return error?.code === CHAT_UNSAFE_ONLINE_RESUME_LINK_CODE
+    || /CHAT_UNSAFE_ONLINE_RESUME_LINK/i.test(String(error?.message || error || ""));
 }
 
 export function createChatProfileNetworkRecorder(client) {
@@ -672,6 +724,22 @@ export async function openChatOnlineResume(client, {
     try {
       buttonHTML = await getOuterHTML(client, buttonState.target.node_id);
     } catch {}
+
+    if (isUnsafeChatOnlineResumeTarget(buttonState.target, buttonHTML)) {
+      const error = makeUnsafeChatOnlineResumeLinkError(buttonState.target, buttonHTML);
+      attempts.push({
+        attempt: index + 1,
+        ok: false,
+        error: error.code,
+        blocked_pre_click: true,
+        button_selector: buttonState.target.selector,
+        button_text: error.button_text,
+        button_href: error.href,
+        button_html_length: buttonHTML.length
+      });
+      error.attempts = attempts;
+      throw error;
+    }
 
     try {
       if (buttonState.target.center) {

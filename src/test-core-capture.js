@@ -212,6 +212,156 @@ async function testCaptureScrolledNodeScreenshotsComposesAllPagesForLlm() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testCaptureScrolledNodeScreenshotsCanUseDomAnchors() {
+  const buffers = await Promise.all([
+    "#fff7ed",
+    "#ecfeff",
+    "#f0fdf4"
+  ].map((background) => sharp({
+    create: {
+      width: 120,
+      height: 80,
+      channels: 3,
+      background
+    }
+  }).jpeg({ quality: 80 }).toBuffer()));
+  const client = createImageSequenceClient(buffers);
+  client.DOM.querySelectorAll = async ({ nodeId, selector }) => {
+    client.calls.push(["DOM.querySelectorAll", nodeId, selector]);
+    return { nodeIds: [21, 22, 23, 24, 25] };
+  };
+  client.DOM.scrollIntoViewIfNeeded = async ({ nodeId }) => {
+    client.calls.push(["DOM.scrollIntoViewIfNeeded", nodeId]);
+  };
+  client.DOM.getBoxModel = async ({ nodeId }) => {
+    client.calls.push(["DOM.getBoxModel", nodeId]);
+    const y = nodeId >= 21 ? 20 + (nodeId - 21) * 260 : 20;
+    return {
+      model: {
+        border: [10, y, 210, y, 210, y + 120, 10, y + 120]
+      }
+    };
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-capture-"));
+  const filePath = path.join(dir, "candidate.jpg");
+  const evidence = await captureScrolledNodeScreenshots(client, 20, {
+    filePath,
+    format: "jpeg",
+    quality: 72,
+    maxScreenshots: 3,
+    duplicateStopCount: 10,
+    skipDuplicateScreenshots: false,
+    scrollMethod: "dom-anchor",
+    settleMs: 0
+  });
+  assert.equal(evidence.screenshot_count, 3);
+  assert.equal(evidence.scroll_anchor_plan.ok, true);
+  assert.equal(client.calls.some(([method]) => method === "DOM.scrollIntoViewIfNeeded"), true);
+  assert.equal(client.calls.some(([method]) => method === "Input.dispatchMouseEvent"), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+async function testCaptureScrolledNodeScreenshotsFallsBackAfterNoopDomAnchorDuplicate() {
+  const buffers = await Promise.all([
+    "#ffffff",
+    "#ffffff",
+    "#dcfce7"
+  ].map((background) => sharp({
+    create: {
+      width: 120,
+      height: 80,
+      channels: 3,
+      background
+    }
+  }).jpeg({ quality: 80 }).toBuffer()));
+  const client = createImageSequenceClient(buffers);
+  client.DOM.querySelectorAll = async ({ nodeId, selector }) => {
+    client.calls.push(["DOM.querySelectorAll", nodeId, selector]);
+    return { nodeIds: [31, 32] };
+  };
+  client.DOM.scrollIntoViewIfNeeded = async ({ nodeId }) => {
+    client.calls.push(["DOM.scrollIntoViewIfNeeded", nodeId]);
+  };
+  client.DOM.getBoxModel = async ({ nodeId }) => {
+    client.calls.push(["DOM.getBoxModel", nodeId]);
+    const y = nodeId >= 31 ? 20 + (nodeId - 31) * 260 : 20;
+    return {
+      model: {
+        border: [10, y, 210, y, 210, y + 120, 10, y + 120]
+      }
+    };
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-capture-"));
+  const filePath = path.join(dir, "candidate.jpg");
+  const evidence = await captureScrolledNodeScreenshots(client, 30, {
+    filePath,
+    format: "jpeg",
+    quality: 72,
+    maxScreenshots: 3,
+    duplicateStopCount: 1,
+    skipDuplicateScreenshots: true,
+    scrollMethod: "dom-anchor-fallback-input",
+    settleMs: 0
+  });
+  assert.equal(evidence.capture_count, 3);
+  assert.equal(evidence.screenshot_count, 2);
+  assert.equal(evidence.dropped_duplicate_count, 1);
+  assert.equal(evidence.file_paths.length, 2);
+  assert.equal(client.calls.some(([method]) => method === "Input.dispatchMouseEvent"), true);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+async function testCaptureScrolledNodeScreenshotsCropsAtStopBoundary() {
+  const client = createImageSequenceClient([Buffer.from("before-stop")]);
+  client.DOM.querySelectorAll = async ({ nodeId, selector }) => {
+    client.calls.push(["DOM.querySelectorAll", nodeId, selector]);
+    return { nodeIds: [41, 42] };
+  };
+  client.DOM.getOuterHTML = async ({ nodeId }) => {
+    client.calls.push(["DOM.getOuterHTML", nodeId]);
+    if (nodeId === 42) return { outerHTML: "<section>其他名企大厂 经历牛人</section>" };
+    return { outerHTML: "<section>项目经历 Spring Boot Redis</section>" };
+  };
+  client.DOM.getBoxModel = async ({ nodeId }) => {
+    client.calls.push(["DOM.getBoxModel", nodeId]);
+    if (nodeId === 42) {
+      return {
+        model: {
+          border: [10, 520, 210, 520, 210, 560, 10, 560]
+        }
+      };
+    }
+    return {
+      model: {
+        border: [10, 20, 210, 20, 210, 620, 10, 620]
+      }
+    };
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-capture-"));
+  const filePath = path.join(dir, "candidate.jpg");
+  const evidence = await captureScrolledNodeScreenshots(client, 40, {
+    filePath,
+    format: "jpeg",
+    quality: 72,
+    maxScreenshots: 5,
+    duplicateStopCount: 1,
+    skipDuplicateScreenshots: true,
+    scrollMethod: "input",
+    stopBoundarySelector: "section",
+    stopBoundaryTextPatterns: ["其他名企大厂"],
+    stopBoundaryTopPadding: 5,
+    stopBoundaryMinCaptureHeight: 120,
+    settleMs: 0
+  });
+  assert.equal(evidence.capture_count, 1);
+  assert.equal(evidence.screenshot_count, 1);
+  assert.equal(evidence.screenshots[0].clip.height, 495);
+  assert.equal(evidence.stop_boundary_result.action, "capture_then_stop");
+  assert.equal(evidence.stop_boundary_result.matched_pattern, "其他名企大厂");
+  assert.equal(client.calls.some(([method]) => method === "Input.dispatchMouseEvent"), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 await testCaptureNodeHtml();
 await testCaptureNodeScreenshot();
 await testCaptureViewportScreenshot();
@@ -219,5 +369,8 @@ await testCaptureCandidateEvidence();
 await testCaptureCandidateEvidenceScrollScreenshotDefault();
 await testCaptureScrolledNodeScreenshotsSkipsDuplicateTail();
 await testCaptureScrolledNodeScreenshotsComposesAllPagesForLlm();
+await testCaptureScrolledNodeScreenshotsCanUseDomAnchors();
+await testCaptureScrolledNodeScreenshotsFallsBackAfterNoopDomAnchorDuplicate();
+await testCaptureScrolledNodeScreenshotsCropsAtStopBoundary();
 
 console.log("Core capture tests passed");

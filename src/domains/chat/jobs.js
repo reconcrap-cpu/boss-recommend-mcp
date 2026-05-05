@@ -4,6 +4,7 @@ import {
   getAttributesMap,
   getNodeBox,
   getOuterHTML,
+  pressKey,
   querySelector,
   querySelectorAll,
   sleep
@@ -223,6 +224,15 @@ function matchJobOption(option, jobLabel = "") {
   ));
 }
 
+function activeMatchingJobOption(options = [], jobLabel = "") {
+  return (options || []).find((option) => option.active && matchJobOption(option, jobLabel)) || null;
+}
+
+function selectedLabelMatches(label = "", jobLabel = "") {
+  const normalized = normalizeJobText(label);
+  return Boolean(normalized && matchJobOption({ label: normalized, value: normalized, title: normalized }, jobLabel));
+}
+
 async function clickFirstVisible(client, rootNodeId, selectors = []) {
   for (const selector of selectors) {
     const nodeIds = await safeQuerySelectorAll(client, rootNodeId, selector);
@@ -247,6 +257,213 @@ async function clickFirstVisible(client, rootNodeId, selectors = []) {
   };
 }
 
+async function openChatJobDropdown(client, rootNodeId, {
+  timeoutMs = 12000,
+  intervalMs = 300,
+  settleMs = 800
+} = {}) {
+  const started = Date.now();
+  const triedPoints = new Set();
+  const attempts = [];
+  for (const selector of CHAT_JOB_TRIGGER_SELECTORS) {
+    const currentRootNodeId = await freshTopRootNodeId(client, rootNodeId);
+    const nodeIds = await safeQuerySelectorAll(client, currentRootNodeId, selector);
+    for (const nodeId of nodeIds) {
+      try {
+        const box = await getNodeBox(client, nodeId);
+        if (box.rect.width <= 2 || box.rect.height <= 2) continue;
+        const y = box.center.y;
+        const xCandidates = [
+          ["center", box.center.x],
+          ["right_12", box.rect.x + box.rect.width - 12],
+          ["right_44", box.rect.x + box.rect.width - 44],
+          ["right_64", box.rect.x + box.rect.width - 64]
+        ].filter(([, x]) => x > box.rect.x + 4 && x < box.rect.x + box.rect.width - 4);
+        for (const [pointName, x] of xCandidates) {
+          const pointKey = `${nodeId}:${Math.round(x)}:${Math.round(y)}`;
+          if (triedPoints.has(pointKey)) continue;
+          triedPoints.add(pointKey);
+          await clickPoint(client, x, y);
+          if (settleMs > 0) await sleep(Math.min(settleMs, 800));
+          const remaining = Math.max(300, timeoutMs - (Date.now() - started));
+          const optionsResult = await waitForChatJobOptions(client, currentRootNodeId, {
+            timeoutMs: Math.min(remaining, 1800),
+            intervalMs,
+            requireVisible: true
+          });
+          const visibleCount = (optionsResult.job_options || []).filter((option) => option.visible).length;
+          const attempt = {
+            clicked: true,
+            selector,
+            node_id: nodeId,
+            point: pointName,
+            center: { x, y },
+            visible_option_count: visibleCount
+          };
+          attempts.push(attempt);
+          if (visibleCount > 0) {
+            return {
+              ...attempt,
+              attempts,
+              options_result: optionsResult
+            };
+          }
+          if (Date.now() - started > timeoutMs) break;
+        }
+      } catch (error) {
+        attempts.push({
+          clicked: false,
+          selector,
+          node_id: nodeId,
+          error: error?.message || String(error)
+        });
+      }
+      if (Date.now() - started > timeoutMs) break;
+    }
+    if (Date.now() - started > timeoutMs) break;
+  }
+  return {
+    clicked: attempts.some((attempt) => attempt.clicked),
+    selector: attempts.find((attempt) => attempt.clicked)?.selector || "",
+    node_id: attempts.find((attempt) => attempt.clicked)?.node_id || 0,
+    attempts,
+    options_result: null
+  };
+}
+
+async function waitForChatJobOptions(client, rootNodeId, {
+  timeoutMs = 12000,
+  intervalMs = 300,
+  requireVisible = false
+} = {}) {
+  const started = Date.now();
+  let latest = null;
+  while (Date.now() - started <= timeoutMs) {
+    const currentRootNodeId = await freshTopRootNodeId(client, rootNodeId);
+    latest = await readChatJobOptions(client, currentRootNodeId, {
+      timeoutMs: Math.min(intervalMs, 300),
+      intervalMs
+    });
+    const options = latest.job_options || [];
+    if (options.length && (!requireVisible || options.some((option) => option.visible))) {
+      return latest;
+    }
+    await sleep(intervalMs);
+  }
+  return latest || {
+    selector: "",
+    source: "chat-job-list",
+    selected_label: "",
+    job_options: []
+  };
+}
+
+async function waitForSelectedChatJob(client, rootNodeId, jobLabel = "", {
+  timeoutMs = 5000,
+  intervalMs = 300
+} = {}) {
+  const started = Date.now();
+  let latest = null;
+  while (Date.now() - started <= timeoutMs) {
+    const currentRootNodeId = await freshTopRootNodeId(client, rootNodeId);
+    latest = await readChatJobOptions(client, currentRootNodeId, {
+      timeoutMs: Math.min(intervalMs, 300),
+      intervalMs
+    });
+    if (
+      selectedLabelMatches(latest.selected_label, jobLabel)
+      || activeMatchingJobOption(latest.job_options || [], jobLabel)
+    ) {
+      return {
+        verified: true,
+        result: latest
+      };
+    }
+    await sleep(intervalMs);
+  }
+  return {
+    verified: false,
+    result: latest
+  };
+}
+
+async function visibleChatJobOptions(client, rootNodeId) {
+  const currentRootNodeId = await freshTopRootNodeId(client, rootNodeId);
+  const visible = [];
+  for (const selector of CHAT_JOB_OPTION_SELECTORS) {
+    const nodeIds = await safeQuerySelectorAll(client, currentRootNodeId, selector);
+    for (const nodeId of nodeIds) {
+      try {
+        const box = await getNodeBox(client, nodeId);
+        if (box.rect.width > 2 && box.rect.height > 2) {
+          visible.push({
+            selector,
+            node_id: nodeId,
+            center: box.center,
+            rect: box.rect
+          });
+        }
+      } catch {
+        // Hidden job options are normal when the dropdown is closed.
+      }
+    }
+  }
+  return visible;
+}
+
+export async function closeChatJobDropdown(client, rootNodeId, {
+  settleMs = 180
+} = {}) {
+  const before = await visibleChatJobOptions(client, rootNodeId);
+  if (!before.length) {
+    return {
+      ok: true,
+      closed: false,
+      reason: "already_closed",
+      visible_before_count: 0,
+      visible_after_count: 0
+    };
+  }
+  if (typeof client?.Input?.dispatchKeyEvent !== "function") {
+    return {
+      ok: false,
+      closed: false,
+      reason: "dispatch_key_unavailable",
+      visible_before_count: before.length,
+      visible_after_count: before.length
+    };
+  }
+  await pressKey(client, "Escape", {
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+    nativeVirtualKeyCode: 27
+  });
+  if (settleMs > 0) await sleep(settleMs);
+  const after = await visibleChatJobOptions(client, rootNodeId);
+  return {
+    ok: after.length === 0,
+    closed: after.length === 0,
+    reason: after.length ? "still_visible_after_escape" : "escape",
+    visible_before_count: before.length,
+    visible_after_count: after.length,
+    first_visible_before: before[0] || null,
+    first_visible_after: after[0] || null
+  };
+}
+
+async function closeChatJobDropdownQuietly(client, rootNodeId, settleMs = 180) {
+  try {
+    return await closeChatJobDropdown(client, rootNodeId, { settleMs });
+  } catch (error) {
+    return {
+      ok: false,
+      closed: false,
+      reason: "close_failed",
+      error: error?.message || String(error)
+    };
+  }
+}
+
 export async function selectChatJob(client, rootNodeId, {
   jobLabel = "",
   timeoutMs = 12000,
@@ -267,36 +484,66 @@ export async function selectChatJob(client, rootNodeId, {
     intervalMs
   });
   let matched = (optionsResult.job_options || []).find((option) => matchJobOption(option, requested)) || null;
+  if (
+    matched
+    && (
+      matched.active
+      || selectedLabelMatches(optionsResult.selected_label, matched.label)
+      || selectedLabelMatches(optionsResult.selected_label, requested)
+    )
+  ) {
+    const menuClose = await closeChatJobDropdownQuietly(client, currentRootNodeId, Math.min(settleMs, 300));
+    return {
+      selected: true,
+      verified: true,
+      already_current: true,
+      requested,
+      selected_option: matched,
+      options: optionsResult.job_options || [],
+      selected_label: optionsResult.selected_label || matched.label,
+      menu_close: menuClose
+    };
+  }
+
   if (!matched || !matched.visible) {
     const triggerRootNodeId = await freshTopRootNodeId(client, currentRootNodeId);
-    const trigger = await clickFirstVisible(client, triggerRootNodeId, CHAT_JOB_TRIGGER_SELECTORS);
-    if (settleMs > 0) await sleep(settleMs);
-    currentRootNodeId = await freshTopRootNodeId(client, triggerRootNodeId);
-    optionsResult = await readChatJobOptions(client, currentRootNodeId, {
+    const trigger = await openChatJobDropdown(client, triggerRootNodeId, {
       timeoutMs,
-      intervalMs
+      intervalMs,
+      settleMs
+    });
+    currentRootNodeId = await freshTopRootNodeId(client, triggerRootNodeId);
+    optionsResult = trigger.options_result || await waitForChatJobOptions(client, currentRootNodeId, {
+      timeoutMs,
+      intervalMs,
+      requireVisible: true
     });
     matched = (optionsResult.job_options || []).find((option) => matchJobOption(option, requested)) || null;
     if (!matched || !matched.visible) {
+      const menuClose = await closeChatJobDropdownQuietly(client, currentRootNodeId, Math.min(settleMs, 300));
       return {
         selected: false,
         reason: matched ? "job_option_not_visible" : "job_option_not_found",
         requested,
         trigger,
         options: optionsResult.job_options || [],
-        selected_label_before: optionsResult.selected_label || ""
+        selected_label_before: optionsResult.selected_label || "",
+        menu_close: menuClose
       };
     }
   }
 
   if (matched.active || normalizeJobText(optionsResult.selected_label).toLowerCase() === normalizeJobText(matched.label).toLowerCase()) {
+    const menuClose = await closeChatJobDropdownQuietly(client, currentRootNodeId, Math.min(settleMs, 300));
     return {
       selected: true,
+      verified: true,
       already_current: true,
       requested,
       selected_option: matched,
       options: optionsResult.job_options || [],
-      selected_label: optionsResult.selected_label || matched.label
+      selected_label: optionsResult.selected_label || matched.label,
+      menu_close: menuClose
     };
   }
 
@@ -310,25 +557,32 @@ export async function selectChatJob(client, rootNodeId, {
   if (settleMs > 0) await sleep(settleMs);
 
   const afterRootNodeId = await freshTopRootNodeId(client, currentRootNodeId);
-  const after = await readChatJobOptions(client, afterRootNodeId, {
-    timeoutMs: Math.min(timeoutMs, 3000),
+  const verification = await waitForSelectedChatJob(client, afterRootNodeId, matched.label, {
+    timeoutMs: Math.min(timeoutMs, 5000),
     intervalMs
   });
+  const after = verification.result || {
+    selected_label: "",
+    job_options: []
+  };
   const afterMatch = (after.job_options || []).find((option) => matchJobOption(option, matched.label)) || matched;
-  const selectedLabel = normalizeJobText(after.selected_label || afterMatch.label || "");
-  const verified = selectedLabel
-    ? matchJobOption({ label: selectedLabel, value: selectedLabel, title: selectedLabel }, matched.label)
-    : true;
+  const selectedLabel = normalizeJobText(after.selected_label || "");
+  const activeMatch = activeMatchingJobOption(after.job_options || [], matched.label);
+  const verified = Boolean(verification.verified || selectedLabelMatches(selectedLabel, matched.label) || activeMatch);
+  const menuClose = await closeChatJobDropdownQuietly(client, afterRootNodeId, Math.min(settleMs, 300));
 
   return {
-    selected: true,
+    selected: verified,
     verified,
     already_current: false,
+    reason: verified ? "verified" : "job_selection_not_verified",
     requested,
     selected_option: afterMatch,
+    active_option: activeMatch,
     options: after.job_options || optionsResult.job_options || [],
     selected_label: selectedLabel,
     before: optionsResult,
-    after
+    after,
+    menu_close: menuClose
   };
 }

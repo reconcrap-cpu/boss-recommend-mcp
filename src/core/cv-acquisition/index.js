@@ -124,6 +124,7 @@ export function hasParsedNetworkProfile(detailResult = {}) {
 export function summarizeImageEvidence(imageEvidence = null) {
   if (!imageEvidence) return null;
   return {
+    ok: imageEvidence.ok !== false,
     source: imageEvidence.source || "",
     elapsed_ms: imageEvidence.elapsed_ms || 0,
     capture_count: imageEvidence.capture_count || imageEvidence.screenshot_count || 0,
@@ -137,6 +138,12 @@ export function summarizeImageEvidence(imageEvidence = null) {
     llm_original_total_byte_length: imageEvidence.llm_original_total_byte_length || 0,
     llm_composition_error: imageEvidence.llm_composition_error || null,
     optimization: imageEvidence.optimization || null,
+    scroll_anchor_plan: imageEvidence.scroll_anchor_plan || null,
+    stop_boundary_plan: imageEvidence.stop_boundary_plan || null,
+    stop_boundary_checks: imageEvidence.stop_boundary_checks || [],
+    stop_boundary_result: imageEvidence.stop_boundary_result || null,
+    error_code: imageEvidence.error_code || imageEvidence.code || null,
+    error: imageEvidence.error || null,
     file_paths: imageEvidence.file_paths || [],
     llm_file_paths: imageEvidence.llm_file_paths || [],
     first_clip: imageEvidence.screenshots?.[0]?.clip || imageEvidence.clip || null

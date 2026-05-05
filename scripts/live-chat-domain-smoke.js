@@ -37,6 +37,7 @@ import {
 } from "../src/core/self-heal/index.js";
 import {
   CHAT_TARGET_URL,
+  captureNodeIdFromResumeState,
   closeChatResumeModal,
   createChatProfileNetworkRecorder,
   extractChatProfileCandidate,
@@ -412,9 +413,7 @@ async function run() {
     });
     const resumeState = contentWait.resume_state || openedResume.resume_state;
     const resumeHtml = contentWait.resume_html || null;
-    const captureNodeId = resumeState?.content?.node_id
-      || resumeState?.popup?.node_id
-      || resumeState?.resumeIframe?.node_id;
+    const captureNodeId = captureNodeIdFromResumeState(resumeState);
     const domEvidence = captureNodeId
       ? await captureNodeHtml(client, captureNodeId, {
         domain: "chat",
@@ -430,13 +429,15 @@ async function run() {
     let imageEvidence = imagePath && captureNodeId && options.detailSource === "image"
       ? await captureScrolledNodeScreenshots(client, captureNodeId, {
           filePath: imagePath,
-          padding: 8,
+          padding: 0,
+          captureViewport: false,
           maxScreenshots: options.maxImagePages,
           wheelDeltaY: options.imageWheelDeltaY,
           settleMs: 1200,
           metadata: {
             detail_source: options.detailSource,
             capture_mode: "scroll_sequence",
+            capture_scope: "resume_modal_clip",
             candidate_index: options.candidateIndex
           }
         })
@@ -466,13 +467,15 @@ async function run() {
         if (captureNodeId) {
           imageEvidence = await captureScrolledNodeScreenshots(client, captureNodeId, {
             filePath: options.saveImage || defaultImagePathForPayload(options.savePayload),
-            padding: 8,
+            padding: 0,
+            captureViewport: false,
             maxScreenshots: options.maxImagePages,
             wheelDeltaY: options.imageWheelDeltaY,
             settleMs: 1200,
             metadata: {
               detail_source: effectiveDetailSource,
               capture_mode: "scroll_sequence",
+              capture_scope: "resume_modal_clip",
               acquisition_reason: "network_miss_image_fallback",
               candidate_index: options.candidateIndex
             }

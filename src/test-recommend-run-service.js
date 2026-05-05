@@ -157,7 +157,7 @@ async function testPostActionOptionDelegation() {
   assert.equal(observedOptions.actionAfterClickDelayMs, 345);
 }
 
-async function testDetailLimitDefaultsToMaxCandidates() {
+async function testDetailLimitDefaultsToUnlimitedForPassTarget() {
   let observedOptions = null;
   const service = createRecommendRunService({
     idPrefix: "test_recommend_detail_default",
@@ -186,14 +186,15 @@ async function testDetailLimitDefaultsToMaxCandidates() {
     maxCandidates: 4
   });
 
-  assert.equal(started.context.detail_limit, 4);
+  assert.equal(started.context.detail_limit, null);
+  assert.equal(started.context.max_candidates_semantics, "passed_candidates");
   const final = await service.waitForRecommendRun(started.runId);
   assert.equal(final.status, "completed");
-  assert.equal(observedOptions.detailLimit, 4);
+  assert.equal(observedOptions.detailLimit, null);
 }
 
 await testLifecycleDelegation();
 await testPostActionOptionDelegation();
-await testDetailLimitDefaultsToMaxCandidates();
+await testDetailLimitDefaultsToUnlimitedForPassTarget();
 
 console.log("recommend run service tests passed");

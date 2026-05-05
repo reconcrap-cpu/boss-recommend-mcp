@@ -361,6 +361,18 @@ function compactRefreshAttempt(refreshAttempt) {
   };
 }
 
+function countPassedResults(results = []) {
+  return results.filter((item) => item?.screening?.passed).length;
+}
+
+function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
+  if (!error) return null;
+  return {
+    code: error.code || fallbackCode,
+    message: error.message || String(error)
+  };
+}
+
 export async function runRecommendWorkflow({
   client,
   targetUrl = "",
@@ -407,9 +419,9 @@ export async function runRecommendWorkflow({
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const postActionEnabled = normalizedPostAction !== "none";
-  const limit = Math.max(1, Number(maxCandidates) || 1);
-  const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
-  const effectiveDetailLimit = postActionEnabled ? limit : detailCountLimit;
+  const targetPassCount = Math.max(1, Number(maxCandidates) || 1);
+  const detailCountLimit = detailLimit == null ? Number.POSITIVE_INFINITY : Math.max(0, Number(detailLimit) || 0);
+  const effectiveDetailLimit = postActionEnabled ? Number.POSITIVE_INFINITY : detailCountLimit;
   const networkRecorder = effectiveDetailLimit > 0
     ? createRecommendDetailNetworkRecorder(client)
     : null;
@@ -522,7 +534,8 @@ export async function runRecommendWorkflow({
 
   runControl.updateProgress({
     card_count: cardNodeIds.length,
-    target_count: limit,
+    target_count: targetPassCount,
+    target_count_semantics: "passed_candidates",
     processed: 0,
     screened: 0,
     detail_opened: 0,
@@ -539,7 +552,7 @@ export async function runRecommendWorkflow({
     viewport_recoveries: viewportGuard.getStats().recoveries
   });
 
-  while (results.length < limit) {
+  while (countPassedResults(results) < targetPassCount) {
     const candidateStarted = Date.now();
     const timings = {};
     await runControl.waitIfPaused();
@@ -587,7 +600,7 @@ export async function runRecommendWorkflow({
       if (
           (nextCandidateResult.end_reached || isRefreshableListStall(nextCandidateResult.reason))
           && refreshOnEnd
-          && results.length < limit
+          && countPassedResults(results) < targetPassCount
           && refreshRounds < Math.max(0, Number(maxRefreshRounds) || 0)
       ) {
         await runControl.waitIfPaused();
@@ -613,7 +626,8 @@ export async function runRecommendWorkflow({
         });
         runControl.updateProgress({
           card_count: refreshResult.card_count || cardNodeIds.length,
-          target_count: limit,
+          target_count: targetPassCount,
+          target_count_semantics: "passed_candidates",
           processed: results.length,
           screened: results.length,
           detail_opened: results.filter((item) => item.detail).length,
@@ -734,6 +748,9 @@ export async function runRecommendWorkflow({
             maxScreenshots: maxImagePages,
             wheelDeltaY: imageWheelDeltaY,
             settleMs: 350,
+            scrollMethod: "dom-anchor-fallback-input",
+            stepTimeoutMs: 45000,
+            totalTimeoutMs: 90000,
             duplicateStopCount: 1,
             skipDuplicateScreenshots: true,
             composeForLlm: true,
@@ -859,7 +876,8 @@ export async function runRecommendWorkflow({
 
     runControl.updateProgress({
       card_count: cardNodeIds.length,
-      target_count: limit,
+      target_count: targetPassCount,
+      target_count_semantics: "passed_candidates",
       processed: results.length,
       screened: results.length,
       detail_opened: results.filter((item) => item.detail).length,
@@ -989,7 +1007,7 @@ export function createRecommendRunService({
     const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
-    const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
+    const normalizedDetailLimit = detailLimit == null ? null : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
       name,
       context: {
@@ -1001,6 +1019,7 @@ export function createRecommendRunService({
         fallback_page_scope: normalizedFallbackPageScope,
         filter: normalizedFilter,
         max_candidates: maxCandidates,
+        max_candidates_semantics: "passed_candidates",
         detail_limit: normalizedDetailLimit,
         close_detail: closeDetail,
         cv_acquisition_mode: cvAcquisitionMode,
@@ -1029,6 +1048,7 @@ export function createRecommendRunService({
       progress: {
         card_count: 0,
         target_count: candidateLimit,
+        target_count_semantics: "passed_candidates",
         processed: 0,
         screened: 0,
         detail_opened: 0,

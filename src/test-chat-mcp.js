@@ -324,6 +324,15 @@ async function testChatRequestCvLoadsLlmConfig() {
     assert.equal(options.llmConfig.baseUrl, "https://api.example.com/v1");
     assert.equal(options.llmConfig.model, "gpt-4.1-mini");
     assert.equal(options.llmConfig.llmThinkingLevel, "low");
+    assert.equal(options.llmConfig.llmMaxTokens, 384);
+    assert.equal(options.llmConfig.llmMaxRetries, 2);
+    assert.equal(options.llmConfig.llmTimeoutMs, 70000);
+    assert.equal(options.llmConfig.llmImageLimit, 6);
+    assert.equal(options.llmConfig.llmImageDetail, "high");
+    assert.equal(options.llmConfig.openaiOrganization, "org-test");
+    assert.equal(options.llmConfig.openaiProject, "proj-test");
+    assert.equal(options.llmConfig.temperature, 0);
+    assert.equal(options.llmConfig.topP, 0.2);
     assert.equal(options.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
     assert.equal(options.llmConfig.humanRestEnabled, false);
     runControl.setPhase("chat:test");
@@ -368,7 +377,6 @@ async function testChatRequestCvLoadsLlmConfig() {
   const started = await callTool(TOOL_START, readyArgs({
     target_count: 2,
     detail_limit: undefined,
-    request_cv: true,
     use_llm: true,
     delay_ms: 0
   }), 9);
@@ -383,6 +391,122 @@ async function testChatRequestCvLoadsLlmConfig() {
   const csv = fs.readFileSync(completed.result.output_csv, "utf8");
   assert.equal(csv.includes("internal reasoning"), true);
   assert.equal(csv.includes("requested"), true);
+}
+
+async function testChatRequestCvCanBeExplicitlyDisabled() {
+  installFakeConnector();
+  setChatMcpWorkflowForTests(async (options, runControl) => {
+    assert.equal(options.requestResumeForPassed, false);
+    runControl.setPhase("chat:test");
+    runControl.updateProgress({
+      processed: 1,
+      screened: 1,
+      passed: 1,
+      requested: 0,
+      target_count: options.targetPassCount
+    });
+    return {
+      domain: "chat",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      llm_screened: 1,
+      passed: 1,
+      requested: 0,
+      results: []
+    };
+  });
+  const started = await callTool(TOOL_START, readyArgs({
+    target_count: 1,
+    post_action: "none",
+    delay_ms: 0
+  }), 10);
+  assert.equal(started.status, "ACCEPTED");
+  const completed = await waitForChatRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(completed.context.shared_run_context.request_resume_for_passed, false);
+}
+
+async function testChatCanceledZeroResultWritesArtifacts() {
+  installFakeConnector();
+  setChatMcpWorkflowForTests(async (options, runControl) => {
+    assert.equal(options.requestResumeForPassed, true);
+    runControl.setPhase("chat:test-zero-cancel");
+    await runControl.sleep(2000);
+    return {
+      domain: "chat",
+      processed: 0,
+      screened: 0,
+      passed: 0,
+      requested: 0,
+      results: []
+    };
+  });
+  const started = await callTool(TOOL_START, readyArgs({
+    target_count: 1,
+    delay_ms: 0
+  }), 11);
+  assert.equal(started.status, "ACCEPTED");
+  await callTool(TOOL_CANCEL, { run_id: started.run_id }, 12);
+  const canceled = await waitForChatRun(started.run_id, (run) => run?.status === "canceled");
+  assert.equal(canceled.result.completion_reason, "canceled_by_user");
+  assert.equal(canceled.result.processed_count, 0);
+  assert.equal(fs.existsSync(canceled.result.output_csv), true);
+  assert.equal(fs.existsSync(canceled.result.report_json), true);
+  const csv = fs.readFileSync(canceled.result.output_csv, "utf8");
+  assert.equal(csv.includes("运行输入字段"), true);
+  assert.equal(csv.includes("姓名"), true);
+}
+
+async function testChatStaleDiskRunIsFinalizedWithArtifacts() {
+  const runId = "mcp_chat_stale_disk_test";
+  const runsDir = path.join(process.env.BOSS_CHAT_HOME, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(path.join(runsDir, `${runId}.json`), JSON.stringify({
+    run_id: runId,
+    mode: "async",
+    state: "running",
+    status: "running",
+    stage: "chat:cleanup",
+    started_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:01.000Z",
+    heartbeat_at: "2026-01-01T00:00:01.000Z",
+    completed_at: null,
+    pid: -1,
+    progress: {
+      processed: 0,
+      screened: 0,
+      passed: 0,
+      requested: 0,
+      target_count: "all"
+    },
+    context: {
+      job: "算法工程师",
+      start_from: "all",
+      target_count: "all",
+      criteria: "测试条件",
+      request_resume_for_passed: true,
+      greeting_text: "测试招呼"
+    },
+    control: {
+      cancel_requested: false
+    },
+    resume: {},
+    error: null,
+    result: null,
+    artifacts: null
+  }, null, 2));
+
+  const payload = await callTool(TOOL_GET, { run_id: runId }, 13);
+  assert.equal(payload.status, "RUN_STATUS");
+  assert.equal(payload.run.status, "failed");
+  assert.equal(payload.run.error.code, "STALE_RUN_PROCESS_EXITED");
+  assert.equal(payload.persistence.source, "disk");
+  assert.equal(payload.persistence.stale_finalized, true);
+  assert.equal(fs.existsSync(payload.run.result.output_csv), true);
+  assert.equal(fs.existsSync(payload.run.result.report_json), true);
+  const csv = fs.readFileSync(payload.run.result.output_csv, "utf8");
+  assert.equal(csv.includes("screen_params.post_action"), true);
+  assert.equal(csv.includes("request_cv"), true);
 }
 
 async function main() {
@@ -401,6 +525,15 @@ async function main() {
     debugPort: 9555,
     outputDir,
     llmThinkingLevel: "low",
+    llmMaxTokens: 384,
+    llmMaxRetries: 2,
+    llmTimeoutMs: 70000,
+    llmImageLimit: 6,
+    llmImageDetail: "high",
+    openaiOrganization: "org-test",
+    openaiProject: "proj-test",
+    temperature: 0,
+    topP: 0.2,
     humanRestEnabled: false
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
@@ -419,6 +552,12 @@ async function main() {
     await testChatAllTargetCountContext();
     resetChatMcpStateForTests();
     await testChatRequestCvLoadsLlmConfig();
+    resetChatMcpStateForTests();
+    await testChatRequestCvCanBeExplicitlyDisabled();
+    resetChatMcpStateForTests();
+    await testChatCanceledZeroResultWritesArtifacts();
+    resetChatMcpStateForTests();
+    await testChatStaleDiskRunIsFinalizedWithArtifacts();
     console.log("chat MCP tests passed");
   } finally {
     resetChatMcpStateForTests();

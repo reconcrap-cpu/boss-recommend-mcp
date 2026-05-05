@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import {
   assertNoForbiddenCdpCalls,
+  buildBossChromeLaunchArgs,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
@@ -54,6 +55,10 @@ const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
 const installConfigDefaults = Object.freeze({
   llmThinkingLevel: "low",
+  llmMaxTokens: 512,
+  llmMaxRetries: 3,
+  llmImageLimit: 8,
+  llmImageDetail: "low",
   humanRestEnabled: false
 });
 const bossChatRuntimeChildDirs = ["logs", "runs", "profiles", "reports", "artifacts", "state"];
@@ -1994,14 +1999,7 @@ async function launchChrome(options = {}) {
   }
 
   const userDataDir = getChromeUserDataDir(port);
-  const args = [
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${userDataDir}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--new-window",
-    bossUrl
-  ];
+  const args = buildBossChromeLaunchArgs({ port, userDataDir, url: bossUrl });
   const child = spawn(chromePath, args, {
     detached: true,
     stdio: "ignore",

@@ -6,6 +6,7 @@ import {
   getAttributesMap,
   getNodeBox,
   getOuterHTML,
+  querySelectorAll,
   sleep
 } from "../browser/index.js";
 import {
@@ -156,6 +157,369 @@ function filePathForLlmSequence(basePath, index) {
 
 function screenshotHash(buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function createCaptureTimeoutError(label, timeoutMs) {
+  const error = new Error(`Image fallback capture timed out during ${label} after ${timeoutMs}ms`);
+  error.code = "IMAGE_CAPTURE_TIMEOUT";
+  error.capture_step = label;
+  error.timeout_ms = timeoutMs;
+  return error;
+}
+
+async function withCaptureTimeout(promise, {
+  label = "capture_step",
+  timeoutMs = 0
+} = {}) {
+  const safeTimeout = Math.max(0, Number(timeoutMs) || 0);
+  if (!safeTimeout) return promise;
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(createCaptureTimeoutError(label, safeTimeout)), safeTimeout);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function assertCaptureTotalBudget(started, totalTimeoutMs, label) {
+  const safeTimeout = Math.max(0, Number(totalTimeoutMs) || 0);
+  if (!safeTimeout) return;
+  const elapsed = Date.now() - started;
+  if (elapsed <= safeTimeout) return;
+  const error = createCaptureTimeoutError(label, safeTimeout);
+  error.elapsed_ms = elapsed;
+  error.code = "IMAGE_CAPTURE_TOTAL_TIMEOUT";
+  throw error;
+}
+
+const DEFAULT_SCROLL_ANCHOR_SELECTOR = [
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "p",
+  "li",
+  "section",
+  "article",
+  "table",
+  "tr",
+  "dl",
+  "dt",
+  "dd",
+  "[class*='resume']",
+  "[class*='work']",
+  "[class*='project']",
+  "[class*='education']",
+  "[class*='experience']",
+  "[class*='item']",
+  "div"
+].join(",");
+
+function normalizeScrollMethod(value = "dom-anchor-fallback-input") {
+  const normalized = normalizeText(value).toLowerCase();
+  if (["dom", "dom-anchor", "dom_anchor", "anchor"].includes(normalized)) return "dom-anchor";
+  if (["dom-anchor-fallback-input", "dom_anchor_fallback_input", "dom-fallback-input"].includes(normalized)) {
+    return "dom-anchor-fallback-input";
+  }
+  return "input";
+}
+
+function uniqueNumbers(values = []) {
+  return Array.from(new Set(values.map((value) => Number(value) || 0).filter(Boolean)));
+}
+
+function pickEvenly(items = [], limit = 1) {
+  const safeLimit = Math.max(1, Number(limit) || 1);
+  if (items.length <= safeLimit) return items;
+  const picked = [];
+  const last = items.length - 1;
+  for (let index = 0; index < safeLimit; index += 1) {
+    const sourceIndex = Math.round((index * last) / Math.max(1, safeLimit - 1));
+    picked.push(items[sourceIndex]);
+  }
+  return Array.from(new Map(picked.map((item) => [item.node_id, item])).values());
+}
+
+function patternLabel(pattern) {
+  if (pattern instanceof RegExp) return pattern.source;
+  return normalizeText(pattern);
+}
+
+function stopBoundaryPatterns(patterns = []) {
+  return (Array.isArray(patterns) ? patterns : [patterns])
+    .filter(Boolean)
+    .map((pattern) => {
+      if (pattern instanceof RegExp) {
+        return {
+          raw: pattern,
+          label: pattern.source,
+          matches: (text) => pattern.test(text)
+        };
+      }
+      const normalized = normalizeText(pattern);
+      return {
+        raw: pattern,
+        label: normalized,
+        matches: (text) => normalized && text.includes(normalized)
+      };
+    });
+}
+
+async function collectStopBoundaryNodes(client, rootNodeId, {
+  selector = "",
+  textPatterns = [],
+  maxProbeNodes = 180,
+  maxTextLength = 700,
+  stepTimeoutMs = 45000
+} = {}) {
+  const patterns = stopBoundaryPatterns(textPatterns);
+  const normalizedSelector = normalizeText(selector);
+  if (!normalizedSelector && !patterns.length) {
+    return {
+      enabled: false,
+      ok: false,
+      reason: "not_configured",
+      nodes: []
+    };
+  }
+  const started = Date.now();
+  let nodeIds = [];
+  try {
+    nodeIds = uniqueNumbers(await querySelectorAll(
+      client,
+      rootNodeId,
+      normalizedSelector || DEFAULT_SCROLL_ANCHOR_SELECTOR
+    ));
+  } catch (error) {
+    return {
+      enabled: true,
+      ok: false,
+      reason: "query_selector_all_failed",
+      selector: normalizedSelector || DEFAULT_SCROLL_ANCHOR_SELECTOR,
+      error: error?.message || String(error),
+      nodes: []
+    };
+  }
+
+  const probeLimit = Math.max(1, Number(maxProbeNodes) || 180);
+  const maxStopTextLength = Math.max(40, Number(maxTextLength) || 700);
+  const perNodeTimeoutMs = Math.min(1000, Math.max(200, Math.floor((Number(stepTimeoutMs) || 45000) / 40)));
+  const nodes = [];
+  for (const nodeId of nodeIds.slice(0, probeLimit)) {
+    try {
+      let text = "";
+      let matchedPattern = null;
+      if (patterns.length) {
+        const outerHTML = await withCaptureTimeout(getOuterHTML(client, nodeId), {
+          label: `stop_boundary_html_${nodeId}`,
+          timeoutMs: perNodeTimeoutMs
+        });
+        text = normalizeText(htmlToText(outerHTML));
+        if (!text || text.length > maxStopTextLength) continue;
+        matchedPattern = patterns.find((pattern) => pattern.matches(text));
+        if (!matchedPattern) continue;
+      }
+      nodes.push({
+        node_id: nodeId,
+        text_preview: text.slice(0, 120),
+        matched_pattern: matchedPattern ? patternLabel(matchedPattern.raw) : null
+      });
+    } catch {}
+  }
+
+  return {
+    enabled: true,
+    ok: nodes.length > 0,
+    reason: nodes.length ? null : "no_matching_stop_boundary_nodes",
+    selector: normalizedSelector || DEFAULT_SCROLL_ANCHOR_SELECTOR,
+    elapsed_ms: Date.now() - started,
+    discovered_node_count: nodeIds.length,
+    probed_node_count: Math.min(nodeIds.length, probeLimit),
+    match_count: nodes.length,
+    pattern_labels: patterns.map((pattern) => pattern.label),
+    nodes
+  };
+}
+
+async function resolveVisibleStopBoundary(client, stopBoundaryPlan, clip, {
+  topPadding = 8,
+  minCaptureHeight = 180,
+  stepTimeoutMs = 45000
+} = {}) {
+  if (!stopBoundaryPlan?.nodes?.length || !clip) return null;
+  const clipTop = Number(clip.y) || 0;
+  const clipBottom = clipTop + (Number(clip.height) || 0);
+  const safePadding = Math.max(0, Number(topPadding) || 0);
+  const safeMinHeight = Math.max(1, Number(minCaptureHeight) || 180);
+  const perNodeTimeoutMs = Math.min(900, Math.max(180, Math.floor((Number(stepTimeoutMs) || 45000) / 50)));
+  const visible = [];
+
+  for (const node of stopBoundaryPlan.nodes) {
+    try {
+      const box = await withCaptureTimeout(getNodeBox(client, node.node_id), {
+        label: `stop_boundary_box_${node.node_id}`,
+        timeoutMs: perNodeTimeoutMs
+      });
+      const rect = box?.rect || {};
+      const width = Number(rect.width) || 0;
+      const height = Number(rect.height) || 0;
+      if (width < 40 || height < 6) continue;
+      const top = Number(rect.y) || 0;
+      const bottom = top + height;
+      if (bottom <= clipTop + 1) {
+        return {
+          action: "stop_before_capture",
+          reason: "stop_boundary_above_clip",
+          node_id: node.node_id,
+          matched_pattern: node.matched_pattern,
+          text_preview: node.text_preview,
+          rect,
+          clip
+        };
+      }
+      if (top < clipBottom && bottom > clipTop) {
+        visible.push({
+          ...node,
+          rect,
+          top,
+          bottom
+        });
+      }
+    } catch {}
+  }
+  if (!visible.length) return null;
+
+  visible.sort((a, b) => a.top - b.top);
+  const boundary = visible[0];
+  const boundaryY = Math.max(clipTop, boundary.top - safePadding);
+  const adjustedHeight = Math.max(0, boundaryY - clipTop);
+  if (adjustedHeight < safeMinHeight) {
+    return {
+      action: "stop_before_capture",
+      reason: "stop_boundary_near_clip_top",
+      node_id: boundary.node_id,
+      matched_pattern: boundary.matched_pattern,
+      text_preview: boundary.text_preview,
+      rect: boundary.rect,
+      clip,
+      adjusted_height: adjustedHeight,
+      min_capture_height: safeMinHeight
+    };
+  }
+
+  return {
+    action: "capture_then_stop",
+    reason: "stop_boundary_visible",
+    node_id: boundary.node_id,
+    matched_pattern: boundary.matched_pattern,
+    text_preview: boundary.text_preview,
+    rect: boundary.rect,
+    clip,
+    adjusted_clip: {
+      ...clip,
+      height: adjustedHeight
+    },
+    adjusted_height: adjustedHeight,
+    min_capture_height: safeMinHeight
+  };
+}
+
+async function collectDomScrollAnchors(client, rootNodeId, {
+  selector = DEFAULT_SCROLL_ANCHOR_SELECTOR,
+  maxScreenshots = 6,
+  maxProbeNodes = 260,
+  minAnchorGap = 180,
+  stepTimeoutMs = 45000
+} = {}) {
+  const started = Date.now();
+  let nodeIds = [];
+  try {
+    nodeIds = uniqueNumbers(await querySelectorAll(client, rootNodeId, selector));
+  } catch (error) {
+    return {
+      ok: false,
+      method: "dom-anchor",
+      reason: "query_selector_all_failed",
+      error: error?.message || String(error)
+    };
+  }
+  if (!nodeIds.length) {
+    return {
+      ok: false,
+      method: "dom-anchor",
+      reason: "no_anchor_nodes"
+    };
+  }
+
+  const probeLimit = Math.max(1, Number(maxProbeNodes) || 260);
+  const perNodeTimeoutMs = Math.min(1200, Math.max(250, Math.floor((Number(stepTimeoutMs) || 45000) / 30)));
+  const measured = [];
+  for (const nodeId of nodeIds.slice(0, probeLimit)) {
+    try {
+      const box = await withCaptureTimeout(getNodeBox(client, nodeId), {
+        label: `anchor_box_${nodeId}`,
+        timeoutMs: perNodeTimeoutMs
+      });
+      const rect = box?.rect || {};
+      if ((Number(rect.width) || 0) < 80 || (Number(rect.height) || 0) < 8) continue;
+      measured.push({
+        node_id: nodeId,
+        y: Math.round(Number(rect.y) || 0),
+        height: Math.round(Number(rect.height) || 0)
+      });
+    } catch {}
+  }
+
+  let anchors = [];
+  if (measured.length) {
+    const sorted = measured.sort((a, b) => a.y - b.y);
+    for (const item of sorted) {
+      const last = anchors[anchors.length - 1];
+      if (!last || Math.abs(item.y - last.y) >= Math.max(40, Number(minAnchorGap) || 180)) {
+        anchors.push(item);
+      }
+    }
+  }
+
+  if (anchors.length < 2) {
+    anchors = nodeIds.slice(0, probeLimit).map((nodeId, index) => ({
+      node_id: nodeId,
+      y: null,
+      height: null,
+      document_order: index
+    }));
+  }
+
+  anchors = pickEvenly(anchors, Math.max(1, Number(maxScreenshots) || 1));
+  return {
+    ok: anchors.length > 0,
+    method: "dom-anchor",
+    elapsed_ms: Date.now() - started,
+    selector,
+    discovered_node_count: nodeIds.length,
+    measured_node_count: measured.length,
+    anchor_count: anchors.length,
+    anchors
+  };
+}
+
+async function scrollDomAnchorIntoView(client, nodeId, {
+  timeoutMs = 10000,
+  label = "dom_scroll_anchor"
+} = {}) {
+  if (client.DOM && typeof client.DOM.scrollIntoViewIfNeeded === "function") {
+    return withCaptureTimeout(client.DOM.scrollIntoViewIfNeeded({ nodeId }), { label, timeoutMs });
+  }
+  if (typeof client.send === "function") {
+    return withCaptureTimeout(client.send("DOM.scrollIntoViewIfNeeded", { nodeId }), { label, timeoutMs });
+  }
+  throw new Error("CDP client does not expose DOM.scrollIntoViewIfNeeded");
 }
 
 async function optimizeScreenshotBuffer(buffer, {
@@ -339,22 +703,136 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
   llmPagesPerImage = 3,
   llmResizeMaxWidth = 1100,
   llmQuality = 72,
+  stepTimeoutMs = 45000,
+  totalTimeoutMs = 90000,
+  scrollMethod = "dom-anchor-fallback-input",
+  scrollAnchorSelector = DEFAULT_SCROLL_ANCHOR_SELECTOR,
+  scrollAnchorMaxProbeNodes = 260,
+  scrollAnchorMinGap = 180,
+  stopBoundarySelector = "",
+  stopBoundaryTextPatterns = [],
+  stopBoundaryMaxProbeNodes = 180,
+  stopBoundaryMaxTextLength = 700,
+  stopBoundaryTopPadding = 8,
+  stopBoundaryMinCaptureHeight = 180,
   metadata = {}
 } = {}) {
   if (!nodeId) throw new Error("captureScrolledNodeScreenshots requires nodeId");
   const sequenceStarted = Date.now();
+  const normalizedScrollMethod = normalizeScrollMethod(scrollMethod);
+  const maxScreenshotCount = Math.max(1, Number(maxScreenshots) || 1);
+  const anchorPlan = normalizedScrollMethod !== "input"
+    ? await collectDomScrollAnchors(client, nodeId, {
+        selector: scrollAnchorSelector,
+        maxScreenshots: maxScreenshotCount,
+        maxProbeNodes: scrollAnchorMaxProbeNodes,
+        minAnchorGap: scrollAnchorMinGap,
+        stepTimeoutMs
+      })
+    : null;
+  const stopBoundaryEnabled = Boolean(
+    normalizeText(stopBoundarySelector)
+    || (Array.isArray(stopBoundaryTextPatterns)
+      ? stopBoundaryTextPatterns.length
+      : stopBoundaryTextPatterns)
+  );
+  let stopBoundaryPlan = {
+    enabled: false,
+    ok: false,
+    reason: "not_configured",
+    nodes: []
+  };
+  const stopBoundaryChecks = [];
   const screenshots = [];
   let consecutiveDuplicates = 0;
   let previousHash = "";
   let captureCount = 0;
   let droppedDuplicateCount = 0;
+  let forceInputScrollAfterDuplicate = false;
+  let stopBoundaryResult = null;
+  let currentScrollMetadata = {
+    before_capture: "initial",
+    method: normalizedScrollMethod,
+    anchor_plan: anchorPlan
+      ? {
+          ok: Boolean(anchorPlan.ok),
+          reason: anchorPlan.reason || null,
+          discovered_node_count: anchorPlan.discovered_node_count || 0,
+          measured_node_count: anchorPlan.measured_node_count || 0,
+          anchor_count: anchorPlan.anchor_count || 0,
+          elapsed_ms: anchorPlan.elapsed_ms || 0
+        }
+      : null
+  };
 
-  for (let index = 0; index < Math.max(1, Number(maxScreenshots) || 1); index += 1) {
+  if (anchorPlan?.anchors?.[0]?.node_id && normalizedScrollMethod !== "input") {
+    try {
+      await scrollDomAnchorIntoView(client, anchorPlan.anchors[0].node_id, {
+        label: "scroll_dom_anchor_initial",
+        timeoutMs: Math.min(Math.max(3000, Number(stepTimeoutMs) || 45000), 10000)
+      });
+      currentScrollMetadata = {
+        before_capture: "dom_anchor_initial",
+        method: "DOM.scrollIntoViewIfNeeded",
+        anchor_node_id: anchorPlan.anchors[0].node_id,
+        anchor_y: anchorPlan.anchors[0].y,
+        anchor_height: anchorPlan.anchors[0].height,
+        anchor_plan: currentScrollMetadata.anchor_plan
+      };
+    } catch (error) {
+      if (normalizedScrollMethod === "dom-anchor") {
+        throw error;
+      }
+      currentScrollMetadata = {
+        before_capture: "dom_anchor_initial_failed",
+        method: "DOM.scrollIntoViewIfNeeded",
+        anchor_node_id: anchorPlan.anchors[0].node_id,
+        error: error?.message || String(error),
+        anchor_plan: currentScrollMetadata.anchor_plan
+      };
+    }
+  }
+
+  for (let index = 0; index < maxScreenshotCount; index += 1) {
+    assertCaptureTotalBudget(sequenceStarted, totalTimeoutMs, `capture_page_${index + 1}`);
     captureCount += 1;
     const captureStarted = Date.now();
-    const box = await getNodeBox(client, nodeId);
+    const box = await withCaptureTimeout(getNodeBox(client, nodeId), {
+      label: `get_box_${index + 1}`,
+      timeoutMs: stepTimeoutMs
+    });
     const clip = withPadding(box.rect, padding);
-    const captureOptions = captureViewport ? {
+    let visibleStopBoundary = null;
+    if (stopBoundaryEnabled) {
+      stopBoundaryPlan = await collectStopBoundaryNodes(client, nodeId, {
+        selector: stopBoundarySelector,
+        textPatterns: stopBoundaryTextPatterns,
+        maxProbeNodes: stopBoundaryMaxProbeNodes,
+        maxTextLength: stopBoundaryMaxTextLength,
+        stepTimeoutMs
+      });
+      stopBoundaryChecks.push({
+        capture_index: index,
+        ok: Boolean(stopBoundaryPlan.ok),
+        reason: stopBoundaryPlan.reason || null,
+        discovered_node_count: stopBoundaryPlan.discovered_node_count || 0,
+        probed_node_count: stopBoundaryPlan.probed_node_count || 0,
+        match_count: stopBoundaryPlan.match_count || 0,
+        elapsed_ms: stopBoundaryPlan.elapsed_ms || 0
+      });
+      visibleStopBoundary = await resolveVisibleStopBoundary(client, stopBoundaryPlan, clip, {
+        topPadding: stopBoundaryTopPadding,
+        minCaptureHeight: stopBoundaryMinCaptureHeight,
+        stepTimeoutMs
+      });
+    }
+    if (visibleStopBoundary?.action === "stop_before_capture") {
+      stopBoundaryResult = visibleStopBoundary;
+      break;
+    }
+    const effectiveClip = visibleStopBoundary?.adjusted_clip || clip;
+    const effectiveCaptureViewport = Boolean(captureViewport && !visibleStopBoundary?.adjusted_clip);
+    const captureOptions = effectiveCaptureViewport ? {
       format,
       fromSurface,
       captureBeyondViewport: false
@@ -362,18 +840,24 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
       format,
       fromSurface,
       captureBeyondViewport,
-      clip
+      clip: effectiveClip
     };
     if (quality != null) {
       captureOptions.quality = quality;
     }
-    const screenshot = await client.Page.captureScreenshot(captureOptions);
+    const screenshot = await withCaptureTimeout(client.Page.captureScreenshot(captureOptions), {
+      label: `capture_screenshot_${index + 1}`,
+      timeoutMs: stepTimeoutMs
+    });
     const originalBuffer = Buffer.from(screenshot.data || "", "base64");
-    const optimized = await optimizeScreenshotBuffer(originalBuffer, {
+    const optimized = await withCaptureTimeout(optimizeScreenshotBuffer(originalBuffer, {
       enabled: optimize,
       format,
       quality,
       resizeMaxWidth
+    }), {
+      label: `optimize_screenshot_${index + 1}`,
+      timeoutMs: stepTimeoutMs
     });
     const buffer = optimized.buffer;
     const hash = screenshotHash(buffer);
@@ -409,42 +893,102 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
         file_path: outputPath,
         sha256: hash,
         duplicate_of_previous: Boolean(duplicateOfPrevious),
-        clip,
-        capture_viewport: Boolean(captureViewport),
+        clip: effectiveClip,
+        capture_viewport: effectiveCaptureViewport,
         node_rect: box.rect,
-        scroll: index === 0
-          ? { before_capture: "initial" }
-          : { before_capture: `wheel_down_${index}` },
+        scroll: currentScrollMetadata,
+        stop_boundary: visibleStopBoundary || null,
         metadata
       });
     }
 
-    previousHash = hash;
-    if (consecutiveDuplicates >= Math.max(1, Number(duplicateStopCount) || 1)) {
+    if (visibleStopBoundary?.action === "capture_then_stop") {
+      stopBoundaryResult = visibleStopBoundary;
       break;
     }
 
-    if (index < Math.max(1, Number(maxScreenshots) || 1) - 1) {
-      const x = box.center.x;
-      const y = box.center.y;
-      await client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" });
-      await client.Input.dispatchMouseEvent({
-        type: "mouseWheel",
-        x,
-        y,
-        deltaX: 0,
-        deltaY: Math.max(1, Number(wheelDeltaY) || 650)
-      });
+    previousHash = hash;
+    forceInputScrollAfterDuplicate = Boolean(
+      duplicateOfPrevious
+      && normalizedScrollMethod === "dom-anchor-fallback-input"
+      && currentScrollMetadata?.method === "DOM.scrollIntoViewIfNeeded"
+    );
+    if (
+      consecutiveDuplicates >= Math.max(1, Number(duplicateStopCount) || 1)
+      && !forceInputScrollAfterDuplicate
+    ) {
+      break;
+    }
+
+    if (index < maxScreenshotCount - 1) {
+      assertCaptureTotalBudget(sequenceStarted, totalTimeoutMs, `scroll_after_page_${index + 1}`);
+      let scrolledByDomAnchor = false;
+      const nextAnchor = anchorPlan?.anchors?.[index + 1] || null;
+      if (nextAnchor?.node_id && normalizedScrollMethod !== "input" && !forceInputScrollAfterDuplicate) {
+        try {
+          await scrollDomAnchorIntoView(client, nextAnchor.node_id, {
+            label: `scroll_dom_anchor_${index + 1}`,
+            timeoutMs: Math.min(Math.max(3000, Number(stepTimeoutMs) || 45000), 10000)
+          });
+          scrolledByDomAnchor = true;
+          currentScrollMetadata = {
+            before_capture: `dom_anchor_${index + 1}`,
+            method: "DOM.scrollIntoViewIfNeeded",
+            anchor_node_id: nextAnchor.node_id,
+            anchor_y: nextAnchor.y,
+            anchor_height: nextAnchor.height
+          };
+        } catch (error) {
+          if (normalizedScrollMethod === "dom-anchor") {
+            throw error;
+          }
+          currentScrollMetadata = {
+            before_capture: `dom_anchor_${index + 1}_failed`,
+            method: "DOM.scrollIntoViewIfNeeded",
+            anchor_node_id: nextAnchor.node_id,
+            error: error?.message || String(error)
+          };
+        }
+      } else if (normalizedScrollMethod === "dom-anchor") {
+        break;
+      }
+
+      if (!scrolledByDomAnchor && normalizedScrollMethod !== "dom-anchor") {
+        const x = box.center.x;
+        const y = box.center.y;
+        await withCaptureTimeout(client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" }), {
+          label: `scroll_mouse_move_${index + 1}`,
+          timeoutMs: Math.min(Math.max(3000, Number(stepTimeoutMs) || 45000), 10000)
+        });
+        await withCaptureTimeout(client.Input.dispatchMouseEvent({
+          type: "mouseWheel",
+          x,
+          y,
+          deltaX: 0,
+          deltaY: Math.max(1, Number(wheelDeltaY) || 650)
+        }), {
+          label: `scroll_wheel_${index + 1}`,
+          timeoutMs: Math.min(Math.max(3000, Number(stepTimeoutMs) || 45000), 10000)
+        });
+        currentScrollMetadata = {
+          before_capture: `wheel_down_${index + 1}`,
+          method: "Input.dispatchMouseEvent",
+          fallback_from_dom_anchor: Boolean(anchorPlan && normalizedScrollMethod === "dom-anchor-fallback-input")
+        };
+      }
       if (settleMs > 0) await sleep(settleMs);
     }
   }
 
   const llmComposition = composeForLlm
-    ? await composeScreenshotsForLlm(screenshots, {
+    ? await withCaptureTimeout(composeScreenshotsForLlm(screenshots, {
         basePath: filePath,
         pagesPerImage: llmPagesPerImage,
         resizeMaxWidth: llmResizeMaxWidth,
         quality: llmQuality
+      }), {
+        label: "compose_llm_screenshots",
+        timeoutMs: stepTimeoutMs
       })
     : {
         llm_file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
@@ -456,6 +1000,7 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
 
   return {
     schema_version: 1,
+    ok: true,
     source: "image-scroll-sequence",
     captured_at: nowIso(),
     node_id: nodeId,
@@ -482,9 +1027,19 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
       llm_compose_enabled: Boolean(composeForLlm),
       llm_pages_per_image: Math.max(1, Math.min(5, Number(llmPagesPerImage) || 3)),
       llm_resize_max_width: Math.max(0, Number(llmResizeMaxWidth) || 0),
-      llm_quality: llmQuality ?? null
-    },
-    file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
+      llm_quality: llmQuality ?? null,
+      step_timeout_ms: Math.max(0, Number(stepTimeoutMs) || 0),
+      total_timeout_ms: Math.max(0, Number(totalTimeoutMs) || 0),
+      scroll_method: normalizedScrollMethod,
+    scroll_anchor_selector: scrollAnchorSelector,
+    scroll_anchor_max_probe_nodes: Math.max(1, Number(scrollAnchorMaxProbeNodes) || 260),
+    scroll_anchor_min_gap: Math.max(0, Number(scrollAnchorMinGap) || 0)
+  },
+  scroll_anchor_plan: anchorPlan,
+  stop_boundary_plan: stopBoundaryPlan,
+  stop_boundary_checks: stopBoundaryChecks,
+  stop_boundary_result: stopBoundaryResult,
+  file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
     screenshots,
     metadata
   };

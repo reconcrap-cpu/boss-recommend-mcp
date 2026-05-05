@@ -7,6 +7,12 @@ import CDP from "chrome-remote-interface";
 export const DEFAULT_CHROME_HOST = "127.0.0.1";
 export const DEFAULT_CHROME_PORT = 9222;
 export const BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/?ka=bticket";
+export const LID_CLOSED_SAFE_CHROME_ARGS = [
+  "--disable-backgrounding-occluded-windows",
+  "--disable-background-timer-throttling",
+  "--disable-renderer-backgrounding",
+  "--disable-features=CalculateNativeWinOcclusion"
+];
 
 export const ALLOWED_CDP_DOMAINS = new Set([
   "Accessibility",
@@ -208,6 +214,33 @@ export function getBossChromeUserDataDir(port = DEFAULT_CHROME_PORT) {
   return sharedPath;
 }
 
+function parseExtraChromeArgs(value = "") {
+  return String(value || "")
+    .split(/\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function buildBossChromeLaunchArgs({
+  port = DEFAULT_CHROME_PORT,
+  userDataDir = "",
+  url = "about:blank",
+  extraArgs = []
+} = {}) {
+  const args = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${userDataDir}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    ...LID_CLOSED_SAFE_CHROME_ARGS,
+    ...parseExtraChromeArgs(process.env.BOSS_MCP_EXTRA_CHROME_ARGS),
+    ...extraArgs,
+    "--new-window",
+    url
+  ];
+  return Array.from(new Set(args.filter(Boolean)));
+}
+
 export async function waitForChromeDebugPort({
   host = DEFAULT_CHROME_HOST,
   port = DEFAULT_CHROME_PORT,
@@ -250,14 +283,7 @@ export async function launchChromeDebugInstance({
     throw new Error("Chrome executable not found. Set BOSS_MCP_CHROME_PATH or BOSS_RECOMMEND_CHROME_PATH.");
   }
   const userDataDir = getBossChromeUserDataDir(port);
-  const args = [
-    `--remote-debugging-port=${port}`,
-    `--user-data-dir=${userDataDir}`,
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--new-window",
-    url
-  ];
+  const args = buildBossChromeLaunchArgs({ port, userDataDir, url });
   const child = spawn(chromePath, args, {
     detached: true,
     stdio: "ignore",
@@ -277,6 +303,7 @@ export async function launchChromeDebugInstance({
     launched: true,
     chrome_path: chromePath,
     user_data_dir: userDataDir,
+    launch_args: args,
     port,
     url,
     readiness: {
