@@ -153,6 +153,11 @@ function resultOpenedDetail(result) {
   return Boolean(result?.detail && !result.detail?.cv_acquisition?.skipped);
 }
 
+export function chatDetailSkipReasonFromReadyState(state = {}) {
+  if (state?.attachment_resume_enabled) return "attachment_resume_already_available";
+  return "";
+}
+
 function llmToScreening(llmResult, candidate) {
   return {
     status: llmResult?.passed ? "pass" : "fail",
@@ -962,20 +967,37 @@ export async function runChatWorkflow({
         }
         effectiveCardNodeId = selected.card_node_id || cardNodeId;
         const selectionNetworkEvents = networkRecorder.events.slice();
+        try {
+          preActionState = await readChatConversationReadyState(client);
+        } catch (error) {
+          preActionState = {
+            error: error?.message || String(error)
+          };
+        }
+        const preDetailSkipReason = chatDetailSkipReasonFromReadyState(preActionState);
+        if (preDetailSkipReason) {
+          detailUnavailableReason = preDetailSkipReason;
+          detailResult = createSkippedDetailResult(cardCandidate, preDetailSkipReason);
+          detailResult.cv_acquisition.pre_detail_state = preActionState;
+          detailResult.cv_acquisition.selection_ready_state = selected.ready;
+        }
         if (!selected.ready?.ok) {
-          if (selected.ready?.reason === "active_candidate_mismatch") {
+          if (detailResult) {
+            // Already classified by the pre-detail conversation state.
+          } else if (selected.ready?.reason === "active_candidate_mismatch") {
             detailUnavailableReason = "active_candidate_mismatch";
             detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason);
             detailResult.cv_acquisition.selection_ready_state = selected.ready;
           } else {
             detailStep = "read_conversation_ready_state";
-            preActionState = await readChatConversationReadyState(client);
             if (preActionState.attachment_resume_enabled) {
               detailUnavailableReason = "attachment_resume_already_available";
               detailResult = createSkippedDetailResult(cardCandidate, "attachment_resume_already_available");
+              detailResult.cv_acquisition.pre_detail_state = preActionState;
             } else {
               detailUnavailableReason = "online_resume_button_unavailable";
               detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason);
+              detailResult.cv_acquisition.pre_detail_state = preActionState;
             }
           }
         }

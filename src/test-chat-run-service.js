@@ -6,6 +6,7 @@ import {
 } from "./core/run/index.js";
 import {
   captureNodeIdFromResumeState,
+  chatDetailSkipReasonFromReadyState,
   createChatRunService,
   resolveChatDomFallbackWait,
   summarizeChatFullCvEvidence
@@ -89,6 +90,20 @@ function testChatResumeCaptureTarget() {
     resumeIframe: { node_id: 303 }
   }), 303);
   assert.equal(captureNodeIdFromResumeState(null), null);
+}
+
+function testChatPreDetailAttachmentResumeSkipReason() {
+  assert.equal(chatDetailSkipReasonFromReadyState({
+    attachment_resume_enabled: true,
+    has_attachment_resume: true
+  }), "attachment_resume_already_available");
+  assert.equal(chatDetailSkipReasonFromReadyState({
+    attachment_resume_enabled: false,
+    has_attachment_resume: true
+  }), "");
+  assert.equal(chatDetailSkipReasonFromReadyState({
+    has_online_resume: true
+  }), "");
 }
 
 function testChatDomFallbackWaitPlan() {
@@ -284,6 +299,7 @@ function testChatFullCvEvidenceGate() {
 
 testChatFullCvEvidenceGate();
 testChatResumeCaptureTarget();
+testChatPreDetailAttachmentResumeSkipReason();
 testChatDomFallbackWaitPlan();
 await testLifecycleDelegation();
 
