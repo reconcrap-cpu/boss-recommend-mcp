@@ -1139,6 +1139,7 @@ export async function clickChatAskResume(client, {
 } = {}) {
   const started = Date.now();
   let lastState = null;
+  let lastDisabledAskResume = null;
   while (Date.now() - started <= timeoutMs) {
     const state = await readChatConversationReadyState(client);
     lastState = state;
@@ -1172,6 +1173,9 @@ export async function clickChatAskResume(client, {
         };
       }
     }
+    if (state.ask_resume?.node_id && state.ask_resume.disabled) {
+      lastDisabledAskResume = state.ask_resume;
+    }
     if (state.already_requested_resume) {
       return {
         ok: true,
@@ -1180,6 +1184,16 @@ export async function clickChatAskResume(client, {
       };
     }
     await sleep(250);
+  }
+  if (lastDisabledAskResume) {
+    return {
+      ok: false,
+      already_requested: true,
+      request_pending: true,
+      error: "ASK_RESUME_BUTTON_DISABLED",
+      control: lastDisabledAskResume,
+      state: lastState
+    };
   }
   return {
     ok: false,
@@ -1317,6 +1331,7 @@ export async function waitForChatResumeRequestMessage(client, {
 export async function requestChatResumeForPassedCandidate(client, {
   greetingText = "Hi同学，能麻烦发下简历吗？",
   maxAttempts = 3,
+  askResumeTimeoutMs = 8000,
   dryRun = false
 } = {}) {
   const effectiveGreetingText = normalizeDetailText(greetingText) || "Hi同学，能麻烦发下简历吗？";
@@ -1362,13 +1377,17 @@ export async function requestChatResumeForPassedCandidate(client, {
   const attempts = [];
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const before = await getChatResumeRequestMessageState(client);
-    const askResult = await clickChatAskResume(client);
+    const askResult = await clickChatAskResume(client, {
+      timeoutMs: askResumeTimeoutMs
+    });
     let confirmResult = {
       confirmed: false,
       assumed_requested: Boolean(askResult.already_requested),
       skipped: true,
       reason: askResult.attachment_resume_available
         ? "attachment_resume_already_available"
+        : askResult.request_pending
+          ? "resume_request_already_pending"
         : askResult.ok
           ? "already_requested"
           : (askResult.error || "ask_resume_not_clicked")
@@ -1387,6 +1406,29 @@ export async function requestChatResumeForPassedCandidate(client, {
         requested: false,
         skipped: true,
         reason: "attachment_resume_already_available",
+        initial_state: initialState,
+        close_before_greeting: closeBeforeGreeting,
+        greeting_sent: true,
+        greeting_send_result: sendResult,
+        attempts
+      };
+    }
+    if (askResult.request_pending || askResult.already_requested) {
+      attempts.push({
+        attempt: attempt + 1,
+        ask_result: askResult,
+        confirm_result: confirmResult,
+        message_before_count: before.count,
+        message_after_count: before.count,
+        resume_attachment_before_count: before.resume_attachment_count || 0,
+        resume_attachment_after_count: before.resume_attachment_count || 0,
+        message_observed: false,
+        message_last_text: before.last_success_text || before.last_text || ""
+      });
+      return {
+        requested: false,
+        skipped: true,
+        reason: "resume_request_already_pending",
         initial_state: initialState,
         close_before_greeting: closeBeforeGreeting,
         greeting_sent: true,

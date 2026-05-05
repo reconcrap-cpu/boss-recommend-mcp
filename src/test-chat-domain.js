@@ -873,6 +873,122 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
   assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [41, 30, 60]);
 }
 
+async function testDisabledAskResumeAfterGreetingSkipsAsPendingRequest() {
+  const state = {
+    editorText: "",
+    messageSent: false,
+    lastBoxNodeId: 0,
+    clicks: [],
+    boxCenters: {}
+  };
+  const nodeHtml = (nodeId) => {
+    if (nodeId === 100) return '<div class="conversation-main"><a class="btn resume-btn-online">在线简历</a><a class="btn resume-btn-file disabled">附件简历</a></div>';
+    if (nodeId === 101) return '<a class="btn resume-btn-online">在线简历</a>';
+    if (nodeId === 102) return '<a class="btn resume-btn-file disabled">附件简历</a>';
+    if (nodeId === 130) return `<div class="conversation-editor"><div id="boss-chat-editor-input" contenteditable="true">${state.editorText}</div><button class="submit active">发送</button></div>`;
+    if (nodeId === 140) return `<div class="chat-message-list">${state.messageSent ? '<div>Hi同学，能麻烦发下简历吗？</div>' : ''}</div>`;
+    if (nodeId === 150) return '<div class="toolbar-box-right"><div class="operate-icon-item"><span class="operate-btn disabled">求简历</span></div></div>';
+    if (nodeId === 103) return '<span class="operate-btn disabled">求简历</span>';
+    if (nodeId === 104) return `<div id="boss-chat-editor-input" contenteditable="true">${state.editorText}</div>`;
+    if (nodeId === 105) return '<button class="submit active">发送</button>';
+    return "";
+  };
+  const client = {
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        const nodeId = params.nodeId;
+        if (nodeId === 1) {
+          if (selector === ".conversation-main") return { nodeIds: [100] };
+          if (selector === ".conversation-editor") return { nodeIds: [130] };
+          if (selector === ".chat-message-list") return { nodeIds: [140] };
+          if (selector === ".toolbar-box-right") return { nodeIds: [150] };
+          return { nodeIds: [] };
+        }
+        if (nodeId === 100) {
+          if (selector.includes("resume-btn-online")) return { nodeIds: [101] };
+          if (selector.includes("resume-btn-file")) return { nodeIds: [102] };
+          return { nodeIds: [] };
+        }
+        if (nodeId === 130) {
+          if (selector.includes("boss-chat-editor-input")) return { nodeIds: [104] };
+          if (selector.includes("submit")) return { nodeIds: [105] };
+          return { nodeIds: [] };
+        }
+        if (nodeId === 140) {
+          if (selector === ".chat-message-list") return { nodeIds: [140] };
+          return { nodeIds: [] };
+        }
+        if (nodeId === 150) {
+          if (selector === "span.operate-btn" || selector === ".operate-btn" || selector.includes("operate")) {
+            return { nodeIds: [103] };
+          }
+          return { nodeIds: [] };
+        }
+        return { nodeIds: [] };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === 100) return { attributes: ["class", "conversation-main"] };
+        if (params.nodeId === 101) return { attributes: ["class", "btn resume-btn-online"] };
+        if (params.nodeId === 102) return { attributes: ["class", "btn resume-btn-file disabled"] };
+        if (params.nodeId === 130) return { attributes: ["class", "conversation-editor"] };
+        if (params.nodeId === 140) return { attributes: ["class", "chat-message-list"] };
+        if (params.nodeId === 150) return { attributes: ["class", "toolbar-box-right"] };
+        if (params.nodeId === 103) return { attributes: ["class", "operate-btn disabled"] };
+        if (params.nodeId === 104) return { attributes: ["id", "boss-chat-editor-input", "contenteditable", "true"] };
+        if (params.nodeId === 105) return { attributes: ["class", "submit active"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        return { outerHTML: nodeHtml(params.nodeId) };
+      },
+      async getBoxModel(params) {
+        state.lastBoxNodeId = params.nodeId;
+        const left = params.nodeId * 10;
+        const right = left + 100;
+        const center = left + 50;
+        state.boxCenters[center] = params.nodeId;
+        return {
+          model: {
+            border: [left, 0, right, 0, right, 30, left, 30]
+          }
+        };
+      },
+      async scrollIntoViewIfNeeded() {}
+    },
+    Input: {
+      async dispatchMouseEvent(params) {
+        if (params.type !== "mouseReleased") return {};
+        const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
+        state.clicks.push(clickedNodeId);
+        if (clickedNodeId === 105) state.messageSent = true;
+        return {};
+      },
+      async dispatchKeyEvent() {
+        return {};
+      },
+      async insertText(params) {
+        state.editorText = params.text;
+        return {};
+      }
+    }
+  };
+
+  const result = await requestChatResumeForPassedCandidate(client, {
+    maxAttempts: 1,
+    askResumeTimeoutMs: 1
+  });
+  assert.equal(result.requested, false);
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, "resume_request_already_pending");
+  assert.equal(result.greeting_sent, true);
+  assert.equal(result.attempts[0].ask_result.error, "ASK_RESUME_BUTTON_DISABLED");
+  assert.deepEqual(state.clicks.filter((nodeId) => [105, 103].includes(nodeId)), [105]);
+}
+
 async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserved() {
   const state = {
     editorText: "",
@@ -1192,6 +1308,7 @@ await testGenericSentMessageIsNotAlreadyRequestedResume();
 await testPlainAttachmentResumeIsNotAskResumeControl();
 await testActiveAttachmentResumeSkipsRequest();
 await testChatResumeRequestSendsMessageBeforeAskResume();
+await testDisabledAskResumeAfterGreetingSkipsAsPendingRequest();
 await testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserved();
 await testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageVerifiesRequest();
 await testLegacyResumeRequestSentMarkerStillVerifiesRequest();
