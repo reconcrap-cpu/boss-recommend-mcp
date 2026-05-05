@@ -8,6 +8,7 @@ import {
   captureNodeIdFromResumeState,
   chatDetailSkipReasonFromReadyState,
   createChatRunService,
+  makeChatResumeModalOpenBeforeCandidateClickError,
   resolveChatDomFallbackWait,
   summarizeChatFullCvEvidence
 } from "./domains/chat/index.js";
@@ -104,6 +105,10 @@ function testChatPreDetailAttachmentResumeSkipReason() {
   assert.equal(chatDetailSkipReasonFromReadyState({
     has_online_resume: true
   }), "");
+
+  const error = makeChatResumeModalOpenBeforeCandidateClickError({ closed: false });
+  assert.equal(error.code, "CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK");
+  assert.equal(error.close_result.closed, false);
 }
 
 function testChatDomFallbackWaitPlan() {

@@ -150,6 +150,14 @@ export const CHAT_RESUME_MODAL_SELECTORS = Object.freeze([
   ".resume-recommend"
 ]);
 
+export const CHAT_RESUME_FAST_MODAL_SELECTORS = Object.freeze([
+  ".boss-popup__wrapper.new-chat-resume-dialog-main-ui",
+  ".new-chat-resume-dialog-main-ui",
+  ".resume-common-dialog.search-resume",
+  ".resume-recommend",
+  'iframe[src*="/web/frame/c-resume/"]'
+]);
+
 export const CHAT_RESUME_CONTENT_SELECTORS = Object.freeze([
   ".resume-center-side .resume-detail-wrap",
   ".resume-detail-wrap",
@@ -171,14 +179,18 @@ export const CHAT_RESUME_IFRAME_SELECTORS = Object.freeze([
 export const CHAT_RESUME_CLOSE_SELECTORS = Object.freeze([
   ".boss-popup__close",
   ".boss-dialog__close",
+  ".new-chat-resume-dialog-main-ui .boss-popup__close",
+  ".new-chat-resume-dialog-main-ui .icon-close",
+  ".new-chat-resume-dialog-main-ui [class*=\"close\"]",
+  ".boss-popup__wrapper [class*=\"close\"]",
+  ".boss-dialog [class*=\"close\"]",
   ".popup-close",
   ".modal-close",
   ".dialog-close",
   ".close-btn",
   ".icon-close",
   '[aria-label*="关闭"]',
-  '[title*="关闭"]',
-  '[class*="close"]'
+  '[title*="关闭"]'
 ]);
 
 export const CHAT_PROFILE_NETWORK_PATTERNS = Object.freeze([

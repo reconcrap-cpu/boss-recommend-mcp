@@ -52,6 +52,7 @@ import {
   extractChatProfileCandidate,
   isUnsafeChatOnlineResumeLinkError,
   openChatOnlineResume,
+  quickChatResumeModalOpenProbe,
   readChatConversationReadyState,
   requestChatResumeForPassedCandidate,
   selectChatMessageFilter,
@@ -156,6 +157,36 @@ function resultOpenedDetail(result) {
 export function chatDetailSkipReasonFromReadyState(state = {}) {
   if (state?.attachment_resume_enabled) return "attachment_resume_already_available";
   return "";
+}
+
+export function makeChatResumeModalOpenBeforeCandidateClickError(closeResult = null) {
+  const error = new Error("CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK");
+  error.code = "CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK";
+  error.close_result = closeResult || null;
+  return error;
+}
+
+export async function ensureNoOpenChatResumeModalBeforeCandidateClick(client, {
+  closeAttempts = 3
+} = {}) {
+  const probe = await quickChatResumeModalOpenProbe(client);
+  if (!probe.open) {
+    return {
+      closed: true,
+      already_closed: true,
+      probe
+    };
+  }
+  const closeResult = await closeChatResumeModal(client, { attemptsLimit: closeAttempts });
+  if (closeResult?.closed) {
+    return {
+      closed: true,
+      already_closed: false,
+      probe,
+      close_result: closeResult
+    };
+  }
+  throw makeChatResumeModalOpenBeforeCandidateClickError(closeResult);
 }
 
 function llmToScreening(llmResult, candidate) {
@@ -458,6 +489,7 @@ async function selectFreshChatCandidate(client, {
 } = {}) {
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    const modalGuard = await ensureNoOpenChatResumeModalBeforeCandidateClick(client);
     const rootState = await getChatRoots(client);
     const freshNodeId = await resolveFreshChatCardNodeId(client, {
       fallbackNodeId: cardNodeId,
@@ -479,6 +511,7 @@ async function selectFreshChatCandidate(client, {
         ready,
         card_node_id: freshNodeId,
         refreshed_node: freshNodeId !== cardNodeId,
+        modal_guard: modalGuard,
         attempt: attempt + 1
       };
     } catch (error) {
@@ -1344,6 +1377,9 @@ export async function runChatWorkflow({
           if (closeResume) {
             detailStep = "close_resume_modal";
             closeResult = await measureTiming(timings, "close_detail_ms", () => closeChatResumeModal(client));
+            if (!closeResult?.closed) {
+              throw makeChatResumeModalOpenBeforeCandidateClickError(closeResult);
+            }
           }
           detailResult.close_result = closeResult;
           detailResult.image_evidence = imageEvidence;

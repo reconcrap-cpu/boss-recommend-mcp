@@ -28,6 +28,7 @@ import {
   CHAT_PROFILE_NETWORK_PATTERNS,
   CHAT_RESUME_CLOSE_SELECTORS,
   CHAT_RESUME_CONTENT_SELECTORS,
+  CHAT_RESUME_FAST_MODAL_SELECTORS,
   CHAT_RESUME_IFRAME_SELECTORS,
   CHAT_RESUME_MODAL_SELECTORS,
   CHAT_SEND_BUTTON_SELECTORS
@@ -571,6 +572,43 @@ export async function waitForChatResumeModal(client, {
     await sleep(intervalMs);
   }
   return lastState;
+}
+
+export async function quickChatResumeModalOpenProbe(client, {
+  selectors = CHAT_RESUME_FAST_MODAL_SELECTORS
+} = {}) {
+  const rootState = await getChatRoots(client);
+  for (const root of rootState.roots) {
+    if (!root?.nodeId) continue;
+    for (const selector of selectors) {
+      let nodeIds = [];
+      try {
+        nodeIds = await querySelectorAll(client, root.nodeId, selector);
+      } catch {
+        nodeIds = [];
+      }
+      for (const nodeId of nodeIds.slice(0, 4)) {
+        try {
+          const box = await getNodeBox(client, nodeId);
+          if (box?.rect?.width > 8 && box?.rect?.height > 8) {
+            return {
+              open: true,
+              root: root.name,
+              selector,
+              node_id: nodeId,
+              rect: box.rect,
+              center: box.center
+            };
+          }
+        } catch {
+          // Hidden or stale modal probes are ignored.
+        }
+      }
+    }
+  }
+  return {
+    open: false
+  };
 }
 
 export async function readChatResumeHtml(client, resumeState) {

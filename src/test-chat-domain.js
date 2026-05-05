@@ -16,6 +16,7 @@ import {
   isUnsafeChatOnlineResumeTarget,
   matchesChatProfileNetwork,
   openChatOnlineResume,
+  quickChatResumeModalOpenProbe,
   readChatConversationReadyState,
   readChatCardCandidate,
   recoverChatShell,
@@ -39,6 +40,39 @@ function testNetworkPatterns() {
     true
   );
   assert.equal(matchesChatProfileNetwork("https://example.com/static/app.js"), false);
+}
+
+async function testQuickChatResumeModalOpenProbe() {
+  let modalVisible = true;
+  const client = {
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        if (modalVisible && selector.includes("new-chat-resume-dialog-main-ui")) {
+          return { nodeIds: [20] };
+        }
+        return { nodeIds: [] };
+      },
+      async getBoxModel() {
+        return {
+          model: {
+            border: [300, 0, 900, 0, 900, 700, 300, 700]
+          }
+        };
+      }
+    }
+  };
+
+  const open = await quickChatResumeModalOpenProbe(client);
+  assert.equal(open.open, true);
+  assert.equal(open.selector.includes("new-chat-resume-dialog-main-ui"), true);
+
+  modalVisible = false;
+  const closed = await quickChatResumeModalOpenProbe(client);
+  assert.equal(closed.open, false);
 }
 
 function testNetworkRecorder() {
@@ -788,6 +822,7 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
 }
 
 testNetworkPatterns();
+await testQuickChatResumeModalOpenProbe();
 testNetworkRecorder();
 await testCardCandidateReader();
 await testChatSelfHealConfig();
