@@ -51,6 +51,16 @@ async function waitForRecommendRun(runId, predicate, timeoutMs = 5000) {
   throw new Error(`Timed out waiting for recommend run ${runId}`);
 }
 
+async function waitUntil(predicate, timeoutMs = 5000) {
+  const started = Date.now();
+  while (Date.now() - started <= timeoutMs) {
+    const value = await predicate();
+    if (value) return value;
+    await sleep(50);
+  }
+  throw new Error("Timed out waiting for condition");
+}
+
 function readyArgs(extra = {}) {
   return {
     instruction: "推荐页筛选算法候选人，目标处理3位",
@@ -373,6 +383,60 @@ async function testRecommendAsyncPauseResumeCancel() {
   assert.equal(connector.closeCount >= 1, true);
 }
 
+async function testRecommendActiveRunPersistsProgressToDisk() {
+  installFakeConnector();
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:test-active-persist");
+    runControl.updateProgress({
+      card_count: 2,
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    runControl.checkpoint({
+      results: [
+        {
+          index: 0,
+          candidate: { identity: { name: "候选人A" } },
+          screening: { passed: false, status: "screened", score: 0 }
+        }
+      ]
+    });
+    await runControl.sleep(300);
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 31);
+  assert.equal(started.status, "ACCEPTED");
+  const statePath = started.run.artifacts.run_state_path;
+  const checkpointPath = started.run.artifacts.checkpoint_path;
+  const diskState = await waitUntil(() => {
+    if (!fs.existsSync(statePath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    return parsed.progress?.processed >= 1 && parsed.state === "running" ? parsed : null;
+  });
+  assert.equal(diskState.progress.processed, 1);
+  assert.equal(diskState.stage, "recommend:test-active-persist");
+
+  const checkpoint = await waitUntil(() => {
+    if (!fs.existsSync(checkpointPath)) return null;
+    const parsed = JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
+    return Array.isArray(parsed.results) && parsed.results.length === 1 ? parsed : null;
+  });
+  assert.equal(checkpoint.results[0].candidate.identity.name, "候选人A");
+
+  const completed = await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(completed.progress.processed, 1);
+}
+
 async function testRecommendMultiSelectFilterMapping() {
   installFakeConnector();
   let observedFilter = null;
@@ -607,6 +671,8 @@ async function main() {
     await testRecommendLoadsLlmConfigByDefault();
     resetRecommendMcpStateForTests();
     await testRecommendAsyncPauseResumeCancel();
+    resetRecommendMcpStateForTests();
+    await testRecommendActiveRunPersistsProgressToDisk();
     resetRecommendMcpStateForTests();
     await testRecommendMultiSelectFilterMapping();
     resetRecommendMcpStateForTests();

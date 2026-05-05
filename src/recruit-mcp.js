@@ -42,7 +42,7 @@ const RUN_MODE_SYNC = "sync";
 const DEFAULT_RECRUIT_POLL_AFTER_SEC = 10;
 const DEFAULT_RECRUIT_HOST = "127.0.0.1";
 const DEFAULT_RECRUIT_PORT = 9222;
-const TARGET_COUNT_SEMANTICS = "target_count means processed candidate count, not passed candidate count";
+const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screening; scan continues until that many candidates pass or the list ends";
 const DEFAULT_RECRUIT_HOME_DIR = ".boss-recruit-mcp";
 
 const TERMINAL_STATUSES = new Set([
@@ -55,7 +55,8 @@ let recruitWorkflowImpl = runRecruitWorkflow;
 let recruitConnectorImpl = connectRecruitChromeSession;
 let recruitRunService = createRecruitRunService({
   idPrefix: "mcp_recruit",
-  workflow: (...args) => recruitWorkflowImpl(...args)
+  workflow: (...args) => recruitWorkflowImpl(...args),
+  onSnapshot: persistRecruitLifecycleSnapshot
 });
 const recruitRunMeta = new Map();
 
@@ -251,6 +252,17 @@ function ensureRecruitRunArtifacts(snapshot) {
   }
 
   return artifacts;
+}
+
+function persistRecruitCheckpointSnapshot(normalized) {
+  const artifacts = getRecruitRunArtifacts(normalized?.run_id || normalized?.runId);
+  if (!artifacts) return;
+  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+    ? normalized.checkpoint
+    : {};
+  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  const meta = getRecruitRunMeta(normalized?.run_id || normalized?.runId);
+  if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 }
 
 function toIsoOrNull(value) {
@@ -565,6 +577,7 @@ function evaluateRecruitPipelineGate(parsed) {
 function normalizeRunSnapshot(snapshot) {
   if (!snapshot) return null;
   const meta = getRecruitRunMeta(snapshot.runId);
+  const artifacts = getRecruitRunArtifacts(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   const legacyResult = (
@@ -603,27 +616,33 @@ function normalizeRunSnapshot(snapshot) {
       cancel_requested: snapshot.status === RUN_STATUS_CANCELING
     },
     resume: {
-      checkpoint_path: legacyResult?.checkpoint_path || null,
-      pause_control_path: getRecruitRunArtifacts(snapshot.runId)?.run_state_path || null,
+      checkpoint_path: legacyResult?.checkpoint_path || meta.checkpointPath || artifacts?.checkpoint_path || null,
+      pause_control_path: artifacts?.run_state_path || null,
       output_csv: legacyResult?.output_csv || null,
       resume_count: meta.resumeCount || 0,
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
     },
     result: legacyResult,
-    artifacts: getRecruitRunArtifacts(snapshot.runId)
+    artifacts
   };
 }
 
-function persistRecruitRunSnapshot(snapshot) {
+function persistRecruitRunSnapshot(snapshot, {
+  persistActiveCheckpoint = false
+} = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecruitRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  if (persistActiveCheckpoint) {
+    persistRecruitCheckpointSnapshot(normalized);
+  }
   const payload = {
     run_id: normalized.run_id,
     mode: normalized.mode,
     state: normalized.state,
+    status: normalized.status,
     stage: normalized.stage,
     started_at: normalized.started_at,
     updated_at: normalized.updated_at,
@@ -642,6 +661,12 @@ function persistRecruitRunSnapshot(snapshot) {
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
   return normalized;
+}
+
+function persistRecruitLifecycleSnapshot(snapshot, event = {}) {
+  return persistRecruitRunSnapshot(snapshot, {
+    persistActiveCheckpoint: event?.type === "checkpoint"
+  });
 }
 
 function getRecruitRunMeta(runId) {
@@ -1248,7 +1273,8 @@ export function __setRecruitMcpWorkflowForTests(nextWorkflow) {
   recruitWorkflowImpl = typeof nextWorkflow === "function" ? nextWorkflow : runRecruitWorkflow;
   recruitRunService = createRecruitRunService({
     idPrefix: "mcp_recruit",
-    workflow: (...args) => recruitWorkflowImpl(...args)
+    workflow: (...args) => recruitWorkflowImpl(...args),
+    onSnapshot: persistRecruitLifecycleSnapshot
   });
 }
 

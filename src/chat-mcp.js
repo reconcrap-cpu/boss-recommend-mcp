@@ -114,7 +114,8 @@ let chatConnectorImpl = connectChatChromeSession;
 let chatJobReaderImpl = readChatJobOptionsFromSession;
 let chatRunService = createChatRunService({
   idPrefix: "mcp_chat",
-  workflow: (...args) => chatWorkflowImpl(...args)
+  workflow: (...args) => chatWorkflowImpl(...args),
+  onSnapshot: persistChatLifecycleSnapshot
 });
 const chatRunMeta = new Map();
 
@@ -387,6 +388,17 @@ function ensureChatRunArtifacts(snapshot) {
   return artifacts;
 }
 
+function persistChatCheckpointSnapshot(normalized) {
+  const artifacts = getChatRunArtifacts(normalized?.run_id || normalized?.runId);
+  if (!artifacts) return;
+  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+    ? normalized.checkpoint
+    : {};
+  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  const meta = getChatRunMeta(normalized?.run_id || normalized?.runId);
+  if (meta) meta.checkpointPath = artifacts.checkpoint_path;
+}
+
 function isPidAlive(pid) {
   const numericPid = Number(pid);
   if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
@@ -565,6 +577,7 @@ function buildLegacyChatResult(snapshot) {
 function normalizeRunSnapshot(snapshot) {
   if (!snapshot) return null;
   const meta = getChatRunMeta(snapshot.runId);
+  const artifacts = getChatRunArtifacts(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   const legacyResult = (
@@ -606,23 +619,28 @@ function normalizeRunSnapshot(snapshot) {
       cancel_requested: snapshot.status === RUN_STATUS_CANCELING
     },
     resume: {
-      checkpoint_path: legacyResult?.checkpoint_path || null,
-      pause_control_path: getChatRunArtifacts(snapshot.runId)?.run_state_path || null,
+      checkpoint_path: legacyResult?.checkpoint_path || meta.checkpointPath || artifacts?.checkpoint_path || null,
+      pause_control_path: artifacts?.run_state_path || null,
       output_csv: legacyResult?.output_csv || null,
       resume_count: meta.resumeCount || 0,
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
     },
     result: legacyResult,
-    artifacts: getChatRunArtifacts(snapshot.runId)
+    artifacts
   };
 }
 
-function persistChatRunSnapshot(snapshot) {
+function persistChatRunSnapshot(snapshot, {
+  persistActiveCheckpoint = false
+} = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getChatRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  if (persistActiveCheckpoint) {
+    persistChatCheckpointSnapshot(normalized);
+  }
   const payload = {
     run_id: normalized.run_id,
     mode: normalized.mode,
@@ -646,6 +664,12 @@ function persistChatRunSnapshot(snapshot) {
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
   return normalized;
+}
+
+function persistChatLifecycleSnapshot(snapshot, event = {}) {
+  return persistChatRunSnapshot(snapshot, {
+    persistActiveCheckpoint: event?.type === "checkpoint"
+  });
 }
 
 function attachMethodEvidence(payload, runId) {
@@ -1729,7 +1753,8 @@ export function __setChatMcpWorkflowForTests(nextWorkflow) {
   chatWorkflowImpl = typeof nextWorkflow === "function" ? nextWorkflow : runChatWorkflow;
   chatRunService = createChatRunService({
     idPrefix: "mcp_chat",
-    workflow: (...args) => chatWorkflowImpl(...args)
+    workflow: (...args) => chatWorkflowImpl(...args),
+    onSnapshot: persistChatLifecycleSnapshot
   });
 }
 

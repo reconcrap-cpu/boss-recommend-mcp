@@ -1564,9 +1564,10 @@ export async function runChatWorkflow({
 export function createChatRunService({
   lifecycle,
   idPrefix = "chat",
-  workflow = runChatWorkflow
+  workflow = runChatWorkflow,
+  onSnapshot = null
 } = {}) {
-  const manager = lifecycle || createRunLifecycleManager({ idPrefix });
+  const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
 
   function startChatRun({
     client,

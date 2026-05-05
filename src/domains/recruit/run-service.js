@@ -619,9 +619,10 @@ export async function runRecruitWorkflow({
 export function createRecruitRunService({
   lifecycle,
   idPrefix = "recruit",
-  workflow = runRecruitWorkflow
+  workflow = runRecruitWorkflow,
+  onSnapshot = null
 } = {}) {
-  const manager = lifecycle || createRunLifecycleManager({ idPrefix });
+  const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
 
   function startRecruitRun({
     client,

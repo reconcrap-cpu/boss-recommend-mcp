@@ -52,7 +52,7 @@ import {
 const DEFAULT_RECOMMEND_HOST = "127.0.0.1";
 const DEFAULT_RECOMMEND_PORT = 9222;
 const DEFAULT_RECOMMEND_POLL_AFTER_SEC = 10;
-const TARGET_COUNT_SEMANTICS = "target_count means processed recommend candidates, not passed candidates";
+const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screening; scan continues until that many candidates pass or the list ends";
 const RUN_MODE_ASYNC = "async";
 
 const TERMINAL_STATUSES = new Set([
@@ -66,7 +66,8 @@ let recommendConnectorImpl = connectRecommendChromeSession;
 let recommendJobReaderImpl = readRecommendJobOptionsFromSession;
 let recommendRunService = createRecommendRunService({
   idPrefix: "mcp_recommend",
-  workflow: (...args) => recommendWorkflowImpl(...args)
+  workflow: (...args) => recommendWorkflowImpl(...args),
+  onSnapshot: persistRecommendLifecycleSnapshot
 });
 const recommendRunMeta = new Map();
 
@@ -328,6 +329,17 @@ function ensureRecommendRunArtifacts(snapshot) {
   return artifacts;
 }
 
+function persistRecommendCheckpointSnapshot(normalized) {
+  const artifacts = getRecommendRunArtifacts(normalized?.run_id || normalized?.runId);
+  if (!artifacts) return;
+  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+    ? normalized.checkpoint
+    : {};
+  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  const meta = getRecommendRunMeta(normalized?.run_id || normalized?.runId);
+  if (meta) meta.checkpointPath = artifacts.checkpoint_path;
+}
+
 function buildLegacyRecommendResult(snapshot) {
   if (!snapshot) return null;
   const artifacts = ensureRecommendRunArtifacts(snapshot);
@@ -390,6 +402,7 @@ function buildLegacyRecommendResult(snapshot) {
 function normalizeRunSnapshot(snapshot) {
   if (!snapshot) return null;
   const meta = getRecommendRunMeta(snapshot.runId);
+  const artifacts = getRecommendRunArtifacts(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   const legacyResult = (
@@ -429,23 +442,28 @@ function normalizeRunSnapshot(snapshot) {
       cancel_requested: snapshot.status === RUN_STATUS_CANCELING
     },
     resume: {
-      checkpoint_path: legacyResult?.checkpoint_path || null,
-      pause_control_path: getRecommendRunArtifacts(snapshot.runId)?.run_state_path || null,
+      checkpoint_path: legacyResult?.checkpoint_path || meta.checkpointPath || artifacts?.checkpoint_path || null,
+      pause_control_path: artifacts?.run_state_path || null,
       output_csv: legacyResult?.output_csv || null,
       resume_count: meta.resumeCount || 0,
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
     },
     result: legacyResult,
-    artifacts: getRecommendRunArtifacts(snapshot.runId)
+    artifacts
   };
 }
 
-function persistRecommendRunSnapshot(snapshot) {
+function persistRecommendRunSnapshot(snapshot, {
+  persistActiveCheckpoint = false
+} = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  if (persistActiveCheckpoint) {
+    persistRecommendCheckpointSnapshot(normalized);
+  }
   const payload = {
     run_id: normalized.run_id,
     mode: normalized.mode,
@@ -469,6 +487,12 @@ function persistRecommendRunSnapshot(snapshot) {
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
   return normalized;
+}
+
+function persistRecommendLifecycleSnapshot(snapshot, event = {}) {
+  return persistRecommendRunSnapshot(snapshot, {
+    persistActiveCheckpoint: event?.type === "checkpoint"
+  });
 }
 
 function attachMethodEvidence(payload, runId) {
@@ -1440,7 +1464,8 @@ export function __setRecommendMcpWorkflowForTests(nextWorkflow) {
   recommendWorkflowImpl = typeof nextWorkflow === "function" ? nextWorkflow : runRecommendWorkflow;
   recommendRunService = createRecommendRunService({
     idPrefix: "mcp_recommend",
-    workflow: (...args) => recommendWorkflowImpl(...args)
+    workflow: (...args) => recommendWorkflowImpl(...args),
+    onSnapshot: persistRecommendLifecycleSnapshot
   });
 }
 

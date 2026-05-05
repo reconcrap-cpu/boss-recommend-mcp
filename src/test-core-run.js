@@ -16,6 +16,34 @@ async function waitUntil(predicate, timeoutMs = 2000) {
   throw new Error("Timed out waiting for condition");
 }
 
+async function testSnapshotHookPersistsProgressAndCheckpointEvents() {
+  const events = [];
+  const manager = createRunLifecycleManager({
+    idPrefix: "test",
+    onSnapshot(snapshot, event) {
+      events.push({
+        type: event.type,
+        status: snapshot.status,
+        progress: snapshot.progress,
+        checkpoint: snapshot.checkpoint
+      });
+    }
+  });
+  const started = manager.startRun({
+    name: "snapshot-hook",
+    task: async (run) => {
+      run.updateProgress({ processed: 1 });
+      run.checkpoint({ results: [{ index: 0 }] });
+      return { processed: 1 };
+    }
+  });
+  const final = await manager.waitForRun(started.runId);
+  assert.equal(final.status, RUN_STATUS_COMPLETED);
+  assert.equal(events.some((event) => event.type === "progress" && event.progress.processed === 1), true);
+  assert.equal(events.some((event) => event.type === "checkpoint" && event.checkpoint.results?.length === 1), true);
+  assert.equal(events.some((event) => event.type === "status" && event.status === RUN_STATUS_COMPLETED), true);
+}
+
 async function testRunCompletes() {
   const manager = createRunLifecycleManager({ idPrefix: "test" });
   const started = manager.startRun({
@@ -64,6 +92,7 @@ async function testPauseResumeCancel() {
 }
 
 await testRunCompletes();
+await testSnapshotHookPersistsProgressAndCheckpointEvents();
 await testPauseResumeCancel();
 
 console.log("Core run lifecycle tests passed");

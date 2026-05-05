@@ -957,9 +957,10 @@ export async function runRecommendWorkflow({
 export function createRecommendRunService({
   lifecycle,
   idPrefix = "recommend",
-  workflow = runRecommendWorkflow
+  workflow = runRecommendWorkflow,
+  onSnapshot = null
 } = {}) {
-  const manager = lifecycle || createRunLifecycleManager({ idPrefix });
+  const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
 
   function startRecommendRun({
     client,

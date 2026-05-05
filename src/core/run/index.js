@@ -65,9 +65,23 @@ function snapshotFromEntry(entry) {
 
 export function createRunLifecycleManager({
   idPrefix = "run",
-  now = nowIso
+  now = nowIso,
+  onSnapshot = null
 } = {}) {
   const runs = new Map();
+
+  function emitSnapshot(entry, event = {}) {
+    if (typeof onSnapshot !== "function") return;
+    try {
+      onSnapshot(snapshotFromEntry(entry), {
+        type: event.type || "update",
+        at: now(),
+        ...event
+      });
+    } catch {
+      // Snapshot hooks must never interrupt an active browser run.
+    }
+  }
 
   function getEntry(runId) {
     const entry = runs.get(runId);
@@ -83,6 +97,7 @@ export function createRunLifecycleManager({
     entry.run.status = status;
     Object.assign(entry.run, patch);
     touch(entry);
+    emitSnapshot(entry, { type: "status", status });
   }
 
   function createControls(entry) {
@@ -104,6 +119,7 @@ export function createRunLifecycleManager({
           ...progressPatch
         };
         touch(entry);
+        emitSnapshot(entry, { type: "progress", progressPatch });
         return snapshotFromEntry(entry);
       },
       checkpoint(checkpointPatch = {}) {
@@ -113,6 +129,7 @@ export function createRunLifecycleManager({
           updatedAt: now()
         };
         touch(entry);
+        emitSnapshot(entry, { type: "checkpoint", checkpointPatch });
         return snapshotFromEntry(entry);
       },
       async waitIfPaused() {
@@ -231,6 +248,7 @@ export function createRunLifecycleManager({
     entry.pauseRequested = true;
     if (entry.run.status === RUN_STATUS_RUNNING) {
       touch(entry);
+      emitSnapshot(entry, { type: "pause_requested" });
     }
     return snapshotFromEntry(entry);
   }
@@ -246,6 +264,7 @@ export function createRunLifecycleManager({
       setStatus(entry, RUN_STATUS_RUNNING);
     } else {
       touch(entry);
+      emitSnapshot(entry, { type: "resume_requested" });
     }
     return snapshotFromEntry(entry);
   }
