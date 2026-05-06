@@ -58,6 +58,19 @@ export const RECOMMEND_CARD_SELECTOR = [
   "a[data-geekid]"
 ].join(", ");
 
+export const RECOMMEND_LIST_CONTAINER_SELECTORS = Object.freeze([
+  ".recommend-list",
+  ".recommend-list-wrap",
+  ".candidate-list",
+  ".candidate-card-list",
+  ".candidate-card-wrap-list",
+  ".geek-list",
+  ".geek-list-wrap",
+  ".card-list",
+  ".list-wrap",
+  ".content-list"
+]);
+
 export const RECOMMEND_END_REFRESH_SELECTOR = [
   ".btn",
   "button",

@@ -16,6 +16,18 @@ export const RECRUIT_CARD_SELECTOR = [
   "a[data-geekid]"
 ].join(", ");
 
+export const RECRUIT_LIST_CONTAINER_SELECTORS = Object.freeze([
+  ".search-list",
+  ".search-result-list",
+  ".candidate-list",
+  ".geek-list",
+  ".geek-list-wrap",
+  ".card-list",
+  ".list-wrap",
+  ".search-content",
+  ".search-container"
+]);
+
 export const RECRUIT_NO_DATA_SELECTORS = Object.freeze([
   "i.tip-nodata",
   ".tip-nodata",
@@ -26,12 +38,14 @@ export const RECRUIT_NO_DATA_SELECTORS = Object.freeze([
 
 export const RECRUIT_BOTTOM_MARKER_SELECTORS = Object.freeze([
   ".finished-wrap",
+  ".loadmore",
   ".load-tips",
   ".tip-nodata",
   ".empty-tip",
   ".empty-text",
   ".no-data",
   "[class*=\"finished\"]",
+  "[class*=\"loadmore\"]",
   "[class*=\"load-tips\"]",
   "[class*=\"empty\"]"
 ]);

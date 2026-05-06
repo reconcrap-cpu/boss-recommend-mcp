@@ -30,6 +30,7 @@ export const DEFAULT_LOAD_MORE_HINT_KEYWORDS = Object.freeze([
 
 export const DEFAULT_BOTTOM_MARKER_SELECTORS = Object.freeze([
   ".finished-wrap",
+  ".loadmore",
   ".load-tips",
   "div[role=\"tfoot\"] .load-tips",
   ".no-data-refresh",
@@ -38,6 +39,7 @@ export const DEFAULT_BOTTOM_MARKER_SELECTORS = Object.freeze([
   ".no-data",
   ".tip-nodata",
   "[class*=\"finished\"]",
+  "[class*=\"loadmore\"]",
   "[class*=\"load-tips\"]",
   "[class*=\"no-more\"]",
   "[class*=\"no_more\"]"
@@ -94,6 +96,345 @@ function plainTextFromHtml(html = "") {
 
 function isUsableBox(box) {
   return Number(box?.rect?.width || 0) > 2 && Number(box?.rect?.height || 0) > 2;
+}
+
+function isUsableRect(rect) {
+  return Number(rect?.width || 0) > 2 && Number(rect?.height || 0) > 2;
+}
+
+function pointFromRect(rect, {
+  xRatio = 0.5,
+  yRatio = 0.75,
+  inset = 8
+} = {}) {
+  if (!isUsableRect(rect)) return null;
+  const safeInsetX = Math.min(Math.max(0, Number(inset) || 0), Math.max(0, rect.width / 2 - 1));
+  const safeInsetY = Math.min(Math.max(0, Number(inset) || 0), Math.max(0, rect.height / 2 - 1));
+  const minX = rect.x + safeInsetX;
+  const maxX = rect.x + rect.width - safeInsetX;
+  const minY = rect.y + safeInsetY;
+  const maxY = rect.y + rect.height - safeInsetY;
+  return {
+    x: Math.min(maxX, Math.max(minX, rect.x + rect.width * (Number(xRatio) || 0.5))),
+    y: Math.min(maxY, Math.max(minY, rect.y + rect.height * (Number(yRatio) || 0.75)))
+  };
+}
+
+function unionRects(rects = []) {
+  const usable = rects.filter(isUsableRect);
+  if (!usable.length) return null;
+  const left = Math.min(...usable.map((rect) => rect.x));
+  const top = Math.min(...usable.map((rect) => rect.y));
+  const right = Math.max(...usable.map((rect) => rect.x + rect.width));
+  const bottom = Math.max(...usable.map((rect) => rect.y + rect.height));
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top
+  };
+}
+
+function pointInsideRect(point, rect, {
+  padding = 0
+} = {}) {
+  if (!point || !isUsableRect(rect)) return false;
+  const pad = Math.max(0, Number(padding) || 0);
+  return Number(point.x) >= rect.x + pad
+    && Number(point.x) <= rect.x + rect.width - pad
+    && Number(point.y) >= rect.y + pad
+    && Number(point.y) <= rect.y + rect.height - pad;
+}
+
+function rectsIntersect(a, b, {
+  padding = 0
+} = {}) {
+  if (!isUsableRect(a) || !isUsableRect(b)) return false;
+  const pad = Math.max(0, Number(padding) || 0);
+  return a.x + a.width >= b.x + pad
+    && b.x + b.width >= a.x + pad
+    && a.y + a.height >= b.y + pad
+    && b.y + b.height >= a.y + pad;
+}
+
+function intersectRects(a, b) {
+  if (!isUsableRect(a) || !isUsableRect(b)) return null;
+  const left = Math.max(a.x, b.x);
+  const top = Math.max(a.y, b.y);
+  const right = Math.min(a.x + a.width, b.x + b.width);
+  const bottom = Math.min(a.y + a.height, b.y + b.height);
+  if (right - left <= 2 || bottom - top <= 2) return null;
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top
+  };
+}
+
+function normalizePoint(point) {
+  if (!point) return null;
+  const x = Number(point.x);
+  const y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
+
+function resolveViewportPoint(viewportPoint, viewport) {
+  if (!viewportPoint) return null;
+  if (viewport && ("xRatio" in viewportPoint || "yRatio" in viewportPoint)) {
+    const xRatio = Number(viewportPoint.xRatio ?? 0);
+    const yRatio = Number(viewportPoint.yRatio ?? 0);
+    if (Number.isFinite(xRatio) && Number.isFinite(yRatio)) {
+      return {
+        x: viewport.x + viewport.width * xRatio,
+        y: viewport.y + viewport.height * yRatio
+      };
+    }
+  }
+  return normalizePoint(viewportPoint);
+}
+
+async function getViewportRect(client) {
+  try {
+    const metrics = await client.Page.getLayoutMetrics();
+    const viewport = metrics.visualViewport || metrics.layoutViewport || metrics.cssVisualViewport || {};
+    const width = Number(viewport.clientWidth || viewport.width || metrics.layoutViewport?.clientWidth || 0);
+    const height = Number(viewport.clientHeight || viewport.height || metrics.layoutViewport?.clientHeight || 0);
+    const x = Number(viewport.pageX || viewport.x || 0);
+    const y = Number(viewport.pageY || viewport.y || 0);
+    if (width > 0 && height > 0) {
+      return { x, y, width, height };
+    }
+  } catch {
+    // Page.getLayoutMetrics is optional for fallback only.
+  }
+  return null;
+}
+
+async function collectUsableNodeBoxes(client, nodeIds = [], {
+  maxNodes = 80
+} = {}) {
+  const boxes = [];
+  const errors = [];
+  for (const nodeId of nodeIds.slice(0, Math.max(1, Number(maxNodes) || 80))) {
+    try {
+      const box = await getNodeBox(client, nodeId);
+      if (isUsableBox(box)) {
+        boxes.push({
+          node_id: nodeId,
+          box,
+          rect: box.rect
+        });
+      }
+    } catch (error) {
+      errors.push({
+        node_id: nodeId,
+        error: error?.message || String(error)
+      });
+    }
+  }
+  return { boxes, errors };
+}
+
+async function querySelectorBoxes(client, rootNodeId, selectors = [], {
+  maxNodes = 80
+} = {}) {
+  const attempts = [];
+  if (!rootNodeId) return { boxes: [], attempts };
+  for (const selector of selectors.filter(Boolean)) {
+    let nodeIds = [];
+    try {
+      nodeIds = await querySelectorAll(client, rootNodeId, selector);
+    } catch (error) {
+      attempts.push({
+        selector,
+        error: error?.message || String(error),
+        node_count: 0,
+        box_count: 0
+      });
+      continue;
+    }
+    const measured = await collectUsableNodeBoxes(client, nodeIds, { maxNodes });
+    attempts.push({
+      selector,
+      node_count: nodeIds.length,
+      box_count: measured.boxes.length,
+      errors: measured.errors
+    });
+    if (measured.boxes.length) {
+      return {
+        boxes: measured.boxes,
+        selector,
+        attempts
+      };
+    }
+  }
+  return { boxes: [], attempts };
+}
+
+export async function resolveInfiniteListFallbackPoint(client, {
+  rootNodeId = 0,
+  containerSelectors = [],
+  itemNodeIds = [],
+  itemSelectors = [],
+  allowedSources = ["container", "item_union", "viewport_ratio"],
+  containerXRatio = 0.5,
+  containerYRatio = 0.5,
+  itemXRatio = 0.5,
+  itemYRatio = 0.5,
+  viewportPoint = null,
+  validateViewportPoint = true,
+  maxProbeNodes = 80
+} = {}) {
+  const attempts = [];
+  const allowed = new Set(Array.isArray(allowedSources) && allowedSources.length
+    ? allowedSources.map((source) => String(source || ""))
+    : ["container", "item_union", "viewport_ratio"]);
+
+  const containerResult = await querySelectorBoxes(client, rootNodeId, containerSelectors, {
+    maxNodes: maxProbeNodes
+  });
+  attempts.push({
+    source: "container",
+    selector: containerResult.selector || null,
+    attempts: containerResult.attempts
+  });
+  const containerBox = containerResult.boxes
+    .slice()
+    .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0];
+  const viewport = await getViewportRect(client);
+  const inputViewportRect = viewport
+    ? { x: 0, y: 0, width: viewport.width, height: viewport.height }
+    : null;
+  const visibleContainerRect = inputViewportRect && containerBox?.rect
+    ? intersectRects(containerBox.rect, inputViewportRect) || containerBox.rect
+    : containerBox?.rect;
+  const containerPoint = pointFromRect(visibleContainerRect, {
+    xRatio: containerXRatio,
+    yRatio: containerYRatio
+  });
+  if (containerPoint && allowed.has("container")) {
+    return {
+      ok: true,
+      source: "container",
+      point: containerPoint,
+      selector: containerResult.selector || null,
+      node_id: containerBox.node_id,
+      assist_node_id: itemNodeIds.slice(-1)[0] || null,
+      rect: visibleContainerRect,
+      full_rect: containerBox.rect,
+      attempts
+    };
+  }
+
+  let itemBoxes = [];
+  const itemProbeNodeIds = itemNodeIds.length > maxProbeNodes
+    ? itemNodeIds.slice(-maxProbeNodes)
+    : itemNodeIds;
+  const measuredItems = await collectUsableNodeBoxes(client, itemProbeNodeIds, { maxNodes: maxProbeNodes });
+  itemBoxes = measuredItems.boxes;
+  attempts.push({
+    source: "visible_items",
+    node_count: itemNodeIds.length,
+    box_count: measuredItems.boxes.length,
+    errors: measuredItems.errors
+  });
+  if (!itemBoxes.length) {
+    const queriedItems = await querySelectorBoxes(client, rootNodeId, itemSelectors, {
+      maxNodes: maxProbeNodes
+    });
+    itemBoxes = queriedItems.boxes;
+    attempts.push({
+      source: "item_selector",
+      selector: queriedItems.selector || null,
+      attempts: queriedItems.attempts
+    });
+  }
+  const itemValidationRects = [
+    inputViewportRect,
+    visibleContainerRect || containerBox?.rect || null
+  ].filter(isUsableRect);
+  const visibleItemBoxes = itemValidationRects.length
+    ? itemBoxes.filter((item) => itemValidationRects.every((rect) => rectsIntersect(item.rect, rect, { padding: 1 })))
+    : itemBoxes;
+  attempts.push({
+    source: "visible_item_filter",
+    input_box_count: itemBoxes.length,
+    output_box_count: visibleItemBoxes.length,
+    validation_rect_count: itemValidationRects.length
+  });
+  const unionSourceBoxes = visibleItemBoxes.length ? visibleItemBoxes : itemBoxes;
+  const rawItemUnion = unionRects(unionSourceBoxes.map((item) => item.rect));
+  const itemUnion = itemValidationRects.reduce(
+    (rect, limit) => intersectRects(rect, limit) || rect,
+    rawItemUnion
+  );
+  const itemPoint = pointFromRect(itemUnion, {
+    xRatio: itemXRatio,
+    yRatio: itemYRatio
+  });
+  if (itemPoint && allowed.has("item_union")) {
+    const assistItem = unionSourceBoxes
+      .slice()
+      .sort((a, b) => ((b.rect.y + b.rect.height) - (a.rect.y + a.rect.height)))[0];
+    return {
+      ok: true,
+      source: "item_union",
+      point: itemPoint,
+      rect: itemUnion,
+      full_rect: rawItemUnion,
+      item_box_count: unionSourceBoxes.length,
+      visible_item_box_count: visibleItemBoxes.length,
+      assist_node_id: assistItem?.node_id || itemNodeIds.slice(-1)[0] || null,
+      attempts
+    };
+  }
+
+  const viewportRatioPoint = resolveViewportPoint(viewportPoint, viewport);
+  const normalizedViewportPoint = normalizePoint(viewportRatioPoint);
+  if (normalizedViewportPoint && allowed.has("viewport_ratio")) {
+    if (!validateViewportPoint) {
+      return {
+        ok: true,
+        source: "viewport_ratio",
+        point: normalizedViewportPoint,
+        viewport,
+        validated: false,
+        attempts
+      };
+    }
+    const validationRects = [
+      ...containerResult.boxes.map((item) => item.rect),
+      ...itemBoxes.map((item) => item.rect)
+    ].filter(isUsableRect);
+    const validatedRect = validationRects.find((rect) => pointInsideRect(normalizedViewportPoint, rect, { padding: 4 }));
+    attempts.push({
+      source: "viewport_ratio",
+      point: normalizedViewportPoint,
+      viewport,
+      validation_rect_count: validationRects.length,
+      validated: Boolean(validatedRect)
+    });
+    if (validatedRect) {
+      return {
+        ok: true,
+        source: "viewport_ratio",
+        point: normalizedViewportPoint,
+        viewport,
+        rect: validatedRect,
+        validated: true,
+        assist_node_id: itemNodeIds.slice(-1)[0] || null,
+        attempts
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    reason: "fallback_point_unavailable",
+    attempts
+  };
 }
 
 function shortHash(value) {
@@ -561,6 +902,29 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
   }
 
   const errors = [];
+  const wheelDelta = Math.max(1, Number(wheelDeltaY) || 850);
+  async function synthesizeGesture(x, y) {
+    if (typeof client?.Input?.synthesizeScrollGesture !== "function") return null;
+    try {
+      const gestureDistance = -Math.min(1200, wheelDelta);
+      await client.Input.synthesizeScrollGesture({
+        x,
+        y,
+        yDistance: gestureDistance,
+        speed: 800,
+        repeatCount: 1
+      });
+      return {
+        ok: true,
+        y_distance: gestureDistance
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error?.message || String(error)
+      };
+    }
+  }
   for (const anchor of candidates.slice().reverse()) {
     try {
       await scrollNodeIntoView(client, anchor.node_id);
@@ -574,15 +938,17 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
         x,
         y,
         deltaX: 0,
-        deltaY: Math.max(1, Number(wheelDeltaY) || 850)
+        deltaY: wheelDelta
       });
+      const gesture = await synthesizeGesture(x, y);
       if (settleMs > 0) await sleep(settleMs);
       return {
         ok: true,
         anchor_key: anchor.key,
         anchor_node_id: anchor.node_id,
         point: { x, y },
-        wheel_delta_y: Math.max(1, Number(wheelDeltaY) || 850),
+        wheel_delta_y: wheelDelta,
+        gesture,
         settle_ms: settleMs,
         skipped_stale_anchor_count: errors.length
       };
@@ -595,23 +961,56 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
     }
   }
 
-  if (fallbackPoint && Number.isFinite(Number(fallbackPoint.x)) && Number.isFinite(Number(fallbackPoint.y))) {
-    const x = Number(fallbackPoint.x);
-    const y = Number(fallbackPoint.y);
+  const resolvedFallback = typeof fallbackPoint === "function"
+    ? await fallbackPoint({ client, items, errors })
+    : (fallbackPoint ? { ok: true, source: "static", point: fallbackPoint } : null);
+  const resolvedPoint = normalizePoint(resolvedFallback?.point || resolvedFallback);
+  if (resolvedPoint) {
+    const x = resolvedPoint.x;
+    const y = resolvedPoint.y;
+    let assist = null;
+    if (resolvedFallback?.assist_node_id) {
+      try {
+        await scrollNodeIntoView(client, resolvedFallback.assist_node_id);
+        await sleep(150);
+        assist = {
+          ok: true,
+          node_id: resolvedFallback.assist_node_id
+        };
+      } catch (error) {
+        assist = {
+          ok: false,
+          node_id: resolvedFallback.assist_node_id,
+          error: error?.message || String(error)
+        };
+      }
+    }
     await client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" });
     await client.Input.dispatchMouseEvent({
       type: "mouseWheel",
       x,
       y,
       deltaX: 0,
-      deltaY: Math.max(1, Number(wheelDeltaY) || 850)
+      deltaY: wheelDelta
     });
+    const gesture = await synthesizeGesture(x, y);
     if (settleMs > 0) await sleep(settleMs);
     return {
       ok: true,
       mode: "fallback_point",
+      fallback: {
+        source: resolvedFallback?.source || "static",
+        selector: resolvedFallback?.selector || null,
+        node_id: resolvedFallback?.node_id || null,
+        assist_node_id: resolvedFallback?.assist_node_id || null,
+        rect: resolvedFallback?.rect || null,
+        validated: resolvedFallback?.validated ?? null,
+        reason: resolvedFallback?.reason || null
+      },
+      assist,
       point: { x, y },
-      wheel_delta_y: Math.max(1, Number(wheelDeltaY) || 850),
+      wheel_delta_y: wheelDelta,
+      gesture,
       settle_ms: settleMs,
       skipped_stale_anchor_count: errors.length,
       stale_anchor_errors: errors
@@ -621,7 +1020,8 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
   return {
     ok: false,
     reason: "scroll_anchor_unavailable",
-    errors
+    errors,
+    fallback: resolvedFallback || null
   };
 }
 

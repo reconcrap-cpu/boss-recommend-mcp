@@ -8,6 +8,21 @@ export const CHAT_CARD_SELECTORS = Object.freeze([
   "div[role=\"listitem\"]"
 ]);
 
+export const CHAT_LIST_CONTAINER_SELECTORS = Object.freeze([
+  ".chat-list",
+  ".chat-list-content",
+  ".chat-left",
+  ".chat-left-main",
+  ".chat-message-list-left",
+  ".chat-conversation-list",
+  ".geek-list",
+  ".geek-list-wrap",
+  ".chat-list-wrap",
+  ".user-list",
+  ".conversation-list",
+  "div[role=\"list\"]"
+]);
+
 export const CHAT_BOTTOM_MARKER_SELECTORS = Object.freeze([
   "div[role=\"tfoot\"] .load-tips",
   "p.load-tips",

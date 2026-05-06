@@ -6,13 +6,19 @@ import {
   compactInfiniteListState,
   createInfiniteListState,
   getNextInfiniteListCandidate,
-  markInfiniteListCandidateProcessed
+  markInfiniteListCandidateProcessed,
+  resolveInfiniteListFallbackPoint
 } from "./core/infinite-list/index.js";
 import {
   normalizeCandidateFromHtml
 } from "./core/screening/index.js";
 
-function createFakeScrollClient({ onWheel = () => {} } = {}) {
+function createFakeScrollClient({
+  onWheel = () => {},
+  boxForNode = null,
+  queryMap = {},
+  viewport = { clientWidth: 1000, clientHeight: 800 }
+} = {}) {
   const events = [];
   return {
     events,
@@ -22,11 +28,21 @@ function createFakeScrollClient({ onWheel = () => {} } = {}) {
           events.push({ type: "scrollIntoViewIfNeeded" });
         },
         async getBoxModel({ nodeId }) {
+          if (typeof boxForNode === "function") {
+            const box = await boxForNode(nodeId);
+            if (box instanceof Error) throw box;
+            if (box) return box;
+          }
           const top = Number(nodeId) * 10;
           return {
             model: {
               border: [10, top, 110, top, 110, top + 40, 10, top + 40]
             }
+          };
+        },
+        async querySelectorAll({ selector }) {
+          return {
+            nodeIds: queryMap[selector] || []
           };
         }
       },
@@ -34,6 +50,13 @@ function createFakeScrollClient({ onWheel = () => {} } = {}) {
         async dispatchMouseEvent(event) {
           events.push(event);
           if (event.type === "mouseWheel") onWheel(event);
+        }
+      },
+      Page: {
+        async getLayoutMetrics() {
+          return {
+            visualViewport: viewport
+          };
         }
       }
     }
@@ -252,6 +275,235 @@ async function testSkipsReadErrors() {
   assert.equal(compactInfiniteListState(state).read_error_count, 1);
 }
 
+async function testResolvesContainerFallbackPoint() {
+  const { client } = createFakeScrollClient({
+    queryMap: {
+      ".chat-list": [10]
+    },
+    boxForNode: (nodeId) => {
+      if (nodeId === 10) {
+        return {
+          model: {
+            border: [100, 50, 300, 50, 300, 450, 100, 450]
+          }
+        };
+      }
+      return null;
+    }
+  });
+  const fallback = await resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: 1,
+    containerSelectors: [".chat-list"],
+    viewportPoint: { xRatio: 0.3, yRatio: 0.72 }
+  });
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.source, "container");
+  assert.deepEqual(fallback.point, { x: 200, y: 250 });
+}
+
+async function testContainerFallbackClampsTallVirtualListToViewport() {
+  const { client } = createFakeScrollClient({
+    queryMap: {
+      ".long-list": [10]
+    },
+    boxForNode: (nodeId) => {
+      if (nodeId === 10) {
+        return {
+          model: {
+            border: [100, 100, 300, 100, 300, 2100, 100, 2100]
+          }
+        };
+      }
+      return null;
+    },
+    viewport: {
+      clientWidth: 1000,
+      clientHeight: 800
+    }
+  });
+  const fallback = await resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: 1,
+    containerSelectors: [".long-list"],
+    allowedSources: ["container"]
+  });
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.source, "container");
+  assert.deepEqual(fallback.point, { x: 200, y: 450 });
+  assert.equal(fallback.rect.height, 700);
+  assert.equal(fallback.full_rect.height, 2000);
+}
+
+async function testAllowedSourcesCanForceItemUnionFallbackPoint() {
+  const { client } = createFakeScrollClient({
+    queryMap: {
+      ".chat-list": [10]
+    },
+    boxForNode: (nodeId) => {
+      if (nodeId === 10) {
+        return {
+          model: {
+            border: [100, 50, 300, 50, 300, 450, 100, 450]
+          }
+        };
+      }
+      if (nodeId === 21) {
+        return {
+          model: {
+            border: [120, 120, 320, 120, 320, 220, 120, 220]
+          }
+        };
+      }
+      if (nodeId === 22) {
+        return {
+          model: {
+            border: [120, 230, 320, 230, 320, 330, 120, 330]
+          }
+        };
+      }
+      return null;
+    }
+  });
+  const fallback = await resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: 1,
+    containerSelectors: [".chat-list"],
+    itemNodeIds: [21, 22],
+    allowedSources: ["item_union"],
+    viewportPoint: { xRatio: 0.3, yRatio: 0.72 }
+  });
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.source, "item_union");
+  assert.deepEqual(fallback.point, { x: 210, y: 225 });
+  assert.deepEqual(fallback.rect, { x: 120, y: 120, width: 180, height: 210 });
+  assert.deepEqual(fallback.full_rect, { x: 120, y: 120, width: 200, height: 210 });
+}
+
+async function testItemUnionFallbackIgnoresOffscreenVirtualItems() {
+  const { client } = createFakeScrollClient({
+    queryMap: {
+      ".chat-list": [10]
+    },
+    boxForNode: (nodeId) => {
+      if (nodeId === 10) {
+        return {
+          model: {
+            border: [100, 50, 500, 50, 500, 650, 100, 650]
+          }
+        };
+      }
+      if (nodeId === 21) {
+        return {
+          model: {
+            border: [120, 100, 320, 100, 320, 200, 120, 200]
+          }
+        };
+      }
+      if (nodeId === 22) {
+        return {
+          model: {
+            border: [120, 900, 320, 900, 320, 1000, 120, 1000]
+          }
+        };
+      }
+      return null;
+    },
+    viewport: {
+      clientWidth: 1000,
+      clientHeight: 800
+    }
+  });
+  const fallback = await resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: 1,
+    containerSelectors: [".chat-list"],
+    itemNodeIds: [21, 22],
+    allowedSources: ["item_union"],
+    viewportPoint: { xRatio: 0.3, yRatio: 0.72 }
+  });
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.source, "item_union");
+  assert.equal(fallback.visible_item_box_count, 1);
+  assert.deepEqual(fallback.point, { x: 220, y: 150 });
+}
+
+async function testAllowedSourcesCanForceValidatedViewportFallbackPoint() {
+  const { client } = createFakeScrollClient({
+    queryMap: {
+      ".chat-list": [10]
+    },
+    boxForNode: (nodeId) => {
+      if (nodeId === 10) {
+        return {
+          model: {
+            border: [100, 50, 500, 50, 500, 650, 100, 650]
+          }
+        };
+      }
+      return null;
+    },
+    viewport: {
+      clientWidth: 1000,
+      clientHeight: 800
+    }
+  });
+  const fallback = await resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: 1,
+    containerSelectors: [".chat-list"],
+    allowedSources: ["viewport_ratio"],
+    viewportPoint: { xRatio: 0.3, yRatio: 0.5 },
+    validateViewportPoint: true
+  });
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.source, "viewport_ratio");
+  assert.equal(fallback.validated, true);
+  assert.deepEqual(fallback.point, { x: 300, y: 400 });
+}
+
+async function testRejectsUnvalidatedViewportFallback() {
+  const { client } = createFakeScrollClient();
+  const fallback = await resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: 1,
+    containerSelectors: [".missing"],
+    itemSelectors: [".missing-card"],
+    viewportPoint: { xRatio: 0.3, yRatio: 0.72 },
+    validateViewportPoint: true
+  });
+  assert.equal(fallback.ok, false);
+  assert.equal(fallback.reason, "fallback_point_unavailable");
+}
+
+async function testUsesFallbackResolverAfterStaleAnchors() {
+  let wheelCount = 0;
+  const { client, events } = createFakeScrollClient({
+    onWheel: () => {
+      wheelCount += 1;
+    },
+    boxForNode: () => new Error("stale node")
+  });
+  const state = createInfiniteListState({ domain: "chat", listName: "chat-candidates" });
+  state.processed_keys.add("chat:id:a");
+  const result = await getNextInfiniteListCandidate({
+    client,
+    state,
+    findNodeIds: async () => [1],
+    readCandidate: async () => ({ domain: "chat", id: "a", attributes: {} }),
+    fallbackPoint: async () => ({
+      ok: true,
+      source: "container",
+      point: { x: 300, y: 500 }
+    }),
+    maxScrolls: 0,
+    stableSignatureLimit: 5,
+    settleMs: 0
+  });
+  const wheel = events.find((event) => event.type === "mouseWheel");
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "max_scrolls_exhausted");
+  assert.equal(wheelCount, 1);
+  assert.equal(wheel.x, 300);
+  assert.equal(wheel.y, 500);
+  assert.equal(result.attempts[0].scroll_result.mode, "fallback_point");
+  assert.equal(result.attempts[0].scroll_result.fallback.source, "container");
+}
+
 testCandidateKeys();
 testClassifiesLegacyBottomMarkers();
 await testTraversesAfterVisibleBatchWithoutDuplicates();
@@ -259,5 +511,12 @@ await testDetectsStableEndOfList();
 await testDoesNotTreatSlowAppendAsEndAfterOneStableSignature();
 await testBottomMarkerStopsBeforeStableFallback();
 await testSkipsReadErrors();
+await testResolvesContainerFallbackPoint();
+await testContainerFallbackClampsTallVirtualListToViewport();
+await testAllowedSourcesCanForceItemUnionFallbackPoint();
+await testItemUnionFallbackIgnoresOffscreenVirtualItems();
+await testAllowedSourcesCanForceValidatedViewportFallbackPoint();
+await testRejectsUnvalidatedViewportFallback();
+await testUsesFallbackResolverAfterStaleAnchors();
 
 console.log("core infinite list tests passed");

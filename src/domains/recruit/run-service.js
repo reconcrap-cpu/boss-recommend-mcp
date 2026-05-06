@@ -22,7 +22,8 @@ import {
   detectInfiniteListBottomMarker,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed,
-  resetInfiniteListForRefreshRound
+  resetInfiniteListForRefreshRound,
+  resolveInfiniteListFallbackPoint
 } from "../../core/infinite-list/index.js";
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import {
@@ -52,7 +53,9 @@ import { refreshRecruitSearchAtEnd } from "./refresh.js";
 import { getRecruitRoots } from "./roots.js";
 import {
   RECRUIT_BOTTOM_MARKER_SELECTORS,
-  RECRUIT_BOTTOM_REFRESH_SELECTORS
+  RECRUIT_BOTTOM_REFRESH_SELECTORS,
+  RECRUIT_CARD_SELECTOR,
+  RECRUIT_LIST_CONTAINER_SELECTORS
 } from "./constants.js";
 
 function compactScreening(screening) {
@@ -194,6 +197,14 @@ export async function runRecruitWorkflow({
   let refreshRounds = 0;
   let cardNodeIds = [];
   let listEndReason = "";
+  const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: rootState?.iframe?.documentNodeId,
+    containerSelectors: RECRUIT_LIST_CONTAINER_SELECTORS,
+    itemNodeIds: items.map((item) => item.node_id).filter(Boolean),
+    itemSelectors: [RECRUIT_CARD_SELECTOR],
+    viewportPoint: { xRatio: 0.28, yRatio: 0.5 },
+    validateViewportPoint: true
+  }));
 
   runControl.setPhase("recruit:cleanup");
   await closeRecruitDetail(client, { attemptsLimit: 2 });
@@ -283,7 +294,7 @@ export async function runRecruitWorkflow({
       stableSignatureLimit: listStableSignatureLimit,
       wheelDeltaY: listWheelDeltaY,
       settleMs: listSettleMs,
-      fallbackPoint: listFallbackPoint,
+      fallbackPoint: listFallbackResolver,
       findNodeIds: async () => {
         let currentRootState = await getRecruitRoots(client);
         currentRootState = await ensureRecruitViewport(currentRootState, "candidate_find_nodes");

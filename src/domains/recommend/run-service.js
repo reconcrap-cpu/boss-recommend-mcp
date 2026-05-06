@@ -24,7 +24,8 @@ import {
   detectInfiniteListBottomMarker,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed,
-  resetInfiniteListForRefreshRound
+  resetInfiniteListForRefreshRound,
+  resolveInfiniteListFallbackPoint
 } from "../../core/infinite-list/index.js";
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import {
@@ -57,7 +58,9 @@ import {
 } from "./scopes.js";
 import {
   RECOMMEND_BOTTOM_MARKER_SELECTORS,
-  RECOMMEND_END_REFRESH_SELECTOR
+  RECOMMEND_CARD_SELECTOR,
+  RECOMMEND_END_REFRESH_SELECTOR,
+  RECOMMEND_LIST_CONTAINER_SELECTORS
 } from "./constants.js";
 import {
   clickRecommendActionControl,
@@ -451,6 +454,14 @@ export async function runRecommendWorkflow({
   let filterResult = null;
   let cardNodeIds = [];
   let listEndReason = "";
+  const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: rootState?.iframe?.documentNodeId,
+    containerSelectors: RECOMMEND_LIST_CONTAINER_SELECTORS,
+    itemNodeIds: items.map((item) => item.node_id).filter(Boolean),
+    itemSelectors: [RECOMMEND_CARD_SELECTOR],
+    viewportPoint: { xRatio: 0.28, yRatio: 0.5 },
+    validateViewportPoint: true
+  }));
 
   runControl.setPhase("recommend:cleanup");
   await closeRecommendDetail(client, { attemptsLimit: 2 });
@@ -567,7 +578,7 @@ export async function runRecommendWorkflow({
       stableSignatureLimit: listStableSignatureLimit,
       wheelDeltaY: listWheelDeltaY,
       settleMs: listSettleMs,
-      fallbackPoint: listFallbackPoint,
+      fallbackPoint: listFallbackResolver,
       findNodeIds: async () => {
         let currentRootState = await getRecommendRoots(client);
         currentRootState = await ensureRecommendViewport(currentRootState, "candidate_find_nodes");

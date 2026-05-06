@@ -22,7 +22,8 @@ import {
   detectInfiniteListBottomMarker,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed,
-  resetInfiniteListForRefreshRound
+  resetInfiniteListForRefreshRound,
+  resolveInfiniteListFallbackPoint
 } from "../../core/infinite-list/index.js";
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import { createRunLifecycleManager } from "../../core/run/index.js";
@@ -38,6 +39,8 @@ import {
 } from "../../core/screening/index.js";
 import {
   CHAT_BOTTOM_MARKER_SELECTORS,
+  CHAT_CARD_SELECTORS,
+  CHAT_LIST_CONTAINER_SELECTORS,
   CHAT_TARGET_URL
 } from "./constants.js";
 import {
@@ -682,6 +685,14 @@ export async function runChatWorkflow({
   const results = [];
   let cardNodeIds = [];
   let listEndReason = "";
+  const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
+    rootNodeId: rootState?.rootNodes?.top,
+    containerSelectors: CHAT_LIST_CONTAINER_SELECTORS,
+    itemNodeIds: items.map((item) => item.node_id).filter(Boolean),
+    itemSelectors: CHAT_CARD_SELECTORS,
+    viewportPoint: { xRatio: 0.16, yRatio: 0.4 },
+    validateViewportPoint: true
+  }));
   let requestedCount = 0;
   let requestSatisfiedCount = 0;
   let requestSkippedCount = 0;
@@ -921,7 +932,7 @@ export async function runChatWorkflow({
       stableSignatureLimit: listStableSignatureLimit,
       wheelDeltaY: listWheelDeltaY,
       settleMs: listSettleMs,
-      fallbackPoint: listFallbackPoint,
+      fallbackPoint: listFallbackResolver,
       findNodeIds: async () => {
         const currentRootState = await ensureChatViewport(await getChatRoots(client), "candidate_find_nodes");
         rootState = currentRootState;
