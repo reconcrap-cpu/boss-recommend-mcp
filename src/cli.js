@@ -57,6 +57,7 @@ const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
 const installConfigDefaults = Object.freeze({
+  greetingMessage: "Hi同学，能麻烦发下简历吗？",
   llmThinkingLevel: "low",
   llmMaxTokens: 512,
   llmMaxRetries: 3,
@@ -1431,6 +1432,8 @@ async function setScreeningConfig(options = {}) {
     apiKey,
     model
   };
+  delete nextConfig.llmModels;
+  delete nextConfig.models;
   if (typeof options["thinking-level"] === "string" && options["thinking-level"].trim()) {
     nextConfig.llmThinkingLevel = options["thinking-level"].trim();
   } else if (typeof options.llmThinkingLevel === "string" && options.llmThinkingLevel.trim()) {
@@ -1444,6 +1447,16 @@ async function setScreeningConfig(options = {}) {
   }
   if (typeof options["output-dir"] === "string" && options["output-dir"].trim()) {
     nextConfig.outputDir = options["output-dir"].trim();
+  }
+  const greetingMessage = String(
+    options["greeting-message"]
+    ?? options.greetingMessage
+    ?? options.greeting_text
+    ?? options.greetingText
+    ?? ""
+  ).trim();
+  if (greetingMessage) {
+    nextConfig.greetingMessage = greetingMessage;
   }
   const debugPort = parsePositivePort(options.port || options["debug-port"]);
   if (debugPort) {
@@ -2538,7 +2551,7 @@ function printHelp() {
   console.log("  boss-recommend-mcp run --detached --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp list-jobs --slow-live --port 9222");
   console.log("  boss-recommend-mcp chat prepare-run --slow-live --port 9222    # CDP-only preflight; start runs through MCP start_boss_chat_run");
-  console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--openai-organization <id>] [--openai-project <id>]");
+  console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--greeting-message <text>] [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
   console.log("  boss-recommend-mcp install --agent qclaw    # updates ~/.qclaw/openclaw.json mcp.servers and mirrors skills");
   console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");

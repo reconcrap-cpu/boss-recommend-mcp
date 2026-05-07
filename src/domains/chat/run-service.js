@@ -109,6 +109,8 @@ function compactLlmResult(llmResult) {
     finish_reason: llmResult.finish_reason || null,
     image_input_count: llmResult.image_input_count || 0,
     attempt_count: llmResult.attempt_count || 0,
+    fallback_count: llmResult.fallback_count || 0,
+    llm_model_failures: Array.isArray(llmResult.llm_model_failures) ? llmResult.llm_model_failures : [],
     error: llmResult.error || null
   };
 }
@@ -287,6 +289,9 @@ function createFailedLlmResult(error) {
     decision_cot: "",
     reasoning_content: "",
     raw_model_output: "",
+    attempt_count: Number(error?.llm_attempt_count) || 0,
+    fallback_count: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures.length : 0,
+    llm_model_failures: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures : [],
     error: error?.message || String(error || "unknown"),
     screened_at: new Date().toISOString()
   };
@@ -1638,6 +1643,7 @@ export function createChatRunService({
         close_resume: closeResume,
         request_resume_for_passed: Boolean(requestResumeForPassed),
         dry_run_request_cv: Boolean(dryRunRequestCv),
+        greeting_text: greetingText,
         cv_acquisition_mode: cvAcquisitionMode,
         call_llm_on_image: Boolean(callLlmOnImage),
         screening_mode: normalizedScreeningMode,

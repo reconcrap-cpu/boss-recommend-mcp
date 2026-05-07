@@ -2,6 +2,8 @@
   "baseUrl": "https://api.openai.com/v1",
   "apiKey": "replace-with-openai-api-key",
   "model": "gpt-4.1-mini",
+  "llmModels": [],
+  "greetingMessage": "Hi同学，能麻烦发下简历吗？",
   "llmThinkingLevel": "low",
   "llmTimeoutMs": 60000,
   "llmMaxTokens": 512,

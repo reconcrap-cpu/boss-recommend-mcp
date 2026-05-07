@@ -243,6 +243,55 @@ function normalizeLlmThinkingLevel(raw, fallback = "low") {
   return LLM_THINKING_LEVELS.has(normalized) ? normalized : fallback;
 }
 
+function firstConfiguredValue(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    return value;
+  }
+  return "";
+}
+
+function resolveRawLlmModelEntries(config = {}) {
+  if (Array.isArray(config.llmModels) && config.llmModels.length > 0) return config.llmModels;
+  if (Array.isArray(config.models) && config.models.length > 0) return config.models;
+  return [config];
+}
+
+function normalizeScreeningLlmModel(config = {}, rawEntry = {}, index = 0) {
+  const entry = typeof rawEntry === "string"
+    ? { model: rawEntry }
+    : (rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry) ? rawEntry : {});
+  return {
+    name: normalizeText(firstConfiguredValue(entry.name, entry.label, entry.id, entry.providerName, entry.provider)),
+    baseUrl: normalizeText(firstConfiguredValue(entry.baseUrl, entry.base_url, config.baseUrl, config.base_url)).replace(/\/+$/, ""),
+    apiKey: normalizeText(firstConfiguredValue(entry.apiKey, entry.api_key, config.apiKey, config.api_key)),
+    model: normalizeText(firstConfiguredValue(entry.model, entry.modelName, entry.model_name, typeof rawEntry === "string" ? rawEntry : "", config.model)),
+    openaiOrganization: normalizeText(firstConfiguredValue(entry.openaiOrganization, entry.organization, config.openaiOrganization, config.organization)),
+    openaiProject: normalizeText(firstConfiguredValue(entry.openaiProject, entry.project, config.openaiProject, config.project)),
+    llmThinkingLevel: normalizeLlmThinkingLevel(
+      firstConfiguredValue(entry.llmThinkingLevel, entry.thinkingLevel, entry.reasoningEffort, config.llmThinkingLevel, config.thinkingLevel, config.reasoningEffort),
+      "low"
+    ),
+    llmTimeoutMs: parsePositiveInteger(firstConfiguredValue(entry.llmTimeoutMs, entry.timeoutMs, config.llmTimeoutMs, config.timeoutMs), null),
+    llmMaxRetries: parsePositiveInteger(firstConfiguredValue(entry.llmMaxRetries, entry.maxRetries, config.llmMaxRetries, config.maxRetries), null),
+    llmMaxTokens: parsePositiveInteger(firstConfiguredValue(entry.llmMaxTokens, entry.maxTokens, config.llmMaxTokens, config.maxTokens), null),
+    llmMaxCompletionTokens: parsePositiveInteger(
+      firstConfiguredValue(entry.llmMaxCompletionTokens, entry.maxCompletionTokens, config.llmMaxCompletionTokens, config.maxCompletionTokens),
+      null
+    ),
+    llmImageLimit: parsePositiveInteger(firstConfiguredValue(entry.llmImageLimit, entry.imageLimit, config.llmImageLimit, config.imageLimit), null),
+    llmImageDetail: normalizeText(firstConfiguredValue(entry.llmImageDetail, entry.imageDetail, config.llmImageDetail, config.imageDetail)),
+    temperature: parseConfigNumber(firstConfiguredValue(entry.temperature, config.temperature), null),
+    topP: parseConfigNumber(firstConfiguredValue(entry.topP, entry.top_p, config.topP, config.top_p), null),
+    llmProviderIndex: index
+  };
+}
+
+function normalizeScreeningLlmModels(config = {}) {
+  return resolveRawLlmModelEntries(config).map((entry, index) => normalizeScreeningLlmModel(config, entry, index));
+}
+
 function resolveConfigPathValue(raw, configDir) {
   const normalized = normalizeText(raw);
   if (!normalized) return "";
@@ -259,13 +308,14 @@ function validateScreeningConfig(config) {
       message: "screening-config.json 缺失或格式无效。请填写 baseUrl、apiKey、model。"
     };
   }
-  const baseUrl = normalizeText(config.baseUrl).replace(/\/+$/, "");
-  const apiKey = normalizeText(config.apiKey);
-  const model = normalizeText(config.model);
+  const llmModels = normalizeScreeningLlmModels(config);
   const missing = [];
-  if (!baseUrl) missing.push("baseUrl");
-  if (!apiKey) missing.push("apiKey");
-  if (!model) missing.push("model");
+  for (const [index, llmModel] of llmModels.entries()) {
+    const prefix = llmModels.length > 1 ? `llmModels[${index}]` : "";
+    if (!llmModel.baseUrl) missing.push(prefix ? `${prefix}.baseUrl` : "baseUrl");
+    if (!llmModel.apiKey) missing.push(prefix ? `${prefix}.apiKey` : "apiKey");
+    if (!llmModel.model) missing.push(prefix ? `${prefix}.model` : "model");
+  }
   if (missing.length > 0) {
     return {
       ok: false,
@@ -273,17 +323,20 @@ function validateScreeningConfig(config) {
       message: `screening-config.json 缺少必填字段：${missing.join(", ")}。`
     };
   }
-  if (/^replace-with/i.test(apiKey) || apiKey === SCREEN_CONFIG_TEMPLATE_DEFAULTS.apiKey) {
+  const placeholderModel = llmModels.find((item) => /^replace-with/i.test(item.apiKey) || item.apiKey === SCREEN_CONFIG_TEMPLATE_DEFAULTS.apiKey);
+  if (placeholderModel) {
     return {
       ok: false,
       reason: "PLACEHOLDER_API_KEY",
       message: "screening-config.json 的 apiKey 仍是模板占位符，请填写真实 API Key。"
     };
   }
+  const firstModel = llmModels[0] || {};
   if (
-    baseUrl === SCREEN_CONFIG_TEMPLATE_DEFAULTS.baseUrl
-    && apiKey === SCREEN_CONFIG_TEMPLATE_DEFAULTS.apiKey
-    && model === SCREEN_CONFIG_TEMPLATE_DEFAULTS.model
+    llmModels.length === 1
+    && firstModel.baseUrl === SCREEN_CONFIG_TEMPLATE_DEFAULTS.baseUrl
+    && firstModel.apiKey === SCREEN_CONFIG_TEMPLATE_DEFAULTS.apiKey
+    && firstModel.model === SCREEN_CONFIG_TEMPLATE_DEFAULTS.model
   ) {
     return {
       ok: false,
@@ -393,24 +446,28 @@ export function resolveBossScreeningConfig(workspaceRoot) {
       candidate_paths: candidatePaths
     };
   }
+  const llmModels = normalizeScreeningLlmModels(parsed);
+  const primaryLlmModel = llmModels[0] || {};
+  const greetingText = normalizeText(
+    parsed.greetingMessage
+    || parsed.greeting_message
+    || parsed.greetingText
+    || parsed.greeting_text
+    || parsed.greeting
+  );
   return {
     ok: true,
     config: {
-      baseUrl: normalizeText(parsed.baseUrl).replace(/\/+$/, ""),
-      apiKey: normalizeText(parsed.apiKey),
-      model: normalizeText(parsed.model),
-      openaiOrganization: normalizeText(parsed.openaiOrganization || parsed.organization),
-      openaiProject: normalizeText(parsed.openaiProject || parsed.project),
+      ...primaryLlmModel,
+      baseUrl: primaryLlmModel.baseUrl,
+      apiKey: primaryLlmModel.apiKey,
+      model: primaryLlmModel.model,
+      openaiOrganization: primaryLlmModel.openaiOrganization,
+      openaiProject: primaryLlmModel.openaiProject,
+      llmModels,
+      greetingMessage: greetingText,
+      greetingText,
       debugPort: parsePositiveInteger(parsed.debugPort, 9222),
-      llmThinkingLevel: normalizeLlmThinkingLevel(parsed.llmThinkingLevel || parsed.thinkingLevel || parsed.reasoningEffort, "low"),
-      llmTimeoutMs: parsePositiveInteger(parsed.llmTimeoutMs || parsed.timeoutMs, null),
-      llmMaxRetries: parsePositiveInteger(parsed.llmMaxRetries || parsed.maxRetries, null),
-      llmMaxTokens: parsePositiveInteger(parsed.llmMaxTokens || parsed.maxTokens, null),
-      llmMaxCompletionTokens: parsePositiveInteger(parsed.llmMaxCompletionTokens || parsed.maxCompletionTokens, null),
-      llmImageLimit: parsePositiveInteger(parsed.llmImageLimit || parsed.imageLimit, null),
-      llmImageDetail: normalizeText(parsed.llmImageDetail || parsed.imageDetail),
-      temperature: parseConfigNumber(parsed.temperature, null),
-      topP: parseConfigNumber(parsed.topP || parsed.top_p, null),
       outputDir: resolveConfigPathValue(parsed.outputDir, configDir),
       humanRestEnabled: parseConfigBoolean(parsed.humanRestEnabled, false)
     },

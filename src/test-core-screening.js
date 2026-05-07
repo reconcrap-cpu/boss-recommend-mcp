@@ -644,6 +644,81 @@ async function testCallScreeningLlmRetriesTransientFailure() {
   }
 }
 
+async function testCallScreeningLlmFallsBackToNextConfiguredModel() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push({ url: String(url), payload });
+    if (payload.model === "primary-model") {
+      return {
+        ok: false,
+        status: 500,
+        async text() {
+          return "primary temporarily unavailable";
+        }
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: { content: "{\"passed\": true}" },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 10 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fallback-configured",
+        text: "王五\n算法工程师\n硕士"
+      }),
+      criteria: "算法经验",
+      config: {
+        llmMaxRetries: 0,
+        llmModels: [
+          {
+            name: "primary",
+            baseUrl: "https://primary.example.com/v1",
+            apiKey: "primary-key",
+            model: "primary-model"
+          },
+          {
+            name: "backup",
+            baseUrl: "https://backup.example.com/v1",
+            apiKey: "backup-key",
+            model: "backup-model"
+          }
+        ]
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].url, "https://primary.example.com/v1/chat/completions");
+    assert.equal(calls[1].url, "https://backup.example.com/v1/chat/completions");
+    assert.equal(result.passed, true);
+    assert.equal(result.provider.name, "backup");
+    assert.equal(result.provider.model, "backup-model");
+    assert.equal(result.attempt_count, 2);
+    assert.equal(result.fallback_count, 1);
+    assert.equal(result.llm_model_failures.length, 1);
+    assert.equal(result.llm_model_failures[0].model, "primary-model");
+    assert.equal(result.llm_model_failures[0].baseUrl, "https://[redacted-host]/v1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 testHtmlToText();
 testNormalizeFromHtml();
 testNormalizeFromHtmlSkipsSalaryAsName();
@@ -663,5 +738,6 @@ testBuildScreeningLlmImageInputsPrefersComposedFullCvImages();
 await testCallScreeningLlmDefaultsThinkingLow();
 await testCallScreeningLlmUsesConfigThinkingAndBudget();
 await testCallScreeningLlmRetriesTransientFailure();
+await testCallScreeningLlmFallsBackToNextConfiguredModel();
 
 console.log("Core screening tests passed");

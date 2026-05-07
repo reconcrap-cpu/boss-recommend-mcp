@@ -874,12 +874,14 @@ async function readChatJobOptionsFromSession(session) {
 
 function normalizeChatStartInput(args = {}, configResolution = null) {
   const target = normalizeTargetCountInput(getBossChatTargetCountValue(args));
+  const explicitGreetingText = normalizeText(args.greeting_text || args.greetingText || args.greeting);
+  const configuredGreetingText = normalizeText(configResolution?.config?.greetingMessage || configResolution?.config?.greetingText);
   return {
     profile: normalizeText(args.profile) || "default",
     job: normalizeText(args.job),
     startFrom: normalizeText(args.start_from).toLowerCase(),
     criteria: normalizeText(args.criteria),
-    greetingText: normalizeText(args.greeting_text || args.greetingText || args.greeting),
+    greetingText: explicitGreetingText || configuredGreetingText,
     target,
     targetCount: target.targetCount,
     publicTargetCount: target.publicValue,

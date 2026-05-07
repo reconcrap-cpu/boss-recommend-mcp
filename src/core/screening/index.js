@@ -58,6 +58,74 @@ function buildChatCompletionsUrl(baseUrl) {
   return `${normalized}/chat/completions`;
 }
 
+function redactBaseUrl(baseUrl) {
+  const normalized = normalizeBaseUrl(baseUrl);
+  return normalized ? normalized.replace(/\/\/[^/]+/, "//[redacted-host]") : "";
+}
+
+function firstConfiguredValue(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null) continue;
+    if (typeof value === "string" && !value.trim()) continue;
+    return value;
+  }
+  return "";
+}
+
+function normalizeLlmProviderEntry(rawEntry, inherited = {}, index = 0) {
+  const entry = typeof rawEntry === "string"
+    ? { model: rawEntry }
+    : (rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry) ? rawEntry : {});
+  const providerName = firstConfiguredValue(
+    entry.name,
+    entry.label,
+    entry.id,
+    entry.providerName,
+    entry.provider,
+    ""
+  );
+  const next = {
+    ...inherited,
+    ...entry,
+    baseUrl: firstConfiguredValue(entry.baseUrl, entry.base_url, inherited.baseUrl, inherited.base_url),
+    apiKey: firstConfiguredValue(entry.apiKey, entry.api_key, inherited.apiKey, inherited.api_key),
+    model: firstConfiguredValue(entry.model, entry.modelName, entry.model_name, typeof rawEntry === "string" ? rawEntry : "", inherited.model),
+    openaiOrganization: firstConfiguredValue(entry.openaiOrganization, entry.organization, inherited.openaiOrganization, inherited.organization),
+    openaiProject: firstConfiguredValue(entry.openaiProject, entry.project, inherited.openaiProject, inherited.project),
+    topP: firstConfiguredValue(entry.topP, entry.top_p, inherited.topP, inherited.top_p),
+    llmProviderName: normalizeText(providerName),
+    llmProviderIndex: index
+  };
+  delete next.llmModels;
+  delete next.models;
+  return next;
+}
+
+function normalizeLlmProviderConfigs(config = {}) {
+  if (Array.isArray(config)) {
+    return config.map((entry, index) => normalizeLlmProviderEntry(entry, {}, index));
+  }
+  const inherited = config && typeof config === "object" && !Array.isArray(config) ? { ...config } : {};
+  const rawProviders = Array.isArray(inherited.llmModels) && inherited.llmModels.length > 0
+    ? inherited.llmModels
+    : (Array.isArray(inherited.models) && inherited.models.length > 0 ? inherited.models : [inherited]);
+  delete inherited.llmModels;
+  delete inherited.models;
+  return rawProviders.map((entry, index) => normalizeLlmProviderEntry(entry, inherited, index));
+}
+
+function compactLlmProviderFailure(error, providerConfig = {}, providerIndex = 0) {
+  return {
+    index: providerIndex + 1,
+    name: normalizeText(providerConfig.llmProviderName || providerConfig.name || providerConfig.label || providerConfig.id) || null,
+    baseUrl: redactBaseUrl(providerConfig.baseUrl),
+    model: normalizeText(providerConfig.model) || null,
+    status: Number.isFinite(Number(error?.status)) ? Number(error.status) : null,
+    attempts: Number(error?.llm_attempt_count) || 0,
+    message: String(error?.message || error || "").slice(0, 500)
+  };
+}
+
 function isVolcengineModel(baseUrl, model) {
   return /volces|volcengine|ark\.cn|doubao|seed/i.test(`${baseUrl || ""} ${model || ""}`);
 }
@@ -1325,6 +1393,8 @@ export function compactScreeningLlmResult(llmResult) {
     finish_reason: llmResult.finish_reason || null,
     image_input_count: llmResult.image_input_count || 0,
     attempt_count: llmResult.attempt_count || 0,
+    fallback_count: llmResult.fallback_count || 0,
+    llm_model_failures: Array.isArray(llmResult.llm_model_failures) ? llmResult.llm_model_failures : [],
     error: llmResult.error || null,
     screened_at: llmResult.screened_at || null
   };
@@ -1358,6 +1428,8 @@ export function createFailedLlmScreeningResult(error) {
     image_input_count: Number(error?.image_input_count) || 0,
     image_inputs: Array.isArray(error?.image_inputs) ? error.image_inputs : [],
     attempt_count: Number(error?.llm_attempt_count) || 0,
+    fallback_count: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures.length : 0,
+    llm_model_failures: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures : [],
     error: error?.message || String(error || "unknown"),
     screened_at: nowIso()
   };
@@ -1435,7 +1507,7 @@ function sleepMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
-export async function callScreeningLlm({
+async function callScreeningLlmWithProvider({
   candidate,
   criteria,
   config = {},
@@ -1488,81 +1560,89 @@ export async function callScreeningLlm({
     thinkingLevel
   });
 
+  const effectiveTimeoutMs = parsePositiveNumber(config.llmTimeoutMs ?? config.timeoutMs, timeoutMs) || timeoutMs;
   const maxRetries = normalizeLlmMaxRetries(config.llmMaxRetries ?? config.maxRetries);
   const maxAttempts = maxRetries + 1;
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     try {
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    };
-    if (config.openaiOrganization) headers["OpenAI-Organization"] = config.openaiOrganization;
-    if (config.openaiProject) headers["OpenAI-Project"] = config.openaiProject;
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`
+      };
+      if (config.openaiOrganization) headers["OpenAI-Organization"] = config.openaiOrganization;
+      if (config.openaiProject) headers["OpenAI-Project"] = config.openaiProject;
 
-    const response = await fetch(buildChatCompletionsUrl(baseUrl), {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-      signal: controller.signal
-    });
-    const responseText = await response.text();
-    if (!response.ok) {
-      const error = new Error(`LLM request failed: ${response.status} ${responseText.slice(0, 400)}`);
-      error.status = response.status;
-      throw error;
-    }
-    const json = tryParseJson(responseText);
-    if (!json) {
-      throw new Error("LLM response was not valid JSON");
-    }
-    const choice = json?.choices?.[0] || {};
-    const content = flattenChatMessageContent(choice?.message?.content);
-    const reasoningContent = collectLlmReasoningText(choice);
-    const parsed = tryExtractJsonObject(content) || tryExtractJsonObject(reasoningContent);
-    const passed = parsePassedDecision(parsed?.passed);
-    if (passed === null) {
-      throw new Error(`LLM response missing boolean passed decision: ${content.slice(0, 240)}`);
-    }
-    const evidence = Array.isArray(parsed?.evidence)
-      ? parsed.evidence.map(normalizeText).filter(Boolean)
-      : [];
-    const decisionCot = firstUsefulLine([
-      parsed?.cot,
-      parsed?.decision_cot,
-      parsed?.reasoning,
-      parsed?.chain_of_thought,
-      reasoningContent
-    ].map(normalizeBlockText).filter(Boolean)) || reasoningContent;
-    return {
-      ok: true,
-      provider: {
-        baseUrl: baseUrl.replace(/\/\/[^/]+/, "//[redacted-host]"),
-        model,
-        thinking_level: normalizeLlmThinkingLevel(thinkingLevel) || "low",
-        thinking: payload.thinking || null,
-        reasoning_effort: payload.reasoning_effort || null,
-        max_tokens: payload.max_tokens,
-        max_completion_tokens: payload.max_completion_tokens || null
-      },
-      passed,
-      reason: "",
-      evidence,
-      cot: decisionCot,
-      decision_cot: decisionCot,
-      reasoning_content: reasoningContent,
-      raw_model_output: content,
-      usage: json.usage || null,
-      finish_reason: choice.finish_reason || null,
-      raw_content_length: content.length,
-      image_input_count: imageInputs.length,
-      image_inputs: summarizeLlmImageInputs(imageInputs),
-      attempt_count: attempt,
-      screened_at: nowIso()
-    };
-  } catch (error) {
+      const response = await fetch(buildChatCompletionsUrl(baseUrl), {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      const responseText = await response.text();
+      if (!response.ok) {
+        const error = new Error(`LLM request failed: ${response.status} ${responseText.slice(0, 400)}`);
+        error.status = response.status;
+        throw error;
+      }
+      const json = tryParseJson(responseText);
+      if (!json) {
+        throw new Error("LLM response was not valid JSON");
+      }
+      const choice = json?.choices?.[0] || {};
+      const content = flattenChatMessageContent(choice?.message?.content);
+      const reasoningContent = collectLlmReasoningText(choice);
+      const parsed = tryExtractJsonObject(content) || tryExtractJsonObject(reasoningContent);
+      const passed = parsePassedDecision(parsed?.passed);
+      if (passed === null) {
+        throw new Error(`LLM response missing boolean passed decision: ${content.slice(0, 240)}`);
+      }
+      const evidence = Array.isArray(parsed?.evidence)
+        ? parsed.evidence.map(normalizeText).filter(Boolean)
+        : [];
+      const decisionCot = firstUsefulLine([
+        parsed?.cot,
+        parsed?.decision_cot,
+        parsed?.reasoning,
+        parsed?.chain_of_thought,
+        reasoningContent
+      ].map(normalizeBlockText).filter(Boolean)) || reasoningContent;
+      const providerName = normalizeText(config.llmProviderName || config.name || config.label || config.id);
+      const providerIndex = Number.isFinite(Number(config.llmProviderIndex)) ? Number(config.llmProviderIndex) : 0;
+      const providerCount = Number.isFinite(Number(config.llmProviderCount)) ? Number(config.llmProviderCount) : 1;
+      return {
+        ok: true,
+        provider: {
+          baseUrl: redactBaseUrl(baseUrl),
+          model,
+          name: providerName || null,
+          index: providerIndex + 1,
+          total: providerCount,
+          thinking_level: normalizeLlmThinkingLevel(thinkingLevel) || "low",
+          thinking: payload.thinking || null,
+          reasoning_effort: payload.reasoning_effort || null,
+          max_tokens: payload.max_tokens,
+          max_completion_tokens: payload.max_completion_tokens || null
+        },
+        passed,
+        reason: "",
+        evidence,
+        cot: decisionCot,
+        decision_cot: decisionCot,
+        reasoning_content: reasoningContent,
+        raw_model_output: content,
+        usage: json.usage || null,
+        finish_reason: choice.finish_reason || null,
+        raw_content_length: content.length,
+        image_input_count: imageInputs.length,
+        image_inputs: summarizeLlmImageInputs(imageInputs),
+        attempt_count: attempt,
+        provider_attempt_count: attempt,
+        screened_at: nowIso()
+      };
+    } catch (error) {
       lastError = error;
       if (attempt >= maxAttempts || !isRetryableLlmRequestError(error)) {
         error.image_input_count = imageInputs.length;
@@ -1571,13 +1651,68 @@ export async function callScreeningLlm({
         throw error;
       }
       await sleepMs(Math.min(2500, 500 * attempt));
-  } finally {
-    clearTimeout(timer);
-  }
+    } finally {
+      clearTimeout(timer);
+    }
   }
   lastError = lastError || new Error("LLM request failed without response");
   lastError.image_input_count = imageInputs.length;
   lastError.image_inputs = summarizeLlmImageInputs(imageInputs);
   lastError.llm_attempt_count = maxAttempts;
   throw lastError;
+}
+
+export async function callScreeningLlm(args = {}) {
+  const providers = normalizeLlmProviderConfigs(args.config || {});
+  if (providers.length <= 1) {
+    return callScreeningLlmWithProvider({
+      ...args,
+      config: {
+        ...(providers[0] || args.config || {}),
+        llmProviderCount: 1
+      }
+    });
+  }
+
+  const providerFailures = [];
+  let lastError = null;
+  for (let index = 0; index < providers.length; index += 1) {
+    const providerConfig = {
+      ...providers[index],
+      llmProviderIndex: index,
+      llmProviderCount: providers.length
+    };
+    try {
+      const previousAttempts = providerFailures.reduce((sum, item) => sum + (Number(item.attempts) || 0), 0);
+      const result = await callScreeningLlmWithProvider({
+        ...args,
+        config: providerConfig
+      });
+      const providerAttempts = Number(result.provider_attempt_count ?? result.attempt_count) || 0;
+      return {
+        ...result,
+        attempt_count: previousAttempts + providerAttempts,
+        llm_model_failures: providerFailures,
+        fallback_count: providerFailures.length
+      };
+    } catch (error) {
+      lastError = error;
+      providerFailures.push(compactLlmProviderFailure(error, providerConfig, index));
+      if (index < providers.length - 1) {
+        await sleepMs(Math.min(1500, 250 * (index + 1)));
+      }
+    }
+  }
+
+  const totalAttempts = providerFailures.reduce((sum, item) => sum + (Number(item.attempts) || 0), 0);
+  const finalError = new Error(
+    `All configured LLM models failed (${providers.length}); last error: ${lastError?.message || "unknown error"}`
+  );
+  finalError.cause = lastError || null;
+  finalError.llm_provider_failures = providerFailures;
+  finalError.llm_model_failures = providerFailures;
+  finalError.llm_attempt_count = totalAttempts;
+  finalError.image_input_count = lastError?.image_input_count || 0;
+  finalError.image_inputs = lastError?.image_inputs || [];
+  throw finalError;
 }

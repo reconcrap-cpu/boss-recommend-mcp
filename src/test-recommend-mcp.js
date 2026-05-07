@@ -313,6 +313,9 @@ async function testRecommendLoadsLlmConfigByDefault() {
   assert.equal(observedOptions.llmConfig.temperature, 0);
   assert.equal(observedOptions.llmConfig.topP, 0.2);
   assert.equal(observedOptions.llmConfig.outputDir, outputDirForTests());
+  assert.equal(observedOptions.llmConfig.llmModels.length, 2);
+  assert.equal(observedOptions.llmConfig.llmModels[1].model, "gpt-4.1-nano");
+  assert.equal(observedOptions.llmConfig.llmModels[1].apiKey, "sk-backup-key");
 }
 
 function outputDirForTests() {
@@ -676,9 +679,20 @@ async function main() {
   process.env.BOSS_RECOMMEND_HOME = tempHome;
   process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
   fs.writeFileSync(configPath, JSON.stringify({
-    baseUrl: "https://api.example.com/v1",
-    apiKey: "sk-test-key",
-    model: "gpt-4.1-mini",
+    llmModels: [
+      {
+        name: "primary",
+        baseUrl: "https://api.example.com/v1",
+        apiKey: "sk-test-key",
+        model: "gpt-4.1-mini"
+      },
+      {
+        name: "backup",
+        baseUrl: "https://backup.example.com/v1",
+        apiKey: "sk-backup-key",
+        model: "gpt-4.1-nano"
+      }
+    ],
     debugPort: 9333,
     outputDir,
     llmThinkingLevel: "low",

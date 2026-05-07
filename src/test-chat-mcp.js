@@ -335,6 +335,8 @@ async function testChatRequestCvLoadsLlmConfig() {
     assert.equal(options.llmConfig.topP, 0.2);
     assert.equal(options.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
     assert.equal(options.llmConfig.humanRestEnabled, false);
+    assert.equal(options.llmConfig.greetingMessage, "配置招呼语");
+    assert.equal(options.greetingText, "配置招呼语");
     runControl.setPhase("chat:test");
     runControl.updateProgress({
       processed: 1,
@@ -524,6 +526,7 @@ async function main() {
     model: "gpt-4.1-mini",
     debugPort: 9555,
     outputDir,
+    greetingMessage: "配置招呼语",
     llmThinkingLevel: "low",
     llmMaxTokens: 384,
     llmMaxRetries: 2,
