@@ -23,19 +23,28 @@ function normalizeJobText(value) {
   return normalizeText(value).replace(/\s+/g, "");
 }
 
-function trimSalarySuffix(label) {
+function stripSalaryText(label) {
   return normalizeText(label)
-    .replace(/\s+(?:\d+(?:-\d+)?K|面议|\d+-\d+元\/天).*$/i, "")
+    .replace(/\s*[（(]\s*(?:\d+(?:-\d+)?K|面议|\d+-\d+元\/天)\s*[）)]\s*$/i, "")
+    .replace(/\s+(?:\d+(?:-\d+)?K|面议|\d+-\d+元\/天)\s*$/i, "")
     .trim();
+}
+
+function trimSalarySuffix(label) {
+  return stripSalaryText(label);
 }
 
 export function jobLabelMatches(optionLabel, targetLabel) {
   const option = normalizeJobText(optionLabel);
   const target = normalizeJobText(targetLabel);
+  const optionWithoutSalary = normalizeJobText(stripSalaryText(optionLabel));
+  const targetWithoutSalary = normalizeJobText(stripSalaryText(targetLabel));
   if (!option || !target) return false;
   return option === target
     || option.startsWith(target)
-    || normalizeJobText(trimSalarySuffix(optionLabel)) === target;
+    || optionWithoutSalary === target
+    || option === targetWithoutSalary
+    || optionWithoutSalary === targetWithoutSalary;
 }
 
 function isVisibleBox(box) {

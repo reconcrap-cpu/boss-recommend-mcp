@@ -675,12 +675,13 @@ Expected behavior:
 
 Current status:
 
-- Intentionally fenced.
+- CDP-only CLI wrapper for `start_recommend_pipeline_run`.
 
 Expected behavior:
 
-- Return JSON `FAILED` with `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`.
-- Point users to MCP `start_recommend_pipeline_run`.
+- Return the same gate statuses as MCP (`NEED_INPUT`, `NEED_CONFIRMATION`, `ACCEPTED`, or `FAILED`) as JSON.
+- Support `--instruction`, `--instruction-file`, `--confirmation-json`, `--confirmation-file`, `--overrides-json`, and `--overrides-file`.
+- Support `--detached` for shell-only agents such as QClaw: the parent process prints the first JSON start/gate result, while the detached child keeps the CDP session and run lifecycle alive after `ACCEPTED`.
 
 ### `boss-recommend-mcp chat health-check`
 

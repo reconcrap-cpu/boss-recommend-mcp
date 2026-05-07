@@ -23,7 +23,10 @@ import {
   prepareBossChatRunTool,
   resumeBossChatRunTool
 } from "./chat-mcp.js";
-import { listRecommendJobsTool } from "./recommend-mcp.js";
+import {
+  listRecommendJobsTool,
+  startRecommendPipelineRunTool
+} from "./recommend-mcp.js";
 import {
   getBossScreenConfigResolution,
   resolveBossChatRuntimeLayout as resolveCdpBossChatRuntimeLayout,
@@ -45,7 +48,7 @@ const bossLoginUrl = "https://www.zhipin.com/web/user/?ka=bticket";
 const chromeOnboardingUrlPattern = /^chrome:\/\/(welcome|intro|newtab|signin|history-sync|settings\/syncSetup)/i;
 const bossLoginUrlPattern = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhipin\.com)/i;
 const bossLoginTitlePattern = /登录|signin|扫码登录|BOSS直聘登录/i;
-const supportedMcpClients = ["generic", "cursor", "trae", "claudecode", "openclaw"];
+const supportedMcpClients = ["generic", "cursor", "trae", "claudecode", "openclaw", "qclaw"];
 const defaultMcpServerName = "boss-recommend";
 const defaultMcpCommand = "npx";
 const recommendMcpPackageName = "@reconcrap/boss-recommend-mcp";
@@ -64,7 +67,7 @@ const installConfigDefaults = Object.freeze({
 const bossChatRuntimeChildDirs = ["logs", "runs", "profiles", "reports", "artifacts", "state"];
 const bossChatCliUnsupportedStartCode = "CHAT_CLI_ASYNC_UNSUPPORTED_CDP_ONLY";
 const calibrateUnsupportedCode = "CALIBRATE_UNSUPPORTED_CDP_ONLY";
-const recommendCliRunUnsupportedCode = "RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY";
+const detachedRecommendRunChildEnv = "BOSS_RECOMMEND_DETACHED_RUN_CHILD";
 
 function getSkillSourceDir(name = skillName) {
   return path.join(packageRoot, "skills", name);
@@ -673,22 +676,25 @@ function getRunInstruction(options) {
 }
 
 function getRunConfirmation(options) {
-  if (typeof options["confirmation-file"] === "string" && options["confirmation-file"].trim()) {
-    return parseJsonOption(readTextFile(options["confirmation-file"], "confirmation"), "confirmation");
+  const filePath = options["confirmation-file"] || options["confirmation-json-path"];
+  if (typeof filePath === "string" && filePath.trim()) {
+    return parseJsonOption(readTextFile(filePath, "confirmation"), "confirmation");
   }
   return parseJsonOption(options["confirmation-json"], "confirmation");
 }
 
 function getRunOverrides(options) {
-  if (typeof options["overrides-file"] === "string" && options["overrides-file"].trim()) {
-    return parseJsonOption(readTextFile(options["overrides-file"], "overrides"), "overrides");
+  const filePath = options["overrides-file"] || options["overrides-json-path"];
+  if (typeof filePath === "string" && filePath.trim()) {
+    return parseJsonOption(readTextFile(filePath, "overrides"), "overrides");
   }
   return parseJsonOption(options["overrides-json"], "overrides");
 }
 
 function getRunFollowUp(options) {
-  if (typeof options["follow-up-file"] === "string" && options["follow-up-file"].trim()) {
-    return parseJsonOption(readTextFile(options["follow-up-file"], "follow_up"), "follow_up");
+  const filePath = options["follow-up-file"] || options["follow-up-json-path"];
+  if (typeof filePath === "string" && filePath.trim()) {
+    return parseJsonOption(readTextFile(filePath, "follow_up"), "follow_up");
   }
   return parseJsonOption(options["follow-up-json"], "follow_up");
 }
@@ -698,6 +704,7 @@ function normalizeMcpClientName(value) {
   if (!raw) return "";
   if (raw === "claude-code") return "claudecode";
   if (raw === "trae-cn") return "trae";
+  if (raw === "q-claw" || raw === "qclaw-win" || raw === "qclaw_win") return "qclaw";
   return raw;
 }
 
@@ -743,9 +750,19 @@ function buildMcpConfigFileContent(options = {}) {
   const serverName = typeof options["server-name"] === "string" && options["server-name"].trim()
     ? options["server-name"].trim()
     : defaultMcpServerName;
+  const launchConfig = buildMcpLaunchConfig(options);
+  if (normalizeMcpClientName(options.client) === "qclaw") {
+    return {
+      mcp: {
+        servers: {
+          [serverName]: launchConfig
+        }
+      }
+    };
+  }
   return {
     mcpServers: {
-      [serverName]: buildMcpLaunchConfig(options)
+      [serverName]: launchConfig
     }
   };
 }
@@ -757,7 +774,7 @@ function writeMcpConfigFiles(options = {}) {
   const files = [];
   for (const client of clients) {
     const filePath = path.join(outputDir, `mcp.${client}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(buildMcpConfigFileContent(options), null, 2), "utf8");
+    fs.writeFileSync(filePath, JSON.stringify(buildMcpConfigFileContent({ ...options, client }), null, 2), "utf8");
     files.push({ client, file: filePath });
   }
   return { outputDir, files };
@@ -778,12 +795,13 @@ function parsePathListFromEnv(raw) {
   return dedupePaths(text.split(path.delimiter).map((item) => item.trim()).filter(Boolean));
 }
 
-const supportedExternalAgents = ["cursor", "trae", "trae-cn", "claude", "openclaw"];
+const supportedExternalAgents = ["cursor", "trae", "trae-cn", "claude", "openclaw", "qclaw"];
 
 function normalizeAgentName(value) {
   const raw = String(value || "").trim().toLowerCase();
   if (!raw) return "";
   if (raw === "claude-code") return "claude";
+  if (raw === "q-claw" || raw === "qclaw-win" || raw === "qclaw_win") return "qclaw";
   return raw;
 }
 
@@ -849,7 +867,8 @@ function getKnownExternalMcpConfigPathsByAgent() {
     trae: [...traeConfigPaths, path.join(home, ".trae", "mcp.json"), path.join(home, ".trae-cn", "mcp.json")],
     "trae-cn": [...traeConfigPaths, path.join(home, ".trae-cn", "mcp.json"), path.join(home, ".trae", "mcp.json")],
     claude: [path.join(home, ".claude", "mcp.json")],
-    openclaw: [path.join(home, ".openclaw", "mcp.json"), ...openClawConfigPaths]
+    openclaw: [path.join(home, ".openclaw", "mcp.json"), ...openClawConfigPaths],
+    qclaw: [path.join(home, ".qclaw", "openclaw.json")]
   };
 }
 
@@ -866,15 +885,38 @@ function resolveExternalMcpConfigTargets(options = {}) {
   return dedupePaths([...fromEnv, ...known]);
 }
 
+function isQClawMcpConfigTarget(filePath, options = {}, current = null) {
+  if (normalizeAgentName(options.agent) === "qclaw" || normalizeMcpClientName(options.client) === "qclaw") {
+    return true;
+  }
+  const normalized = path.resolve(String(filePath || "")).replace(/\\/g, "/").toLowerCase();
+  if (normalized.endsWith("/.qclaw/openclaw.json")) {
+    return true;
+  }
+  return Boolean(
+    current?.mcp?.servers
+    && typeof current.mcp.servers === "object"
+    && !Array.isArray(current.mcp.servers)
+    && !current?.mcpServers
+  );
+}
+
+function getMcpServersFromConfig(config = {}, useQClawShape = false) {
+  const servers = useQClawShape ? config?.mcp?.servers : config?.mcpServers;
+  if (servers && typeof servers === "object" && !Array.isArray(servers)) {
+    return servers;
+  }
+  return {};
+}
+
 function mergeMcpServerConfigFile(filePath, options = {}) {
-  const nextConfig = buildMcpConfigFileContent(options);
-  const serverName = Object.keys(nextConfig.mcpServers || {})[0] || defaultMcpServerName;
-  const launchConfig = nextConfig.mcpServers?.[serverName] || buildMcpLaunchConfig(options);
   const current = readJsonObjectFileSafe(filePath);
-  const existingServers =
-    current?.mcpServers && typeof current.mcpServers === "object" && !Array.isArray(current.mcpServers)
-      ? current.mcpServers
-      : {};
+  const useQClawShape = isQClawMcpConfigTarget(filePath, options, current);
+  const nextConfig = buildMcpConfigFileContent({ ...options, client: useQClawShape ? "qclaw" : options.client });
+  const nextServers = useQClawShape ? nextConfig.mcp?.servers : nextConfig.mcpServers;
+  const serverName = Object.keys(nextServers || {})[0] || defaultMcpServerName;
+  const launchConfig = nextServers?.[serverName] || buildMcpLaunchConfig(options);
+  const existingServers = getMcpServersFromConfig(current, useQClawShape);
   const existingEntry = existingServers[serverName];
   const retainedServers = {};
   const migratedLegacyServers = [];
@@ -886,13 +928,24 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
     }
     retainedServers[name] = config;
   }
-  const merged = {
-    ...current,
-    mcpServers: {
-      ...retainedServers,
-      [serverName]: launchConfig
-    }
-  };
+  const merged = useQClawShape
+    ? {
+        ...current,
+        mcp: {
+          ...(current?.mcp && typeof current.mcp === "object" && !Array.isArray(current.mcp) ? current.mcp : {}),
+          servers: {
+            ...retainedServers,
+            [serverName]: launchConfig
+          }
+        }
+      }
+    : {
+        ...current,
+        mcpServers: {
+          ...retainedServers,
+          [serverName]: launchConfig
+        }
+      };
 
   ensureDir(path.dirname(filePath));
   const before = pathExists(filePath) ? fs.readFileSync(filePath, "utf8") : "";
@@ -907,6 +960,7 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
   return {
     file: filePath,
     server: serverName,
+    config_shape: useQClawShape ? "qclaw" : "mcpServers",
     updated,
     migrated_legacy_servers: migratedLegacyServers,
     backup_file: backupFile
@@ -957,7 +1011,8 @@ function getKnownExternalSkillBaseDirsByAgent() {
     trae: [path.join(home, ".trae", "skills"), path.join(home, ".trae-cn", "skills"), ...traeSkillDirs],
     "trae-cn": [path.join(home, ".trae-cn", "skills"), path.join(home, ".trae", "skills"), ...traeSkillDirs],
     claude: [path.join(home, ".claude", "skills")],
-    openclaw: [path.join(home, ".openclaw", "skills"), ...openClawSkillDirs]
+    openclaw: [path.join(home, ".openclaw", "skills"), ...openClawSkillDirs],
+    qclaw: [path.join(home, ".qclaw", "skills")]
   };
 }
 
@@ -1008,9 +1063,9 @@ function inspectMcpServerEntries(filePath) {
     };
   }
   const parsed = readJsonObjectFileSafe(filePath);
-  const servers = parsed?.mcpServers && typeof parsed.mcpServers === "object" && !Array.isArray(parsed.mcpServers)
-    ? parsed.mcpServers
-    : {};
+  const rootServers = getMcpServersFromConfig(parsed, false);
+  const qclawServers = getMcpServersFromConfig(parsed, true);
+  const servers = { ...rootServers, ...qclawServers };
   const recommendNames = [];
   const recruitNames = [];
   const chatNames = [];
@@ -1400,6 +1455,177 @@ async function setScreeningConfig(options = {}) {
 
 function printJson(value) {
   console.log(JSON.stringify(value, null, 2));
+}
+
+function stripDetachedRunArgs(args = []) {
+  const booleanKeys = new Set(["--detached", "--background"]);
+  const valueKeys = new Set(["--detached-start-timeout-ms"]);
+  const nextArgs = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (booleanKeys.has(token)) continue;
+    if (valueKeys.has(token)) {
+      index += 1;
+      continue;
+    }
+    nextArgs.push(token);
+  }
+  return nextArgs;
+}
+
+function extractFirstJsonObject(text = "") {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return text.slice(start, index + 1);
+    }
+  }
+  return null;
+}
+
+function readFirstJsonObjectFromFile(filePath) {
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    const jsonText = extractFirstJsonObject(text);
+    return jsonText ? JSON.parse(jsonText) : null;
+  } catch {
+    return null;
+  }
+}
+
+function createDetachedRecommendRunPaths() {
+  const dir = path.join(getStateHome(), "detached-runs");
+  ensureDir(dir);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const nonce = Math.random().toString(36).slice(2, 8);
+  const base = `recommend-run-${stamp}-${nonce}`;
+  return {
+    dir,
+    stdoutPath: path.join(dir, `${base}.stdout.json`),
+    stderrPath: path.join(dir, `${base}.stderr.log`)
+  };
+}
+
+function appendDetachedCliMeta(payload, meta) {
+  return {
+    ...payload,
+    cli: {
+      ...(payload?.cli || {}),
+      command: "run",
+      cdp_only: true,
+      detached: true,
+      detached_parent: true,
+      child_pid: meta.childPid || null,
+      stdout_path: meta.stdoutPath,
+      stderr_path: meta.stderrPath
+    }
+  };
+}
+
+async function waitForDetachedRecommendRunStart({
+  child,
+  stdoutPath,
+  stderrPath,
+  timeoutMs
+}) {
+  const deadline = Date.now() + timeoutMs;
+  let childExit = null;
+  child.once("exit", (code, signal) => {
+    childExit = { code, signal };
+  });
+
+  while (Date.now() <= deadline) {
+    const parsed = readFirstJsonObjectFromFile(stdoutPath);
+    if (parsed) return appendDetachedCliMeta(parsed, {
+      childPid: child.pid,
+      stdoutPath,
+      stderrPath
+    });
+    if (childExit) break;
+    await sleepMs(500);
+  }
+
+  const stderrPreview = (() => {
+    try {
+      return fs.readFileSync(stderrPath, "utf8").slice(-2000);
+    } catch {
+      return "";
+    }
+  })();
+
+  return appendDetachedCliMeta({
+    status: "FAILED",
+    error: {
+      code: childExit ? "DETACHED_RECOMMEND_RUN_CHILD_EXITED" : "DETACHED_RECOMMEND_RUN_START_TIMEOUT",
+      message: childExit
+        ? `Detached recommend run child exited before producing a JSON result (code=${childExit.code ?? "null"}, signal=${childExit.signal ?? "null"}).`
+        : `Timed out waiting ${timeoutMs}ms for detached recommend run start output.`,
+      retryable: true,
+      child_exit: childExit,
+      stderr_preview: stderrPreview || null
+    }
+  }, {
+    childPid: child.pid,
+    stdoutPath,
+    stderrPath
+  });
+}
+
+async function runPipelineDetached(rawArgs = [], options = {}) {
+  const timeoutMs = parseNonNegativeInteger(options["detached-start-timeout-ms"], 180000);
+  const childArgs = stripDetachedRunArgs(rawArgs);
+  const { stdoutPath, stderrPath } = createDetachedRecommendRunPaths();
+  const stdoutFd = fs.openSync(stdoutPath, "a");
+  const stderrFd = fs.openSync(stderrPath, "a");
+  let child;
+  try {
+    child = spawn(process.execPath, [currentFilePath, "run", ...childArgs], {
+      cwd: process.cwd(),
+      detached: true,
+      env: {
+        ...process.env,
+        [detachedRecommendRunChildEnv]: "1"
+      },
+      stdio: ["ignore", stdoutFd, stderrFd],
+      windowsHide: true
+    });
+  } finally {
+    fs.closeSync(stdoutFd);
+    fs.closeSync(stderrFd);
+  }
+  child.unref();
+
+  const result = await waitForDetachedRecommendRunStart({
+    child,
+    stdoutPath,
+    stderrPath,
+    timeoutMs
+  });
+  printJson(result);
+  if (result.status !== "ACCEPTED") {
+    process.exitCode = 1;
+  }
 }
 
 async function listChromeTabs(port) {
@@ -2293,26 +2519,28 @@ function printHelp() {
   console.log("Usage:");
   console.log("  boss-recommend-mcp              Start the MCP server");
   console.log("  boss-recommend-mcp start        Start the MCP server");
-  console.log("  boss-recommend-mcp run          Disabled until the one-shot CLI has a CDP-only async replacement");
+  console.log("  boss-recommend-mcp run          Start a CDP-only recommend run through the shared run service");
   console.log("  boss-recommend-mcp list-jobs    CDP-only list of exact recommend job names for cron/one-shot inputs");
   console.log("  boss-recommend-mcp chat <subcommand>  Run CDP-only boss-chat health/prepare/status commands");
-  console.log("  boss-recommend-mcp install      Install/migrate skills and MCP configs; replaces legacy Boss MCP routes (supports --agent trae-cn/openclaw/...)");
+  console.log("  boss-recommend-mcp install      Install/migrate skills and MCP configs; replaces legacy Boss MCP routes (supports --agent trae-cn/openclaw/qclaw/...)");
   console.log("  boss-recommend-mcp install-skill Install bundled Codex skills (recommend/recruit/chat)");
   console.log("  boss-recommend-mcp init-config  Create screening-config.json if missing (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp config set   Write baseUrl/apiKey/model (prefer workspace config/, fallback ~/.boss-recommend-mcp)");
   console.log("  boss-recommend-mcp set-port     Persist preferred Chrome debug port to screening-config.json");
-  console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae(含 trae-cn)/Claude Code/OpenClaw");
-  console.log("  boss-recommend-mcp doctor       Check config/runtime/calibration prerequisites (supports --agent trae-cn/cursor/...)");
+  console.log("  boss-recommend-mcp mcp-config   Generate MCP config JSON for Cursor/Trae(含 trae-cn)/Claude Code/OpenClaw/QClaw");
+  console.log("  boss-recommend-mcp doctor       Check config/runtime/calibration prerequisites (supports --agent trae-cn/qclaw/cursor/...)");
   console.log("  boss-recommend-mcp calibrate    Disabled until CDP-only featured calibration is live-verified");
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("");
   console.log("Run command:");
-  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\"    # returns RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY during rewrite; use MCP start_recommend_pipeline_run");
+  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" --overrides-file overrides.json --confirmation-file confirmation.json");
+  console.log("  boss-recommend-mcp run --detached --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp list-jobs --slow-live --port 9222");
   console.log("  boss-recommend-mcp chat prepare-run --slow-live --port 9222    # CDP-only preflight; start runs through MCP start_boss_chat_run");
   console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--openai-organization <id>] [--openai-project <id>]");
   console.log("  boss-recommend-mcp install --agent trae-cn");
+  console.log("  boss-recommend-mcp install --agent qclaw    # updates ~/.qclaw/openclaw.json mcp.servers and mirrors skills");
   console.log("  boss-recommend-mcp doctor --agent trae-cn --page-scope featured");
   console.log("  boss-recommend-mcp calibrate --port 9222    # returns CALIBRATE_UNSUPPORTED_CDP_ONLY during rewrite");
 }
@@ -2401,42 +2629,6 @@ async function installAll(options = {}) {
   }
 }
 
-function buildUnsupportedRecommendCliRunResponse({
-  instruction,
-  confirmation,
-  overrides,
-  followUp,
-  workspaceRoot,
-  port
-} = {}) {
-  return {
-    status: "FAILED",
-    error: {
-      code: recommendCliRunUnsupportedCode,
-      message: "boss-recommend-mcp run is fenced during the CDP-only rewrite because the old one-shot CLI route can reach page-JS/Runtime-based orchestration. Use the MCP tool start_recommend_pipeline_run for CDP-only recommend runs until a live-verified one-shot CLI replacement exists.",
-      retryable: false
-    },
-    cdp_only: true,
-    runtime_evaluate_used: false,
-    method_summary: {},
-    method_log: [],
-    run_mode: "mcp_async_required",
-    port,
-    target_url: bossUrl,
-    input: {
-      workspace_root: workspaceRoot,
-      instruction,
-      confirmation: confirmation ?? null,
-      overrides: overrides ?? null,
-      follow_up: followUp ?? null
-    },
-    guidance: {
-      recommended_tool: "start_recommend_pipeline_run",
-      next_development_task: "Implement a CDP-only CLI wrapper that starts a durable shared run-service session, persists run state, and exits only after its live gate proves no Runtime.* methods are reachable."
-    }
-  };
-}
-
 async function runPipelineOnce(options = {}) {
   const instruction = getRunInstruction(options);
   const confirmation = getRunConfirmation(options);
@@ -2445,15 +2637,70 @@ async function runPipelineOnce(options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
 
-  printJson(buildUnsupportedRecommendCliRunResponse({
-    workspaceRoot,
+  const args = {
     instruction,
-    confirmation,
-    overrides,
-    followUp,
-    port
-  }));
-  process.exitCode = 1;
+    confirmation: confirmation ?? undefined,
+    overrides: overrides ?? undefined,
+    follow_up: followUp ?? undefined,
+    host: typeof options.host === "string" && options.host.trim() ? options.host.trim() : undefined,
+    port,
+    target_url_includes: typeof options["target-url-includes"] === "string" && options["target-url-includes"].trim()
+      ? options["target-url-includes"].trim()
+      : undefined,
+    allow_navigate: !(options["no-navigate"] === true || options.noNavigate === true || options.allow_navigate === false),
+    slow_live: options["slow-live"] === true || options.slowLive === true || options.slow_live === true
+  };
+
+  const optionalPassthrough = [
+    "detail_limit",
+    "allow_card_only_screening",
+    "debug_test_mode",
+    "screening_mode",
+    "use_llm",
+    "delay_ms",
+    "max_image_pages",
+    "image_wheel_delta_y",
+    "cv_acquisition_mode",
+    "list_max_scrolls",
+    "list_stable_signature_limit",
+    "list_wheel_delta_y",
+    "list_settle_ms",
+    "refresh_on_end",
+    "max_refresh_rounds",
+    "refresh_button_settle_ms",
+    "refresh_reload_settle_ms",
+    "dry_run_post_action",
+    "execute_post_action",
+    "action_timeout_ms",
+    "action_interval_ms",
+    "action_after_click_delay_ms",
+    "llm_timeout_ms",
+    "llm_image_limit",
+    "llm_image_detail"
+  ];
+  for (const key of optionalPassthrough) {
+    const kebab = key.replace(/_/g, "-");
+    if (options[key] !== undefined) args[key] = options[key];
+    else if (options[kebab] !== undefined) args[key] = options[kebab];
+  }
+
+  const result = await startRecommendPipelineRunTool({
+    workspaceRoot,
+    args
+  });
+  printJson({
+    ...result,
+    cli: {
+      command: "run",
+      cdp_only: true,
+      shared_run_service: true,
+      workspace_root: workspaceRoot,
+      port
+    }
+  });
+  if (result.status !== "ACCEPTED") {
+    process.exitCode = 1;
+  }
 }
 
 function buildRecommendJobListCliInput(options = {}) {
@@ -2590,11 +2837,19 @@ export async function runCli(argv = process.argv) {
 
   switch (command) {
     case "start":
+    case "mcp":
       startServer();
       break;
     case "run":
       try {
-        await runPipelineOnce(options);
+        if (
+          (options.detached === true || options.background === true)
+          && process.env[detachedRecommendRunChildEnv] !== "1"
+        ) {
+          await runPipelineDetached(argv.slice(3), options);
+        } else {
+          await runPipelineOnce(options);
+        }
       } catch (error) {
         printJson({
           status: "FAILED",
@@ -2754,7 +3009,6 @@ export const __testables = {
   buildBossChatCliInput,
   buildDefaultMcpArgs,
   buildMcpLaunchConfig,
-  buildUnsupportedRecommendCliRunResponse,
   collectRuntimeDirectories,
   ensureBossChatRuntimeReady: ensureBossChatRuntimeReadyLocal,
   ensureRuntimeDirectories,

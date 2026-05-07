@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { createRunLifecycleManager } from "../../core/run/index.js";
 import {
   addTiming,
@@ -376,6 +378,66 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   };
 }
 
+export function isRecoverableImageCaptureError(error) {
+  const code = String(error?.code || "");
+  if (code === "IMAGE_CAPTURE_TIMEOUT" || code === "IMAGE_CAPTURE_TOTAL_TIMEOUT") return true;
+  return /Image fallback capture timed out/i.test(String(error?.message || error || ""));
+}
+
+function collectPartialImageEvidencePaths(basePath = "", extension = "jpg", maxCount = 12) {
+  const resolved = String(basePath || "").trim();
+  if (!resolved) return [];
+  const parsed = path.parse(resolved);
+  const ext = parsed.ext || `.${String(extension || "jpg").replace(/^\./, "") || "jpg"}`;
+  const files = [];
+  for (let index = 0; index < Math.max(1, Number(maxCount) || 1); index += 1) {
+    const page = String(index + 1).padStart(2, "0");
+    const candidatePath = path.join(parsed.dir, `${parsed.name}-page-${page}${ext}`);
+    if (fs.existsSync(candidatePath)) files.push(candidatePath);
+  }
+  return files;
+}
+
+export function createRecoverableImageCaptureEvidence(error, {
+  elapsedMs = 0,
+  filePath = "",
+  extension = "jpg",
+  maxScreenshots = 8
+} = {}) {
+  const filePaths = collectPartialImageEvidencePaths(filePath, extension, maxScreenshots);
+  return {
+    schema_version: 1,
+    ok: false,
+    source: "image-scroll-sequence",
+    elapsed_ms: Math.max(0, Math.round(Number(error?.elapsed_ms ?? elapsedMs) || 0)),
+    capture_count: filePaths.length,
+    screenshot_count: filePaths.length,
+    unique_screenshot_count: filePaths.length,
+    dropped_duplicate_count: 0,
+    total_byte_length: 0,
+    original_total_byte_length: 0,
+    llm_screenshot_count: 0,
+    llm_total_byte_length: 0,
+    llm_original_total_byte_length: 0,
+    llm_composition_error: null,
+    error_code: error?.code || "IMAGE_CAPTURE_FAILED",
+    error: error?.message || String(error || "Image capture failed"),
+    file_paths: filePaths,
+    llm_file_paths: []
+  };
+}
+
+function createImageCaptureFailureScreening(candidate, error) {
+  return {
+    status: "fail",
+    passed: false,
+    score: 0,
+    reasons: ["image_capture_failed"],
+    error: compactError(error, "IMAGE_CAPTURE_FAILED"),
+    candidate
+  };
+}
+
 export async function runRecommendWorkflow({
   client,
   targetUrl = "",
@@ -742,42 +804,57 @@ export async function runRecommendWorkflow({
           || openedDetail.detail_state?.resumeIframe?.node_id
           || null;
         if (captureNodeId) {
-          imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
-            filePath: imageEvidenceFilePath({
-              imageOutputDir,
-              domain: "recommend",
-              runId: runControl?.runId,
-              index,
-              extension: "jpg"
-            }),
-            format: "jpeg",
-            quality: 72,
-            optimize: true,
-            resizeMaxWidth: 1100,
-            captureViewport: true,
-            padding: 4,
-            maxScreenshots: maxImagePages,
-            wheelDeltaY: imageWheelDeltaY,
-            settleMs: 350,
-            scrollMethod: "dom-anchor-fallback-input",
-            stepTimeoutMs: 45000,
-            totalTimeoutMs: 90000,
-            duplicateStopCount: 1,
-            skipDuplicateScreenshots: true,
-            composeForLlm: true,
-            llmPagesPerImage: 3,
-            llmResizeMaxWidth: 1100,
-            llmQuality: 72,
-            metadata: {
-              domain: "recommend",
-              capture_mode: "scroll_sequence",
-              acquisition_reason: "network_miss_image_fallback",
-              run_candidate_index: index,
-              candidate_key: candidateKey
-            }
-          }));
-          source = "image";
+          const imageEvidencePath = imageEvidenceFilePath({
+            imageOutputDir,
+            domain: "recommend",
+            runId: runControl?.runId,
+            index,
+            extension: "jpg"
+          });
+          try {
+            imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+              filePath: imageEvidencePath,
+              format: "jpeg",
+              quality: 72,
+              optimize: true,
+              resizeMaxWidth: 1100,
+              captureViewport: true,
+              padding: 4,
+              maxScreenshots: maxImagePages,
+              wheelDeltaY: imageWheelDeltaY,
+              settleMs: 350,
+              scrollMethod: "dom-anchor-fallback-input",
+              stepTimeoutMs: 45000,
+              totalTimeoutMs: 90000,
+              duplicateStopCount: 1,
+              skipDuplicateScreenshots: true,
+              composeForLlm: true,
+              llmPagesPerImage: 3,
+              llmResizeMaxWidth: 1100,
+              llmQuality: 72,
+              metadata: {
+                domain: "recommend",
+                capture_mode: "scroll_sequence",
+                acquisition_reason: "network_miss_image_fallback",
+                run_candidate_index: index,
+                candidate_key: candidateKey
+              }
+            }));
+            source = "image";
+          } catch (error) {
+            if (!isRecoverableImageCaptureError(error)) throw error;
+            imageEvidence = createRecoverableImageCaptureEvidence(error, {
+              elapsedMs: timings.screenshot_capture_ms,
+              filePath: imageEvidencePath,
+              extension: "jpg",
+              maxScreenshots: maxImagePages
+            });
+            source = "image_capture_failed";
+          }
           recordCvImageFallback(cvAcquisitionState, {
+            reason: source === "image_capture_failed"
+              ? "network_miss_image_capture_failed"
+              : "network_miss_image_fallback",
             parsedNetworkProfileCount,
             waitResult: networkWait,
             imageEvidence
@@ -809,7 +886,9 @@ export async function runRecommendWorkflow({
     runControl.setPhase("recommend:screening");
     let llmResult = null;
     if (useLlmScreening) {
-      if (!llmConfig) {
+      if (detailResult?.image_evidence?.ok === false) {
+        llmResult = null;
+      } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
       } else {
         try {
@@ -831,9 +910,14 @@ export async function runRecommendWorkflow({
       }
       if (detailResult) detailResult.llm_result = llmResult;
     }
-    const screening = useLlmScreening
-      ? llmResultToScreening(llmResult, screeningCandidate)
-      : screenCandidate(screeningCandidate, { criteria });
+    const screening = detailResult?.image_evidence?.ok === false
+      ? createImageCaptureFailureScreening(screeningCandidate, {
+        code: detailResult.image_evidence.error_code,
+        message: detailResult.image_evidence.error
+      })
+      : useLlmScreening
+        ? llmResultToScreening(llmResult, screeningCandidate)
+        : screenCandidate(screeningCandidate, { criteria });
     let actionDiscovery = null;
     let postActionResult = null;
     if (postActionEnabled && detailResult) {
@@ -875,6 +959,12 @@ export async function runRecommendWorkflow({
       screening: compactScreening(screening),
       action_discovery: compactActionDiscovery(actionDiscovery),
       post_action: postActionResult,
+      error: detailResult?.image_evidence?.ok === false
+        ? compactError({
+          code: detailResult.image_evidence.error_code,
+          message: detailResult.image_evidence.error
+        }, "IMAGE_CAPTURE_FAILED")
+        : null,
       timings
     };
     results.push(compactResult);
@@ -896,6 +986,7 @@ export async function runRecommendWorkflow({
       llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
       greet_count: greetCount,
       post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
+      image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
       refresh_rounds: refreshRounds,
@@ -920,6 +1011,7 @@ export async function runRecommendWorkflow({
           score: screening.score
         },
         llm_screening: compactScreeningLlmResult(llmResult),
+        error: compactResult.error,
         post_action: postActionResult
       }
     });

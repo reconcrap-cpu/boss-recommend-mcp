@@ -140,7 +140,7 @@ Run lifecycle statuses:
 
 Important intentional fences:
 
-- `boss-recommend-mcp run` returns `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`.
+- `boss-recommend-mcp run` is a CDP-only wrapper around `start_recommend_pipeline_run`; use `--detached` for shell-only agents that need the parent command to return after `ACCEPTED` while the child process keeps the live CDP run alive.
 - `boss-recommend-mcp chat run` and `boss-recommend-mcp chat start-run` return `CHAT_CLI_ASYNC_UNSUPPORTED_CDP_ONLY`.
 - `boss-recommend-mcp calibrate` returns `CALIBRATE_UNSUPPORTED_CDP_ONLY`.
 - `run_featured_calibration` returns `FEATURED_CALIBRATION_UNSUPPORTED_CDP_ONLY`.

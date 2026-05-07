@@ -317,6 +317,8 @@ function ensureRecommendRunArtifacts(snapshot) {
       progress: snapshot.progress || {},
       context: snapshot.context || {},
       checkpoint,
+      error: snapshot.error || null,
+      last_message: snapshot.error?.message || snapshot.phase || snapshot.stage || null,
       summary: artifactSummary,
       generated_at: new Date().toISOString()
     });

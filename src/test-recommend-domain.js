@@ -1,14 +1,20 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   chooseFilterOptionByLabels,
   chooseFilterOptionsByLabels,
+  createRecoverableImageCaptureEvidence,
   chooseFirstSafeFilterOption,
   findRecommendCardNodeForCandidateKey,
   getRecommendPageScopeStatus,
   isActiveOption,
+  isRecoverableImageCaptureError,
   isSafeFilterOptionLabel,
   isStaleRecommendNodeError,
+  jobLabelMatches,
   listRecommendPageScopeTabs,
   matchesRecommendDetailNetwork,
   normalizeFilterOptionLabel,
@@ -27,6 +33,42 @@ function testFilterOptionHelpers() {
   assert.equal(isSafeFilterOptionLabel("本科"), true);
   assert.equal(isActiveOption({ class: "option active" }), true);
   assert.equal(isActiveOption({ class: "option" }, '<span class="option active">本科</span>'), true);
+}
+
+function testJobLabelMatchingIgnoresSalaryFormatting() {
+  assert.equal(jobLabelMatches("大模型高招岗位 _ 杭州 50-80K", "大模型高招岗位 _ 杭州 (50-80K)"), true);
+  assert.equal(jobLabelMatches("大模型高招岗位 _ 杭州", "大模型高招岗位 _ 杭州 (50-80K)"), true);
+  assert.equal(jobLabelMatches("研发实习生（AI应用方向）- 26/27届校招 _ 杭州 150-250元/天", "研发实习生（AI应用方向）- 26/27届校招 _ 杭州 (150-250元/天)"), true);
+  assert.equal(jobLabelMatches("数据分析实习生 _ 杭州 100-150元/天", "算法工程师 _ 杭州 (25-50K)"), false);
+}
+
+function testRecoverableImageCaptureEvidencePreservesPartialPages() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-capture-"));
+  try {
+    const basePath = path.join(tempDir, "recommend-candidate-001.jpg");
+    const firstPage = path.join(tempDir, "recommend-candidate-001-page-01.jpg");
+    const secondPage = path.join(tempDir, "recommend-candidate-001-page-02.jpg");
+    fs.writeFileSync(firstPage, "first");
+    fs.writeFileSync(secondPage, "second");
+    const error = new Error("Image fallback capture timed out during capture_screenshot_4 after 45000ms");
+    error.code = "IMAGE_CAPTURE_TIMEOUT";
+
+    assert.equal(isRecoverableImageCaptureError(error), true);
+    assert.equal(isRecoverableImageCaptureError(new Error("Inspected target navigated or closed")), false);
+    const evidence = createRecoverableImageCaptureEvidence(error, {
+      elapsedMs: 45003,
+      filePath: basePath,
+      maxScreenshots: 4
+    });
+
+    assert.equal(evidence.ok, false);
+    assert.equal(evidence.error_code, "IMAGE_CAPTURE_TIMEOUT");
+    assert.equal(evidence.screenshot_count, 2);
+    assert.deepEqual(evidence.file_paths, [firstPage, secondPage]);
+    assert.deepEqual(evidence.llm_file_paths, []);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
 }
 
 function testDeterministicFilterChoice() {
@@ -314,6 +356,8 @@ async function testPageScopeFallbackToRecommend() {
 }
 
 testFilterOptionHelpers();
+testJobLabelMatchingIgnoresSalaryFormatting();
+testRecoverableImageCaptureEvidencePreservesPartialPages();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();

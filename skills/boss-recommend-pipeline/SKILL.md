@@ -139,11 +139,29 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - `featured` 且缺少校准文件：先 `boss-recommend-mcp calibrate`。
 - `latest`：流程同 `recommend`，但使用最新 tab 结构（`data-status=1`）。
 
-## Fallback CLI
+## QClaw / Shell-Only Fallback
 
-MCP 不可用时：
+当 QClaw/OpenClaw 变体只暴露 shell、没有原生 MCP tool list 时，禁止停在“请使用 `start_recommend_pipeline_run` 工具”。必须用 shell 继续启动。
 
-`npx -y @reconcrap/boss-recommend-mcp@latest run --instruction "..." [--confirmation-json '{...}'] [--overrides-json '{...}']`
+推荐做法：
+
+1. 将锁定的用户原文写入 instruction 文件，将已确认参数写入 `overrides` 与 `confirmation` JSON 文件。
+2. 用 detached CLI 启动，让父命令返回启动证据，子进程继续持有 CDP 会话：
+
+```powershell
+npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --slow-live --port 9222
+```
+
+3. 若返回 `ACCEPTED + run_id`，即任务已启动；记录 `run_id/stdout_path/stderr_path`。若返回 `NEED_INPUT` 或 `NEED_CONFIRMATION`，只补 `pending_questions`，不要重写已锁定的用户原文。
+
+兼容路径：
+
+- 若 `--detached` 不可用，或返回 `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`，说明 npm/QClaw 仍在使用旧包；先运行 `npx -y @reconcrap/boss-recommend-mcp@latest install --agent qclaw` 并重启 QClaw。
+- 在包更新未生效时，可以使用已验证过的直接 MCP stdio JSON-RPC 方式调用 `start_recommend_pipeline_run`；该方式等价于原生 MCP tool 调用，不能改用 recruit/search 路径。
+
+普通 MCP 可用时：
+
+`start_recommend_pipeline_run` 仍是首选。
 
 禁止错误回退：
 
