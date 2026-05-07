@@ -41,6 +41,7 @@ import {
   closeRecommendDetail,
   createRecommendDetailNetworkRecorder,
   extractRecommendDetailCandidate,
+  isStaleRecommendNodeError,
   openRecommendCardDetailWithFreshRetry,
   waitForRecommendDetailNetworkEvents
 } from "./detail.js";
@@ -381,6 +382,7 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
 export function isRecoverableImageCaptureError(error) {
   const code = String(error?.code || "");
   if (code === "IMAGE_CAPTURE_TIMEOUT" || code === "IMAGE_CAPTURE_TOTAL_TIMEOUT") return true;
+  if (isStaleRecommendNodeError(error)) return true;
   return /Image fallback capture timed out/i.test(String(error?.message || error || ""));
 }
 
@@ -420,7 +422,7 @@ export function createRecoverableImageCaptureEvidence(error, {
     llm_total_byte_length: 0,
     llm_original_total_byte_length: 0,
     llm_composition_error: null,
-    error_code: error?.code || "IMAGE_CAPTURE_FAILED",
+    error_code: error?.code || (isStaleRecommendNodeError(error) ? "IMAGE_CAPTURE_STALE_NODE" : "IMAGE_CAPTURE_FAILED"),
     error: error?.message || String(error || "Image capture failed"),
     file_paths: filePaths,
     llm_file_paths: []
@@ -434,6 +436,27 @@ function createImageCaptureFailureScreening(candidate, error) {
     score: 0,
     reasons: ["image_capture_failed"],
     error: compactError(error, "IMAGE_CAPTURE_FAILED"),
+    candidate
+  };
+}
+
+export function isRecoverableRecommendDetailError(error) {
+  return isStaleRecommendNodeError(error);
+}
+
+function compactRecoverableDetailError(error) {
+  return compactError(error, isStaleRecommendNodeError(error) ? "DETAIL_STALE_NODE" : "DETAIL_OPEN_FAILED");
+}
+
+function createRecoverableDetailFailureScreening(candidate, error) {
+  return {
+    status: "fail",
+    passed: false,
+    score: 0,
+    reasons: isStaleRecommendNodeError(error)
+      ? ["detail_open_failed", "stale_node"]
+      : ["detail_open_failed"],
+    error: compactRecoverableDetailError(error),
     candidate
   };
 }
@@ -746,139 +769,149 @@ export async function runRecommendWorkflow({
 
     let screeningCandidate = cardCandidate;
     let detailResult = null;
+    let recoverableDetailError = null;
     if (index < effectiveDetailLimit) {
-      await runControl.waitIfPaused();
-      runControl.throwIfCanceled();
-      runControl.setPhase("recommend:detail");
-      rootState = await ensureRecommendViewport(rootState, "detail");
-      networkRecorder.clear();
-      const openedDetail = await openRecommendCardDetailWithFreshRetry(client, {
-        cardNodeId,
-        candidateKey,
-        cardCandidate,
-        rootState,
-        targetUrl,
-        maxAttempts: 2
-      });
-      addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
-      addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
-      cardNodeId = openedDetail.card_node_id || cardNodeId;
-      cardCandidate = openedDetail.card_candidate || cardCandidate;
-      screeningCandidate = cardCandidate;
-      const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
-      const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
-        waitForRecommendDetailNetworkEvents,
-        networkRecorder,
-        {
-          waitPlan,
-          minCount: 1,
-          requireLoaded: true,
-          intervalMs: 120
-        }
-      ));
-      if (networkWait?.elapsed_ms != null) {
-        timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
-      }
-      detailResult = await extractRecommendDetailCandidate(client, {
-        cardCandidate,
-        cardNodeId,
-        detailState: openedDetail.detail_state,
-        networkEvents: networkRecorder.events,
-        targetUrl,
-        closeDetail: false,
-        networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
-        networkParseIntervalMs: 250
-      });
-      addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
-
-      const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
-      let source = "network";
-      let imageEvidence = null;
-      if (parsedNetworkProfileCount > 0) {
-        recordCvNetworkHit(cvAcquisitionState, {
-          parsedNetworkProfileCount,
-          waitResult: networkWait
+      try {
+        await runControl.waitIfPaused();
+        runControl.throwIfCanceled();
+        runControl.setPhase("recommend:detail");
+        rootState = await ensureRecommendViewport(rootState, "detail");
+        networkRecorder.clear();
+        const openedDetail = await openRecommendCardDetailWithFreshRetry(client, {
+          cardNodeId,
+          candidateKey,
+          cardCandidate,
+          rootState,
+          targetUrl,
+          retryTimeoutMs: 8000,
+          maxAttempts: 3
         });
-      } else {
-        const captureNodeId = openedDetail.detail_state?.popup?.node_id
-          || openedDetail.detail_state?.resumeIframe?.node_id
-          || null;
-        if (captureNodeId) {
-          const imageEvidencePath = imageEvidenceFilePath({
-            imageOutputDir,
-            domain: "recommend",
-            runId: runControl?.runId,
-            index,
-            extension: "jpg"
-          });
-          try {
-            imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
-              filePath: imageEvidencePath,
-              format: "jpeg",
-              quality: 72,
-              optimize: true,
-              resizeMaxWidth: 1100,
-              captureViewport: true,
-              padding: 4,
-              maxScreenshots: maxImagePages,
-              wheelDeltaY: imageWheelDeltaY,
-              settleMs: 350,
-              scrollMethod: "dom-anchor-fallback-input",
-              stepTimeoutMs: 45000,
-              totalTimeoutMs: 90000,
-              duplicateStopCount: 1,
-              skipDuplicateScreenshots: true,
-              composeForLlm: true,
-              llmPagesPerImage: 3,
-              llmResizeMaxWidth: 1100,
-              llmQuality: 72,
-              metadata: {
-                domain: "recommend",
-                capture_mode: "scroll_sequence",
-                acquisition_reason: "network_miss_image_fallback",
-                run_candidate_index: index,
-                candidate_key: candidateKey
-              }
-            }));
-            source = "image";
-          } catch (error) {
-            if (!isRecoverableImageCaptureError(error)) throw error;
-            imageEvidence = createRecoverableImageCaptureEvidence(error, {
-              elapsedMs: timings.screenshot_capture_ms,
-              filePath: imageEvidencePath,
-              extension: "jpg",
-              maxScreenshots: maxImagePages
-            });
-            source = "image_capture_failed";
+        addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
+        addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
+        cardNodeId = openedDetail.card_node_id || cardNodeId;
+        cardCandidate = openedDetail.card_candidate || cardCandidate;
+        screeningCandidate = cardCandidate;
+        const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
+        const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
+          waitForRecommendDetailNetworkEvents,
+          networkRecorder,
+          {
+            waitPlan,
+            minCount: 1,
+            requireLoaded: true,
+            intervalMs: 120
           }
-          recordCvImageFallback(cvAcquisitionState, {
-            reason: source === "image_capture_failed"
-              ? "network_miss_image_capture_failed"
-              : "network_miss_image_fallback",
-            parsedNetworkProfileCount,
-            waitResult: networkWait,
-            imageEvidence
-          });
-        } else {
-          source = "missing_capture_node";
-          recordCvNetworkMiss(cvAcquisitionState, {
-            reason: "network_miss_no_capture_node",
+        ));
+        if (networkWait?.elapsed_ms != null) {
+          timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
+        }
+        detailResult = await extractRecommendDetailCandidate(client, {
+          cardCandidate,
+          cardNodeId,
+          detailState: openedDetail.detail_state,
+          networkEvents: networkRecorder.events,
+          targetUrl,
+          closeDetail: false,
+          networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
+          networkParseIntervalMs: 250
+        });
+        addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
+
+        const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
+        let source = "network";
+        let imageEvidence = null;
+        if (parsedNetworkProfileCount > 0) {
+          recordCvNetworkHit(cvAcquisitionState, {
             parsedNetworkProfileCount,
             waitResult: networkWait
           });
+        } else {
+          const captureNodeId = openedDetail.detail_state?.popup?.node_id
+            || openedDetail.detail_state?.resumeIframe?.node_id
+            || null;
+          if (captureNodeId) {
+            const imageEvidencePath = imageEvidenceFilePath({
+              imageOutputDir,
+              domain: "recommend",
+              runId: runControl?.runId,
+              index,
+              extension: "jpg"
+            });
+            try {
+              imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+                filePath: imageEvidencePath,
+                format: "jpeg",
+                quality: 72,
+                optimize: true,
+                resizeMaxWidth: 1100,
+                captureViewport: true,
+                padding: 4,
+                maxScreenshots: maxImagePages,
+                wheelDeltaY: imageWheelDeltaY,
+                settleMs: 350,
+                scrollMethod: "dom-anchor-fallback-input",
+                stepTimeoutMs: 45000,
+                totalTimeoutMs: 90000,
+                duplicateStopCount: 1,
+                skipDuplicateScreenshots: true,
+                composeForLlm: true,
+                llmPagesPerImage: 3,
+                llmResizeMaxWidth: 1100,
+                llmQuality: 72,
+                metadata: {
+                  domain: "recommend",
+                  capture_mode: "scroll_sequence",
+                  acquisition_reason: "network_miss_image_fallback",
+                  run_candidate_index: index,
+                  candidate_key: candidateKey
+                }
+              }));
+              source = "image";
+            } catch (error) {
+              if (!isRecoverableImageCaptureError(error)) throw error;
+              imageEvidence = createRecoverableImageCaptureEvidence(error, {
+                elapsedMs: timings.screenshot_capture_ms,
+                filePath: imageEvidencePath,
+                extension: "jpg",
+                maxScreenshots: maxImagePages
+              });
+              source = "image_capture_failed";
+            }
+            recordCvImageFallback(cvAcquisitionState, {
+              reason: source === "image_capture_failed"
+                ? "network_miss_image_capture_failed"
+                : "network_miss_image_fallback",
+              parsedNetworkProfileCount,
+              waitResult: networkWait,
+              imageEvidence
+            });
+          } else {
+            source = "missing_capture_node";
+            recordCvNetworkMiss(cvAcquisitionState, {
+              reason: "network_miss_no_capture_node",
+              parsedNetworkProfileCount,
+              waitResult: networkWait
+            });
+          }
         }
-      }
 
-      detailResult.image_evidence = imageEvidence;
-      detailResult.cv_acquisition = {
-        source,
-        mode_after: compactCvAcquisitionState(cvAcquisitionState).mode,
-        wait_plan: waitPlan,
-        network_wait: networkWait,
-        parsed_network_profile_count: parsedNetworkProfileCount,
-        image_evidence: summarizeImageEvidence(imageEvidence)
-      };
-      screeningCandidate = detailResult.candidate;
+        detailResult.image_evidence = imageEvidence;
+        detailResult.cv_acquisition = {
+          source,
+          mode_after: compactCvAcquisitionState(cvAcquisitionState).mode,
+          wait_plan: waitPlan,
+          network_wait: networkWait,
+          parsed_network_profile_count: parsedNetworkProfileCount,
+          image_evidence: summarizeImageEvidence(imageEvidence)
+        };
+        screeningCandidate = detailResult.candidate;
+      } catch (error) {
+        if (!isRecoverableRecommendDetailError(error)) throw error;
+        recoverableDetailError = error;
+        detailResult = null;
+        timings.detail_recovered_error = compactRecoverableDetailError(error);
+        await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+      }
     }
 
     await runControl.waitIfPaused();
@@ -886,7 +919,7 @@ export async function runRecommendWorkflow({
     runControl.setPhase("recommend:screening");
     let llmResult = null;
     if (useLlmScreening) {
-      if (detailResult?.image_evidence?.ok === false) {
+      if (recoverableDetailError || detailResult?.image_evidence?.ok === false) {
         llmResult = null;
       } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
@@ -910,7 +943,9 @@ export async function runRecommendWorkflow({
       }
       if (detailResult) detailResult.llm_result = llmResult;
     }
-    const screening = detailResult?.image_evidence?.ok === false
+    const screening = recoverableDetailError
+      ? createRecoverableDetailFailureScreening(screeningCandidate, recoverableDetailError)
+      : detailResult?.image_evidence?.ok === false
       ? createImageCaptureFailureScreening(screeningCandidate, {
         code: detailResult.image_evidence.error_code,
         message: detailResult.image_evidence.error
@@ -959,7 +994,9 @@ export async function runRecommendWorkflow({
       screening: compactScreening(screening),
       action_discovery: compactActionDiscovery(actionDiscovery),
       post_action: postActionResult,
-      error: detailResult?.image_evidence?.ok === false
+      error: recoverableDetailError
+        ? compactRecoverableDetailError(recoverableDetailError)
+        : detailResult?.image_evidence?.ok === false
         ? compactError({
           code: detailResult.image_evidence.error_code,
           message: detailResult.image_evidence.error
@@ -987,6 +1024,8 @@ export async function runRecommendWorkflow({
       greet_count: greetCount,
       post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
       image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
+      detail_open_failed: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "DETAIL_OPEN_FAILED").length,
+      transient_recovered: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_TIMEOUT" || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT").length,
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
       refresh_rounds: refreshRounds,
@@ -1050,6 +1089,9 @@ export async function runRecommendWorkflow({
     screened: results.length,
     detail_opened: results.filter((item) => item.detail).length,
     llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
+    detail_open_failed: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "DETAIL_OPEN_FAILED").length,
+    image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
+    transient_recovered: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_TIMEOUT" || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT").length,
     passed: results.filter((item) => item.screening.passed).length,
     greet_count: greetCount,
     post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,

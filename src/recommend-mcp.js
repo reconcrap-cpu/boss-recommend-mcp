@@ -288,6 +288,66 @@ function completionReason(status) {
   return null;
 }
 
+function normalizeErrorText(error = {}) {
+  return normalizeText([
+    error?.code || "",
+    error?.message || error || ""
+  ].join(" "));
+}
+
+function classifyRecommendRecovery(error = {}) {
+  const text = normalizeErrorText(error);
+  if (!text) return null;
+  if (/BOSS_LOGIN_REQUIRED/i.test(text)) return "login_required";
+  if (/Could not find node with given id|No node with given id|Node is detached|Cannot find node|DETAIL_STALE_NODE|IMAGE_CAPTURE_STALE_NODE/i.test(text)) {
+    return "transient_stale_dom";
+  }
+  if (/IMAGE_CAPTURE_TIMEOUT|IMAGE_CAPTURE_TOTAL_TIMEOUT|Image fallback capture timed out/i.test(text)) {
+    return "transient_image_capture";
+  }
+  if (/(?:aborted|abort|timeout|timed out|fetch failed|socket|network|ECONNRESET|ETIMEDOUT|EAI_AGAIN)/i.test(text)) {
+    return "transient_network_or_llm";
+  }
+  return null;
+}
+
+function buildConstrainedAgentRecovery(snapshot = {}, meta = {}, artifacts = null) {
+  const error = snapshot?.error || snapshot?.result?.error || null;
+  const classification = classifyRecommendRecovery(error);
+  if (!classification) return null;
+  const canRestartSameRequest = classification !== "login_required";
+  return {
+    policy_version: 1,
+    classification,
+    safe_for_outer_ai_agent: true,
+    recommended_action: canRestartSameRequest
+      ? "restart_same_recommend_request_only"
+      : "ask_user_to_login_then_retry_same_recommend_request",
+    package_requirement: "@reconcrap/boss-recommend-mcp@>=2.0.30",
+    run_id: snapshot?.runId || snapshot?.run_id || null,
+    retryable: true,
+    same_request_sources: {
+      instruction: "run.context.instruction",
+      confirmation: "run.context.confirmation",
+      overrides: "run.context.overrides",
+      follow_up: "run.context.follow_up"
+    },
+    constraints: [
+      "Do not change instruction, criteria, filters, job, page_scope, target_count, post_action, or max_greet_count.",
+      "Do not switch to search/recruit/chat and do not add follow_up.chat.",
+      "Do not summarize, translate, or rewrite criteria.",
+      "Do not ask the user to reconfirm business choices unless Boss login is required or the stored context is missing.",
+      "Use the same Chrome debug port and recommend page route."
+    ],
+    artifacts: artifacts ? {
+      run_state_path: artifacts.run_state_path || null,
+      checkpoint_path: artifacts.checkpoint_path || null,
+      report_json: artifacts.report_json || null,
+      output_csv: artifacts.output_csv || null
+    } : null
+  };
+}
+
 function ensureRecommendRunArtifacts(snapshot) {
   const artifacts = getRecommendRunArtifacts(snapshot?.runId || snapshot?.run_id);
   if (!artifacts) return null;
@@ -319,6 +379,7 @@ function ensureRecommendRunArtifacts(snapshot) {
       checkpoint,
       error: snapshot.error || null,
       last_message: snapshot.error?.message || snapshot.phase || snapshot.stage || null,
+      recovery: buildConstrainedAgentRecovery(snapshot, meta, artifacts),
       summary: artifactSummary,
       generated_at: new Date().toISOString()
     });
@@ -397,6 +458,7 @@ function buildLegacyRecommendResult(snapshot) {
     screen_params: clonePlain(meta.parsed?.screenParams || {}, {}),
     target_count_semantics: TARGET_COUNT_SEMANTICS,
     error: snapshot.error || null,
+    recovery: buildConstrainedAgentRecovery(snapshot, meta, artifacts),
     results: resultRows
   };
 }
@@ -411,6 +473,7 @@ function normalizeRunSnapshot(snapshot) {
     TERMINAL_STATUSES.has(snapshot.status)
     || snapshot.status === RUN_STATUS_PAUSED
   ) ? buildLegacyRecommendResult({ ...snapshot, progress }) : null;
+  const recovery = buildConstrainedAgentRecovery(snapshot, meta, artifacts);
   const oldContext = {
     workspace_root: meta.workspaceRoot || null,
     instruction: meta.args?.instruction || "",
@@ -451,6 +514,7 @@ function normalizeRunSnapshot(snapshot) {
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
     },
+    recovery,
     result: legacyResult,
     artifacts
   };
@@ -483,6 +547,7 @@ function persistRecommendRunSnapshot(snapshot, {
     control: normalized.control,
     resume: normalized.resume,
     error: normalized.error,
+    recovery: normalized.recovery,
     result: normalized.result,
     summary: normalized.summary,
     artifacts: normalized.artifacts

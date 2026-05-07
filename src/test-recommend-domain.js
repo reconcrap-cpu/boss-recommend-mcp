@@ -12,6 +12,7 @@ import {
   getRecommendPageScopeStatus,
   isActiveOption,
   isRecoverableImageCaptureError,
+  isRecoverableRecommendDetailError,
   isSafeFilterOptionLabel,
   isStaleRecommendNodeError,
   jobLabelMatches,
@@ -52,8 +53,12 @@ function testRecoverableImageCaptureEvidencePreservesPartialPages() {
     fs.writeFileSync(secondPage, "second");
     const error = new Error("Image fallback capture timed out during capture_screenshot_4 after 45000ms");
     error.code = "IMAGE_CAPTURE_TIMEOUT";
+    const staleError = new Error("Could not find node with given id");
 
     assert.equal(isRecoverableImageCaptureError(error), true);
+    assert.equal(isRecoverableImageCaptureError(staleError), true);
+    assert.equal(isRecoverableRecommendDetailError(staleError), true);
+    assert.equal(isRecoverableRecommendDetailError(new Error("Boss recommend page is not healthy")), false);
     assert.equal(isRecoverableImageCaptureError(new Error("Inspected target navigated or closed")), false);
     const evidence = createRecoverableImageCaptureEvidence(error, {
       elapsedMs: 45003,
@@ -66,6 +71,11 @@ function testRecoverableImageCaptureEvidencePreservesPartialPages() {
     assert.equal(evidence.screenshot_count, 2);
     assert.deepEqual(evidence.file_paths, [firstPage, secondPage]);
     assert.deepEqual(evidence.llm_file_paths, []);
+    const staleEvidence = createRecoverableImageCaptureEvidence(staleError, {
+      filePath: basePath,
+      maxScreenshots: 4
+    });
+    assert.equal(staleEvidence.error_code, "IMAGE_CAPTURE_STALE_NODE");
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

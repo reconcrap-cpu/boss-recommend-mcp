@@ -437,6 +437,44 @@ async function testRecommendActiveRunPersistsProgressToDisk() {
   assert.equal(completed.progress.processed, 1);
 }
 
+async function testRecommendFailedRunIncludesConstrainedRecoveryGuidance() {
+  installFakeConnector();
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:detail");
+    runControl.updateProgress({
+      card_count: 2,
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    runControl.checkpoint({
+      results: [
+        {
+          index: 0,
+          candidate_key: "recommend:id:test-stale",
+          candidate: { identity: { name: "候选人A" } },
+          screening: { passed: false, status: "fail", score: 0 }
+        }
+      ]
+    });
+    throw new Error("Could not find node with given id");
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 32);
+  assert.equal(started.status, "ACCEPTED");
+  const failed = await waitForRecommendRun(started.run_id, (run) => run?.status === "failed");
+  assert.equal(failed.recovery.classification, "transient_stale_dom");
+  assert.equal(failed.recovery.recommended_action, "restart_same_recommend_request_only");
+  assert.equal(failed.recovery.safe_for_outer_ai_agent, true);
+  assert.equal(failed.recovery.same_request_sources.instruction, "run.context.instruction");
+  assert.equal(failed.recovery.constraints.some((item) => item.includes("Do not switch")), true);
+  assert.equal(failed.result.recovery.classification, "transient_stale_dom");
+  const report = JSON.parse(fs.readFileSync(failed.result.report_json, "utf8"));
+  assert.equal(report.recovery.classification, "transient_stale_dom");
+  assert.equal(report.recovery.package_requirement, "@reconcrap/boss-recommend-mcp@>=2.0.30");
+}
+
 async function testRecommendMultiSelectFilterMapping() {
   installFakeConnector();
   let observedFilter = null;
@@ -673,6 +711,8 @@ async function main() {
     await testRecommendAsyncPauseResumeCancel();
     resetRecommendMcpStateForTests();
     await testRecommendActiveRunPersistsProgressToDisk();
+    resetRecommendMcpStateForTests();
+    await testRecommendFailedRunIncludesConstrainedRecoveryGuidance();
     resetRecommendMcpStateForTests();
     await testRecommendMultiSelectFilterMapping();
     resetRecommendMcpStateForTests();
