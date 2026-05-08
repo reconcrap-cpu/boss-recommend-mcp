@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "2.0.31",
+  "version": "2.0.32",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -24,6 +24,7 @@
     "test:run-state": "node src/test-run-state.js",
     "test:cdp-browser": "node src/test-cdp-browser.js",
     "test:core-capture": "node src/test-core-capture.js",
+    "test:core-cv-capture-target": "node src/test-core-cv-capture-target.js",
     "test:core-cv-acquisition": "node src/test-core-cv-acquisition.js",
     "test:core-greet-quota": "node src/test-core-greet-quota.js",
     "test:core-infinite-list": "node src/test-core-infinite-list.js",
@@ -72,6 +73,7 @@
     "live:chat-domain": "node scripts/live-chat-domain-smoke.js",
     "live:chat-run-service": "node scripts/live-chat-run-service-smoke.js",
     "live:chat-mcp": "node scripts/live-chat-mcp-smoke.js",
+    "live:cv-capture-target": "node scripts/live-cv-capture-target-smoke.js",
     "live:chat-phase10-full": "node scripts/live-chat-phase10-full.js",
     "live:chat-image-screening": "node scripts/live-chat-image-screening-smoke.js"
   },

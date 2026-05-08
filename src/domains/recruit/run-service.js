@@ -5,10 +5,12 @@ import {
   measureTiming
 } from "../../core/run/timing.js";
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
+import { waitForCvCaptureTarget } from "../../core/cv-capture-target/index.js";
 import {
   compactCvAcquisitionState,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
+  DEFAULT_MAX_IMAGE_PAGES,
   getCvNetworkWaitPlan,
   recordCvImageFallback,
   recordCvNetworkHit,
@@ -148,7 +150,7 @@ export async function runRecruitWorkflow({
   resetBeforeSearch = true,
   resetTimeoutMs = 180000,
   cityOptionTimeoutMs = 30000,
-  maxImagePages = 8,
+  maxImagePages = DEFAULT_MAX_IMAGE_PAGES,
   imageWheelDeltaY = 650,
   cvAcquisitionMode = "unknown",
   listMaxScrolls = 20,
@@ -434,15 +436,21 @@ export async function runRecruitWorkflow({
       const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
       let source = "network";
       let imageEvidence = null;
+      let captureTarget = null;
+      let captureTargetWait = null;
       if (parsedNetworkProfileCount > 0) {
         recordCvNetworkHit(cvAcquisitionState, {
           parsedNetworkProfileCount,
           waitResult: networkWait
         });
       } else {
-        const captureNodeId = openedDetail.detail_state?.popup?.node_id
-          || openedDetail.detail_state?.resumeIframe?.node_id
-          || null;
+        captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
+          domain: "recruit",
+          timeoutMs: 6000,
+          intervalMs: 250
+        });
+        captureTarget = captureTargetWait.target || null;
+        const captureNodeId = captureTarget?.node_id || null;
         if (captureNodeId) {
           imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
             filePath: imageEvidenceFilePath({
@@ -456,8 +464,8 @@ export async function runRecruitWorkflow({
             quality: 72,
             optimize: true,
             resizeMaxWidth: 1100,
-            captureViewport: true,
-            padding: 4,
+            captureViewport: false,
+            padding: 0,
             maxScreenshots: maxImagePages,
             wheelDeltaY: imageWheelDeltaY,
             settleMs: 350,
@@ -475,7 +483,9 @@ export async function runRecruitWorkflow({
               capture_mode: "scroll_sequence",
               acquisition_reason: "network_miss_image_fallback",
               run_candidate_index: index,
-              candidate_key: candidateKey
+              candidate_key: candidateKey,
+              capture_target: captureTarget,
+              capture_target_wait: captureTargetWait
             }
           }));
           source = "image";
@@ -506,7 +516,9 @@ export async function runRecruitWorkflow({
         wait_plan: waitPlan,
         network_wait: networkWait,
         parsed_network_profile_count: parsedNetworkProfileCount,
-        image_evidence: summarizeImageEvidence(imageEvidence)
+        image_evidence: summarizeImageEvidence(imageEvidence),
+        capture_target: captureTarget || null,
+        capture_target_wait: captureTargetWait
       };
       screeningCandidate = detailResult.candidate;
     }
@@ -648,7 +660,7 @@ export function createRecruitRunService({
     resetBeforeSearch = true,
     resetTimeoutMs = 180000,
     cityOptionTimeoutMs = 30000,
-    maxImagePages = 8,
+    maxImagePages = DEFAULT_MAX_IMAGE_PAGES,
     imageWheelDeltaY = 650,
     cvAcquisitionMode = "unknown",
     listMaxScrolls = 20,

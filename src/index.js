@@ -756,7 +756,7 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       max_image_pages: {
         type: "integer",
         minimum: 1,
-        description: "可选，图片简历 fallback 的滚动截图页数上限"
+        description: "可选，图片简历 fallback 的滚动截图页数上限，默认 24"
       },
       list_max_scrolls: {
         type: "integer",

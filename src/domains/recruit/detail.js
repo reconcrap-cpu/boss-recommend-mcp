@@ -19,8 +19,7 @@ import {
   RECRUIT_DETAIL_RESUME_IFRAME_SELECTORS
 } from "./constants.js";
 import {
-  getRecruitRoots,
-  queryFirstAcrossRoots
+  getRecruitRoots
 } from "./roots.js";
 
 export function matchesRecruitDetailNetwork(url) {
@@ -128,8 +127,8 @@ export async function waitForRecruitDetail(client, {
   let lastState = null;
   while (Date.now() - started <= timeoutMs) {
     const rootState = await getRecruitRoots(client);
-    const popup = await queryFirstAcrossRoots(client, rootState.roots, RECRUIT_DETAIL_POPUP_SELECTORS);
-    const resumeIframe = await queryFirstAcrossRoots(client, rootState.roots, RECRUIT_DETAIL_RESUME_IFRAME_SELECTORS);
+    const popup = await findVisibleDetailTarget(client, rootState.roots, RECRUIT_DETAIL_POPUP_SELECTORS);
+    const resumeIframe = await findVisibleDetailTarget(client, rootState.roots, RECRUIT_DETAIL_RESUME_IFRAME_SELECTORS);
     lastState = {
       iframe: rootState.iframe,
       roots: rootState.roots,
@@ -140,6 +139,31 @@ export async function waitForRecruitDetail(client, {
     await sleep(intervalMs);
   }
   return lastState;
+}
+
+async function findVisibleDetailTarget(client, roots, selectors) {
+  for (const root of roots) {
+    if (!root?.nodeId) continue;
+    for (const selector of selectors) {
+      const nodeIds = await querySelectorAll(client, root.nodeId, selector);
+      for (const nodeId of nodeIds) {
+        try {
+          const box = await getNodeBox(client, nodeId);
+          if (box.rect.width > 2 && box.rect.height > 2) {
+            return {
+              root: root.name,
+              root_node_id: root.nodeId,
+              selector,
+              node_id: nodeId,
+              center: box.center,
+              rect: box.rect
+            };
+          }
+        } catch {}
+      }
+    }
+  }
+  return null;
 }
 
 export async function readRecruitDetailHtml(client, detailState) {

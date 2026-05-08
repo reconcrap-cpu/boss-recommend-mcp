@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import {
+  DEFAULT_MAX_IMAGE_PAGES,
   NETWORK_RESUME_IMAGE_MODE_GRACE_MS,
   NETWORK_RESUME_RETRY_WAIT_MS,
   NETWORK_RESUME_WAIT_MS,
@@ -15,6 +16,10 @@ import {
   summarizeImageEvidence,
   waitForCvNetworkEvents
 } from "./core/cv-acquisition/index.js";
+
+function testDefaultImagePageCap() {
+  assert.equal(DEFAULT_MAX_IMAGE_PAGES, 24);
+}
 
 function testWaitPlans() {
   const state = createCvAcquisitionState();
@@ -150,6 +155,7 @@ async function testImageModeSkipsRetry() {
   assert.equal(result.stages.length, 1);
 }
 
+testDefaultImagePageCap();
 testWaitPlans();
 testStateTransitions();
 testProfileCountingAndEvidenceSummary();

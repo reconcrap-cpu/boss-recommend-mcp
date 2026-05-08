@@ -36,6 +36,7 @@ import {
   resolveBossConfiguredOutputDir,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
+import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const RUN_MODE_ASYNC = "async";
 const RUN_MODE_SYNC = "sync";
@@ -855,6 +856,7 @@ function getRunOptions(args, parsed, session, configResolution = null) {
     resetBeforeSearch: args.reset_search !== false,
     resetTimeoutMs: slowLive ? 300000 : 180000,
     cityOptionTimeoutMs: slowLive ? 60000 : 30000,
+    maxImagePages: parsePositiveInteger(args.max_image_pages, DEFAULT_MAX_IMAGE_PAGES),
     screeningMode,
     llmConfig: screeningMode === "llm" && configResolution?.ok ? {
       ...configResolution.config

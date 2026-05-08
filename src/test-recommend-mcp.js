@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
+import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const {
   handleRequest,
@@ -278,6 +279,7 @@ async function testRecommendDetailLimitDefaultsToTargetCount() {
   const observedOptions = await observeRecommendWorkflowOptions(readyArgs(), 12);
   assert.equal(observedOptions.maxCandidates, 3);
   assert.equal(observedOptions.detailLimit, 3);
+  assert.equal(observedOptions.maxImagePages, DEFAULT_MAX_IMAGE_PAGES);
 }
 
 async function testRecommendDetailLimitZeroRequiresDebugFlag() {

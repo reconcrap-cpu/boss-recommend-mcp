@@ -82,7 +82,7 @@ function testChatResumeCaptureTarget() {
     content: { node_id: 101 },
     popup: { node_id: 202 },
     resumeIframe: { node_id: 303 }
-  }), 202);
+  }), 101);
   assert.equal(captureNodeIdFromResumeState({
     content: { node_id: 101 },
     resumeIframe: { node_id: 303 }
@@ -90,6 +90,9 @@ function testChatResumeCaptureTarget() {
   assert.equal(captureNodeIdFromResumeState({
     resumeIframe: { node_id: 303 }
   }), 303);
+  assert.equal(captureNodeIdFromResumeState({
+    popup: { node_id: 202 }
+  }), 202);
   assert.equal(captureNodeIdFromResumeState(null), null);
 }
 

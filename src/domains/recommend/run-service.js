@@ -7,12 +7,14 @@ import {
   measureTiming
 } from "../../core/run/timing.js";
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
+import { waitForCvCaptureTarget } from "../../core/cv-capture-target/index.js";
 import { sleep } from "../../core/browser/index.js";
 import { GREET_CREDITS_EXHAUSTED_CODE } from "../../core/greet-quota/index.js";
 import {
   compactCvAcquisitionState,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
+  DEFAULT_MAX_IMAGE_PAGES,
   getCvNetworkWaitPlan,
   recordCvImageFallback,
   recordCvNetworkHit,
@@ -404,7 +406,7 @@ export function createRecoverableImageCaptureEvidence(error, {
   elapsedMs = 0,
   filePath = "",
   extension = "jpg",
-  maxScreenshots = 8
+  maxScreenshots = DEFAULT_MAX_IMAGE_PAGES
 } = {}) {
   const filePaths = collectPartialImageEvidencePaths(filePath, extension, maxScreenshots);
   return {
@@ -474,7 +476,7 @@ export async function runRecommendWorkflow({
   closeDetail = true,
   delayMs = 0,
   cardTimeoutMs = 10000,
-  maxImagePages = 8,
+  maxImagePages = DEFAULT_MAX_IMAGE_PAGES,
   imageWheelDeltaY = 650,
   cvAcquisitionMode = "unknown",
   listMaxScrolls = 20,
@@ -820,15 +822,21 @@ export async function runRecommendWorkflow({
         const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
         let source = "network";
         let imageEvidence = null;
+        let captureTarget = null;
+        let captureTargetWait = null;
         if (parsedNetworkProfileCount > 0) {
           recordCvNetworkHit(cvAcquisitionState, {
             parsedNetworkProfileCount,
             waitResult: networkWait
           });
         } else {
-          const captureNodeId = openedDetail.detail_state?.popup?.node_id
-            || openedDetail.detail_state?.resumeIframe?.node_id
-            || null;
+          captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
+            domain: "recommend",
+            timeoutMs: 6000,
+            intervalMs: 250
+          });
+          captureTarget = captureTargetWait.target || null;
+          const captureNodeId = captureTarget?.node_id || null;
           if (captureNodeId) {
             const imageEvidencePath = imageEvidenceFilePath({
               imageOutputDir,
@@ -844,8 +852,8 @@ export async function runRecommendWorkflow({
                 quality: 72,
                 optimize: true,
                 resizeMaxWidth: 1100,
-                captureViewport: true,
-                padding: 4,
+                captureViewport: false,
+                padding: 0,
                 maxScreenshots: maxImagePages,
                 wheelDeltaY: imageWheelDeltaY,
                 settleMs: 350,
@@ -863,7 +871,9 @@ export async function runRecommendWorkflow({
                   capture_mode: "scroll_sequence",
                   acquisition_reason: "network_miss_image_fallback",
                   run_candidate_index: index,
-                  candidate_key: candidateKey
+                  candidate_key: candidateKey,
+                  capture_target: captureTarget,
+                  capture_target_wait: captureTargetWait
                 }
               }));
               source = "image";
@@ -902,7 +912,9 @@ export async function runRecommendWorkflow({
           wait_plan: waitPlan,
           network_wait: networkWait,
           parsed_network_profile_count: parsedNetworkProfileCount,
-          image_evidence: summarizeImageEvidence(imageEvidence)
+          image_evidence: summarizeImageEvidence(imageEvidence),
+          capture_target: captureTarget || null,
+          capture_target_wait: captureTargetWait
         };
         screeningCandidate = detailResult.candidate;
       } catch (error) {
@@ -1120,7 +1132,7 @@ export function createRecommendRunService({
     closeDetail = true,
     delayMs = 0,
     cardTimeoutMs = 10000,
-    maxImagePages = 8,
+    maxImagePages = DEFAULT_MAX_IMAGE_PAGES,
     imageWheelDeltaY = 650,
     cvAcquisitionMode = "unknown",
     listMaxScrolls = 20,

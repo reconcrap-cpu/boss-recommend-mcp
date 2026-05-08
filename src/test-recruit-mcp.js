@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
+import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const {
   handleRequest,
@@ -155,6 +156,7 @@ async function testRecruitDefaultsUseScreeningConfig() {
   assert.equal(payload.chrome.port, 9444);
   assert.equal(observedOptions.screeningMode, "llm");
   assert.equal(observedOptions.detailLimit, 3);
+  assert.equal(observedOptions.maxImagePages, DEFAULT_MAX_IMAGE_PAGES);
   assert.equal(observedOptions.llmConfig.apiKey, "sk-test-key");
   assert.equal(observedOptions.llmConfig.baseUrl, "https://api.example.com/v1");
   assert.equal(observedOptions.llmConfig.model, "gpt-4.1-mini");

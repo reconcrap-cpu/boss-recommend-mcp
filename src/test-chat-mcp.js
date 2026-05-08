@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
+import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const {
   handleRequest,
@@ -219,6 +220,7 @@ async function testChatAsyncPauseResumeCancel() {
     assert.equal(options.maxCandidates, 100000);
     assert.equal(options.detailLimit, 100000);
     assert.equal(options.screeningMode, "llm");
+    assert.equal(options.maxImagePages, DEFAULT_MAX_IMAGE_PAGES);
     assert.equal(options.llmConfig.apiKey, "sk-test-key");
     for (let index = 0; index < 4; index += 1) {
       await runControl.waitIfPaused();

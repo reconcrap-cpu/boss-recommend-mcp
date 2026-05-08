@@ -1,4 +1,5 @@
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
+import { waitForCvCaptureTarget } from "../../core/cv-capture-target/index.js";
 import {
   clickPoint,
   getNodeBox,
@@ -9,6 +10,7 @@ import {
   compactCvAcquisitionState,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
+  DEFAULT_MAX_IMAGE_PAGES,
   getCvNetworkWaitPlan,
   recordCvImageFallback,
   recordCvNetworkHit,
@@ -205,9 +207,9 @@ function llmToScreening(llmResult, candidate) {
 }
 
 export function captureNodeIdFromResumeState(resumeState) {
-  return resumeState?.popup?.node_id
-    || resumeState?.content?.node_id
+  return resumeState?.content?.node_id
     || resumeState?.resumeIframe?.node_id
+    || resumeState?.popup?.node_id
     || null;
 }
 
@@ -641,7 +643,7 @@ export async function runChatWorkflow({
   readyTimeoutMs = 60000,
   onlineResumeButtonTimeoutMs = 30000,
   resumeDomTimeoutMs = 60000,
-  maxImagePages = 8,
+  maxImagePages = DEFAULT_MAX_IMAGE_PAGES,
   imageWheelDeltaY = 650,
   cvAcquisitionMode = "unknown",
   callLlmOnImage = false,
@@ -1231,11 +1233,19 @@ export async function runChatWorkflow({
           let source = normalizedDetailSource === "dom" ? "dom" : "network";
           let imageEvidence = null;
           let llmResult = null;
-          const captureNodeId = captureNodeIdFromResumeState(resumeState);
+          let captureTarget = null;
+          let captureTargetWait = null;
           let fullCvEvidence = summarizeChatFullCvEvidence({ detailResult, contentWait });
           const shouldCaptureImage = normalizedDetailSource === "image"
             || (normalizedDetailSource === "cascade" && !fullCvEvidence.full_cv_acquired);
           if (shouldCaptureImage) {
+            captureTargetWait = await waitForCvCaptureTarget(client, resumeState, {
+              domain: "chat",
+              timeoutMs: 6000,
+              intervalMs: 250
+            });
+            captureTarget = captureTargetWait.target || null;
+            const captureNodeId = captureTarget?.node_id || null;
             if (captureNodeId) {
               detailStep = "capture_image_fallback";
               imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
@@ -1277,7 +1287,9 @@ export async function runChatWorkflow({
                     ? "forced_image"
                     : "network_miss_image_fallback",
                   run_candidate_index: index,
-                  candidate_key: candidateKey
+                  candidate_key: candidateKey,
+                  capture_target: captureTarget,
+                  capture_target_wait: captureTargetWait
                 }
               }));
               source = "image";
@@ -1421,6 +1433,8 @@ export async function runChatWorkflow({
             },
             parsed_network_profile_count: parsedNetworkProfileCount,
             image_evidence: summarizeImageEvidence(imageEvidence),
+            capture_target: captureTarget || null,
+            capture_target_wait: captureTargetWait,
             full_cv_evidence: fullCvEvidence
           };
         }
@@ -1605,7 +1619,7 @@ export function createChatRunService({
     readyTimeoutMs = 60000,
     onlineResumeButtonTimeoutMs = 30000,
     resumeDomTimeoutMs = 60000,
-    maxImagePages = 8,
+    maxImagePages = DEFAULT_MAX_IMAGE_PAGES,
     imageWheelDeltaY = 650,
     cvAcquisitionMode = "unknown",
     callLlmOnImage = false,

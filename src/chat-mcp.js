@@ -50,6 +50,7 @@ import {
   resolveBossChatRuntimeLayout,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
+import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const DEFAULT_CHAT_HOST = "127.0.0.1";
 const DEFAULT_CHAT_PORT = 9222;
@@ -1100,7 +1101,7 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
       slowLive ? 30000 : 15000
     ),
     resumeDomTimeoutMs: slowLive ? 120000 : 60000,
-    maxImagePages: parsePositiveInteger(args.max_image_pages, 8),
+    maxImagePages: parsePositiveInteger(args.max_image_pages, DEFAULT_MAX_IMAGE_PAGES),
     imageWheelDeltaY: parsePositiveInteger(args.image_wheel_delta_y, 650),
     llmConfig: resolvedConfig.ok ? {
       ...resolvedConfig.config
