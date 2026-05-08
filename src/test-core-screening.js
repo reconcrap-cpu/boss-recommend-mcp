@@ -535,6 +535,65 @@ async function testCallScreeningLlmDefaultsThinkingLow() {
   }
 }
 
+async function testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao() {
+  const originalFetch = globalThis.fetch;
+  let payload = null;
+  globalThis.fetch = async (_url, options) => {
+    payload = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": true}",
+                role: "assistant",
+                provider_specific_fields: {
+                  reasoning_content: "proxy nested reasoning"
+                }
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: {
+            total_tokens: 16,
+            completion_tokens_details: {
+              reasoning_tokens: 8
+            }
+          }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "doubao-openai-proxy",
+        text: "张三\n算法工程师\n本科"
+      }),
+      criteria: "算法经验",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "doubao-seed-2.0-code"
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(result.passed, true);
+    assert.deepEqual(payload.thinking, { type: "enabled" });
+    assert.equal(payload.reasoning_effort, "low");
+    assert.equal(result.reasoning_content, "proxy nested reasoning");
+    assert.equal(result.cot, "proxy nested reasoning");
+    assert.equal(result.provider.reasoning_effort, "low");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testCallScreeningLlmUsesConfigThinkingAndBudget() {
   const originalFetch = globalThis.fetch;
   let payload = null;
@@ -736,6 +795,7 @@ testBuildScreeningLlmMessages();
 testBuildScreeningLlmMessagesWithImages();
 testBuildScreeningLlmImageInputsPrefersComposedFullCvImages();
 await testCallScreeningLlmDefaultsThinkingLow();
+await testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao();
 await testCallScreeningLlmUsesConfigThinkingAndBudget();
 await testCallScreeningLlmRetriesTransientFailure();
 await testCallScreeningLlmFallsBackToNextConfiguredModel();

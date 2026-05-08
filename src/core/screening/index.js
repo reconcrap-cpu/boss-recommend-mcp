@@ -130,6 +130,14 @@ function isVolcengineModel(baseUrl, model) {
   return /volces|volcengine|ark\.cn|doubao|seed/i.test(`${baseUrl || ""} ${model || ""}`);
 }
 
+function isNativeVolcengineBaseUrl(baseUrl) {
+  return /volces|volcengine|ark\.cn/i.test(String(baseUrl || ""));
+}
+
+function isOpenAiCompatibleV1BaseUrl(baseUrl) {
+  return /(?:^|\/)v1(?:\/)?$/i.test(normalizeBaseUrl(baseUrl));
+}
+
 function applyChatCompletionThinking(payload, { baseUrl = "", model = "", thinkingLevel = "" } = {}) {
   const level = normalizeLlmThinkingLevel(thinkingLevel);
   if (!level || level === "current" || level === "auto") return payload;
@@ -138,6 +146,9 @@ function applyChatCompletionThinking(payload, { baseUrl = "", model = "", thinki
       payload.thinking = { type: "disabled" };
     } else {
       payload.thinking = { type: "enabled" };
+    }
+    if (!isNativeVolcengineBaseUrl(baseUrl) && isOpenAiCompatibleV1BaseUrl(baseUrl)) {
+      payload.reasoning_effort = level === "off" ? "minimal" : level;
     }
     return payload;
   }
@@ -463,13 +474,21 @@ function collectLlmReasoningText(choice = {}) {
   const message = choice?.message || {};
   return [
     message.reasoning_content,
+    message.provider_specific_fields?.reasoning_content,
     message.reasoning,
+    message.provider_specific_fields?.reasoning,
     message.cot,
+    message.provider_specific_fields?.cot,
     message.chain_of_thought,
+    message.provider_specific_fields?.chain_of_thought,
     choice.reasoning_content,
+    choice.provider_specific_fields?.reasoning_content,
     choice.reasoning,
+    choice.provider_specific_fields?.reasoning,
     choice.cot,
-    choice.chain_of_thought
+    choice.provider_specific_fields?.cot,
+    choice.chain_of_thought,
+    choice.provider_specific_fields?.chain_of_thought
   ].map(flattenChatMessageContent).map(normalizeBlockText).filter(Boolean).join("\n\n");
 }
 
