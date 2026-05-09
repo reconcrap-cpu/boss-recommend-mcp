@@ -3,7 +3,10 @@ import {
   RUN_STATUS_CANCELED,
   RUN_STATUS_PAUSED
 } from "./core/run/index.js";
-import { createRecommendRunService } from "./domains/recommend/index.js";
+import {
+  countRecommendResultStatuses,
+  createRecommendRunService
+} from "./domains/recommend/index.js";
 
 async function waitUntil(predicate, timeoutMs = 2500) {
   const started = Date.now();
@@ -193,8 +196,51 @@ async function testDetailLimitDefaultsToUnlimitedForPassTarget() {
   assert.equal(observedOptions.detailLimit, null);
 }
 
+function testRecommendStatusCountersPreserveProgressAfterRecovery() {
+  const counts = countRecommendResultStatuses([
+    {
+      screening: { passed: true },
+      detail: {
+        llm_screening: { status: "pass" },
+        image_evidence: { ok: true }
+      },
+      post_action: { action_clicked: true }
+    },
+    {
+      screening: { passed: false },
+      detail: null,
+      llm_screening: null,
+      error: { code: "DETAIL_STALE_NODE" }
+    },
+    {
+      screening: { passed: false },
+      detail: {
+        image_evidence: {
+          ok: false,
+          error_code: "IMAGE_CAPTURE_TIMEOUT"
+        }
+      },
+      error: { code: "IMAGE_CAPTURE_TIMEOUT" }
+    }
+  ], {
+    greetCount: 1
+  });
+
+  assert.equal(counts.processed, 3);
+  assert.equal(counts.screened, 3);
+  assert.equal(counts.detail_opened, 2);
+  assert.equal(counts.passed, 1);
+  assert.equal(counts.llm_screened, 1);
+  assert.equal(counts.greet_count, 1);
+  assert.equal(counts.post_action_clicked, 1);
+  assert.equal(counts.detail_open_failed, 1);
+  assert.equal(counts.image_capture_failed, 1);
+  assert.equal(counts.transient_recovered, 2);
+}
+
 await testLifecycleDelegation();
 await testPostActionOptionDelegation();
 await testDetailLimitDefaultsToUnlimitedForPassTarget();
+testRecommendStatusCountersPreserveProgressAfterRecovery();
 
 console.log("recommend run service tests passed");

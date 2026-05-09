@@ -4,9 +4,12 @@ import { GREET_CREDITS_EXHAUSTED_CODE } from "./core/greet-quota/index.js";
 import { RUN_STATUS_COMPLETED } from "./core/run/index.js";
 import {
   buildRecruitJobTitleSearchTerms,
+  buildRecruitRefreshSearchParams,
+  countRecruitResultStatuses,
   createRecruitRunService,
   chooseRecruitTextCandidate,
   clickRecruitActionControl,
+  isRecoverableRecruitDetailError,
   isRecruitNationalCity,
   matchesRecruitDetailNetwork,
   normalizeRecruitSearchLabel,
@@ -170,11 +173,49 @@ async function testRecruitGreetQuotaClickGuard() {
   );
 }
 
+function testRecruitRecoveryHelpers() {
+  const refreshParams = buildRecruitRefreshSearchParams({
+    keyword: "LLM",
+    filter_recent_viewed: false
+  });
+  assert.equal(refreshParams.keyword, "LLM");
+  assert.equal(refreshParams.filter_recent_viewed, true);
+  assert.equal(
+    isRecoverableRecruitDetailError(new Error("Could not find node with given id")),
+    true
+  );
+
+  const counts = countRecruitResultStatuses([
+    {
+      screening: { passed: true },
+      detail: { llm_screening: { status: "pass" }, image_evidence: { ok: true } }
+    },
+    {
+      screening: { passed: false },
+      detail: null,
+      error: { code: "DETAIL_STALE_NODE" }
+    },
+    {
+      screening: { passed: false },
+      detail: { image_evidence: { ok: false, error_code: "IMAGE_CAPTURE_TIMEOUT" } },
+      error: { code: "IMAGE_CAPTURE_TIMEOUT" }
+    }
+  ]);
+  assert.equal(counts.processed, 3);
+  assert.equal(counts.detail_opened, 2);
+  assert.equal(counts.passed, 1);
+  assert.equal(counts.llm_screened, 1);
+  assert.equal(counts.detail_open_failed, 1);
+  assert.equal(counts.image_capture_failed, 1);
+  assert.equal(counts.transient_recovered, 2);
+}
+
 testParserImportSemantics();
 testNetworkPatterns();
 testSearchParamHelpers();
 await testCardCandidateReader();
 await testRunServiceLifecycle();
 await testRecruitGreetQuotaClickGuard();
+testRecruitRecoveryHelpers();
 
 console.log("recruit domain tests passed");

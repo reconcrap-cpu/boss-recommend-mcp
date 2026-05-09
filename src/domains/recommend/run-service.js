@@ -65,7 +65,8 @@ import {
   RECOMMEND_BOTTOM_MARKER_SELECTORS,
   RECOMMEND_CARD_SELECTOR,
   RECOMMEND_END_REFRESH_SELECTOR,
-  RECOMMEND_LIST_CONTAINER_SELECTORS
+  RECOMMEND_LIST_CONTAINER_SELECTORS,
+  RECOMMEND_TARGET_URL
 } from "./constants.js";
 import {
   clickRecommendActionControl,
@@ -355,6 +356,7 @@ function compactRefreshAttempt(refreshAttempt) {
     ok: Boolean(refreshAttempt.ok),
     method: refreshAttempt.method || "",
     forced_recent_not_view: Boolean(refreshAttempt.forced_recent_not_view),
+    target_url: refreshAttempt.target_url || null,
     card_count: refreshAttempt.card_count || 0,
     attempts: (refreshAttempt.attempts || []).map((attempt) => ({
       ok: Boolean(attempt.ok),
@@ -364,13 +366,39 @@ function compactRefreshAttempt(refreshAttempt) {
       before_card_count: attempt.before_card_count || 0,
       after_card_count: attempt.after_card_count || 0
     })),
+    job_selection: compactJobSelection(refreshAttempt.job_selection),
     page_scope: compactPageScopeSelection(refreshAttempt.page_scope),
     filter: compactFilterResult(refreshAttempt.filter)
   };
 }
 
+export function countRecommendResultStatuses(results = [], {
+  greetCount = 0
+} = {}) {
+  return {
+    processed: results.length,
+    screened: results.length,
+    detail_opened: results.filter((item) => item.detail).length,
+    passed: results.filter((item) => item.screening?.passed).length,
+    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
+    greet_count: greetCount,
+    post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
+    image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
+    detail_open_failed: results.filter((item) => (
+      item.error?.code === "DETAIL_STALE_NODE"
+      || item.error?.code === "DETAIL_OPEN_FAILED"
+    )).length,
+    transient_recovered: results.filter((item) => (
+      item.error?.code === "DETAIL_STALE_NODE"
+      || item.error?.code === "IMAGE_CAPTURE_STALE_NODE"
+      || item.error?.code === "IMAGE_CAPTURE_TIMEOUT"
+      || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT"
+    )).length
+  };
+}
+
 function countPassedResults(results = []) {
-  return results.filter((item) => item?.screening?.passed).length;
+  return countRecommendResultStatuses(results).passed;
 }
 
 function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
@@ -379,6 +407,13 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
     code: error.code || fallbackCode,
     message: error.message || String(error)
   };
+}
+
+function createRecommendCloseFailureError(closeResult) {
+  const error = new Error(closeResult?.reason || "Recommend detail did not close before recovery");
+  error.code = "DETAIL_CLOSE_FAILED";
+  error.close_result = closeResult || null;
+  return error;
 }
 
 export function isRecoverableImageCaptureError(error) {
@@ -535,7 +570,9 @@ export async function runRecommendWorkflow({
   const results = [];
   const refreshAttempts = [];
   let refreshRounds = 0;
+  let contextRecoveryAttempts = 0;
   let greetCount = 0;
+  const candidateRecoveryCounts = new Map();
   let jobSelection = null;
   let pageScopeSelection = null;
   let filterResult = null;
@@ -549,6 +586,121 @@ export async function runRecommendWorkflow({
     viewportPoint: { xRatio: 0.28, yRatio: 0.5 },
     validateViewportPoint: true
   }));
+
+  function updateRecommendProgress(extra = {}) {
+    const counts = countRecommendResultStatuses(results, { greetCount });
+    const listSnapshot = compactInfiniteListState(listState);
+    runControl.updateProgress({
+      card_count: cardNodeIds.length,
+      target_count: targetPassCount,
+      target_count_semantics: "passed_candidates",
+      ...counts,
+      screening_mode: normalizedScreeningMode,
+      unique_seen: listSnapshot.seen_count,
+      scroll_count: listSnapshot.scroll_count,
+      refresh_rounds: refreshRounds,
+      refresh_attempts: refreshAttempts.length,
+      context_recoveries: contextRecoveryAttempts,
+      list_end_reason: listEndReason || null,
+      viewport_checks: viewportGuard.getStats().checks,
+      viewport_recoveries: viewportGuard.getStats().recoveries,
+      ...extra
+    });
+  }
+
+  function checkpointInProgressCandidate({
+    index = results.length,
+    candidateKey = "",
+    cardNodeId = null,
+    detailStep = "",
+    error = null
+  } = {}) {
+    runControl.checkpoint({
+      in_progress_candidate: {
+        index,
+        key: candidateKey,
+        card_node_id: cardNodeId,
+        detail_step: detailStep || null,
+        counters: countRecommendResultStatuses(results, { greetCount }),
+        error: compactError(error, "RECOMMEND_IN_PROGRESS_ERROR")
+      },
+      candidate_list: compactInfiniteListState(listState)
+    });
+  }
+
+  async function recoverAndReapplyRecommendContext(reason = "context_recovery", error = null, {
+    forceRecentNotView = true
+  } = {}) {
+    await runControl.waitIfPaused();
+    runControl.throwIfCanceled();
+    const started = Date.now();
+    runControl.setPhase("recommend:recover-context");
+    contextRecoveryAttempts += 1;
+    const refreshResult = await refreshRecommendListAtEnd(client, {
+      rootState,
+      jobLabel,
+      pageScope: pageScopeSelection?.effective_scope || requestedPageScope,
+      fallbackPageScope: normalizedFallbackPageScope,
+      filter: normalizedFilter,
+      preferEndRefreshButton: false,
+      forceNavigate: true,
+      targetUrl: targetUrl || RECOMMEND_TARGET_URL,
+      forceRecentNotView,
+      cardTimeoutMs,
+      buttonSettleMs: refreshButtonSettleMs,
+      reloadSettleMs: refreshReloadSettleMs
+    });
+    const compactRefresh = {
+      ...compactRefreshAttempt(refreshResult),
+      context_recovery: true,
+      recovery_reason: reason,
+      trigger_error: compactError(error, "RECOMMEND_CONTEXT_RECOVERY_TRIGGER"),
+      elapsed_ms: Date.now() - started
+    };
+    refreshAttempts.push(compactRefresh);
+    runControl.checkpoint({
+      context_recovery: {
+        attempt: contextRecoveryAttempts,
+        reason,
+        trigger_error: compactError(error, "RECOMMEND_CONTEXT_RECOVERY_TRIGGER"),
+        refresh: compactRefresh,
+        counters: countRecommendResultStatuses(results, { greetCount })
+      },
+      candidate_list: compactInfiniteListState(listState)
+    });
+    if (!refreshResult.ok) {
+      updateRecommendProgress({
+        refresh_method: refreshResult.method || null,
+        refresh_forced_recent_not_view: forceRecentNotView,
+        recovery_reason: reason
+      });
+      throw new Error(`Recommend context recovery failed after ${reason}: ${refreshResult.reason || refreshResult.error || "refresh returned no cards"}`);
+    }
+    rootState = refreshResult.root_state || await getRecommendRoots(client);
+    rootState = await ensureRecommendViewport(rootState, "recover_after");
+    cardNodeIds = await waitForRecommendCardNodeIds(client, rootState.iframe.documentNodeId, {
+      timeoutMs: cardTimeoutMs,
+      intervalMs: 300
+    });
+    resetInfiniteListForRefreshRound(listState, {
+      reason: `context_recovery:${reason}`,
+      round: contextRecoveryAttempts,
+      method: refreshResult.method,
+      metadata: {
+        card_count: cardNodeIds.length,
+        forced_recent_not_view: forceRecentNotView,
+        counters: countRecommendResultStatuses(results, { greetCount })
+      }
+    });
+    listEndReason = "";
+    updateRecommendProgress({
+      card_count: cardNodeIds.length,
+      refresh_method: refreshResult.method || null,
+      refresh_forced_recent_not_view: forceRecentNotView,
+      recovery_reason: reason
+    });
+    return refreshResult;
+  }
 
   runControl.setPhase("recommend:cleanup");
   await closeRecommendDetail(client, { attemptsLimit: 2 });
@@ -630,24 +782,8 @@ export async function runRecommendWorkflow({
     throw new Error("No recommend candidate cards found for run service");
   }
 
-  runControl.updateProgress({
-    card_count: cardNodeIds.length,
-    target_count: targetPassCount,
-    target_count_semantics: "passed_candidates",
-    processed: 0,
-    screened: 0,
-    detail_opened: 0,
-    passed: 0,
-    greet_count: 0,
-    post_action_clicked: 0,
-    screening_mode: normalizedScreeningMode,
-    llm_screened: 0,
-    unique_seen: compactInfiniteListState(listState).seen_count,
-    scroll_count: 0,
-    refresh_rounds: 0,
-    refresh_attempts: 0,
-    viewport_checks: viewportGuard.getStats().checks,
-    viewport_recoveries: viewportGuard.getStats().recoveries
+  updateRecommendProgress({
+    list_end_reason: null
   });
 
   while (countPassedResults(results) < targetPassCount) {
@@ -722,24 +858,11 @@ export async function runRecommendWorkflow({
           refresh_round: refreshRounds,
           refresh: compactRefresh
         });
-        runControl.updateProgress({
+        updateRecommendProgress({
           card_count: refreshResult.card_count || cardNodeIds.length,
-          target_count: targetPassCount,
-          target_count_semantics: "passed_candidates",
-          processed: results.length,
-          screened: results.length,
-          detail_opened: results.filter((item) => item.detail).length,
-          passed: results.filter((item) => item.screening.passed).length,
-          llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-          unique_seen: compactInfiniteListState(listState).seen_count,
-          scroll_count: compactInfiniteListState(listState).scroll_count,
-          refresh_rounds: refreshRounds,
-          refresh_attempts: refreshAttempts.length,
           refresh_method: refreshResult.method || null,
           refresh_forced_recent_not_view: true,
-          list_end_reason: listEndReason,
-          viewport_checks: viewportGuard.getStats().checks,
-          viewport_recoveries: viewportGuard.getStats().recoveries
+          list_end_reason: listEndReason
         });
         if (refreshResult.ok) {
           rootState = refreshResult.root_state || await getRecommendRoots(client);
@@ -772,12 +895,16 @@ export async function runRecommendWorkflow({
     let screeningCandidate = cardCandidate;
     let detailResult = null;
     let recoverableDetailError = null;
+    let detailStep = "not_started";
     if (index < effectiveDetailLimit) {
       try {
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
         runControl.setPhase("recommend:detail");
+        detailStep = "ensure_viewport";
         rootState = await ensureRecommendViewport(rootState, "detail");
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+        detailStep = "open_detail";
         networkRecorder.clear();
         const openedDetail = await openRecommendCardDetailWithFreshRetry(client, {
           cardNodeId,
@@ -794,6 +921,7 @@ export async function runRecommendWorkflow({
         cardCandidate = openedDetail.card_candidate || cardCandidate;
         screeningCandidate = cardCandidate;
         const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
+        detailStep = "wait_network";
         const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
           waitForRecommendDetailNetworkEvents,
           networkRecorder,
@@ -807,6 +935,7 @@ export async function runRecommendWorkflow({
         if (networkWait?.elapsed_ms != null) {
           timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
         }
+        detailStep = "extract_detail";
         detailResult = await extractRecommendDetailCandidate(client, {
           cardCandidate,
           cardNodeId,
@@ -830,6 +959,7 @@ export async function runRecommendWorkflow({
             waitResult: networkWait
           });
         } else {
+          detailStep = "wait_capture_target";
           captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
             domain: "recommend",
             timeoutMs: 6000,
@@ -846,6 +976,7 @@ export async function runRecommendWorkflow({
               extension: "jpg"
             });
             try {
+              detailStep = "capture_image";
               imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
                 filePath: imageEvidencePath,
                 format: "jpeg",
@@ -879,6 +1010,17 @@ export async function runRecommendWorkflow({
               source = "image";
             } catch (error) {
               if (!isRecoverableImageCaptureError(error)) throw error;
+              const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
+              if (recoveryCount < 1) {
+                candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
+                timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
+                checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
+                await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+                await recoverAndReapplyRecommendContext(`image_capture:${detailStep}`, error, {
+                  forceRecentNotView: true
+                });
+                continue;
+              }
               imageEvidence = createRecoverableImageCaptureEvidence(error, {
                 elapsedMs: timings.screenshot_capture_ms,
                 filePath: imageEvidencePath,
@@ -919,6 +1061,17 @@ export async function runRecommendWorkflow({
         screeningCandidate = detailResult.candidate;
       } catch (error) {
         if (!isRecoverableRecommendDetailError(error)) throw error;
+        const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
+        if (recoveryCount < 1) {
+          candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
+          timings.detail_recovery_trigger = compactRecoverableDetailError(error);
+          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
+          await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
+            forceRecentNotView: true
+          });
+          continue;
+        }
         recoverableDetailError = error;
         detailResult = null;
         timings.detail_recovered_error = compactRecoverableDetailError(error);
@@ -994,6 +1147,21 @@ export async function runRecommendWorkflow({
     }
     if (detailResult && closeDetail) {
       detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
+      if (!detailResult.close_result?.closed) {
+        const closeError = createRecommendCloseFailureError(detailResult.close_result);
+        const recovery = await recoverAndReapplyRecommendContext("detail_close_failed", closeError, {
+          forceRecentNotView: true
+        });
+        detailResult.cv_acquisition = {
+          ...(detailResult.cv_acquisition || {}),
+          close_recovery: {
+            ok: Boolean(recovery.ok),
+            method: recovery.method || "",
+            forced_recent_not_view: Boolean(recovery.forced_recent_not_view),
+            card_count: recovery.card_count || 0
+          }
+        };
+      }
     }
     timings.total_ms = Date.now() - candidateStarted;
     const compactResult = {
@@ -1024,27 +1192,7 @@ export async function runRecommendWorkflow({
       }
     });
 
-    runControl.updateProgress({
-      card_count: cardNodeIds.length,
-      target_count: targetPassCount,
-      target_count_semantics: "passed_candidates",
-      processed: results.length,
-      screened: results.length,
-      detail_opened: results.filter((item) => item.detail).length,
-      passed: results.filter((item) => item.screening.passed).length,
-      llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-      greet_count: greetCount,
-      post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
-      image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
-      detail_open_failed: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "DETAIL_OPEN_FAILED").length,
-      transient_recovered: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_TIMEOUT" || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT").length,
-      unique_seen: compactInfiniteListState(listState).seen_count,
-      scroll_count: compactInfiniteListState(listState).scroll_count,
-      refresh_rounds: refreshRounds,
-      refresh_attempts: refreshAttempts.length,
-      list_end_reason: listEndReason || null,
-      viewport_checks: viewportGuard.getStats().checks,
-      viewport_recoveries: viewportGuard.getStats().recoveries,
+    updateRecommendProgress({
       last_candidate_id: screeningCandidate.id || null,
       last_candidate_key: candidateKey,
       last_score: screening.score
@@ -1097,16 +1245,8 @@ export async function runRecommendWorkflow({
     list_end_reason: listEndReason || null,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
-    processed: results.length,
-    screened: results.length,
-    detail_opened: results.filter((item) => item.detail).length,
-    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-    detail_open_failed: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "DETAIL_OPEN_FAILED").length,
-    image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
-    transient_recovered: results.filter((item) => item.error?.code === "DETAIL_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_STALE_NODE" || item.error?.code === "IMAGE_CAPTURE_TIMEOUT" || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT").length,
-    passed: results.filter((item) => item.screening.passed).length,
-    greet_count: greetCount,
-    post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
+    context_recoveries: contextRecoveryAttempts,
+    ...countRecommendResultStatuses(results, { greetCount }),
     results
   };
 }
@@ -1213,7 +1353,11 @@ export function createRecommendRunService({
         llm_screened: 0,
         passed: 0,
         greet_count: 0,
-        post_action_clicked: 0
+        post_action_clicked: 0,
+        image_capture_failed: 0,
+        detail_open_failed: 0,
+        transient_recovered: 0,
+        context_recoveries: 0
       },
       checkpoint: {},
       task: (runControl) => workflow({

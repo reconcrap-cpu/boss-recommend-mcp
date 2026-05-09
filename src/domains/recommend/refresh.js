@@ -4,7 +4,8 @@ import {
   waitForRecommendCardNodeIds
 } from "./cards.js";
 import {
-  RECOMMEND_RECENT_NOT_VIEW_LABEL
+  RECOMMEND_RECENT_NOT_VIEW_LABEL,
+  RECOMMEND_TARGET_URL
 } from "./constants.js";
 import { selectAndConfirmFirstSafeFilter } from "./filters.js";
 import { selectRecommendJob } from "./jobs.js";
@@ -94,6 +95,8 @@ export async function refreshRecommendListAtEnd(client, {
   fallbackPageScope = "recommend",
   filter = {},
   preferEndRefreshButton = true,
+  forceNavigate = false,
+  targetUrl = RECOMMEND_TARGET_URL,
   forceRecentNotView = true,
   cardTimeoutMs = 30000,
   buttonSettleMs = 8000,
@@ -156,8 +159,17 @@ export async function refreshRecommendListAtEnd(client, {
     }
   }
 
+  let fallbackMethod = "page_reload";
   try {
-    await client.Page.reload({ ignoreCache: true });
+    let method = "page_reload";
+    if (forceNavigate && typeof client?.Page?.navigate === "function") {
+      await client.Page.navigate({ url: targetUrl || RECOMMEND_TARGET_URL });
+      method = "page_navigate";
+      fallbackMethod = method;
+    } else {
+      await client.Page.reload({ ignoreCache: true });
+      fallbackMethod = method;
+    }
     if (reloadSettleMs > 0) await sleep(reloadSettleMs);
     currentRootState = await waitForRecommendRoots(client, {
       timeoutMs: Math.max(30000, reloadSettleMs * 4),
@@ -202,8 +214,9 @@ export async function refreshRecommendListAtEnd(client, {
     });
     return {
       ok: cardNodeIds.length > 0,
-      method: "page_reload",
+      method,
       attempts,
+      target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
       page_scope: pageScopeResult,
       filter: filterResult,
@@ -214,10 +227,11 @@ export async function refreshRecommendListAtEnd(client, {
   } catch (error) {
     return {
       ok: false,
-      method: "page_reload",
-      reason: "page_reload_failed",
+      method: fallbackMethod,
+      reason: fallbackMethod === "page_navigate" ? "page_navigate_failed" : "page_reload_failed",
       error: error?.message || String(error),
       attempts,
+      target_url: fallbackMethod === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       card_count: 0,
       root_state: currentRootState,
       forced_recent_not_view: forceRecentNotView

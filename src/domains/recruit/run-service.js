@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { createRunLifecycleManager } from "../../core/run/index.js";
 import {
   addTiming,
@@ -137,6 +139,129 @@ function compactRefreshAttempt(refreshAttempt) {
   };
 }
 
+function compactError(error, fallbackCode = "RECRUIT_RUN_ERROR") {
+  if (!error) return null;
+  return {
+    code: error.code || fallbackCode,
+    message: error.message || String(error)
+  };
+}
+
+function createRecruitCloseFailureError(closeResult) {
+  const error = new Error(closeResult?.reason || "Recruit detail did not close before recovery");
+  error.code = "DETAIL_CLOSE_FAILED";
+  error.close_result = closeResult || null;
+  return error;
+}
+
+export function isStaleRecruitNodeError(error) {
+  const message = String(error?.message || error || "");
+  return /Could not find node with given id|No node with given id|Node is detached|Cannot find node/i.test(message);
+}
+
+export function isRecoverableRecruitImageCaptureError(error) {
+  const code = String(error?.code || "");
+  if (code === "IMAGE_CAPTURE_TIMEOUT" || code === "IMAGE_CAPTURE_TOTAL_TIMEOUT") return true;
+  if (isStaleRecruitNodeError(error)) return true;
+  return /Image fallback capture timed out/i.test(String(error?.message || error || ""));
+}
+
+export function isRecoverableRecruitDetailError(error) {
+  return isStaleRecruitNodeError(error);
+}
+
+function compactRecoverableDetailError(error) {
+  return compactError(error, isStaleRecruitNodeError(error) ? "DETAIL_STALE_NODE" : "DETAIL_OPEN_FAILED");
+}
+
+function collectPartialImageEvidencePaths(basePath = "", extension = "jpg", maxCount = 12) {
+  const resolved = String(basePath || "").trim();
+  if (!resolved) return [];
+  const parsed = path.parse(resolved);
+  const ext = parsed.ext || `.${String(extension || "jpg").replace(/^\./, "") || "jpg"}`;
+  const files = [];
+  for (let index = 0; index < Math.max(1, Number(maxCount) || 1); index += 1) {
+    const page = String(index + 1).padStart(2, "0");
+    const candidatePath = path.join(parsed.dir, `${parsed.name}-page-${page}${ext}`);
+    if (fs.existsSync(candidatePath)) files.push(candidatePath);
+  }
+  return files;
+}
+
+export function createRecoverableRecruitImageCaptureEvidence(error, {
+  elapsedMs = 0,
+  filePath = "",
+  extension = "jpg",
+  maxScreenshots = DEFAULT_MAX_IMAGE_PAGES
+} = {}) {
+  const filePaths = collectPartialImageEvidencePaths(filePath, extension, maxScreenshots);
+  return {
+    schema_version: 1,
+    ok: false,
+    source: "image-scroll-sequence",
+    elapsed_ms: Math.max(0, Math.round(Number(error?.elapsed_ms ?? elapsedMs) || 0)),
+    capture_count: filePaths.length,
+    screenshot_count: filePaths.length,
+    unique_screenshot_count: filePaths.length,
+    dropped_duplicate_count: 0,
+    total_byte_length: 0,
+    original_total_byte_length: 0,
+    llm_screenshot_count: 0,
+    llm_total_byte_length: 0,
+    llm_original_total_byte_length: 0,
+    llm_composition_error: null,
+    error_code: error?.code || (isStaleRecruitNodeError(error) ? "IMAGE_CAPTURE_STALE_NODE" : "IMAGE_CAPTURE_FAILED"),
+    error: error?.message || String(error || "Image capture failed"),
+    file_paths: filePaths,
+    llm_file_paths: []
+  };
+}
+
+function createImageCaptureFailureScreening(candidate, error) {
+  return {
+    status: "fail",
+    passed: false,
+    score: 0,
+    reasons: ["image_capture_failed"],
+    error: compactError(error, "IMAGE_CAPTURE_FAILED"),
+    candidate
+  };
+}
+
+function createRecoverableDetailFailureScreening(candidate, error) {
+  return {
+    status: "fail",
+    passed: false,
+    score: 0,
+    reasons: isStaleRecruitNodeError(error)
+      ? ["detail_open_failed", "stale_node"]
+      : ["detail_open_failed"],
+    error: compactRecoverableDetailError(error),
+    candidate
+  };
+}
+
+export function countRecruitResultStatuses(results = []) {
+  return {
+    processed: results.length,
+    screened: results.length,
+    detail_opened: results.filter((item) => item.detail).length,
+    passed: results.filter((item) => item.screening?.passed).length,
+    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
+    image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
+    detail_open_failed: results.filter((item) => (
+      item.error?.code === "DETAIL_STALE_NODE"
+      || item.error?.code === "DETAIL_OPEN_FAILED"
+    )).length,
+    transient_recovered: results.filter((item) => (
+      item.error?.code === "DETAIL_STALE_NODE"
+      || item.error?.code === "IMAGE_CAPTURE_STALE_NODE"
+      || item.error?.code === "IMAGE_CAPTURE_TIMEOUT"
+      || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT"
+    )).length
+  };
+}
+
 export async function runRecruitWorkflow({
   client,
   targetUrl = "",
@@ -197,6 +322,8 @@ export async function runRecruitWorkflow({
   const results = [];
   const refreshAttempts = [];
   let refreshRounds = 0;
+  let contextRecoveryAttempts = 0;
+  const candidateRecoveryCounts = new Map();
   let cardNodeIds = [];
   let listEndReason = "";
   const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
@@ -207,6 +334,115 @@ export async function runRecruitWorkflow({
     viewportPoint: { xRatio: 0.28, yRatio: 0.5 },
     validateViewportPoint: true
   }));
+
+  function updateRecruitProgress(extra = {}) {
+    const counts = countRecruitResultStatuses(results);
+    const listSnapshot = compactInfiniteListState(listState);
+    runControl.updateProgress({
+      card_count: cardNodeIds.length,
+      target_count: limit,
+      ...counts,
+      screening_mode: normalizedScreeningMode,
+      unique_seen: listSnapshot.seen_count,
+      scroll_count: listSnapshot.scroll_count,
+      refresh_rounds: refreshRounds,
+      refresh_attempts: refreshAttempts.length,
+      context_recoveries: contextRecoveryAttempts,
+      list_end_reason: listEndReason || null,
+      viewport_checks: viewportGuard.getStats().checks,
+      viewport_recoveries: viewportGuard.getStats().recoveries,
+      ...extra
+    });
+  }
+
+  function checkpointInProgressCandidate({
+    index = results.length,
+    candidateKey = "",
+    cardNodeId = null,
+    detailStep = "",
+    error = null
+  } = {}) {
+    runControl.checkpoint({
+      in_progress_candidate: {
+        index,
+        key: candidateKey,
+        card_node_id: cardNodeId,
+        detail_step: detailStep || null,
+        counters: countRecruitResultStatuses(results),
+        error: compactError(error, "RECRUIT_IN_PROGRESS_ERROR")
+      },
+      candidate_list: compactInfiniteListState(listState)
+    });
+  }
+
+  async function recoverAndReapplyRecruitContext(reason = "context_recovery", error = null, {
+    forceRecentViewed = true
+  } = {}) {
+    await runControl.waitIfPaused();
+    runControl.throwIfCanceled();
+    const started = Date.now();
+    runControl.setPhase("recruit:recover-context");
+    contextRecoveryAttempts += 1;
+    const refreshResult = await refreshRecruitSearchAtEnd(client, {
+      searchParams: normalizedSearchParams,
+      requireCards: true,
+      searchTimeoutMs: cardTimeoutMs,
+      resetTimeoutMs,
+      resetSettleMs: refreshResetSettleMs,
+      cityOptionTimeoutMs,
+      forceRecentViewed
+    });
+    const compactRefresh = {
+      ...compactRefreshAttempt(refreshResult),
+      context_recovery: true,
+      recovery_reason: reason,
+      trigger_error: compactError(error, "RECRUIT_CONTEXT_RECOVERY_TRIGGER"),
+      elapsed_ms: Date.now() - started
+    };
+    refreshAttempts.push(compactRefresh);
+    runControl.checkpoint({
+      context_recovery: {
+        attempt: contextRecoveryAttempts,
+        reason,
+        trigger_error: compactError(error, "RECRUIT_CONTEXT_RECOVERY_TRIGGER"),
+        refresh: compactRefresh,
+        counters: countRecruitResultStatuses(results)
+      },
+      candidate_list: compactInfiniteListState(listState)
+    });
+    if (!refreshResult.ok) {
+      updateRecruitProgress({
+        refresh_method: refreshResult.method || null,
+        refresh_forced_recent_viewed: forceRecentViewed,
+        recovery_reason: reason
+      });
+      throw new Error(`Recruit context recovery failed after ${reason}: ${refreshResult.application?.reason || "refresh returned no cards"}`);
+    }
+    rootState = await getRecruitRoots(client);
+    rootState = await ensureRecruitViewport(rootState, "recover_after");
+    cardNodeIds = await waitForRecruitCardNodeIds(client, rootState.iframe.documentNodeId, {
+      timeoutMs: cardTimeoutMs,
+      intervalMs: 300
+    });
+    resetInfiniteListForRefreshRound(listState, {
+      reason: `context_recovery:${reason}`,
+      round: contextRecoveryAttempts,
+      method: refreshResult.method,
+      metadata: {
+        card_count: cardNodeIds.length,
+        forced_recent_viewed: forceRecentViewed,
+        counters: countRecruitResultStatuses(results)
+      }
+    });
+    listEndReason = "";
+    updateRecruitProgress({
+      card_count: cardNodeIds.length,
+      refresh_method: refreshResult.method || null,
+      refresh_forced_recent_viewed: forceRecentViewed,
+      recovery_reason: reason
+    });
+    return refreshResult;
+  }
 
   runControl.setPhase("recruit:cleanup");
   await closeRecruitDetail(client, { attemptsLimit: 2 });
@@ -264,21 +500,8 @@ export async function runRecruitWorkflow({
     throw new Error("No recruit/search candidate cards found for run service");
   }
 
-  runControl.updateProgress({
-    card_count: cardNodeIds.length,
-    target_count: limit,
-    processed: 0,
-    screened: 0,
-    detail_opened: 0,
-    passed: 0,
-    screening_mode: normalizedScreeningMode,
-    llm_screened: 0,
-    unique_seen: compactInfiniteListState(listState).seen_count,
-    scroll_count: 0,
-    refresh_rounds: 0,
-    refresh_attempts: 0,
-    viewport_checks: viewportGuard.getStats().checks,
-    viewport_recoveries: viewportGuard.getStats().recoveries
+  updateRecruitProgress({
+    list_end_reason: null
   });
 
   while (results.length < limit) {
@@ -351,23 +574,11 @@ export async function runRecruitWorkflow({
           refresh_round: refreshRounds,
           refresh: compactRefresh
         });
-        runControl.updateProgress({
+        updateRecruitProgress({
           card_count: refreshResult.card_count || cardNodeIds.length,
-          target_count: limit,
-          processed: results.length,
-          screened: results.length,
-          detail_opened: results.filter((item) => item.detail).length,
-          passed: results.filter((item) => item.screening.passed).length,
-          llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-          unique_seen: compactInfiniteListState(listState).seen_count,
-          scroll_count: compactInfiniteListState(listState).scroll_count,
-          refresh_rounds: refreshRounds,
-          refresh_attempts: refreshAttempts.length,
           refresh_method: refreshResult.method || null,
           refresh_forced_recent_viewed: true,
-          list_end_reason: listEndReason,
-          viewport_checks: viewportGuard.getStats().checks,
-          viewport_recoveries: viewportGuard.getStats().recoveries
+          list_end_reason: listEndReason
         });
         if (refreshResult.ok) {
           rootState = await getRecruitRoots(client);
@@ -399,128 +610,197 @@ export async function runRecruitWorkflow({
 
     let screeningCandidate = cardCandidate;
     let detailResult = null;
+    let recoverableDetailError = null;
+    let detailStep = "not_started";
     if (index < detailCountLimit) {
-      await runControl.waitIfPaused();
-      runControl.throwIfCanceled();
-      runControl.setPhase("recruit:detail");
-      rootState = await ensureRecruitViewport(rootState, "detail");
-      networkRecorder.clear();
-      const openedDetail = await openRecruitCardDetail(client, cardNodeId);
-      addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
-      addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
-      const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
-      const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
-        waitForRecruitDetailNetworkEvents,
-        networkRecorder,
-        {
-          waitPlan,
-          minCount: 1,
-          requireLoaded: true,
-          intervalMs: 120
+      try {
+        await runControl.waitIfPaused();
+        runControl.throwIfCanceled();
+        runControl.setPhase("recruit:detail");
+        detailStep = "ensure_viewport";
+        rootState = await ensureRecruitViewport(rootState, "detail");
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+        detailStep = "open_detail";
+        networkRecorder.clear();
+        const openedDetail = await openRecruitCardDetail(client, cardNodeId);
+        addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
+        addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
+        const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
+        detailStep = "wait_network";
+        const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
+          waitForRecruitDetailNetworkEvents,
+          networkRecorder,
+          {
+            waitPlan,
+            minCount: 1,
+            requireLoaded: true,
+            intervalMs: 120
+          }
+        ));
+        if (networkWait?.elapsed_ms != null) {
+          timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
         }
-      ));
-      if (networkWait?.elapsed_ms != null) {
-        timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
-      }
-      detailResult = await extractRecruitDetailCandidate(client, {
-        cardCandidate,
-        cardNodeId,
-        detailState: openedDetail.detail_state,
-        networkEvents: networkRecorder.events,
-        targetUrl,
-        closeDetail: false,
-        networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
-        networkParseIntervalMs: 250
-      });
-      addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
-      const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
-      let source = "network";
-      let imageEvidence = null;
-      let captureTarget = null;
-      let captureTargetWait = null;
-      if (parsedNetworkProfileCount > 0) {
-        recordCvNetworkHit(cvAcquisitionState, {
-          parsedNetworkProfileCount,
-          waitResult: networkWait
+        detailStep = "extract_detail";
+        detailResult = await extractRecruitDetailCandidate(client, {
+          cardCandidate,
+          cardNodeId,
+          detailState: openedDetail.detail_state,
+          networkEvents: networkRecorder.events,
+          targetUrl,
+          closeDetail: false,
+          networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
+          networkParseIntervalMs: 250
         });
-      } else {
-        captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
-          domain: "recruit",
-          timeoutMs: 6000,
-          intervalMs: 250
-        });
-        captureTarget = captureTargetWait.target || null;
-        const captureNodeId = captureTarget?.node_id || null;
-        if (captureNodeId) {
-          imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
-            filePath: imageEvidenceFilePath({
+        addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
+        const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
+        let source = "network";
+        let imageEvidence = null;
+        let captureTarget = null;
+        let captureTargetWait = null;
+        if (parsedNetworkProfileCount > 0) {
+          recordCvNetworkHit(cvAcquisitionState, {
+            parsedNetworkProfileCount,
+            waitResult: networkWait
+          });
+        } else {
+          detailStep = "wait_capture_target";
+          captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
+            domain: "recruit",
+            timeoutMs: 6000,
+            intervalMs: 250
+          });
+          captureTarget = captureTargetWait.target || null;
+          const captureNodeId = captureTarget?.node_id || null;
+          if (captureNodeId) {
+            const imageEvidencePath = imageEvidenceFilePath({
               imageOutputDir,
               domain: "recruit",
               runId: runControl?.runId,
               index,
               extension: "jpg"
-            }),
-            format: "jpeg",
-            quality: 72,
-            optimize: true,
-            resizeMaxWidth: 1100,
-            captureViewport: false,
-            padding: 0,
-            maxScreenshots: maxImagePages,
-            wheelDeltaY: imageWheelDeltaY,
-            settleMs: 350,
-            scrollMethod: "dom-anchor-fallback-input",
-            stepTimeoutMs: 45000,
-            totalTimeoutMs: 90000,
-            duplicateStopCount: 1,
-            skipDuplicateScreenshots: true,
-            composeForLlm: true,
-            llmPagesPerImage: 3,
-            llmResizeMaxWidth: 1100,
-            llmQuality: 72,
-            metadata: {
-              domain: "recruit",
-              capture_mode: "scroll_sequence",
-              acquisition_reason: "network_miss_image_fallback",
-              run_candidate_index: index,
-              candidate_key: candidateKey,
-              capture_target: captureTarget,
-              capture_target_wait: captureTargetWait
+            });
+            try {
+              detailStep = "capture_image";
+              imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+                filePath: imageEvidencePath,
+                format: "jpeg",
+                quality: 72,
+                optimize: true,
+                resizeMaxWidth: 1100,
+                captureViewport: false,
+                padding: 0,
+                maxScreenshots: maxImagePages,
+                wheelDeltaY: imageWheelDeltaY,
+                settleMs: 350,
+                scrollMethod: "dom-anchor-fallback-input",
+                stepTimeoutMs: 45000,
+                totalTimeoutMs: 90000,
+                duplicateStopCount: 1,
+                skipDuplicateScreenshots: true,
+                composeForLlm: true,
+                llmPagesPerImage: 3,
+                llmResizeMaxWidth: 1100,
+                llmQuality: 72,
+                metadata: {
+                  domain: "recruit",
+                  capture_mode: "scroll_sequence",
+                  acquisition_reason: "network_miss_image_fallback",
+                  run_candidate_index: index,
+                  candidate_key: candidateKey,
+                  capture_target: captureTarget,
+                  capture_target_wait: captureTargetWait
+                }
+              }));
+              source = "image";
+            } catch (error) {
+              if (!isRecoverableRecruitImageCaptureError(error)) throw error;
+              const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
+              if (recoveryCount < 1) {
+                candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
+                timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
+                checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
+                await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+                await recoverAndReapplyRecruitContext(`image_capture:${detailStep}`, error, {
+                  forceRecentViewed: true
+                });
+                continue;
+              }
+              imageEvidence = createRecoverableRecruitImageCaptureEvidence(error, {
+                elapsedMs: timings.screenshot_capture_ms,
+                filePath: imageEvidencePath,
+                extension: "jpg",
+                maxScreenshots: maxImagePages
+              });
+              source = "image_capture_failed";
             }
-          }));
-          source = "image";
-          recordCvImageFallback(cvAcquisitionState, {
-            parsedNetworkProfileCount,
-            waitResult: networkWait,
-            imageEvidence
-          });
-        } else {
-          source = "missing_capture_node";
-          recordCvNetworkMiss(cvAcquisitionState, {
-            reason: "network_miss_no_capture_node",
-            parsedNetworkProfileCount,
-            waitResult: networkWait
-          });
+            recordCvImageFallback(cvAcquisitionState, {
+              reason: source === "image_capture_failed"
+                ? "network_miss_image_capture_failed"
+                : "network_miss_image_fallback",
+              parsedNetworkProfileCount,
+              waitResult: networkWait,
+              imageEvidence
+            });
+          } else {
+            source = "missing_capture_node";
+            recordCvNetworkMiss(cvAcquisitionState, {
+              reason: "network_miss_no_capture_node",
+              parsedNetworkProfileCount,
+              waitResult: networkWait
+            });
+          }
         }
-      }
 
-      let closeResult = null;
-      if (closeDetail) {
-        closeResult = await measureTiming(timings, "close_detail_ms", () => closeRecruitDetail(client));
+        detailResult.image_evidence = imageEvidence;
+        detailResult.cv_acquisition = {
+          source,
+          mode_after: compactCvAcquisitionState(cvAcquisitionState).mode,
+          wait_plan: waitPlan,
+          network_wait: networkWait,
+          parsed_network_profile_count: parsedNetworkProfileCount,
+          image_evidence: summarizeImageEvidence(imageEvidence),
+          capture_target: captureTarget || null,
+          capture_target_wait: captureTargetWait
+        };
+        screeningCandidate = detailResult.candidate;
+        if (closeDetail) {
+          detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecruitDetail(client));
+          if (!detailResult.close_result?.closed) {
+            const closeError = createRecruitCloseFailureError(detailResult.close_result);
+            const recovery = await recoverAndReapplyRecruitContext("detail_close_failed", closeError, {
+              forceRecentViewed: true
+            });
+            detailResult.cv_acquisition = {
+              ...(detailResult.cv_acquisition || {}),
+              close_recovery: {
+                ok: Boolean(recovery.ok),
+                method: recovery.method || "",
+                forced_recent_viewed: Boolean(recovery.forced_recent_viewed),
+                card_count: recovery.card_count || 0
+              }
+            };
+          }
+        } else {
+          detailResult.close_result = null;
+        }
+      } catch (error) {
+        if (!isRecoverableRecruitDetailError(error)) throw error;
+        const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
+        if (recoveryCount < 1) {
+          candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
+          timings.detail_recovery_trigger = compactRecoverableDetailError(error);
+          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
+          await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await recoverAndReapplyRecruitContext(`detail:${detailStep}`, error, {
+            forceRecentViewed: true
+          });
+          continue;
+        }
+        recoverableDetailError = error;
+        detailResult = null;
+        timings.detail_recovered_error = compactRecoverableDetailError(error);
+        await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
       }
-      detailResult.close_result = closeResult;
-      detailResult.image_evidence = imageEvidence;
-      detailResult.cv_acquisition = {
-        source,
-        mode_after: compactCvAcquisitionState(cvAcquisitionState).mode,
-        wait_plan: waitPlan,
-        network_wait: networkWait,
-        parsed_network_profile_count: parsedNetworkProfileCount,
-        image_evidence: summarizeImageEvidence(imageEvidence),
-        capture_target: captureTarget || null,
-        capture_target_wait: captureTargetWait
-      };
-      screeningCandidate = detailResult.candidate;
     }
 
     await runControl.waitIfPaused();
@@ -528,7 +808,9 @@ export async function runRecruitWorkflow({
     runControl.setPhase("recruit:screening");
     let llmResult = null;
     if (useLlmScreening) {
-      if (!llmConfig) {
+      if (recoverableDetailError || detailResult?.image_evidence?.ok === false) {
+        llmResult = null;
+      } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
       } else {
         try {
@@ -550,9 +832,16 @@ export async function runRecruitWorkflow({
       }
       if (detailResult) detailResult.llm_result = llmResult;
     }
-    const screening = useLlmScreening
-      ? llmResultToScreening(llmResult, screeningCandidate)
-      : screenCandidate(screeningCandidate, { criteria });
+    const screening = recoverableDetailError
+      ? createRecoverableDetailFailureScreening(screeningCandidate, recoverableDetailError)
+      : detailResult?.image_evidence?.ok === false
+      ? createImageCaptureFailureScreening(screeningCandidate, {
+        code: detailResult.image_evidence.error_code,
+        message: detailResult.image_evidence.error
+      })
+      : useLlmScreening
+        ? llmResultToScreening(llmResult, screeningCandidate)
+        : screenCandidate(screeningCandidate, { criteria });
     timings.total_ms = Date.now() - candidateStarted;
     const compactResult = {
       index,
@@ -562,6 +851,14 @@ export async function runRecruitWorkflow({
       detail: compactDetail(detailResult),
       llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
       screening: compactScreening(screening),
+      error: recoverableDetailError
+        ? compactRecoverableDetailError(recoverableDetailError)
+        : detailResult?.image_evidence?.ok === false
+        ? compactError({
+          code: detailResult.image_evidence.error_code,
+          message: detailResult.image_evidence.error
+        }, "IMAGE_CAPTURE_FAILED")
+        : null,
       timings
     };
     results.push(compactResult);
@@ -572,21 +869,7 @@ export async function runRecruitWorkflow({
       }
     });
 
-    runControl.updateProgress({
-      card_count: cardNodeIds.length,
-      target_count: limit,
-      processed: results.length,
-      screened: results.length,
-      detail_opened: results.filter((item) => item.detail).length,
-      passed: results.filter((item) => item.screening.passed).length,
-      llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-      unique_seen: compactInfiniteListState(listState).seen_count,
-      scroll_count: compactInfiniteListState(listState).scroll_count,
-      refresh_rounds: refreshRounds,
-      refresh_attempts: refreshAttempts.length,
-      list_end_reason: listEndReason || null,
-      viewport_checks: viewportGuard.getStats().checks,
-      viewport_recoveries: viewportGuard.getStats().recoveries,
+    updateRecruitProgress({
       last_candidate_id: screeningCandidate.id || null,
       last_candidate_key: candidateKey,
       last_score: screening.score
@@ -603,7 +886,8 @@ export async function runRecruitWorkflow({
           passed: screening.passed,
           score: screening.score
         },
-        llm_screening: compactScreeningLlmResult(llmResult)
+        llm_screening: compactScreeningLlmResult(llmResult),
+        error: compactResult.error
       }
     });
     addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
@@ -630,11 +914,8 @@ export async function runRecruitWorkflow({
     list_end_reason: listEndReason || null,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
-    processed: results.length,
-    screened: results.length,
-    detail_opened: results.filter((item) => item.detail).length,
-    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-    passed: results.filter((item) => item.screening.passed).length,
+    context_recoveries: contextRecoveryAttempts,
+    ...countRecruitResultStatuses(results),
     results
   };
 }
@@ -722,7 +1003,11 @@ export function createRecruitRunService({
         screened: 0,
         detail_opened: 0,
         llm_screened: 0,
-        passed: 0
+        passed: 0,
+        image_capture_failed: 0,
+        detail_open_failed: 0,
+        transient_recovered: 0,
+        context_recoveries: 0
       },
       checkpoint: {},
       task: (runControl) => workflow({
