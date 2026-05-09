@@ -23,6 +23,7 @@ import {
   parseRecommendCardFieldsFromHtml,
   readRecommendDetailHtml,
   readRecommendCardCandidate,
+  refreshRecommendListAtEnd,
   selectRecommendPageScope
 } from "./domains/recommend/index.js";
 
@@ -160,6 +161,40 @@ async function testCardCandidateReader() {
   assert.equal(candidate.id, "abc123");
   assert.equal(candidate.identity.degree, "本科");
   assert.match(candidate.text.raw, /算法工程师/);
+}
+
+async function testRefreshRecoveryFallsBackFromNavigateToReload() {
+  const calls = [];
+  const result = await refreshRecommendListAtEnd({
+    Page: {
+      async navigate() {
+        calls.push("navigate");
+        throw new Error("navigate timeout");
+      },
+      async reload() {
+        calls.push("reload");
+        throw new Error("reload timeout");
+      }
+    }
+  }, {
+    preferEndRefreshButton: false,
+    forceNavigate: true,
+    reloadSettleMs: 0
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.method, "page_reload");
+  assert.equal(result.reason, "page_reload_failed");
+  assert.equal(result.error, "reload timeout");
+  assert.deepEqual(calls, ["navigate", "reload"]);
+  assert.deepEqual(result.attempts.map((attempt) => attempt.reason), [
+    "page_navigate_failed",
+    "page_reload_failed"
+  ]);
+  assert.deepEqual(result.attempts.map((attempt) => attempt.error), [
+    "navigate timeout",
+    "reload timeout"
+  ]);
 }
 
 function testRecommendCardFieldParser() {
@@ -373,6 +408,7 @@ testTargetedFilterChoice();
 testNetworkPatterns();
 testRecommendCardFieldParser();
 await testCardCandidateReader();
+await testRefreshRecoveryFallsBackFromNavigateToReload();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();

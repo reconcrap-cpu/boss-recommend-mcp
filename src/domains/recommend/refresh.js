@@ -88,6 +88,105 @@ export function buildRecommendFilterSelectionOptions(filter = {}, {
   };
 }
 
+function refreshFailureReason(method = "") {
+  return method === "page_navigate" ? "page_navigate_failed" : "page_reload_failed";
+}
+
+async function applyRefreshMethod(client, method, {
+  jobLabel = "",
+  pageScope = "recommend",
+  fallbackPageScope = "recommend",
+  filter = {},
+  targetUrl = RECOMMEND_TARGET_URL,
+  forceRecentNotView = true,
+  cardTimeoutMs = 30000,
+  reloadSettleMs = 8000
+} = {}) {
+  const started = Date.now();
+  let currentRootState = null;
+  let jobSelection = null;
+  let pageScopeResult = null;
+  let filterResult = null;
+  try {
+    if (method === "page_navigate") {
+      await client.Page.navigate({ url: targetUrl || RECOMMEND_TARGET_URL });
+    } else {
+      await client.Page.reload({ ignoreCache: true });
+    }
+    if (reloadSettleMs > 0) await sleep(reloadSettleMs);
+    currentRootState = await waitForRecommendRoots(client, {
+      timeoutMs: Math.max(45000, reloadSettleMs * 6),
+      intervalMs: 500
+    });
+    if (!currentRootState?.iframe?.documentNodeId) {
+      throw new Error("Recommend iframe was not ready after refresh reload");
+    }
+    if (jobLabel) {
+      jobSelection = await selectRecommendJob(client, currentRootState.iframe.documentNodeId, {
+        jobLabel,
+        settleMs: reloadSettleMs > 10000 ? 12000 : 6000
+      });
+      if (!jobSelection.selected) {
+        throw new Error(`Requested recommend job was not selected after refresh reload: ${jobSelection.reason}`);
+      }
+      currentRootState = await getRecommendRoots(client);
+    }
+    pageScopeResult = await selectRecommendPageScope(
+      client,
+      currentRootState.iframe.documentNodeId,
+      {
+        pageScope,
+        fallbackScope: fallbackPageScope,
+        settleMs: reloadSettleMs > 10000 ? 3000 : 1200,
+        timeoutMs: Math.max(10000, Math.min(cardTimeoutMs, 60000))
+      }
+    );
+    if (!pageScopeResult.selected) {
+      throw new Error(`Recommend page scope was not selected after refresh reload: ${pageScopeResult.reason || pageScope}`);
+    }
+    currentRootState = await getRecommendRoots(client);
+    filterResult = await selectAndConfirmFirstSafeFilter(
+      client,
+      currentRootState.iframe.documentNodeId,
+      buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
+    );
+    const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
+      timeoutMs: cardTimeoutMs,
+      intervalMs: 500
+    });
+    if (!cardNodeIds.length) {
+      throw new Error("No recommend candidate cards were found after refresh reload");
+    }
+    return {
+      ok: true,
+      method,
+      target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
+      job_selection: jobSelection,
+      page_scope: pageScopeResult,
+      filter: filterResult,
+      card_count: cardNodeIds.length,
+      root_state: currentRootState,
+      forced_recent_not_view: forceRecentNotView,
+      elapsed_ms: Date.now() - started
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      method,
+      reason: refreshFailureReason(method),
+      error: error?.message || String(error),
+      target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
+      job_selection: jobSelection,
+      page_scope: pageScopeResult,
+      filter: filterResult,
+      card_count: 0,
+      root_state: currentRootState,
+      forced_recent_not_view: forceRecentNotView,
+      elapsed_ms: Date.now() - started
+    };
+  }
+}
+
 export async function refreshRecommendListAtEnd(client, {
   rootState = null,
   jobLabel = "",
@@ -103,9 +202,10 @@ export async function refreshRecommendListAtEnd(client, {
   reloadSettleMs = 8000
 } = {}) {
   const attempts = [];
-  let currentRootState = rootState || await getRecommendRoots(client);
+  let currentRootState = rootState || null;
 
   if (preferEndRefreshButton) {
+    currentRootState = currentRootState || await getRecommendRoots(client);
     const buttonResult = await clickRecommendEndRefreshButton(
       client,
       currentRootState.iframe.documentNodeId,
@@ -159,82 +259,49 @@ export async function refreshRecommendListAtEnd(client, {
     }
   }
 
-  let fallbackMethod = "page_reload";
-  try {
-    let method = "page_reload";
-    if (forceNavigate && typeof client?.Page?.navigate === "function") {
-      await client.Page.navigate({ url: targetUrl || RECOMMEND_TARGET_URL });
-      method = "page_navigate";
-      fallbackMethod = method;
-    } else {
-      await client.Page.reload({ ignoreCache: true });
-      fallbackMethod = method;
-    }
-    if (reloadSettleMs > 0) await sleep(reloadSettleMs);
-    currentRootState = await waitForRecommendRoots(client, {
-      timeoutMs: Math.max(30000, reloadSettleMs * 4),
-      intervalMs: 500
+  const fallbackMethods = [];
+  if (forceNavigate && typeof client?.Page?.navigate === "function") {
+    fallbackMethods.push("page_navigate");
+  }
+  if (typeof client?.Page?.reload === "function") {
+    fallbackMethods.push("page_reload");
+  }
+  if (!fallbackMethods.length) {
+    fallbackMethods.push("page_reload");
+  }
+
+  let lastRefreshResult = null;
+  for (const method of fallbackMethods) {
+    const refreshResult = await applyRefreshMethod(client, method, {
+      jobLabel,
+      pageScope,
+      fallbackPageScope,
+      filter,
+      targetUrl,
+      forceRecentNotView,
+      cardTimeoutMs,
+      reloadSettleMs
     });
-    if (!currentRootState?.iframe?.documentNodeId) {
-      throw new Error("Recommend iframe was not ready after refresh reload");
+    if (refreshResult.ok) {
+      return {
+        ...refreshResult,
+        attempts
+      };
     }
-    let jobSelection = null;
-    if (jobLabel) {
-      jobSelection = await selectRecommendJob(client, currentRootState.iframe.documentNodeId, {
-        jobLabel,
-        settleMs: reloadSettleMs > 10000 ? 12000 : 6000
-      });
-      if (!jobSelection.selected) {
-        throw new Error(`Requested recommend job was not selected after refresh reload: ${jobSelection.reason}`);
-      }
-      currentRootState = await getRecommendRoots(client);
-    }
-    const pageScopeResult = await selectRecommendPageScope(
-      client,
-      currentRootState.iframe.documentNodeId,
-      {
-        pageScope,
-        fallbackScope: fallbackPageScope,
-        settleMs: reloadSettleMs > 10000 ? 3000 : 1200,
-        timeoutMs: Math.max(10000, Math.min(cardTimeoutMs, 60000))
-      }
-    );
-    if (!pageScopeResult.selected) {
-      throw new Error(`Recommend page scope was not selected after refresh reload: ${pageScopeResult.reason || pageScope}`);
-    }
-    currentRootState = await getRecommendRoots(client);
-    const filterResult = await selectAndConfirmFirstSafeFilter(
-      client,
-      currentRootState.iframe.documentNodeId,
-      buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
-    );
-    const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
-      timeoutMs: cardTimeoutMs,
-      intervalMs: 500
-    });
-    return {
-      ok: cardNodeIds.length > 0,
-      method,
-      attempts,
-      target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
-      job_selection: jobSelection,
-      page_scope: pageScopeResult,
-      filter: filterResult,
-      card_count: cardNodeIds.length,
-      root_state: currentRootState,
-      forced_recent_not_view: forceRecentNotView
-    };
-  } catch (error) {
-    return {
+    attempts.push(refreshResult);
+    lastRefreshResult = refreshResult;
+  }
+
+  return {
+    ...(lastRefreshResult || {
       ok: false,
-      method: fallbackMethod,
-      reason: fallbackMethod === "page_navigate" ? "page_navigate_failed" : "page_reload_failed",
-      error: error?.message || String(error),
-      attempts,
-      target_url: fallbackMethod === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
+      method: fallbackMethods[fallbackMethods.length - 1] || "page_reload",
+      reason: "refresh_failed",
+      error: "Recommend refresh did not run",
       card_count: 0,
       root_state: currentRootState,
       forced_recent_not_view: forceRecentNotView
-    };
-  }
+    }),
+    attempts
+  };
 }

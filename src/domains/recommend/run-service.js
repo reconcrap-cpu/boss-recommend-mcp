@@ -355,16 +355,22 @@ function compactRefreshAttempt(refreshAttempt) {
   return {
     ok: Boolean(refreshAttempt.ok),
     method: refreshAttempt.method || "",
+    reason: refreshAttempt.reason || null,
+    error: refreshAttempt.error || null,
     forced_recent_not_view: Boolean(refreshAttempt.forced_recent_not_view),
     target_url: refreshAttempt.target_url || null,
     card_count: refreshAttempt.card_count || 0,
+    elapsed_ms: refreshAttempt.elapsed_ms || 0,
     attempts: (refreshAttempt.attempts || []).map((attempt) => ({
       ok: Boolean(attempt.ok),
       method: attempt.method || "",
       reason: attempt.reason || null,
+      error: attempt.error || null,
       label: attempt.label || null,
       before_card_count: attempt.before_card_count || 0,
-      after_card_count: attempt.after_card_count || 0
+      after_card_count: attempt.after_card_count || 0,
+      card_count: attempt.card_count || 0,
+      elapsed_ms: attempt.elapsed_ms || 0
     })),
     job_selection: compactJobSelection(refreshAttempt.job_selection),
     page_scope: compactPageScopeSelection(refreshAttempt.page_scope),
