@@ -240,6 +240,28 @@ async function testChatTopLevelPageGuard() {
   assert.equal(recovery.recovered, true);
   assert.deepEqual(navigations, ["https://www.zhipin.com/web/chat/index"]);
   assert.equal(recovery.after.is_chat_shell, true);
+
+  const noOpRecovery = await recoverChatShell(client, {
+    targetUrl: "https://www.zhipin.com/web/chat/index",
+    timeoutMs: 200,
+    intervalMs: 10
+  });
+  assert.equal(noOpRecovery.recovered, false);
+  assert.equal(navigations.length, 1);
+
+  const forcedRecovery = await recoverChatShell(client, {
+    targetUrl: "https://www.zhipin.com/web/chat/index",
+    timeoutMs: 200,
+    intervalMs: 10,
+    forceNavigate: true,
+    settleMs: 0
+  });
+  assert.equal(forcedRecovery.recovered, true);
+  assert.equal(forcedRecovery.refreshed, true);
+  assert.deepEqual(navigations, [
+    "https://www.zhipin.com/web/chat/index",
+    "https://www.zhipin.com/web/chat/index"
+  ]);
 }
 
 async function testUnsafeOnlineResumeLinkIsBlockedBeforeClick() {

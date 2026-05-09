@@ -161,6 +161,17 @@ function resultOpenedDetail(result) {
   return Boolean(result?.detail && !result.detail?.cv_acquisition?.skipped);
 }
 
+export function countChatResultStatuses(results = []) {
+  return {
+    processed: results.length,
+    screened: results.length,
+    detail_opened: results.filter(resultOpenedDetail).length,
+    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
+    passed: results.filter((item) => item.screening?.passed).length,
+    skipped: results.filter((item) => item.screening?.status === "skip").length
+  };
+}
+
 export function chatDetailSkipReasonFromReadyState(state = {}) {
   if (state?.attachment_resume_enabled) return "attachment_resume_already_available";
   return "";
@@ -171,6 +182,11 @@ export function makeChatResumeModalOpenBeforeCandidateClickError(closeResult = n
   error.code = "CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK";
   error.close_result = closeResult || null;
   return error;
+}
+
+export function isChatResumeModalCloseFailureError(error) {
+  return error?.code === "CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK"
+    || /CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK/i.test(String(error?.message || error || ""));
 }
 
 export async function ensureNoOpenChatResumeModalBeforeCandidateClick(client, {
@@ -319,9 +335,21 @@ function createSkippedDetailResult(cardCandidate, reason, error = null) {
     cv_acquisition: {
       source: reason,
       skipped: true,
-      error: error?.message || null
+      error: error?.message || null,
+      error_code: error?.code || null
     },
     close_result: null
+  };
+}
+
+function compactChatRuntimeError(error) {
+  if (!error) return null;
+  return {
+    name: error.name || "Error",
+    code: error.code || null,
+    message: error.message || String(error),
+    close_result: error.close_result || null,
+    page_state: error.page_state || null
   };
 }
 
@@ -745,21 +773,25 @@ export async function runChatWorkflow({
     chat_context: contextSetup
   });
 
-  async function recoverAndReapplyChatContext(reason, error = null) {
+  async function recoverAndReapplyChatContext(reason, error = null, {
+    forceRefresh = false
+  } = {}) {
     runControl.setPhase("chat:recover_shell");
-    const recovery = await recoverChatShell(client, {
+    const shellRecovery = await recoverChatShell(client, {
       targetUrl,
-      timeoutMs: readyTimeoutMs
+      timeoutMs: readyTimeoutMs,
+      forceNavigate: forceRefresh
     });
     runControl.checkpoint({
       chat_shell_recovery: {
         reason,
         error: error?.message || null,
-        ...recovery
+        total_refresh: Boolean(forceRefresh),
+        ...shellRecovery
       }
     });
-    if (!recovery.recovered && !recovery.after?.is_chat_shell) {
-      throw new Error(`Chat shell recovery failed after ${reason}: ${recovery.after?.url || recovery.before?.url || "unknown"}`);
+    if (!shellRecovery.recovered && !shellRecovery.after?.is_chat_shell) {
+      throw new Error(`Chat shell recovery failed after ${reason}: ${shellRecovery.after?.url || shellRecovery.before?.url || "unknown"}`);
     }
     await closeChatResumeModal(client, { attemptsLimit: 2 });
     const recoveredSetup = await setupChatRunContext(client, {
@@ -771,6 +803,24 @@ export async function runChatWorkflow({
       ensureViewport: ensureChatViewport
     });
     rootState = recoveredSetup.rootState;
+    const counters = countChatResultStatuses(results);
+    const candidateList = resetInfiniteListForRefreshRound(listState, {
+      reason,
+      round: listState.ledger?.length || 0,
+      method: forceRefresh ? "total_refresh_reapply_chat_context" : "reapply_chat_context",
+      metadata: {
+        processed: counters.processed,
+        passed: counters.passed,
+        skipped: counters.skipped
+      }
+    });
+    const recovery = {
+      reason,
+      total_refresh: Boolean(forceRefresh),
+      shell: shellRecovery,
+      candidate_list: candidateList,
+      counters
+    };
     contextSetup = {
       ...recoveredSetup.contextSetup,
       recovered_from: reason,
@@ -778,7 +828,8 @@ export async function runChatWorkflow({
       previous_context: contextSetup
     };
     runControl.checkpoint({
-      chat_context: contextSetup
+      chat_context: contextSetup,
+      candidate_list: candidateList
     });
     return recovery;
   }
@@ -811,6 +862,7 @@ export async function runChatWorkflow({
       detail_opened: 0,
       llm_screened: 0,
       passed: 0,
+      skipped: 0,
       requested: 0,
       request_satisfied: 0,
       request_skipped: 0,
@@ -846,6 +898,7 @@ export async function runChatWorkflow({
       detail_opened: 0,
       llm_screened: 0,
       passed: 0,
+      skipped: 0,
       requested: requestedCount,
       request_satisfied: requestSatisfiedCount,
       request_skipped: requestSkippedCount,
@@ -863,6 +916,7 @@ export async function runChatWorkflow({
     detail_opened: 0,
     llm_screened: 0,
     passed: 0,
+    skipped: 0,
     requested: 0,
     request_satisfied: 0,
     request_skipped: 0,
@@ -1000,11 +1054,23 @@ export async function runChatWorkflow({
     let detailUnavailableReason = "";
     if (index < detailCountLimit) {
       let detailStep = "start";
+      const checkpointInProgressCandidate = (patch = {}) => runControl.checkpoint({
+        in_progress_candidate: {
+          index,
+          key: candidateKey,
+          card_node_id: effectiveCardNodeId || cardNodeId,
+          candidate: compactCandidate(cardCandidate),
+          detail_step: detailStep,
+          counters: countChatResultStatuses(results),
+          ...patch
+        }
+      });
       try {
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
         runControl.setPhase("chat:detail");
         rootState = await ensureChatViewport(rootState, "detail");
+        checkpointInProgressCandidate({ event: "detail_start" });
 
         detailStep = "select_candidate";
         networkRecorder.clear();
@@ -1402,11 +1468,23 @@ export async function runChatWorkflow({
           }
 
           let closeResult = null;
+          let closeRecovery = null;
           if (closeResume) {
             detailStep = "close_resume_modal";
+            checkpointInProgressCandidate({
+              event: "before_close_resume_modal",
+              source,
+              image_evidence: summarizeImageEvidence(imageEvidence),
+              llm_screening: compactLlmResult(llmResult),
+              full_cv_evidence: fullCvEvidence
+            });
             closeResult = await measureTiming(timings, "close_detail_ms", () => closeChatResumeModal(client));
             if (!closeResult?.closed) {
-              throw makeChatResumeModalOpenBeforeCandidateClickError(closeResult);
+              closeRecovery = await recoverAndReapplyChatContext(
+                "resume_modal_close_failed:close_resume_modal",
+                makeChatResumeModalOpenBeforeCandidateClickError(closeResult),
+                { forceRefresh: true }
+              );
             }
           }
           detailResult.close_result = closeResult;
@@ -1435,15 +1513,28 @@ export async function runChatWorkflow({
             image_evidence: summarizeImageEvidence(imageEvidence),
             capture_target: captureTarget || null,
             capture_target_wait: captureTargetWait,
-            full_cv_evidence: fullCvEvidence
+            full_cv_evidence: fullCvEvidence,
+            close_recovery: closeRecovery
           };
         }
       } catch (error) {
+        checkpointInProgressCandidate({
+          event: "detail_error",
+          error: compactChatRuntimeError(error)
+        });
         if (isForbiddenChatResumeNavigationError(error)) {
           detailUnavailableReason = "forbidden_top_level_resume_navigation";
           const recovery = await recoverAndReapplyChatContext(detailUnavailableReason, error);
           detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
           detailResult.cv_acquisition.recovery = recovery;
+        } else if (isChatResumeModalCloseFailureError(error)) {
+          const recoveryReason = `resume_modal_close_failed:${detailStep}`;
+          const recovery = await recoverAndReapplyChatContext(recoveryReason, error, { forceRefresh: true });
+          checkpointInProgressCandidate({
+            event: "retry_after_modal_recovery",
+            recovery
+          });
+          continue;
         } else if (isUnsafeChatOnlineResumeLinkError(error)) {
           detailUnavailableReason = "unsafe_online_resume_navigation_link";
           detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
@@ -1516,16 +1607,18 @@ export async function runChatWorkflow({
       }
     });
 
+    const counters = countChatResultStatuses(results);
     runControl.updateProgress({
       card_count: cardNodeIds.length,
       target_count: passTarget || (processUntilListEnd ? "all" : processedLimit),
       target_pass_count: passTarget,
       processed_limit: processedLimit,
-      processed: results.length,
-      screened: results.length,
-      detail_opened: results.filter(resultOpenedDetail).length,
-      llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-      passed: results.filter((item) => item.screening.passed).length,
+      processed: counters.processed,
+      screened: counters.screened,
+      detail_opened: counters.detail_opened,
+      llm_screened: counters.llm_screened,
+      passed: counters.passed,
+      skipped: counters.skipped,
       requested: requestedCount,
       request_satisfied: requestSatisfiedCount,
       request_skipped: requestSkippedCount,
@@ -1541,6 +1634,7 @@ export async function runChatWorkflow({
     const checkpointStarted = Date.now();
     runControl.checkpoint({
       results,
+      in_progress_candidate: null,
       last_candidate: {
         id: screeningCandidate.id || null,
         key: candidateKey,
@@ -1564,6 +1658,7 @@ export async function runChatWorkflow({
   }
 
   runControl.setPhase("chat:done");
+  const finalCounters = countChatResultStatuses(results);
   return {
     domain: "chat",
     target_url: targetUrl,
@@ -1579,11 +1674,12 @@ export async function runChatWorkflow({
     process_until_list_end: Boolean(processUntilListEnd),
     processed_limit: processedLimit,
     detail_source: normalizedDetailSource,
-    processed: results.length,
-    screened: results.length,
-    detail_opened: results.filter(resultOpenedDetail).length,
-    llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
-    passed: results.filter((item) => item.screening.passed).length,
+    processed: finalCounters.processed,
+    screened: finalCounters.screened,
+    detail_opened: finalCounters.detail_opened,
+    llm_screened: finalCounters.llm_screened,
+    passed: finalCounters.passed,
+    skipped: finalCounters.skipped,
     requested: requestedCount,
     request_satisfied: requestSatisfiedCount,
     request_skipped: requestSkippedCount,
@@ -1685,6 +1781,7 @@ export function createChatRunService({
         detail_opened: 0,
         llm_screened: 0,
         passed: 0,
+        skipped: 0,
         requested: 0,
         request_satisfied: 0,
         request_skipped: 0

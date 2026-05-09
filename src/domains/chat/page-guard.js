@@ -1,5 +1,6 @@
 import {
   getMainFrameUrl,
+  sleep,
   waitForMainFrameUrl
 } from "../../core/browser/index.js";
 import { CHAT_TARGET_URL } from "./constants.js";
@@ -60,19 +61,25 @@ export async function assertChatShellNotResumeTopLevel(client, {
 export async function recoverChatShell(client, {
   targetUrl = CHAT_TARGET_URL,
   timeoutMs = 60000,
-  intervalMs = 500
+  intervalMs = 500,
+  forceNavigate = false,
+  settleMs = 1200
 } = {}) {
   const before = await getChatTopLevelState(client);
-  if (before.is_chat_shell) {
+  if (before.is_chat_shell && !forceNavigate) {
     return {
       recovered: false,
       before,
       after: before,
-      navigate_url: null
+      navigate_url: null,
+      force_navigate: false
     };
   }
 
-  await client.Page.navigate({ url: targetUrl });
+  const navigateResult = await client.Page.navigate({ url: targetUrl });
+  if (forceNavigate && settleMs > 0) {
+    await sleep(settleMs);
+  }
   const waited = await waitForMainFrameUrl(client, isChatShellUrl, {
     timeoutMs,
     intervalMs
@@ -80,9 +87,12 @@ export async function recoverChatShell(client, {
   const after = await getChatTopLevelState(client);
   return {
     recovered: waited.ok && after.is_chat_shell,
+    refreshed: Boolean(forceNavigate && before.is_chat_shell && after.is_chat_shell),
     before,
     after,
     wait: waited,
-    navigate_url: targetUrl
+    navigate_result: navigateResult || null,
+    navigate_url: targetUrl,
+    force_navigate: Boolean(forceNavigate)
   };
 }

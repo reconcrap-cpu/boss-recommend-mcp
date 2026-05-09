@@ -7,7 +7,9 @@ import {
 import {
   captureNodeIdFromResumeState,
   chatDetailSkipReasonFromReadyState,
+  countChatResultStatuses,
   createChatRunService,
+  isChatResumeModalCloseFailureError,
   makeChatResumeModalOpenBeforeCandidateClickError,
   resolveChatDomFallbackWait,
   summarizeChatFullCvEvidence
@@ -112,6 +114,44 @@ function testChatPreDetailAttachmentResumeSkipReason() {
   const error = makeChatResumeModalOpenBeforeCandidateClickError({ closed: false });
   assert.equal(error.code, "CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK");
   assert.equal(error.close_result.closed, false);
+  assert.equal(isChatResumeModalCloseFailureError(error), true);
+  assert.equal(isChatResumeModalCloseFailureError(new Error("different")), false);
+}
+
+function testChatResultCountersPreserveCommittedRows() {
+  const counters = countChatResultStatuses([
+    {
+      detail: {
+        cv_acquisition: { skipped: false },
+        llm_screening: { ok: true }
+      },
+      screening: {
+        status: "pass",
+        passed: true
+      }
+    },
+    {
+      detail: {
+        cv_acquisition: {
+          skipped: true,
+          source: "resume_modal_close_failed:close_resume_modal"
+        }
+      },
+      screening: {
+        status: "skip",
+        passed: false
+      }
+    }
+  ]);
+
+  assert.deepEqual(counters, {
+    processed: 2,
+    screened: 2,
+    detail_opened: 1,
+    llm_screened: 1,
+    passed: 1,
+    skipped: 1
+  });
 }
 
 function testChatDomFallbackWaitPlan() {
@@ -308,6 +348,7 @@ function testChatFullCvEvidenceGate() {
 testChatFullCvEvidenceGate();
 testChatResumeCaptureTarget();
 testChatPreDetailAttachmentResumeSkipReason();
+testChatResultCountersPreserveCommittedRows();
 testChatDomFallbackWaitPlan();
 await testLifecycleDelegation();
 
