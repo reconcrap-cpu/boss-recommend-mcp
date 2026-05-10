@@ -47,6 +47,7 @@ function snapshotFromEntry(entry) {
   return clone({
     runId: run.runId,
     name: run.name,
+    pid: run.pid,
     status: run.status,
     phase: run.phase,
     progress: run.progress,
@@ -205,11 +206,14 @@ export function createRunLifecycleManager({
     }
   }
 
-  function startRun({ name, context = {}, progress = {}, checkpoint = {}, task }) {
+  function startRun({ runId: requestedRunId = "", name, pid = process.pid, context = {}, progress = {}, checkpoint = {}, task }) {
     if (typeof task !== "function") {
       throw new Error("startRun requires a task function");
     }
-    const runId = createRunId(idPrefix);
+    const runId = String(requestedRunId || "").trim() || createRunId(idPrefix);
+    if (runs.has(runId)) {
+      throw new Error(`Run already exists: ${runId}`);
+    }
     const startedAt = now();
     const entry = {
       controller: new AbortController(),
@@ -219,6 +223,7 @@ export function createRunLifecycleManager({
       run: {
         runId,
         name: name || runId,
+        pid: Number.isInteger(pid) && pid > 0 ? pid : process.pid,
         status: RUN_STATUS_QUEUED,
         phase: "queued",
         progress,

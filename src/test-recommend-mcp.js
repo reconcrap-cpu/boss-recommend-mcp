@@ -9,9 +9,11 @@ import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 const {
   handleRequest,
   resetRecommendMcpStateForTests,
+  runDetachedWorkerForTests,
   setRecommendMcpConnectorForTests,
   setRecommendMcpJobReaderForTests,
-  setRecommendMcpWorkflowForTests
+  setRecommendMcpWorkflowForTests,
+  setSpawnProcessImplForTests
 } = __testables;
 
 const TOOL_LIST_JOBS = "list_recommend_jobs";
@@ -442,6 +444,170 @@ async function testRecommendActiveRunPersistsProgressToDisk() {
   assert.equal(completed.progress.processed, 1);
 }
 
+async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
+  resetRecommendMcpStateForTests();
+  const runId = "mcp_recommend_deadpid_test";
+  const runsDir = path.join(process.env.BOSS_RECOMMEND_HOME, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const statePath = path.join(runsDir, `${runId}.json`);
+  const checkpointPath = path.join(runsDir, `${runId}.checkpoint.json`);
+  const startedAt = new Date(Date.now() - 60_000).toISOString();
+  const checkpoint = {
+    updatedAt: startedAt,
+    results: [
+      {
+        index: 0,
+        candidate: { identity: { name: "候选人Z" } },
+        screening: { passed: true, status: "pass", score: 92 }
+      }
+    ]
+  };
+  fs.writeFileSync(checkpointPath, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8");
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    run_id: runId,
+    state: "running",
+    status: "running",
+    stage: "recommend:detail",
+    started_at: startedAt,
+    updated_at: startedAt,
+    heartbeat_at: startedAt,
+    pid: 987654321,
+    progress: {
+      target_count: 3,
+      processed: 1,
+      screened: 1,
+      passed: 1,
+      skipped: 0,
+      greet_count: 1
+    },
+    context: {
+      instruction: "推荐页筛选算法候选人",
+      confirmation: { job_value: "算法工程师" },
+      overrides: {
+        job: "算法工程师",
+        criteria: "候选人具备算法经验",
+        target_count: 3,
+        post_action: "greet",
+        max_greet_count: 3
+      }
+    },
+    resume: {
+      checkpoint_path: checkpointPath
+    },
+    result: null,
+    error: null
+  }, null, 2)}\n`, "utf8");
+
+  const payload = await callTool(TOOL_GET, { run_id: runId }, 32);
+  assert.equal(payload.status, "RUN_STATUS");
+  assert.equal(payload.run.state, "failed");
+  assert.equal(payload.run.pid, 987654321);
+  assert.equal(payload.run.error.code, "RUN_PROCESS_EXITED");
+  assert.equal(payload.persistence.source, "disk");
+  assert.equal(payload.persistence.active_control_available, false);
+  assert.equal(payload.persistence.stale_process_reconciled, true);
+  assert.equal(payload.run.result.status, "FAILED");
+  assert.equal(payload.run.result.processed_count, 1);
+  assert.equal(payload.run.result.passed_count, 1);
+  assert.equal(fs.existsSync(payload.run.result.output_csv), true);
+  assert.equal(fs.existsSync(payload.run.result.report_json), true);
+}
+
+async function testRecommendDetachedStartUsesWorkerProcess() {
+  const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
+  process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  let spawnCall = null;
+  let unrefCalled = false;
+  let connectOptions = null;
+  let workflowOptions = null;
+  setSpawnProcessImplForTests((command, args, options) => {
+    spawnCall = { command, args, options };
+    return {
+      pid: 456789,
+      unref() {
+        unrefCalled = true;
+      }
+    };
+  });
+  try {
+    installFakeConnector({
+      onConnect(options) {
+        connectOptions = options;
+      }
+    });
+    setRecommendMcpWorkflowForTests(async (options, runControl) => {
+      workflowOptions = options;
+      runControl.setPhase("recommend:detached-test");
+      runControl.updateProgress({
+        card_count: 1,
+        target_count: options.maxCandidates,
+        processed: 1,
+        screened: 1,
+        passed: 1,
+        greet_count: 0
+      });
+      return {
+        domain: "recommend",
+        processed: 1,
+        screened: 1,
+        detail_opened: 0,
+        passed: 1,
+        results: []
+      };
+    });
+
+    const startArgs = readyArgs({
+      host: "127.0.0.1",
+      port: 9777,
+      slow_live: true,
+      delay_ms: 0,
+      debug_test_mode: true,
+      screening_mode: "deterministic",
+      no_filter: true,
+      detail_limit: 1,
+      list_settle_ms: 3456,
+      execute_post_action: false
+    });
+    const started = await callTool(TOOL_START, startArgs, 33);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.run.pid, 456789);
+    assert.equal(started.run.state, "queued");
+    assert.equal(unrefCalled, true);
+    assert.equal(spawnCall.args.includes("--detached-worker"), true);
+    assert.equal(spawnCall.args.includes(started.run_id), true);
+
+    const workerResult = await runDetachedWorkerForTests({
+      runId: started.run_id,
+      workerPid: 456789
+    });
+    assert.equal(workerResult.ok, true);
+    assert.equal(connectOptions.port, 9777);
+    assert.equal(connectOptions.slowLive, true);
+    assert.equal(workflowOptions.screeningMode, "deterministic");
+    assert.equal(workflowOptions.detailLimit, 1);
+    assert.equal(workflowOptions.listSettleMs, 3456);
+    assert.equal(workflowOptions.executePostAction, false);
+    const completed = await callTool(TOOL_GET, { run_id: started.run_id }, 34);
+    assert.equal(completed.run.state, "completed");
+    assert.equal(completed.run.pid, process.pid);
+    assert.equal(completed.run.progress.processed, 1);
+  } finally {
+    setSpawnProcessImplForTests(null);
+    if (previousDetached === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_DETACHED = previousDetached;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+  }
+}
+
 async function testRecommendFailedRunIncludesConstrainedRecoveryGuidance() {
   installFakeConnector();
   setRecommendMcpWorkflowForTests(async (options, runControl) => {
@@ -675,11 +841,13 @@ async function main() {
   const previousHome = process.env.BOSS_RECOMMEND_HOME;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
   const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recommend-mcp-test-"));
   const outputDir = path.join(tempHome, "configured-output");
   const configPath = path.join(tempHome, "screening-config.json");
   process.env.BOSS_RECOMMEND_HOME = tempHome;
   process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "1";
   fs.writeFileSync(configPath, JSON.stringify({
     llmModels: [
       {
@@ -728,6 +896,10 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendActiveRunPersistsProgressToDisk();
     resetRecommendMcpStateForTests();
+    await testRecommendDiskRunningRunWithDeadPidIsReconciled();
+    resetRecommendMcpStateForTests();
+    await testRecommendDetachedStartUsesWorkerProcess();
+    resetRecommendMcpStateForTests();
     await testRecommendFailedRunIncludesConstrainedRecoveryGuidance();
     resetRecommendMcpStateForTests();
     await testRecommendMultiSelectFilterMapping();
@@ -756,6 +928,11 @@ async function main() {
       delete process.env.TEST_BOSS_OUTPUT_DIR;
     } else {
       process.env.TEST_BOSS_OUTPUT_DIR = previousOutputDir;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
     }
     fs.rmSync(tempHome, { recursive: true, force: true });
   }

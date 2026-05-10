@@ -46,6 +46,7 @@ import {
   getRecommendPipelineRunTool,
   listRecommendJobsTool,
   pauseRecommendPipelineRunTool,
+  prepareRecommendPipelineRunTool,
   resumeRecommendPipelineRunTool,
   startRecommendPipelineRunTool
 } from "./recommend-mcp.js";
@@ -116,6 +117,16 @@ const FRAMING_LINE = "line";
 const DETACHED_WORKER_FLAG = "--detached-worker";
 const DETACHED_WORKER_RUN_ID_FLAG = "--run-id";
 const DETACHED_WORKER_RESUME_FLAG = "--resume";
+const AGENT_RUNTIME_HINT_KEYS = [
+  "CODEX_CI",
+  "CODEX_THREAD_ID",
+  "CODEX_HOME",
+  "OPENCLAW_HOME",
+  "OPENCLAW",
+  "TRAE_CN",
+  "TRAE_HOME",
+  "TRAE_AGENT"
+];
 const featuredCalibrationUnsupportedCode = "FEATURED_CALIBRATION_UNSUPPORTED_CDP_ONLY";
 const recommendSelfHealApplyUnsupportedCode = "RECOMMEND_SELF_HEAL_APPLY_UNSUPPORTED_CDP_ONLY";
 const detachedLegacyPipelineUnsupportedCode = "DETACHED_LEGACY_PIPELINE_UNSUPPORTED_CDP_ONLY";
@@ -136,6 +147,31 @@ async function getRunPipelineImpl() {
 
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function clonePlain(value, fallback = null) {
+  try {
+    return value === undefined ? fallback : JSON.parse(JSON.stringify(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function isLikelyAgentRuntime() {
+  for (const key of AGENT_RUNTIME_HINT_KEYS) {
+    if (normalizeText(process.env[key] || "")) return true;
+  }
+  const originHints = [
+    normalizeText(process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || ""),
+    normalizeText(process.env.TERM_PROGRAM || "")
+  ].join(" ").toLowerCase();
+  return /codex|openclaw|trae/.test(originHints);
+}
+
+function shouldStartRecommendDetached() {
+  if (normalizeText(process.env.BOSS_RECOMMEND_CDP_INPROC || "") === "1") return false;
+  if (normalizeText(process.env.BOSS_RECOMMEND_CDP_DETACHED || "") === "1") return true;
+  return isLikelyAgentRuntime();
 }
 
 function isUnlimitedTargetCountToken(value) {
@@ -263,9 +299,57 @@ function getRunArtifacts(runId) {
   };
 }
 
+function writeRawRunState(runId, payload) {
+  const artifacts = getRunArtifacts(runId);
+  fs.mkdirSync(path.dirname(artifacts.run_state_path), { recursive: true });
+  const tempPath = `${artifacts.run_state_path}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  fs.renameSync(tempPath, artifacts.run_state_path);
+  return payload;
+}
+
+function readRawRunState(runId) {
+  const artifacts = getRunArtifacts(runId);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(artifacts.run_state_path, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function patchRawRunState(runId, patch) {
+  const current = readRawRunState(runId);
+  if (!current) return null;
+  const now = new Date().toISOString();
+  const next = {
+    ...current,
+    ...patch,
+    run_id: current.run_id || runId,
+    updated_at: now,
+    heartbeat_at: current.heartbeat_at || now,
+    control: {
+      ...(current.control || {}),
+      ...(patch.control || {})
+    },
+    resume: {
+      ...(current.resume || {}),
+      ...(patch.resume || {})
+    }
+  };
+  return writeRawRunState(runId, next);
+}
+
+function createDetachedRecommendRunId() {
+  const suffix = Math.random().toString(36).slice(2, 10);
+  return `mcp_recommend_${Date.now().toString(36)}_${suffix}`;
+}
+
 function buildRunContext(workspaceRoot, args = {}) {
+  const clonedArgs = clonePlain(args, {});
   return {
     workspace_root: path.resolve(workspaceRoot),
+    args: clonedArgs,
     instruction: String(args?.instruction || ""),
     confirmation: args?.confirmation && typeof args.confirmation === "object" ? args.confirmation : {},
     overrides: args?.overrides && typeof args.overrides === "object" ? args.overrides : {},
@@ -275,23 +359,38 @@ function buildRunContext(workspaceRoot, args = {}) {
 
 function resolveRunContext(snapshot) {
   const workspaceRoot = normalizeText(snapshot?.context?.workspace_root || "");
-  const instruction = typeof snapshot?.context?.instruction === "string"
-    ? snapshot.context.instruction
-    : "";
+  const storedArgs = snapshot?.context?.args && typeof snapshot.context.args === "object" && !Array.isArray(snapshot.context.args)
+    ? clonePlain(snapshot.context.args, {})
+    : null;
+  const instruction = typeof storedArgs?.instruction === "string"
+    ? storedArgs.instruction
+    : typeof snapshot?.context?.instruction === "string"
+      ? snapshot.context.instruction
+      : "";
+  const confirmation = storedArgs?.confirmation && typeof storedArgs.confirmation === "object" && !Array.isArray(storedArgs.confirmation)
+    ? storedArgs.confirmation
+    : snapshot?.context?.confirmation && typeof snapshot.context.confirmation === "object"
+      ? snapshot.context.confirmation
+      : {};
+  const overrides = storedArgs?.overrides && typeof storedArgs.overrides === "object" && !Array.isArray(storedArgs.overrides)
+    ? storedArgs.overrides
+    : snapshot?.context?.overrides && typeof snapshot.context.overrides === "object"
+      ? snapshot.context.overrides
+      : {};
+  const followUp = storedArgs && Object.prototype.hasOwnProperty.call(storedArgs, "follow_up")
+    ? storedArgs.follow_up
+    : snapshot?.context?.follow_up && typeof snapshot.context.follow_up === "object"
+      ? snapshot.context.follow_up
+      : null;
   if (!workspaceRoot || !instruction.trim()) return null;
   return {
     workspaceRoot,
     args: {
+      ...(storedArgs || {}),
       instruction,
-      confirmation: snapshot?.context?.confirmation && typeof snapshot.context.confirmation === "object"
-        ? snapshot.context.confirmation
-        : {},
-      overrides: snapshot?.context?.overrides && typeof snapshot.context.overrides === "object"
-        ? snapshot.context.overrides
-        : {},
-      follow_up: snapshot?.context?.follow_up && typeof snapshot.context.follow_up === "object"
-        ? snapshot.context.follow_up
-        : null
+      confirmation,
+      overrides,
+      follow_up: followUp
     }
   };
 }
@@ -1827,35 +1926,184 @@ async function runDetachedWorker({ runId, resumeRun = false, workerPid = process
       : "detached worker 已启动，准备执行。"
   });
 
-  await executeTrackedPipeline({
-    runId: normalizedRunId,
-    mode: RUN_MODE_ASYNC,
+  const started = await startRecommendPipelineRunTool({
     workspaceRoot: executionContext.workspaceRoot,
     args: executionContext.args,
-    signal: new AbortController().signal,
-    resumeRun
+    runId: normalizedRunId
   });
+  if (started?.status !== "ACCEPTED") {
+    const failedPayload = started?.error || {
+      code: "RUN_WORKER_START_FAILED",
+      message: started?.status || "detached recommend worker failed to start",
+      retryable: true
+    };
+    safeUpdateRunState(normalizedRunId, {
+      state: RUN_STATE_FAILED,
+      stage: snapshot.stage || RUN_STAGE_PREFLIGHT,
+      last_message: failedPayload.message,
+      error: failedPayload,
+      result: {
+        status: "FAILED",
+        error: failedPayload
+      }
+    });
+    return { ok: false, error: failedPayload.message };
+  }
+
+  while (true) {
+    const payload = getRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    const state = normalizeText(payload?.run?.state || payload?.run?.status || "");
+    if (TERMINAL_RUN_STATES.has(state)) break;
+    const persisted = readRawRunState(normalizedRunId);
+    if (persisted?.control?.cancel_requested === true) {
+      cancelRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    } else if (persisted?.control?.pause_requested === true && state === RUN_STATE_RUNNING) {
+      pauseRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    } else if (persisted?.control?.pause_requested === false && state === RUN_STATE_PAUSED) {
+      resumeRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    }
+    await sleepMs(1000);
+  }
   return { ok: true };
 }
 
 async function handleStartRunTool({ workspaceRoot, args }) {
-  return startRecommendPipelineRunTool({ workspaceRoot, args });
+  if (!shouldStartRecommendDetached()) {
+    return startRecommendPipelineRunTool({ workspaceRoot, args });
+  }
+
+  const prepared = prepareRecommendPipelineRunTool({ workspaceRoot, args });
+  if (prepared.status !== "READY") return prepared;
+
+  cleanupExpiredRuns();
+  const runId = createDetachedRecommendRunId();
+  try {
+    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
+  } catch (error) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "RUN_STATE_IO_ERROR",
+        message: `无法写入运行状态目录：${error.message || "unknown"}`,
+        retryable: false
+      }
+    };
+  }
+
+  let worker;
+  try {
+    worker = launchDetachedRunWorker({ runId });
+    safeUpdateRunState(runId, { pid: worker.pid || process.pid });
+  } catch (error) {
+    const failed = buildWorkerLaunchFailedPayload(error?.message || "无法启动 detached recommend worker。");
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: RUN_STAGE_PREFLIGHT,
+      last_message: failed.error.message,
+      error: failed.error,
+      result: failed
+    });
+    return failed;
+  }
+
+  const run = readRunState(runId);
+  return {
+    status: "ACCEPTED",
+    run_id: runId,
+    state: "queued",
+    run,
+    poll_after_sec: getRecommendedPollAfterSec(args),
+    message: getDefaultAcceptedMessage(args),
+    post_action: prepared.post_action,
+    target_count_semantics: prepared.target_count_semantics,
+    review: prepared.review
+  };
 }
 
 function handleGetRunTool(args) {
   return getRecommendPipelineRunTool({ args });
 }
 
+function patchDetachedRecommendControl(args, controlPatch, {
+  status,
+  message,
+  lastMessage
+} = {}) {
+  const runId = normalizeText(args?.run_id || args?.runId || "");
+  if (!runId) return null;
+  const current = readRawRunState(runId);
+  const state = normalizeText(current?.state || current?.status || "");
+  if (!current || TERMINAL_RUN_STATES.has(state)) return null;
+  const patched = patchRawRunState(runId, {
+    last_message: lastMessage || message || current.last_message || "",
+    control: controlPatch
+  });
+  if (!patched) return null;
+  return {
+    status,
+    run: patched,
+    message,
+    persistence: {
+      source: "disk",
+      active_control_available: false,
+      detached_control_requested: true
+    },
+    runtime_evaluate_used: false,
+    method_summary: {},
+    method_log: [],
+    chrome: null
+  };
+}
+
 function handleCancelRunTool(args) {
-  return cancelRecommendPipelineRunTool({ args });
+  const result = cancelRecommendPipelineRunTool({ args });
+  if (result?.status === "RUN_STATUS" && result?.persistence?.active_control_available === false) {
+    return patchDetachedRecommendControl(args, {
+      pause_requested: true,
+      pause_requested_at: new Date().toISOString(),
+      pause_requested_by: TOOL_CANCEL_RUN,
+      cancel_requested: true
+    }, {
+      status: "CANCEL_REQUESTED",
+      message: "已收到取消请求，将由 detached worker 在下一个安全边界停止。",
+      lastMessage: "已收到取消请求，将由 detached worker 在下一个安全边界停止。"
+    }) || result;
+  }
+  return result;
 }
 
 function handlePauseRunTool(args) {
-  return pauseRecommendPipelineRunTool({ args });
+  const result = pauseRecommendPipelineRunTool({ args });
+  if (result?.status === "RUN_STATUS" && result?.persistence?.active_control_available === false) {
+    return patchDetachedRecommendControl(args, {
+      pause_requested: true,
+      pause_requested_at: new Date().toISOString(),
+      pause_requested_by: TOOL_PAUSE_RUN,
+      cancel_requested: false
+    }, {
+      status: "PAUSE_REQUESTED",
+      message: "暂停请求已写入 detached run 控制文件。",
+      lastMessage: "暂停请求已写入 detached run 控制文件。"
+    }) || result;
+  }
+  return result;
 }
 
 function handleResumeRunTool(args) {
-  return resumeRecommendPipelineRunTool({ args });
+  const result = resumeRecommendPipelineRunTool({ args });
+  if (result?.status === "FAILED" && result?.error?.code === "RUN_NOT_ACTIVE") {
+    return patchDetachedRecommendControl(args, {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    }, {
+      status: "RESUME_REQUESTED",
+      message: "恢复请求已写入 detached run 控制文件。",
+      lastMessage: "恢复请求已写入 detached run 控制文件。"
+    }) || result;
+  }
+  return result;
 }
 
 function handleGetFeaturedCalibrationStatusTool(workspaceRoot) {

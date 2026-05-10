@@ -140,6 +140,15 @@ function clonePlain(value, fallback = null) {
   }
 }
 
+function plainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function nonEmptyRecord(value) {
+  const record = plainRecord(value);
+  return Object.keys(record).length ? record : null;
+}
+
 function normalizeRunId(runId) {
   const normalized = normalizeText(runId);
   if (!normalized || normalized.includes("/") || normalized.includes("\\")) return "";
@@ -191,11 +200,29 @@ function recommendSearchParamsForCsv(searchParams = {}) {
   };
 }
 
-function selectedRecommendJobForCsv(meta = {}) {
+function getSnapshotRequestContext(snapshot = {}) {
+  const context = plainRecord(snapshot?.context);
+  const shared = plainRecord(context.shared_run_context);
+  return {
+    context,
+    confirmation: nonEmptyRecord(context.confirmation) || plainRecord(shared.confirmation),
+    overrides: nonEmptyRecord(context.overrides) || plainRecord(shared.overrides),
+    followUp: context.follow_up ?? shared.follow_up ?? null,
+    shared
+  };
+}
+
+function selectedRecommendJobForCsv(meta = {}, snapshot = {}) {
+  const { confirmation, overrides, shared } = getSnapshotRequestContext(snapshot);
   const value = normalizeText(
     meta.args?.confirmation?.job_value
     || meta.normalized?.job
     || meta.args?.overrides?.job
+    || confirmation.job_value
+    || overrides.job
+    || shared.confirmation?.job_value
+    || shared.overrides?.job
+    || shared.job_label
     || ""
   );
   return {
@@ -206,21 +233,28 @@ function selectedRecommendJobForCsv(meta = {}) {
 }
 
 function buildRecommendCsvInputRows(snapshot = {}, meta = {}) {
-  const searchParams = recommendSearchParamsForCsv(meta.parsed?.searchParams || {});
-  const screenParams = meta.parsed?.screenParams || {};
+  const { context, confirmation, overrides, followUp, shared } = getSnapshotRequestContext(snapshot);
+  const searchParams = recommendSearchParamsForCsv(meta.parsed?.searchParams || {
+    school_tag: overrides.school_tag ?? confirmation.school_tag_value,
+    degree: overrides.degree ?? confirmation.degree_value,
+    gender: overrides.gender ?? confirmation.gender_value,
+    recent_not_view: overrides.recent_not_view ?? confirmation.recent_not_view_value
+  });
+  const parsedScreenParams = meta.parsed?.screenParams || {};
+  const screenParams = {
+    criteria: parsedScreenParams.criteria || meta.normalized?.criteria || overrides.criteria || "",
+    target_count: parsedScreenParams.target_count || snapshot.progress?.target_count || meta.normalized?.targetCount || overrides.target_count || confirmation.target_count_value || shared.max_candidates || "",
+    post_action: parsedScreenParams.post_action || overrides.post_action || confirmation.post_action_value || shared.post_action || "none",
+    max_greet_count: parsedScreenParams.max_greet_count ?? overrides.max_greet_count ?? confirmation.max_greet_count_value ?? shared.max_greet_count ?? ""
+  };
   return buildLegacyScreenInputRows({
-    instruction: meta.args?.instruction || "",
+    instruction: meta.args?.instruction || context.instruction || shared.instruction || "",
     selectedPage: "recommend",
-    selectedJob: selectedRecommendJobForCsv(meta),
+    selectedJob: selectedRecommendJobForCsv(meta, snapshot),
     userSearchParams: cloneReportInput(searchParams, {}),
     effectiveSearchParams: cloneReportInput(searchParams, {}),
-    screenParams: {
-      criteria: screenParams.criteria || meta.normalized?.criteria || "",
-      target_count: screenParams.target_count || snapshot.progress?.target_count || meta.normalized?.targetCount || "",
-      post_action: screenParams.post_action || "none",
-      max_greet_count: screenParams.max_greet_count ?? ""
-    },
-    followUp: meta.args?.follow_up || meta.args?.overrides?.follow_up || null
+    screenParams,
+    followUp: meta.args?.follow_up || meta.args?.overrides?.follow_up || followUp || overrides.follow_up || null
   });
 }
 
@@ -235,6 +269,16 @@ function readRecommendRunState(runId) {
   const artifacts = getRecommendRunArtifacts(runId);
   if (!artifacts) return null;
   return readJsonFile(artifacts.run_state_path);
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function getRecommendRunMeta(runId) {
@@ -475,12 +519,14 @@ function normalizeRunSnapshot(snapshot) {
     || snapshot.status === RUN_STATUS_PAUSED
   ) ? buildLegacyRecommendResult({ ...snapshot, progress }) : null;
   const recovery = buildConstrainedAgentRecovery(snapshot, meta, artifacts);
+  const snapshotContext = plainRecord(snapshot.context);
+  const metaArgs = plainRecord(meta.args);
   const oldContext = {
-    workspace_root: meta.workspaceRoot || null,
-    instruction: meta.args?.instruction || "",
-    confirmation: clonePlain(meta.args?.confirmation || {}, {}),
-    overrides: clonePlain(meta.args?.overrides || {}, {}),
-    follow_up: clonePlain(meta.args?.follow_up || {}, {}),
+    workspace_root: meta.workspaceRoot || snapshotContext.workspace_root || null,
+    instruction: metaArgs.instruction || snapshotContext.instruction || "",
+    confirmation: clonePlain(metaArgs.confirmation ?? snapshotContext.confirmation ?? {}, {}),
+    overrides: clonePlain(metaArgs.overrides ?? snapshotContext.overrides ?? {}, {}),
+    follow_up: clonePlain(metaArgs.follow_up ?? snapshotContext.follow_up ?? null, null),
     target_count_semantics: TARGET_COUNT_SEMANTICS
   };
   return {
@@ -494,12 +540,12 @@ function normalizeRunSnapshot(snapshot) {
     updated_at: snapshot.updatedAt,
     completed_at: toIsoOrNull(snapshot.completedAt),
     heartbeat_at: snapshot.updatedAt,
-    pid: process.pid || null,
+    pid: Number.isInteger(snapshot.pid) && snapshot.pid > 0 ? snapshot.pid : process.pid || null,
     last_message: snapshot.error?.message || snapshot.phase || null,
     context: {
-      ...(snapshot.context || {}),
+      ...snapshotContext,
       ...oldContext,
-      shared_run_context: snapshot.context || {}
+      shared_run_context: snapshotContext
     },
     control: {
       pause_requested: snapshot.status === RUN_STATUS_PAUSED,
@@ -521,6 +567,41 @@ function normalizeRunSnapshot(snapshot) {
   };
 }
 
+function mergePersistedControlRequest(normalized, existing) {
+  const control = {
+    ...(normalized?.control || {})
+  };
+  if (!normalized || TERMINAL_STATUSES.has(normalized.state)) return control;
+  const existingControl = plainRecord(existing?.control);
+  if (existingControl.cancel_requested === true) {
+    return {
+      ...control,
+      pause_requested: true,
+      pause_requested_at: existingControl.pause_requested_at || control.pause_requested_at || new Date().toISOString(),
+      pause_requested_by: existingControl.pause_requested_by || control.pause_requested_by || "cancel_recommend_pipeline_run",
+      cancel_requested: true
+    };
+  }
+  if (existingControl.pause_requested === true && normalized.state !== RUN_STATUS_PAUSED) {
+    return {
+      ...control,
+      pause_requested: true,
+      pause_requested_at: existingControl.pause_requested_at || control.pause_requested_at || new Date().toISOString(),
+      pause_requested_by: existingControl.pause_requested_by || control.pause_requested_by || "pause_recommend_pipeline_run"
+    };
+  }
+  if (existingControl.pause_requested === false && normalized.state === RUN_STATUS_PAUSED) {
+    return {
+      ...control,
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    };
+  }
+  return control;
+}
+
 function persistRecommendRunSnapshot(snapshot, {
   persistActiveCheckpoint = false
 } = {}) {
@@ -528,6 +609,8 @@ function persistRecommendRunSnapshot(snapshot, {
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const existing = readJsonFile(artifacts.run_state_path);
+  normalized.control = mergePersistedControlRequest(normalized, existing);
   if (persistActiveCheckpoint) {
     persistRecommendCheckpointSnapshot(normalized);
   }
@@ -555,6 +638,38 @@ function persistRecommendRunSnapshot(snapshot, {
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
   return normalized;
+}
+
+function reconcilePersistedRecommendRunIfNeeded(persisted) {
+  if (!persisted || typeof persisted !== "object") return persisted;
+  const persistedState = normalizeText(persisted.state || persisted.status);
+  if (TERMINAL_STATUSES.has(persistedState)) return persisted;
+  if (isProcessAlive(persisted.pid)) return persisted;
+
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  const artifacts = getRecommendRunArtifacts(runId);
+  const checkpoint = artifacts?.checkpoint_path ? readJsonFile(artifacts.checkpoint_path) : null;
+  const now = new Date().toISOString();
+  const error = {
+    code: "RUN_PROCESS_EXITED",
+    message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}），已自动标记为失败。`,
+    retryable: true
+  };
+  return persistRecommendRunSnapshot({
+    runId,
+    name: persisted.name || runId,
+    status: RUN_STATUS_FAILED,
+    phase: persisted.stage || persisted.phase || "recommend:orphaned",
+    progress: persisted.progress || {},
+    context: persisted.context || {},
+    checkpoint: checkpoint || persisted.checkpoint || {},
+    startedAt: persisted.started_at || persisted.startedAt || now,
+    updatedAt: now,
+    completedAt: now,
+    pid: Number.isInteger(persisted.pid) && persisted.pid > 0 ? persisted.pid : null,
+    error,
+    summary: persisted.summary || null
+  });
 }
 
 function persistRecommendLifecycleSnapshot(snapshot, event = {}) {
@@ -1154,6 +1269,47 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
   };
 }
 
+function prepareRecommendPipelineStart(args = {}, { workspaceRoot = "" } = {}) {
+  const parsed = parseRecommendPipelineRequest(args);
+  const gate = evaluateRecommendPipelineGate(parsed, args);
+  if (gate) return { response: gate };
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const normalized = normalizeRecommendStartInput(args, parsed, configResolution);
+  const debugTestOptions = collectRecommendDebugTestOptions(args, normalized);
+  if (debugTestOptions.length && !isDebugTestMode(args)) {
+    return {
+      response: {
+        status: "FAILED",
+        error: {
+          code: "DEBUG_TEST_MODE_REQUIRED",
+          message: `这些参数属于调试/测试路径，正式 live run 不会默认启用：${debugTestOptions.join(", ")}。如确需测试，请显式传 debug_test_mode=true。`,
+          retryable: false
+        },
+        debug_test_options: debugTestOptions
+      }
+    };
+  }
+  if (normalized.screeningMode === "llm" && !configResolution.ok) {
+    return {
+      response: {
+        status: "FAILED",
+        error: {
+          code: "SCREEN_CONFIG_ERROR",
+          message: configResolution.error?.message || "screening-config.json is required for LLM screening.",
+          retryable: true
+        },
+        config_path: configResolution.config_path || null,
+        candidate_paths: configResolution.candidate_paths || []
+      }
+    };
+  }
+  return {
+    parsed,
+    configResolution,
+    normalized
+  };
+}
+
 async function closeRecommendRunSession(runId) {
   const meta = recommendRunMeta.get(runId);
   if (!meta || meta.closed) return;
@@ -1199,34 +1355,19 @@ function trackRecommendRun(runId) {
     });
 }
 
-async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = "" } = {}) {
-  const parsed = parseRecommendPipelineRequest(args);
-  const gate = evaluateRecommendPipelineGate(parsed, args);
-  if (gate) return gate;
-  const configResolution = resolveBossScreeningConfig(workspaceRoot);
-  const normalized = normalizeRecommendStartInput(args, parsed, configResolution);
-  const debugTestOptions = collectRecommendDebugTestOptions(args, normalized);
-  if (debugTestOptions.length && !isDebugTestMode(args)) {
+async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = "", runId = "" } = {}) {
+  const prepared = prepareRecommendPipelineStart(args, { workspaceRoot });
+  if (prepared.response) return prepared.response;
+  const { parsed, configResolution, normalized } = prepared;
+  const fixedRunId = normalizeRunId(runId);
+  if (runId && !fixedRunId) {
     return {
       status: "FAILED",
       error: {
-        code: "DEBUG_TEST_MODE_REQUIRED",
-        message: `这些参数属于调试/测试路径，正式 live run 不会默认启用：${debugTestOptions.join(", ")}。如确需测试，请显式传 debug_test_mode=true。`,
+        code: "INVALID_RUN_ID",
+        message: "run_id is invalid",
         retryable: false
-      },
-      debug_test_options: debugTestOptions
-    };
-  }
-  if (normalized.screeningMode === "llm" && !configResolution.ok) {
-    return {
-      status: "FAILED",
-      error: {
-        code: "SCREEN_CONFIG_ERROR",
-        message: configResolution.error?.message || "screening-config.json is required for LLM screening.",
-        retryable: true
-      },
-      config_path: configResolution.config_path || null,
-      candidate_paths: configResolution.candidate_paths || []
+      }
     };
   }
 
@@ -1260,7 +1401,11 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
 
   let started;
   try {
-    started = recommendRunService.startRecommendRun(getRunOptions(args, parsed, normalized, session, configResolution));
+    started = recommendRunService.startRecommendRun({
+      ...getRunOptions(args, parsed, normalized, session, configResolution),
+      runId: fixedRunId || undefined,
+      pid: process.pid
+    });
   } catch (error) {
     await session.close?.();
     return {
@@ -1311,8 +1456,24 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
   };
 }
 
-export async function startRecommendPipelineRunTool({ workspaceRoot = "", args = {} } = {}) {
-  const started = await startRecommendPipelineRunInternal(args, { workspaceRoot });
+export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} } = {}) {
+  const prepared = prepareRecommendPipelineStart(args, { workspaceRoot });
+  if (prepared.response) return prepared.response;
+  const { parsed, normalized } = prepared;
+  return {
+    status: "READY",
+    review: parsed.review,
+    post_action: {
+      requested: normalized.postAction,
+      execute_post_action: args.dry_run_post_action === true ? false : args.execute_post_action !== false,
+      max_greet_count: normalized.maxGreetCount
+    },
+    target_count_semantics: TARGET_COUNT_SEMANTICS
+  };
+}
+
+export async function startRecommendPipelineRunTool({ workspaceRoot = "", args = {}, runId = "" } = {}) {
+  const started = await startRecommendPipelineRunInternal(args, { workspaceRoot, runId });
   if (started.status !== "ACCEPTED") return started;
   return attachMethodEvidence(started, started.run_id);
 }
@@ -1339,12 +1500,14 @@ export function getRecommendPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedRecommendRunIfNeeded(persisted);
       return {
         status: "RUN_STATUS",
-        run: persisted,
+        run: reconciled,
         persistence: {
           source: "disk",
-          active_control_available: false
+          active_control_available: false,
+          stale_process_reconciled: reconciled?.state !== persisted.state
         },
         runtime_evaluate_used: false,
         method_summary: {},

@@ -1266,6 +1266,8 @@ export function createRecommendRunService({
   const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
 
   function startRecommendRun({
+    runId = "",
+    pid = process.pid,
     client,
     targetUrl = "",
     criteria = "",
@@ -1313,7 +1315,9 @@ export function createRecommendRunService({
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? null : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
+      runId,
       name,
+      pid,
       context: {
         domain: "recommend",
         target_url: targetUrl,
