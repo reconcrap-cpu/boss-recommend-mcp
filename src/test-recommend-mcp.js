@@ -574,9 +574,15 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(started.status, "ACCEPTED");
     assert.equal(started.run.pid, 456789);
     assert.equal(started.run.state, "queued");
+    assert.ok(started.run.resume.worker_stdout_path.endsWith(`${started.run_id}.worker.stdout.log`));
+    assert.ok(started.run.resume.worker_stderr_path.endsWith(`${started.run_id}.worker.stderr.log`));
+    assert.equal(fs.existsSync(started.run.resume.worker_stdout_path), true);
+    assert.equal(fs.existsSync(started.run.resume.worker_stderr_path), true);
     assert.equal(unrefCalled, true);
     assert.equal(spawnCall.args.includes("--detached-worker"), true);
     assert.equal(spawnCall.args.includes(started.run_id), true);
+    assert.equal(spawnCall.options.detached, true);
+    assert.equal(spawnCall.options.stdio[0], "ignore");
 
     const workerResult = await runDetachedWorkerForTests({
       runId: started.run_id,

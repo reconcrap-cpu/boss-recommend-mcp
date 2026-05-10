@@ -160,6 +160,8 @@ function defaultResume(resume = {}) {
     checkpoint_path: normalizeMessage(resume?.checkpoint_path || ""),
     pause_control_path: normalizeMessage(resume?.pause_control_path || ""),
     output_csv: normalizeMessage(resume?.output_csv || ""),
+    worker_stdout_path: normalizeMessage(resume?.worker_stdout_path || ""),
+    worker_stderr_path: normalizeMessage(resume?.worker_stderr_path || ""),
     follow_up_phase: normalizeMessage(resume?.follow_up_phase || ""),
     chat_run_id: normalizeMessage(resume?.chat_run_id || ""),
     chat_state: normalizeMessage(resume?.chat_state || ""),

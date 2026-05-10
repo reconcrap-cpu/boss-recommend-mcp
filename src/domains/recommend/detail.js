@@ -131,19 +131,47 @@ export async function waitForRecommendDetail(client, {
   const started = Date.now();
   let lastState = null;
   while (Date.now() - started <= timeoutMs) {
-    const rootState = await getRecommendRoots(client);
-    const popup = await findVisibleDetailTarget(client, rootState.roots, DETAIL_POPUP_SELECTORS);
-    const resumeIframe = await findVisibleDetailTarget(client, rootState.roots, DETAIL_RESUME_IFRAME_SELECTORS);
-    lastState = {
-      iframe: rootState.iframe,
-      roots: rootState.roots,
-      popup,
-      resumeIframe
-    };
-    if (popup || resumeIframe) return lastState;
+    lastState = await readRecommendDetailState(client);
+    if (lastState?.popup || lastState?.resumeIframe) return lastState;
     await sleep(intervalMs);
   }
   return lastState;
+}
+
+async function readRecommendDetailState(client) {
+  const rootState = await getRecommendRoots(client);
+  const popup = await findVisibleDetailTarget(client, rootState.roots, DETAIL_POPUP_SELECTORS);
+  const resumeIframe = await findVisibleDetailTarget(client, rootState.roots, DETAIL_RESUME_IFRAME_SELECTORS);
+  return {
+    iframe: rootState.iframe,
+    roots: rootState.roots,
+    popup,
+    resumeIframe
+  };
+}
+
+export async function waitForRecommendDetailClosed(client, {
+  timeoutMs = 4000,
+  intervalMs = 250
+} = {}) {
+  const started = Date.now();
+  let lastState = null;
+  while (Date.now() - started <= timeoutMs) {
+    lastState = await readRecommendDetailState(client);
+    if (!lastState?.popup && !lastState?.resumeIframe) {
+      return {
+        closed: true,
+        elapsed_ms: Date.now() - started,
+        state: lastState
+      };
+    }
+    await sleep(intervalMs);
+  }
+  return {
+    closed: false,
+    elapsed_ms: Date.now() - started,
+    state: lastState
+  };
 }
 
 async function findVisibleDetailTarget(client, roots, selectors) {
@@ -397,7 +425,9 @@ export async function openRecommendCardDetailWithFreshRetry(client, {
 }
 
 export async function closeRecommendDetail(client, {
-  attemptsLimit = 3
+  attemptsLimit = 4,
+  closeWaitMs = 5000,
+  escapeWaitMs = 3500
 } = {}) {
   const attempts = [];
   for (let index = 0; index < attemptsLimit; index += 1) {
@@ -433,15 +463,21 @@ export async function closeRecommendDetail(client, {
         await pressEscape(client);
         attempts.push({ mode: "Escape-after-close-selector-error" });
       }
-      await sleep(700);
     } else {
       await pressEscape(client);
       attempts.push({ mode: "Escape" });
-      await sleep(700);
     }
 
-    let state = await waitForRecommendDetail(client, { timeoutMs: 1000 });
-    if (!state?.popup && !state?.resumeIframe) {
+    const closedAfterClick = await waitForRecommendDetailClosed(client, {
+      timeoutMs: closeWaitMs,
+      intervalMs: 250
+    });
+    attempts.push({
+      mode: "wait-closed-after-primary",
+      closed: closedAfterClick.closed,
+      elapsed_ms: closedAfterClick.elapsed_ms
+    });
+    if (closedAfterClick.closed) {
       return {
         closed: true,
         attempts
@@ -450,10 +486,17 @@ export async function closeRecommendDetail(client, {
 
     await pressEscape(client);
     attempts.push({ mode: "Escape-fallback" });
-    await sleep(700);
 
-    state = await waitForRecommendDetail(client, { timeoutMs: 1000 });
-    if (!state?.popup && !state?.resumeIframe) {
+    const closedAfterEscape = await waitForRecommendDetailClosed(client, {
+      timeoutMs: escapeWaitMs,
+      intervalMs: 250
+    });
+    attempts.push({
+      mode: "wait-closed-after-escape",
+      closed: closedAfterEscape.closed,
+      elapsed_ms: closedAfterEscape.elapsed_ms
+    });
+    if (closedAfterEscape.closed) {
       return {
         closed: true,
         attempts

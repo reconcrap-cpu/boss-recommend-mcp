@@ -295,7 +295,9 @@ function getRunArtifacts(runId) {
   const normalizedRunId = normalizeText(runId);
   return {
     run_state_path: path.join(getRunsDir(), `${normalizedRunId}.json`),
-    checkpoint_path: path.join(getRunsDir(), `${normalizedRunId}.checkpoint.json`)
+    checkpoint_path: path.join(getRunsDir(), `${normalizedRunId}.checkpoint.json`),
+    worker_stdout_path: path.join(getRunsDir(), `${normalizedRunId}.worker.stdout.log`),
+    worker_stderr_path: path.join(getRunsDir(), `${normalizedRunId}.worker.stderr.log`)
   };
 }
 
@@ -1554,16 +1556,143 @@ function launchDetachedRunWorker({ runId, resumeRun = false }) {
   if (resumeRun) {
     childArgs.push(DETACHED_WORKER_RESUME_FLAG);
   }
-  const child = spawnProcessImpl(process.execPath, childArgs, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
-    env: process.env
-  });
+  const artifacts = getRunArtifacts(runId);
+  fs.mkdirSync(path.dirname(artifacts.worker_stdout_path), { recursive: true });
+  const stdoutFd = fs.openSync(artifacts.worker_stdout_path, "a");
+  const stderrFd = fs.openSync(artifacts.worker_stderr_path, "a");
+  let child;
+  try {
+    child = spawnProcessImpl(process.execPath, childArgs, {
+      detached: true,
+      stdio: ["ignore", stdoutFd, stderrFd],
+      windowsHide: true,
+      env: process.env
+    });
+  } finally {
+    fs.closeSync(stdoutFd);
+    fs.closeSync(stderrFd);
+  }
+  child.workerLogPaths = {
+    stdoutPath: artifacts.worker_stdout_path,
+    stderrPath: artifacts.worker_stderr_path
+  };
   if (typeof child?.unref === "function") {
     child.unref();
   }
   return child;
+}
+
+function errorToDetachedWorkerPayload(error, fallbackMessage = "detached recommend worker exited unexpectedly") {
+  const message = normalizeText(error?.message || error || fallbackMessage) || fallbackMessage;
+  const payload = {
+    code: normalizeText(error?.code || "") || "RUN_WORKER_UNHANDLED_EXCEPTION",
+    message,
+    retryable: true
+  };
+  if (normalizeText(error?.name || "")) {
+    payload.name = normalizeText(error.name);
+  }
+  if (normalizeText(error?.stack || "")) {
+    payload.stack = String(error.stack).slice(0, 8000);
+  }
+  return payload;
+}
+
+function markDetachedWorkerFailed(runId, error, options = {}) {
+  const normalizedRunId = normalizeText(runId);
+  if (!normalizedRunId) return null;
+  const existing = readRawRunState(normalizedRunId) || {};
+  const existingState = normalizeText(existing.state || existing.status);
+  if (TERMINAL_RUN_STATES.has(existingState)) return existing;
+
+  const now = new Date().toISOString();
+  const artifacts = getRunArtifacts(normalizedRunId);
+  const errorPayload = {
+    ...errorToDetachedWorkerPayload(error, options.message),
+    ...(options.code ? { code: options.code } : {})
+  };
+  const previousResult = existing.result && typeof existing.result === "object" ? existing.result : {};
+  const result = {
+    ...previousResult,
+    status: "FAILED",
+    completion_reason: "failed",
+    error: errorPayload,
+    worker_stdout_path: artifacts.worker_stdout_path,
+    worker_stderr_path: artifacts.worker_stderr_path
+  };
+
+  return writeRawRunState(normalizedRunId, {
+    ...existing,
+    run_id: normalizedRunId,
+    mode: existing.mode || RUN_MODE_ASYNC,
+    state: RUN_STATE_FAILED,
+    status: RUN_STATE_FAILED,
+    stage: existing.stage || RUN_STAGE_PREFLIGHT,
+    started_at: existing.started_at || now,
+    updated_at: now,
+    heartbeat_at: now,
+    completed_at: now,
+    pid: Number.isInteger(existing.pid) && existing.pid > 0 ? existing.pid : process.pid,
+    progress: existing.progress || {},
+    last_message: errorPayload.message,
+    context: existing.context || {},
+    control: existing.control || {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    },
+    resume: {
+      ...(existing.resume && typeof existing.resume === "object" ? existing.resume : {}),
+      checkpoint_path: existing.resume?.checkpoint_path || artifacts.checkpoint_path,
+      pause_control_path: existing.resume?.pause_control_path || artifacts.run_state_path,
+      worker_stdout_path: artifacts.worker_stdout_path,
+      worker_stderr_path: artifacts.worker_stderr_path
+    },
+    artifacts: {
+      ...(existing.artifacts && typeof existing.artifacts === "object" ? existing.artifacts : {}),
+      worker_stdout_path: artifacts.worker_stdout_path,
+      worker_stderr_path: artifacts.worker_stderr_path
+    },
+    error: errorPayload,
+    result
+  });
+}
+
+function installDetachedWorkerFailureHandlers(runId) {
+  let handled = false;
+  const failOnce = (error, options = {}) => {
+    if (handled) return;
+    handled = true;
+    try {
+      markDetachedWorkerFailed(runId, error, options);
+    } catch (markError) {
+      console.error("[boss-recommend-mcp] failed to persist detached worker failure", markError);
+    }
+  };
+
+  process.on("uncaughtException", (error) => {
+    console.error("[boss-recommend-mcp] detached worker uncaught exception", error);
+    failOnce(error, { code: "RUN_WORKER_UNCAUGHT_EXCEPTION" });
+    process.exit(1);
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    console.error("[boss-recommend-mcp] detached worker unhandled rejection", reason);
+    const error = reason instanceof Error ? reason : new Error(normalizeText(reason) || "Unhandled promise rejection");
+    failOnce(error, { code: "RUN_WORKER_UNHANDLED_REJECTION" });
+    process.exit(1);
+  });
+
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(signal, () => {
+      const error = new Error(`detached recommend worker received ${signal}`);
+      console.error("[boss-recommend-mcp] detached worker received signal", signal);
+      failOnce(error, { code: "RUN_WORKER_SIGNAL" });
+      const signalExitCodes = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+      process.exit(signalExitCodes[signal] || 1);
+    });
+  }
 }
 
 function buildWorkerLaunchFailedPayload(message) {
@@ -1993,7 +2122,14 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   let worker;
   try {
     worker = launchDetachedRunWorker({ runId });
-    safeUpdateRunState(runId, { pid: worker.pid || process.pid });
+    const workerLogPaths = worker.workerLogPaths || {};
+    safeUpdateRunState(runId, {
+      pid: worker.pid || process.pid,
+      resume: {
+        worker_stdout_path: workerLogPaths.stdoutPath || getRunArtifacts(runId).worker_stdout_path,
+        worker_stderr_path: workerLogPaths.stderrPath || getRunArtifacts(runId).worker_stderr_path
+      }
+    });
   } catch (error) {
     const failed = buildWorkerLaunchFailedPayload(error?.message || "无法启动 detached recommend worker。");
     safeUpdateRunState(runId, {
@@ -2602,6 +2738,7 @@ const thisFilePath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === thisFilePath) {
   const detachedWorkerOptions = parseDetachedWorkerOptions(process.argv.slice(2));
   if (detachedWorkerOptions) {
+    installDetachedWorkerFailureHandlers(detachedWorkerOptions.runId);
     runDetachedWorker({
       runId: detachedWorkerOptions.runId,
       resumeRun: detachedWorkerOptions.resumeRun
@@ -2609,7 +2746,9 @@ if (process.argv[1] && path.resolve(process.argv[1]) === thisFilePath) {
       if (!result?.ok) {
         process.exitCode = 1;
       }
-    }).catch(() => {
+    }).catch((error) => {
+      console.error("[boss-recommend-mcp] detached worker failed", error);
+      markDetachedWorkerFailed(detachedWorkerOptions.runId, error);
       process.exitCode = 1;
     });
   } else {

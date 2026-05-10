@@ -165,6 +165,8 @@ function getRecommendRunArtifacts(runId) {
     output_dir: outputDir,
     run_state_path: path.join(runsDir, `${normalized}.json`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
+    worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
   };
@@ -557,6 +559,8 @@ function normalizeRunSnapshot(snapshot) {
       checkpoint_path: legacyResult?.checkpoint_path || meta.checkpointPath || artifacts?.checkpoint_path || null,
       pause_control_path: artifacts?.run_state_path || null,
       output_csv: legacyResult?.output_csv || null,
+      worker_stdout_path: artifacts?.worker_stdout_path || null,
+      worker_stderr_path: artifacts?.worker_stderr_path || null,
       resume_count: meta.resumeCount || 0,
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null

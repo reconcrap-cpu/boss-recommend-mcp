@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   chooseFilterOptionByLabels,
   chooseFilterOptionsByLabels,
+  closeRecommendDetail,
   createRecoverableImageCaptureEvidence,
   chooseFirstSafeFilterOption,
   findRecommendCardNodeForCandidateKey,
@@ -400,6 +401,74 @@ async function testPageScopeFallbackToRecommend() {
   assert.equal(result.after.card_count, 2);
 }
 
+async function testCloseRecommendDetailWaitsUntilClosed() {
+  let detailVisible = true;
+  let closePollsRemaining = null;
+  let clickCount = 0;
+
+  const client = {
+    DOM: {
+      async getDocument() {
+        if (closePollsRemaining !== null) {
+          if (closePollsRemaining <= 0) {
+            detailVisible = false;
+          } else {
+            closePollsRemaining -= 1;
+          }
+        }
+        return { root: { nodeId: 1 } };
+      },
+      async querySelector({ nodeId, selector }) {
+        if (nodeId === 1 && selector.includes("iframe")) return { nodeId: 2 };
+        return { nodeId: 0 };
+      },
+      async describeNode({ nodeId }) {
+        assert.equal(nodeId, 2);
+        return { node: { contentDocument: { nodeId: 3 } } };
+      },
+      async querySelectorAll({ selector }) {
+        if (!detailVisible) return { nodeIds: [] };
+        if (selector === ".dialog-wrap.active") return { nodeIds: [5] };
+        if (selector === ".boss-popup__close") return { nodeIds: [4] };
+        return { nodeIds: [] };
+      },
+      async getBoxModel({ nodeId }) {
+        assert.ok([4, 5].includes(nodeId));
+        return { model: { border: [10, 10, 50, 10, 50, 40, 10, 40] } };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") {
+          clickCount += 1;
+          closePollsRemaining = 2;
+        }
+        return {};
+      },
+      async dispatchKeyEvent() {
+        return {};
+      }
+    }
+  };
+
+  const result = await closeRecommendDetail(client, {
+    attemptsLimit: 1,
+    closeWaitMs: 1500,
+    escapeWaitMs: 50
+  });
+
+  assert.equal(result.closed, true);
+  assert.equal(clickCount, 1);
+  assert.equal(
+    result.attempts.some((attempt) => (
+      attempt.mode === "wait-closed-after-primary"
+      && attempt.closed === true
+      && attempt.elapsed_ms >= 250
+    )),
+    true
+  );
+}
+
 testFilterOptionHelpers();
 testJobLabelMatchingIgnoresSalaryFormatting();
 testRecoverableImageCaptureEvidencePreservesPartialPages();
@@ -413,5 +482,6 @@ await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();
 await testPageScopeFallbackToRecommend();
+await testCloseRecommendDetailWaitsUntilClosed();
 
 console.log("recommend domain tests passed");
