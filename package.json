@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "2.0.41",
+  "version": "2.0.42",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -60,6 +60,7 @@
     "live:infinite-list": "node scripts/live-infinite-list-smoke.js",
     "live:scroll-end": "node scripts/live-scroll-end-screenshot.js",
     "live:refresh-round": "node scripts/live-refresh-round-smoke.js",
+    "live:recommend-recovery": "node scripts/live-recommend-recovery-smoke.js",
     "live:self-heal": "node scripts/live-self-heal-smoke.js",
     "live:recommend-actions": "node scripts/live-recommend-actions-smoke.js",
     "live:recommend-phase10-full": "node scripts/live-recommend-phase10-full.js",
@@ -82,6 +83,7 @@
     "config/screening-config.example.json",
     "skills",
     "scripts/postinstall.cjs",
+    "scripts/live-recommend-recovery-smoke.js",
     "src/core",
     "src/domains",
     "src/chat-mcp.js",
