@@ -92,10 +92,28 @@ export async function findRecommendJobTrigger(client, frameNodeId) {
   return null;
 }
 
-export async function openRecommendJobDropdown(client, frameNodeId, {
-  timeoutMs = 4000
+export async function waitForRecommendJobTrigger(client, frameNodeId, {
+  timeoutMs = 8000,
+  intervalMs = 250
 } = {}) {
-  const trigger = await findRecommendJobTrigger(client, frameNodeId);
+  const started = Date.now();
+  while (Date.now() - started <= timeoutMs) {
+    const trigger = await findRecommendJobTrigger(client, frameNodeId);
+    if (trigger) return trigger;
+    await sleep(intervalMs);
+  }
+  return null;
+}
+
+export async function openRecommendJobDropdown(client, frameNodeId, {
+  timeoutMs = 4000,
+  triggerTimeoutMs = Math.max(8000, timeoutMs),
+  triggerIntervalMs = 250
+} = {}) {
+  const trigger = await waitForRecommendJobTrigger(client, frameNodeId, {
+    timeoutMs: triggerTimeoutMs,
+    intervalMs: triggerIntervalMs
+  });
   if (!trigger) {
     throw new Error("Recommend job trigger was not found");
   }
@@ -166,7 +184,8 @@ export async function closeRecommendJobDropdown(client) {
 
 export async function selectRecommendJob(client, frameNodeId, {
   jobLabel = "",
-  settleMs = 6000
+  settleMs = 6000,
+  dropdownTimeoutMs = Math.max(8000, settleMs)
 } = {}) {
   const target = normalizeText(jobLabel);
   if (!target) {
@@ -178,7 +197,10 @@ export async function selectRecommendJob(client, frameNodeId, {
     };
   }
 
-  const opened = await openRecommendJobDropdown(client, frameNodeId);
+  const opened = await openRecommendJobDropdown(client, frameNodeId, {
+    timeoutMs: dropdownTimeoutMs,
+    triggerTimeoutMs: dropdownTimeoutMs
+  });
   const options = opened.options.length
     ? opened.options
     : await listRecommendJobOptions(client, frameNodeId, { openDropdown: false });

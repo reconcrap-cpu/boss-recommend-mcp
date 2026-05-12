@@ -180,9 +180,11 @@ async function applyRefreshMethod(client, method, {
       throw new Error("Recommend iframe was not ready after refresh reload");
     }
     if (jobLabel) {
+      const jobDropdownTimeoutMs = reloadSettleMs > 10000 ? 15000 : 12000;
       jobSelection = await selectRecommendJob(client, currentRootState.iframe.documentNodeId, {
         jobLabel,
-        settleMs: reloadSettleMs > 10000 ? 12000 : 6000
+        settleMs: reloadSettleMs > 10000 ? 12000 : 6000,
+        dropdownTimeoutMs: jobDropdownTimeoutMs
       });
       if (!jobSelection.selected) {
         throw new Error(`Requested recommend job was not selected after refresh reload: ${jobSelection.reason}`);

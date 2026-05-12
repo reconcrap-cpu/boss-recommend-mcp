@@ -22,6 +22,7 @@ import {
   matchesRecommendDetailNetwork,
   normalizeFilterOptionLabel,
   normalizeRecommendPageScope,
+  openRecommendJobDropdown,
   parseRecommendCardFieldsFromHtml,
   readRecommendDetailHtml,
   readRecommendCardCandidate,
@@ -197,6 +198,65 @@ async function testRefreshRecoveryFallsBackFromNavigateToReload() {
     "navigate timeout",
     "reload timeout"
   ]);
+}
+
+async function testOpenRecommendJobDropdownWaitsForLateTrigger() {
+  let triggerPolls = 0;
+  let clicked = false;
+  const optionSelector = ".job-selecter-options .job-item, .job-list .job-item, .job-item";
+  const client = {
+    DOM: {
+      async querySelectorAll({ selector }) {
+        if (selector.includes("job-selecter-wrap")) {
+          triggerPolls += 1;
+          return { nodeIds: triggerPolls >= 3 ? [10] : [] };
+        }
+        if (selector === optionSelector) {
+          return { nodeIds: clicked ? [20] : [] };
+        }
+        return { nodeIds: [] };
+      },
+      async querySelector({ selector }) {
+        if (selector === optionSelector && clicked) return { nodeId: 20 };
+        return { nodeId: 0 };
+      },
+      async getBoxModel({ nodeId }) {
+        if (nodeId === 10) {
+          return { model: { border: [10, 10, 110, 10, 110, 40, 10, 40] } };
+        }
+        if (nodeId === 20) {
+          return { model: { border: [10, 50, 160, 50, 160, 80, 10, 80] } };
+        }
+        throw new Error(`Unexpected node ${nodeId}`);
+      },
+      async getAttributes({ nodeId }) {
+        assert.equal(nodeId, 20);
+        return { attributes: ["class", "job-item curr"] };
+      },
+      async getOuterHTML({ nodeId }) {
+        assert.equal(nodeId, 20);
+        return { outerHTML: '<li class="job-item curr">算法工程师 _ 杭州 25-50K</li>' };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") clicked = true;
+        return {};
+      }
+    }
+  };
+
+  const result = await openRecommendJobDropdown(client, 99, {
+    timeoutMs: 200,
+    triggerTimeoutMs: 500,
+    triggerIntervalMs: 10
+  });
+
+  assert.equal(result.opened, true);
+  assert.equal(result.already_open, false);
+  assert.equal(result.trigger.node_id, 10);
+  assert.equal(result.options.length, 1);
+  assert.equal(triggerPolls >= 3, true);
 }
 
 function testRetryableRecommendFilterReapplyError() {
@@ -487,6 +547,7 @@ testRetryableRecommendFilterReapplyError();
 testRecommendCardFieldParser();
 await testCardCandidateReader();
 await testRefreshRecoveryFallsBackFromNavigateToReload();
+await testOpenRecommendJobDropdownWaitsForLateTrigger();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();
