@@ -27,6 +27,15 @@ import {
   readRecommendCardCandidate
 } from "./cards.js";
 
+const DETAIL_OUTSIDE_CLOSE_BOUNDARY_SELECTORS = Object.freeze([
+  ".resume-center-side .resume-detail-wrap",
+  ".resume-detail-wrap",
+  ".boss-popup__wrapper .boss-popup__body",
+  ".boss-popup__wrapper .dialog-body",
+  ".dialog-wrap.active .resume-detail-wrap",
+  ".geek-detail-modal .resume-detail-wrap"
+]);
+
 export function matchesRecommendDetailNetwork(url) {
   return DETAIL_NETWORK_PATTERNS.some((pattern) => pattern.test(String(url || "")));
 }
@@ -171,6 +180,61 @@ export async function waitForRecommendDetailClosed(client, {
     closed: false,
     elapsed_ms: Date.now() - started,
     state: lastState
+  };
+}
+
+function compactRect(rect) {
+  if (!rect) return null;
+  return {
+    x: Math.round(Number(rect.x) || 0),
+    y: Math.round(Number(rect.y) || 0),
+    width: Math.round(Number(rect.width) || 0),
+    height: Math.round(Number(rect.height) || 0)
+  };
+}
+
+function compactDetailTarget(target) {
+  if (!target) return null;
+  return {
+    root: target.root || "",
+    root_node_id: target.root_node_id || null,
+    selector: target.selector || "",
+    node_id: target.node_id || null,
+    rect: compactRect(target.rect)
+  };
+}
+
+function compactDetailOpenState(state) {
+  if (!state) {
+    return {
+      open: false,
+      popup: null,
+      resume_iframe: null,
+      iframe_document_node_id: null
+    };
+  }
+  return {
+    open: Boolean(state.popup || state.resumeIframe),
+    popup: compactDetailTarget(state.popup),
+    resume_iframe: compactDetailTarget(state.resumeIframe),
+    iframe_document_node_id: state.iframe?.documentNodeId || null
+  };
+}
+
+async function verifyRecommendDetailStillOpen(client, {
+  settleMs = 350
+} = {}) {
+  const firstState = await readRecommendDetailState(client);
+  if (settleMs > 0) await sleep(settleMs);
+  const secondState = await readRecommendDetailState(client);
+  const first = compactDetailOpenState(firstState);
+  const second = compactDetailOpenState(secondState);
+  const stableOpen = Boolean(first.open && second.open);
+  return {
+    open: Boolean(second.open),
+    stable_open: stableOpen,
+    first,
+    second
   };
 }
 
@@ -484,6 +548,26 @@ export async function closeRecommendDetail(client, {
       };
     }
 
+    const outsideClick = await clickOutsideRecommendDetail(client, closedAfterClick.state || existingState);
+    attempts.push(outsideClick);
+    if (outsideClick.clicked) {
+      const closedAfterOutsideClick = await waitForRecommendDetailClosed(client, {
+        timeoutMs: closeWaitMs,
+        intervalMs: 250
+      });
+      attempts.push({
+        mode: "wait-closed-after-outside-click",
+        closed: closedAfterOutsideClick.closed,
+        elapsed_ms: closedAfterOutsideClick.elapsed_ms
+      });
+      if (closedAfterOutsideClick.closed) {
+        return {
+          closed: true,
+          attempts
+        };
+      }
+    }
+
     await pressEscape(client);
     attempts.push({ mode: "Escape-fallback" });
 
@@ -504,9 +588,29 @@ export async function closeRecommendDetail(client, {
     }
   }
 
+  const verification = await verifyRecommendDetailStillOpen(client);
+  attempts.push({
+    mode: "final-close-verification",
+    open: verification.open,
+    stable_open: verification.stable_open,
+    popup: verification.second.popup,
+    resume_iframe: verification.second.resume_iframe
+  });
+  if (!verification.open) {
+    return {
+      closed: true,
+      attempts,
+      verification
+    };
+  }
+
   return {
     closed: false,
-    attempts
+    reason: verification.stable_open
+      ? "detail_still_visible_after_close_attempts"
+      : "detail_visibility_ambiguous_after_close_attempts",
+    attempts,
+    verification
   };
 }
 
@@ -546,6 +650,98 @@ async function pressEscape(client) {
     windowsVirtualKeyCode: 27,
     nativeVirtualKeyCode: 27
   });
+}
+
+function clampPointCoordinate(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+async function getClickViewport(client) {
+  try {
+    const metrics = typeof client?.Page?.getLayoutMetrics === "function"
+      ? await client.Page.getLayoutMetrics()
+      : null;
+    const viewport = metrics?.cssLayoutViewport || metrics?.layoutViewport || metrics?.visualViewport || {};
+    return {
+      width: Number(viewport.clientWidth || viewport.width || 1440),
+      height: Number(viewport.clientHeight || viewport.height || 900)
+    };
+  } catch {
+    return {
+      width: 1440,
+      height: 900
+    };
+  }
+}
+
+function getOutsideClickPoint(rect, viewport) {
+  if (!rect || rect.width <= 2 || rect.height <= 2) return null;
+  const margin = 24;
+  const minX = 8;
+  const minY = 8;
+  const maxX = Math.max(minX, (Number(viewport?.width) || 1440) - 8);
+  const maxY = Math.max(minY, (Number(viewport?.height) || 900) - 8);
+  const midX = rect.x + rect.width / 2;
+  const midY = rect.y + Math.min(Math.max(rect.height * 0.2, 48), Math.max(48, rect.height - 24));
+  const candidates = [
+    { side: "left", x: rect.x - margin, y: midY },
+    { side: "right", x: rect.x + rect.width + margin, y: midY },
+    { side: "above", x: midX, y: rect.y - margin },
+    { side: "below", x: midX, y: rect.y + rect.height + margin },
+    { side: "viewport-corner", x: 16, y: 16 }
+  ];
+
+  for (const candidate of candidates) {
+    const x = clampPointCoordinate(candidate.x, minX, maxX);
+    const y = clampPointCoordinate(candidate.y, minY, maxY);
+    const insideRect = (
+      x >= rect.x
+      && x <= rect.x + rect.width
+      && y >= rect.y
+      && y <= rect.y + rect.height
+    );
+    if (!insideRect) {
+      return {
+        ...candidate,
+        x,
+        y
+      };
+    }
+  }
+  return null;
+}
+
+async function clickOutsideRecommendDetail(client, detailState) {
+  const rootState = detailState?.roots?.length
+    ? detailState
+    : await readRecommendDetailState(client);
+  const boundaryTarget = await findVisibleDetailTarget(
+    client,
+    rootState.roots || [],
+    DETAIL_OUTSIDE_CLOSE_BOUNDARY_SELECTORS
+  );
+  const target = boundaryTarget || rootState.resumeIframe || rootState.popup || null;
+  const viewport = await getClickViewport(client);
+  const point = getOutsideClickPoint(target?.rect, viewport);
+  if (!point) {
+    return {
+      clicked: false,
+      mode: "outside-modal-click",
+      reason: "no_outside_click_point",
+      selector: target?.selector || null,
+      root: target?.root || null
+    };
+  }
+  await clickPoint(client, point.x, point.y);
+  return {
+    clicked: true,
+    mode: "outside-modal-click",
+    selector: target?.selector || null,
+    root: target?.root || null,
+    side: point.side,
+    x: Math.round(point.x),
+    y: Math.round(point.y)
+  };
 }
 
 export async function extractRecommendDetailCandidate(client, {

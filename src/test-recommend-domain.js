@@ -612,6 +612,188 @@ async function testCloseRecommendDetailWaitsUntilClosed() {
   );
 }
 
+async function testCloseRecommendDetailClicksOutsideModalBeforeEscape() {
+  let detailVisible = true;
+  let closeAfterOutsideClick = false;
+  let closeClickCount = 0;
+  let outsideClickCount = 0;
+  let escapeCount = 0;
+
+  const client = {
+    Page: {
+      async getLayoutMetrics() {
+        return {
+          cssLayoutViewport: {
+            clientWidth: 1200,
+            clientHeight: 800
+          }
+        };
+      }
+    },
+    DOM: {
+      async getDocument() {
+        if (closeAfterOutsideClick) {
+          detailVisible = false;
+          closeAfterOutsideClick = false;
+        }
+        return { root: { nodeId: 1 } };
+      },
+      async querySelector({ nodeId, selector }) {
+        if (nodeId === 1 && selector.includes("iframe")) return { nodeId: 2 };
+        return { nodeId: 0 };
+      },
+      async describeNode({ nodeId }) {
+        assert.equal(nodeId, 2);
+        return { node: { contentDocument: { nodeId: 3 } } };
+      },
+      async querySelectorAll({ selector }) {
+        if (!detailVisible) return { nodeIds: [] };
+        if (selector === ".dialog-wrap.active") return { nodeIds: [6] };
+        if (selector === ".boss-popup__close") return { nodeIds: [4] };
+        if (selector === ".resume-center-side .resume-detail-wrap") return { nodeIds: [5] };
+        return { nodeIds: [] };
+      },
+      async getBoxModel({ nodeId }) {
+        if (nodeId === 4) {
+          return { model: { border: [900, 90, 930, 90, 930, 120, 900, 120] } };
+        }
+        if (nodeId === 5) {
+          return { model: { border: [200, 100, 800, 100, 800, 600, 200, 600] } };
+        }
+        if (nodeId === 6) {
+          return { model: { border: [0, 0, 1200, 0, 1200, 800, 0, 800] } };
+        }
+        throw new Error(`Unexpected node ${nodeId}`);
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type !== "mouseReleased") return {};
+        if (event.x < 200) {
+          outsideClickCount += 1;
+          closeAfterOutsideClick = true;
+        } else {
+          closeClickCount += 1;
+        }
+        return {};
+      },
+      async dispatchKeyEvent() {
+        escapeCount += 1;
+        return {};
+      }
+    }
+  };
+
+  const result = await closeRecommendDetail(client, {
+    attemptsLimit: 1,
+    closeWaitMs: 20,
+    escapeWaitMs: 20
+  });
+
+  assert.equal(result.closed, true);
+  assert.equal(closeClickCount, 1);
+  assert.equal(outsideClickCount, 1);
+  assert.equal(escapeCount, 0);
+  assert.equal(result.attempts.some((attempt) => attempt.mode === "outside-modal-click" && attempt.clicked), true);
+  assert.equal(
+    result.attempts.some((attempt) => (
+      attempt.mode === "wait-closed-after-outside-click"
+      && attempt.closed === true
+    )),
+    true
+  );
+}
+
+async function testCloseRecommendDetailReportsFinalVerificationWhenStillOpen() {
+  let closeClickCount = 0;
+  let outsideClickCount = 0;
+  let escapeCount = 0;
+
+  const client = {
+    Page: {
+      async getLayoutMetrics() {
+        return {
+          cssLayoutViewport: {
+            clientWidth: 1200,
+            clientHeight: 800
+          }
+        };
+      }
+    },
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelector({ nodeId, selector }) {
+        if (nodeId === 1 && selector.includes("iframe")) return { nodeId: 2 };
+        return { nodeId: 0 };
+      },
+      async describeNode({ nodeId }) {
+        assert.equal(nodeId, 2);
+        return { node: { contentDocument: { nodeId: 3 } } };
+      },
+      async querySelectorAll({ selector }) {
+        if (selector === ".dialog-wrap.active") return { nodeIds: [6] };
+        if (selector === ".boss-popup__close") return { nodeIds: [4] };
+        if (selector === ".resume-center-side .resume-detail-wrap") return { nodeIds: [5] };
+        return { nodeIds: [] };
+      },
+      async getBoxModel({ nodeId }) {
+        if (nodeId === 4) {
+          return { model: { border: [900, 90, 930, 90, 930, 120, 900, 120] } };
+        }
+        if (nodeId === 5) {
+          return { model: { border: [200, 100, 800, 100, 800, 600, 200, 600] } };
+        }
+        if (nodeId === 6) {
+          return { model: { border: [0, 0, 1200, 0, 1200, 800, 0, 800] } };
+        }
+        throw new Error(`Unexpected node ${nodeId}`);
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type !== "mouseReleased") return {};
+        if (event.x < 200) {
+          outsideClickCount += 1;
+        } else {
+          closeClickCount += 1;
+        }
+        return {};
+      },
+      async dispatchKeyEvent() {
+        escapeCount += 1;
+        return {};
+      }
+    }
+  };
+
+  const result = await closeRecommendDetail(client, {
+    attemptsLimit: 1,
+    closeWaitMs: 20,
+    escapeWaitMs: 20
+  });
+
+  assert.equal(result.closed, false);
+  assert.equal(result.reason, "detail_still_visible_after_close_attempts");
+  assert.equal(closeClickCount, 1);
+  assert.equal(outsideClickCount, 1);
+  assert.equal(escapeCount, 2);
+  assert.equal(result.verification.open, true);
+  assert.equal(result.verification.stable_open, true);
+  assert.equal(result.verification.second.popup.selector, ".dialog-wrap.active");
+  assert.equal(result.verification.second.resume_iframe, null);
+  assert.equal(
+    result.attempts.some((attempt) => (
+      attempt.mode === "final-close-verification"
+      && attempt.open === true
+      && attempt.stable_open === true
+      && attempt.popup?.selector === ".dialog-wrap.active"
+    )),
+    true
+  );
+}
+
 testFilterOptionHelpers();
 testJobLabelMatchingIgnoresSalaryFormatting();
 testRecoverableImageCaptureEvidencePreservesPartialPages();
@@ -629,5 +811,7 @@ await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();
 await testPageScopeFallbackToRecommend();
 await testCloseRecommendDetailWaitsUntilClosed();
+await testCloseRecommendDetailClicksOutsideModalBeforeEscape();
+await testCloseRecommendDetailReportsFinalVerificationWhenStillOpen();
 
 console.log("recommend domain tests passed");

@@ -424,12 +424,26 @@ function countPassedResults(results = []) {
   return countRecommendResultStatuses(results).passed;
 }
 
+function compactCloseResult(closeResult) {
+  if (!closeResult) return null;
+  return {
+    closed: Boolean(closeResult.closed),
+    reason: closeResult.reason || null,
+    attempts: closeResult.attempts || [],
+    verification: closeResult.verification || null
+  };
+}
+
 function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   if (!error) return null;
-  return {
+  const result = {
     code: error.code || fallbackCode,
     message: error.message || String(error)
   };
+  if (error.close_result) {
+    result.close_result = compactCloseResult(error.close_result);
+  }
+  return result;
 }
 
 function createRecommendCloseFailureError(closeResult) {
