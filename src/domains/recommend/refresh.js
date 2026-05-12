@@ -101,6 +101,91 @@ function compactFilterReapplyError(error) {
   return error?.message || String(error || "Recommend filter reapply failed");
 }
 
+export function isRetryableRecommendJobSelectionError(error) {
+  const message = String(error?.message || error || "");
+  return /Recommend job trigger was not found|Recommend job dropdown did not mount options/i.test(message);
+}
+
+function compactJobSelectionAttempt({
+  ok = false,
+  attempt = 0,
+  iframeDocumentNodeId = 0,
+  error = null,
+  selection = null
+} = {}) {
+  return {
+    ok: Boolean(ok),
+    method: "job_select",
+    reason: error ? "job_select_failed" : null,
+    error: error ? (error?.message || String(error)) : null,
+    attempt,
+    iframe_document_node_id: iframeDocumentNodeId || 0,
+    selected: Boolean(selection?.selected),
+    selection_reason: selection?.reason || null
+  };
+}
+
+export async function selectRecommendJobWithRootRefresh(client, rootState, {
+  jobLabel = "",
+  settleMs = 6000,
+  dropdownTimeoutMs = 4000,
+  totalTimeoutMs = 30000,
+  retryDelayMs = 1000
+} = {}) {
+  const started = Date.now();
+  const attempts = [];
+  let currentRootState = rootState || null;
+  let lastError = null;
+  let attempt = 0;
+
+  while (Date.now() - started <= totalTimeoutMs) {
+    attempt += 1;
+    if (!currentRootState?.iframe?.documentNodeId) {
+      currentRootState = await getRecommendRoots(client);
+    }
+    const iframeDocumentNodeId = currentRootState?.iframe?.documentNodeId || 0;
+    try {
+      const selection = await selectRecommendJob(client, iframeDocumentNodeId, {
+        jobLabel,
+        settleMs,
+        dropdownTimeoutMs
+      });
+      attempts.push(compactJobSelectionAttempt({
+        ok: true,
+        attempt,
+        iframeDocumentNodeId,
+        selection
+      }));
+      return {
+        job_selection: {
+          ...selection,
+          refresh_attempts: attempts
+        },
+        root_state: currentRootState,
+        attempts
+      };
+    } catch (error) {
+      lastError = error;
+      attempts.push(compactJobSelectionAttempt({
+        ok: false,
+        attempt,
+        iframeDocumentNodeId,
+        error
+      }));
+      if (!isRetryableRecommendJobSelectionError(error) || Date.now() - started >= totalTimeoutMs) {
+        break;
+      }
+      if (retryDelayMs > 0) await sleep(retryDelayMs);
+      currentRootState = await getRecommendRoots(client);
+    }
+  }
+
+  const wrapped = new Error(lastError?.message || "Recommend job selection failed after refresh reload");
+  wrapped.cause = lastError;
+  wrapped.job_selection_attempts = attempts;
+  throw wrapped;
+}
+
 async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
   maxAttempts = 3,
   retryDelayMs = 1500
@@ -162,6 +247,7 @@ async function applyRefreshMethod(client, method, {
   const started = Date.now();
   let currentRootState = null;
   let jobSelection = null;
+  let jobSelectionAttempts = [];
   let pageScopeResult = null;
   let filterResult = null;
   let filterReapplyAttempts = [];
@@ -180,16 +266,19 @@ async function applyRefreshMethod(client, method, {
       throw new Error("Recommend iframe was not ready after refresh reload");
     }
     if (jobLabel) {
-      const jobDropdownTimeoutMs = reloadSettleMs > 10000 ? 15000 : 12000;
-      jobSelection = await selectRecommendJob(client, currentRootState.iframe.documentNodeId, {
+      const jobSelectionResult = await selectRecommendJobWithRootRefresh(client, currentRootState, {
         jobLabel,
         settleMs: reloadSettleMs > 10000 ? 12000 : 6000,
-        dropdownTimeoutMs: jobDropdownTimeoutMs
+        dropdownTimeoutMs: 4000,
+        totalTimeoutMs: reloadSettleMs > 10000 ? 45000 : 30000,
+        retryDelayMs: 1200
       });
+      jobSelection = jobSelectionResult.job_selection;
+      jobSelectionAttempts = jobSelectionResult.attempts;
       if (!jobSelection.selected) {
         throw new Error(`Requested recommend job was not selected after refresh reload: ${jobSelection.reason}`);
       }
-      currentRootState = await getRecommendRoots(client);
+      currentRootState = jobSelectionResult.root_state || await getRecommendRoots(client);
     }
     pageScopeResult = await selectRecommendPageScope(
       client,
@@ -228,6 +317,7 @@ async function applyRefreshMethod(client, method, {
       method,
       target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
+      job_selection_attempts: jobSelectionAttempts,
       page_scope: pageScopeResult,
       filter: filterResult,
       filter_reapply_attempts: filterReapplyAttempts,
@@ -244,6 +334,7 @@ async function applyRefreshMethod(client, method, {
       error: error?.message || String(error),
       target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
+      job_selection_attempts: error?.job_selection_attempts || jobSelectionAttempts,
       page_scope: pageScopeResult,
       filter: filterResult,
       filter_reapply_attempts: error?.filter_reapply_attempts || filterReapplyAttempts,

@@ -27,6 +27,7 @@ import {
   readRecommendDetailHtml,
   readRecommendCardCandidate,
   refreshRecommendListAtEnd,
+  selectRecommendJobWithRootRefresh,
   selectRecommendPageScope
 } from "./domains/recommend/index.js";
 
@@ -257,6 +258,80 @@ async function testOpenRecommendJobDropdownWaitsForLateTrigger() {
   assert.equal(result.trigger.node_id, 10);
   assert.equal(result.options.length, 1);
   assert.equal(triggerPolls >= 3, true);
+}
+
+async function testSelectRecommendJobRefreshesStaleFrameRoot() {
+  let currentDocumentNodeId = 100;
+  let triggerClicked = false;
+  const optionSelector = ".job-selecter-options .job-item, .job-list .job-item, .job-item";
+  const client = {
+    DOM: {
+      async getDocument() {
+        currentDocumentNodeId = 200;
+        return { root: { nodeId: 1 } };
+      },
+      async querySelector({ nodeId, selector }) {
+        if (nodeId === 1 && selector.includes("iframe")) return { nodeId: 2 };
+        if (nodeId === 200 && selector === optionSelector && triggerClicked) return { nodeId: 20 };
+        return { nodeId: 0 };
+      },
+      async describeNode({ nodeId }) {
+        assert.equal(nodeId, 2);
+        return { node: { contentDocument: { nodeId: currentDocumentNodeId } } };
+      },
+      async querySelectorAll({ nodeId, selector }) {
+        if (selector.includes("job-selecter-wrap")) {
+          return { nodeIds: nodeId === 200 ? [10] : [] };
+        }
+        if (selector === optionSelector) {
+          return { nodeIds: nodeId === 200 && triggerClicked ? [20] : [] };
+        }
+        return { nodeIds: [] };
+      },
+      async getBoxModel({ nodeId }) {
+        if (nodeId === 10) {
+          return { model: { border: [10, 10, 110, 10, 110, 40, 10, 40] } };
+        }
+        if (nodeId === 20) {
+          return { model: { border: [10, 50, 190, 50, 190, 80, 10, 80] } };
+        }
+        throw new Error(`Unexpected node ${nodeId}`);
+      },
+      async getAttributes({ nodeId }) {
+        assert.equal(nodeId, 20);
+        return { attributes: ["class", "job-item curr"] };
+      },
+      async getOuterHTML({ nodeId }) {
+        assert.equal(nodeId, 20);
+        return { outerHTML: '<li class="job-item curr">海外用户增长运营专家（AI产品） _ 杭州 25-35K</li>' };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") triggerClicked = true;
+        return {};
+      },
+      async dispatchKeyEvent() {
+        return {};
+      }
+    }
+  };
+
+  const result = await selectRecommendJobWithRootRefresh(client, {
+    iframe: { documentNodeId: 100 }
+  }, {
+    jobLabel: "海外用户增长运营专家（AI产品）",
+    settleMs: 0,
+    dropdownTimeoutMs: 50,
+    totalTimeoutMs: 1000,
+    retryDelayMs: 10
+  });
+
+  assert.equal(result.job_selection.selected, true);
+  assert.equal(result.root_state.iframe.documentNodeId, 200);
+  assert.equal(result.attempts.length >= 2, true);
+  assert.equal(result.attempts[0].ok, false);
+  assert.equal(result.attempts.at(-1).ok, true);
 }
 
 function testRetryableRecommendFilterReapplyError() {
@@ -548,6 +623,7 @@ testRecommendCardFieldParser();
 await testCardCandidateReader();
 await testRefreshRecoveryFallsBackFromNavigateToReload();
 await testOpenRecommendJobDropdownWaitsForLateTrigger();
+await testSelectRecommendJobRefreshesStaleFrameRoot();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();

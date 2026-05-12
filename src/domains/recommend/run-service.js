@@ -379,6 +379,16 @@ function compactRefreshAttempt(refreshAttempt) {
       error: attempt.error || null,
       attempt: attempt.attempt || 0
     })),
+    job_selection_attempts: (refreshAttempt.job_selection_attempts || []).map((attempt) => ({
+      ok: Boolean(attempt.ok),
+      method: attempt.method || "job_select",
+      reason: attempt.reason || null,
+      error: attempt.error || null,
+      attempt: attempt.attempt || 0,
+      iframe_document_node_id: attempt.iframe_document_node_id || 0,
+      selected: Boolean(attempt.selected),
+      selection_reason: attempt.selection_reason || null
+    })),
     job_selection: compactJobSelection(refreshAttempt.job_selection),
     page_scope: compactPageScopeSelection(refreshAttempt.page_scope),
     filter: compactFilterResult(refreshAttempt.filter)
