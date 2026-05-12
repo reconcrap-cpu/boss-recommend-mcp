@@ -372,6 +372,13 @@ function compactRefreshAttempt(refreshAttempt) {
       card_count: attempt.card_count || 0,
       elapsed_ms: attempt.elapsed_ms || 0
     })),
+    filter_reapply_attempts: (refreshAttempt.filter_reapply_attempts || []).map((attempt) => ({
+      ok: Boolean(attempt.ok),
+      method: attempt.method || "filter_reapply",
+      reason: attempt.reason || null,
+      error: attempt.error || null,
+      attempt: attempt.attempt || 0
+    })),
     job_selection: compactJobSelection(refreshAttempt.job_selection),
     page_scope: compactPageScopeSelection(refreshAttempt.page_scope),
     filter: compactFilterResult(refreshAttempt.filter)

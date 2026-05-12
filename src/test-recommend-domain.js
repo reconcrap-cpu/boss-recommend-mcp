@@ -14,6 +14,7 @@ import {
   isActiveOption,
   isRecoverableImageCaptureError,
   isRecoverableRecommendDetailError,
+  isRetryableRecommendFilterReapplyError,
   isSafeFilterOptionLabel,
   isStaleRecommendNodeError,
   jobLabelMatches,
@@ -196,6 +197,13 @@ async function testRefreshRecoveryFallsBackFromNavigateToReload() {
     "navigate timeout",
     "reload timeout"
   ]);
+}
+
+function testRetryableRecommendFilterReapplyError() {
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter panel did not open after 6 trigger attempts")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter trigger was not found")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter confirm button was not found")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Requested recommend job was not selected after refresh reload")), false);
 }
 
 function testRecommendCardFieldParser() {
@@ -475,6 +483,7 @@ testRecoverableImageCaptureEvidencePreservesPartialPages();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
+testRetryableRecommendFilterReapplyError();
 testRecommendCardFieldParser();
 await testCardCandidateReader();
 await testRefreshRecoveryFallsBackFromNavigateToReload();

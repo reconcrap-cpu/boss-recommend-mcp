@@ -92,6 +92,63 @@ function refreshFailureReason(method = "") {
   return method === "page_navigate" ? "page_navigate_failed" : "page_reload_failed";
 }
 
+export function isRetryableRecommendFilterReapplyError(error) {
+  const message = String(error?.message || error || "");
+  return /Recommend filter panel did not open|Recommend filter trigger was not found|Recommend filter confirm button was not found|No matching recommend filter option/i.test(message);
+}
+
+function compactFilterReapplyError(error) {
+  return error?.message || String(error || "Recommend filter reapply failed");
+}
+
+async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
+  maxAttempts = 3,
+  retryDelayMs = 1500
+} = {}) {
+  const attempts = [];
+  let currentRootState = rootState;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const filter = await selectAndConfirmFirstSafeFilter(
+        client,
+        currentRootState.iframe.documentNodeId,
+        filterOptions
+      );
+      attempts.push({
+        ok: true,
+        method: "filter_reapply",
+        attempt
+      });
+      return {
+        filter,
+        root_state: currentRootState,
+        attempts
+      };
+    } catch (error) {
+      lastError = error;
+      attempts.push({
+        ok: false,
+        method: "filter_reapply",
+        reason: "filter_reapply_failed",
+        error: compactFilterReapplyError(error),
+        attempt
+      });
+      if (attempt >= maxAttempts || !isRetryableRecommendFilterReapplyError(error)) {
+        break;
+      }
+      if (retryDelayMs > 0) await sleep(retryDelayMs);
+      currentRootState = await getRecommendRoots(client);
+    }
+  }
+
+  const wrapped = new Error(compactFilterReapplyError(lastError));
+  wrapped.cause = lastError;
+  wrapped.filter_reapply_attempts = attempts;
+  throw wrapped;
+}
+
 async function applyRefreshMethod(client, method, {
   jobLabel = "",
   pageScope = "recommend",
@@ -107,6 +164,7 @@ async function applyRefreshMethod(client, method, {
   let jobSelection = null;
   let pageScopeResult = null;
   let filterResult = null;
+  let filterReapplyAttempts = [];
   try {
     if (method === "page_navigate") {
       await client.Page.navigate({ url: targetUrl || RECOMMEND_TARGET_URL });
@@ -145,11 +203,17 @@ async function applyRefreshMethod(client, method, {
       throw new Error(`Recommend page scope was not selected after refresh reload: ${pageScopeResult.reason || pageScope}`);
     }
     currentRootState = await getRecommendRoots(client);
-    filterResult = await selectAndConfirmFirstSafeFilter(
+    const filterSelection = await selectAndConfirmRefreshFilter(
       client,
-      currentRootState.iframe.documentNodeId,
-      buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
+      currentRootState,
+      buildRecommendFilterSelectionOptions(filter, { forceRecentNotView }),
+      {
+        retryDelayMs: Math.max(1200, Math.min(5000, Math.floor((reloadSettleMs || 8000) / 2)))
+      }
     );
+    filterResult = filterSelection.filter;
+    filterReapplyAttempts = filterSelection.attempts;
+    currentRootState = await getRecommendRoots(client);
     const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
       timeoutMs: cardTimeoutMs,
       intervalMs: 500
@@ -164,6 +228,7 @@ async function applyRefreshMethod(client, method, {
       job_selection: jobSelection,
       page_scope: pageScopeResult,
       filter: filterResult,
+      filter_reapply_attempts: filterReapplyAttempts,
       card_count: cardNodeIds.length,
       root_state: currentRootState,
       forced_recent_not_view: forceRecentNotView,
@@ -179,6 +244,7 @@ async function applyRefreshMethod(client, method, {
       job_selection: jobSelection,
       page_scope: pageScopeResult,
       filter: filterResult,
+      filter_reapply_attempts: error?.filter_reapply_attempts || filterReapplyAttempts,
       card_count: 0,
       root_state: currentRootState,
       forced_recent_not_view: forceRecentNotView,
@@ -229,11 +295,16 @@ export async function refreshRecommendListAtEnd(client, {
           throw new Error(`Recommend page scope was not selected after end refresh: ${pageScopeResult.reason || pageScope}`);
         }
         currentRootState = await getRecommendRoots(client);
-        const filterResult = await selectAndConfirmFirstSafeFilter(
+        const filterSelection = await selectAndConfirmRefreshFilter(
           client,
-          currentRootState.iframe.documentNodeId,
-          buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
+          currentRootState,
+          buildRecommendFilterSelectionOptions(filter, { forceRecentNotView }),
+          {
+            retryDelayMs: Math.max(1200, Math.min(5000, Math.floor((buttonSettleMs || 8000) / 2)))
+          }
         );
+        const filterResult = filterSelection.filter;
+        currentRootState = await getRecommendRoots(client);
         const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
           timeoutMs: cardTimeoutMs,
           intervalMs: 500
@@ -244,6 +315,7 @@ export async function refreshRecommendListAtEnd(client, {
           attempts,
           page_scope: pageScopeResult,
           filter: filterResult,
+          filter_reapply_attempts: filterSelection.attempts,
           card_count: cardNodeIds.length,
           root_state: currentRootState,
           forced_recent_not_view: forceRecentNotView
