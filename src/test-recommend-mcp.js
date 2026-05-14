@@ -317,9 +317,27 @@ async function testRecommendLoadsLlmConfigByDefault() {
   assert.equal(observedOptions.llmConfig.temperature, 0);
   assert.equal(observedOptions.llmConfig.topP, 0.2);
   assert.equal(observedOptions.llmConfig.outputDir, outputDirForTests());
+  assert.equal(observedOptions.llmConfig.humanRestEnabled, true);
+  assert.equal(observedOptions.humanRestEnabled, true);
+  assert.equal(observedOptions.humanBehavior.profile, "paced_with_rests");
+  assert.equal(observedOptions.humanBehavior.textEntry, true);
+  assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
   assert.equal(observedOptions.llmConfig.llmModels.length, 2);
   assert.equal(observedOptions.llmConfig.llmModels[1].model, "gpt-4.1-nano");
   assert.equal(observedOptions.llmConfig.llmModels[1].apiKey, "sk-backup-key");
+}
+
+async function testRecommendHumanBehaviorArgsOverrideConfig() {
+  const observedOptions = await observeRecommendWorkflowOptions(readyArgs({
+    delay_ms: 0,
+    human_behavior_profile: "paced",
+    batch_rest_enabled: false
+  }), 16);
+  assert.equal(observedOptions.humanBehavior.profile, "paced");
+  assert.equal(observedOptions.humanBehavior.enabled, true);
+  assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
+  assert.equal(observedOptions.humanBehavior.restEnabled, false);
+  assert.equal(observedOptions.humanRestEnabled, false);
 }
 
 function outputDirForTests() {
@@ -881,7 +899,7 @@ async function main() {
     openaiProject: "proj-test",
     temperature: 0,
     topP: 0.2,
-    humanRestEnabled: false
+    humanRestEnabled: true
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
@@ -897,6 +915,8 @@ async function main() {
     await testRecommendDetailLimitZeroRequiresDebugFlag();
     resetRecommendMcpStateForTests();
     await testRecommendLoadsLlmConfigByDefault();
+    resetRecommendMcpStateForTests();
+    await testRecommendHumanBehaviorArgsOverrideConfig();
     resetRecommendMcpStateForTests();
     await testRecommendAsyncPauseResumeCancel();
     resetRecommendMcpStateForTests();

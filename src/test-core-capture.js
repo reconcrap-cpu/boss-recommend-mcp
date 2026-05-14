@@ -311,6 +311,37 @@ async function testCaptureScrolledNodeScreenshotsFallsBackAfterNoopDomAnchorDupl
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+async function testCaptureScrolledNodeScreenshotsUsesCoverageSafeScrollJitter() {
+  const client = createFakeClient();
+  const wheelEvents = [];
+  client.Input.dispatchMouseEvent = async (params) => {
+    client.calls.push(["Input.dispatchMouseEvent", params.type, params]);
+    if (params.type === "mouseWheel") wheelEvents.push(params);
+  };
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-capture-"));
+  const filePath = path.join(dir, "candidate.jpg");
+  const evidence = await captureScrolledNodeScreenshots(client, 13, {
+    filePath,
+    format: "jpeg",
+    maxScreenshots: 2,
+    duplicateStopCount: 10,
+    scrollMethod: "input",
+    wheelDeltaY: 650,
+    scrollDeltaJitterEnabled: true,
+    scrollDeltaJitterRandom: () => 0,
+    scrollDeltaJitterPreserveCoverage: false,
+    settleMs: 0
+  });
+  assert.equal(evidence.screenshot_count, 2);
+  assert.equal(wheelEvents.length, 1);
+  assert.equal(wheelEvents[0].deltaY, 80);
+  assert.equal(evidence.screenshots[1].scroll.wheel_delta_y, 80);
+  assert.equal(evidence.screenshots[1].scroll.wheel_delta_jitter.max_delta_for_overlap, 80);
+  assert.equal(evidence.optimization.scroll_delta_jitter.enabled, true);
+  assert.equal(evidence.optimization.scroll_delta_jitter.preserve_coverage, false);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 async function testCaptureScrolledNodeScreenshotsCropsAtStopBoundary() {
   const client = createImageSequenceClient([Buffer.from("before-stop")]);
   client.DOM.querySelectorAll = async ({ nodeId, selector }) => {
@@ -362,6 +393,22 @@ async function testCaptureScrolledNodeScreenshotsCropsAtStopBoundary() {
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
+function testDomainCaptureJitterWiring() {
+  const runServicePaths = [
+    path.join("src", "domains", "recommend", "run-service.js"),
+    path.join("src", "domains", "chat", "run-service.js"),
+    path.join("src", "domains", "recruit", "run-service.js")
+  ];
+  for (const filePath of runServicePaths) {
+    const source = fs.readFileSync(filePath, "utf8");
+    assert.equal(
+      source.includes("scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter"),
+      true,
+      `${filePath} must wire humanBehavior listScrollJitter into CV capture scroll jitter`
+    );
+  }
+}
+
 await testCaptureNodeHtml();
 await testCaptureNodeScreenshot();
 await testCaptureViewportScreenshot();
@@ -371,6 +418,8 @@ await testCaptureScrolledNodeScreenshotsSkipsDuplicateTail();
 await testCaptureScrolledNodeScreenshotsComposesAllPagesForLlm();
 await testCaptureScrolledNodeScreenshotsCanUseDomAnchors();
 await testCaptureScrolledNodeScreenshotsFallsBackAfterNoopDomAnchorDuplicate();
+await testCaptureScrolledNodeScreenshotsUsesCoverageSafeScrollJitter();
 await testCaptureScrolledNodeScreenshotsCropsAtStopBoundary();
+testDomainCaptureJitterWiring();
 
 console.log("Core capture tests passed");

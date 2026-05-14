@@ -38,6 +38,76 @@ function withPadding(rect, padding = 0) {
   };
 }
 
+function normalizeRandom(random) {
+  return typeof random === "function" ? random : Math.random;
+}
+
+function randomBetween(random, min, max) {
+  const lower = Number(min) || 0;
+  const upper = Number(max) || lower;
+  if (upper <= lower) return lower;
+  return lower + normalizeRandom(random)() * (upper - lower);
+}
+
+function normalizeRatio(raw, fallback, { min = 0, max = 1 } = {}) {
+  const parsed = Number(raw);
+  const value = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizeScrollDeltaJitter({
+  enabled = false,
+  minRatio = 0.65,
+  maxRatio = 0.9,
+  minOverlapRatio = 0.2,
+  preserveCoverage = true,
+  random = Math.random
+} = {}) {
+  const safeMinRatio = normalizeRatio(minRatio, 0.65, { min: 0.1, max: 1 });
+  const safeMaxRatio = Math.max(safeMinRatio, normalizeRatio(maxRatio, 0.9, { min: safeMinRatio, max: 1 }));
+  return {
+    enabled: enabled === true,
+    min_ratio: safeMinRatio,
+    max_ratio: safeMaxRatio,
+    min_overlap_ratio: normalizeRatio(minOverlapRatio, 0.2, { min: 0, max: 0.8 }),
+    preserve_coverage: preserveCoverage !== false,
+    random: normalizeRandom(random)
+  };
+}
+
+function resolveCoverageSafeScrollDelta({
+  baseDelta,
+  clipHeight,
+  jitter
+} = {}) {
+  const safeBase = Math.max(1, Number(baseDelta) || 650);
+  if (!jitter?.enabled) {
+    return {
+      deltaY: safeBase,
+      jittered: false,
+      base_delta_y: safeBase
+    };
+  }
+  const safeClipHeight = Math.max(1, Number(clipHeight) || 1);
+  const maxDeltaForOverlap = Math.max(1, Math.floor(safeClipHeight * (1 - jitter.min_overlap_ratio)));
+  const upper = Math.max(1, Math.min(Math.round(safeBase * jitter.max_ratio), maxDeltaForOverlap));
+  const lower = Math.min(upper, Math.max(1, Math.round(safeBase * jitter.min_ratio)));
+  const deltaY = Math.max(1, Math.round(randomBetween(jitter.random, lower, upper)));
+  return {
+    deltaY,
+    jittered: true,
+    base_delta_y: safeBase,
+    min_delta_y: lower,
+    max_delta_y: upper,
+    min_ratio: jitter.min_ratio,
+    max_ratio: jitter.max_ratio,
+    min_overlap_ratio: jitter.min_overlap_ratio,
+    clip_height: safeClipHeight,
+    max_delta_for_overlap: maxDeltaForOverlap,
+    preserve_coverage: jitter.preserve_coverage
+  };
+}
+
 export async function captureNodeHtml(client, nodeId, {
   domain = "unknown",
   source = "dom",
@@ -709,6 +779,12 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
   scrollAnchorSelector = DEFAULT_SCROLL_ANCHOR_SELECTOR,
   scrollAnchorMaxProbeNodes = 260,
   scrollAnchorMinGap = 180,
+  scrollDeltaJitterEnabled = false,
+  scrollDeltaJitterMinRatio = 0.65,
+  scrollDeltaJitterMaxRatio = 0.9,
+  scrollDeltaJitterMinOverlapRatio = 0.2,
+  scrollDeltaJitterPreserveCoverage = true,
+  scrollDeltaJitterRandom = Math.random,
   stopBoundarySelector = "",
   stopBoundaryTextPatterns = [],
   stopBoundaryMaxProbeNodes = 180,
@@ -721,10 +797,21 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
   const sequenceStarted = Date.now();
   const normalizedScrollMethod = normalizeScrollMethod(scrollMethod);
   const maxScreenshotCount = Math.max(1, Number(maxScreenshots) || 1);
+  const scrollDeltaJitter = normalizeScrollDeltaJitter({
+    enabled: scrollDeltaJitterEnabled,
+    minRatio: scrollDeltaJitterMinRatio,
+    maxRatio: scrollDeltaJitterMaxRatio,
+    minOverlapRatio: scrollDeltaJitterMinOverlapRatio,
+    preserveCoverage: scrollDeltaJitterPreserveCoverage,
+    random: scrollDeltaJitterRandom
+  });
+  const maxCaptureIterations = scrollDeltaJitter.enabled && scrollDeltaJitter.preserve_coverage
+    ? Math.max(maxScreenshotCount, Math.ceil(maxScreenshotCount / scrollDeltaJitter.min_ratio))
+    : maxScreenshotCount;
   const anchorPlan = normalizedScrollMethod !== "input"
     ? await collectDomScrollAnchors(client, nodeId, {
         selector: scrollAnchorSelector,
-        maxScreenshots: maxScreenshotCount,
+        maxScreenshots: maxCaptureIterations,
         maxProbeNodes: scrollAnchorMaxProbeNodes,
         minAnchorGap: scrollAnchorMinGap,
         stepTimeoutMs
@@ -793,7 +880,7 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
     }
   }
 
-  for (let index = 0; index < maxScreenshotCount; index += 1) {
+  for (let index = 0; index < maxCaptureIterations; index += 1) {
     assertCaptureTotalBudget(sequenceStarted, totalTimeoutMs, `capture_page_${index + 1}`);
     captureCount += 1;
     const captureStarted = Date.now();
@@ -920,7 +1007,7 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
       break;
     }
 
-    if (index < maxScreenshotCount - 1) {
+    if (index < maxCaptureIterations - 1) {
       assertCaptureTotalBudget(sequenceStarted, totalTimeoutMs, `scroll_after_page_${index + 1}`);
       let scrolledByDomAnchor = false;
       const nextAnchor = anchorPlan?.anchors?.[index + 1] || null;
@@ -956,6 +1043,11 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
       if (!scrolledByDomAnchor && normalizedScrollMethod !== "dom-anchor") {
         const x = box.center.x;
         const y = box.center.y;
+        const scrollDelta = resolveCoverageSafeScrollDelta({
+          baseDelta: wheelDeltaY,
+          clipHeight: effectiveClip.height,
+          jitter: scrollDeltaJitter
+        });
         await withCaptureTimeout(client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" }), {
           label: `scroll_mouse_move_${index + 1}`,
           timeoutMs: Math.min(Math.max(3000, Number(stepTimeoutMs) || 45000), 10000)
@@ -965,7 +1057,7 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
           x,
           y,
           deltaX: 0,
-          deltaY: Math.max(1, Number(wheelDeltaY) || 650)
+          deltaY: scrollDelta.deltaY
         }), {
           label: `scroll_wheel_${index + 1}`,
           timeoutMs: Math.min(Math.max(3000, Number(stepTimeoutMs) || 45000), 10000)
@@ -973,7 +1065,10 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
         currentScrollMetadata = {
           before_capture: `wheel_down_${index + 1}`,
           method: "Input.dispatchMouseEvent",
-          fallback_from_dom_anchor: Boolean(anchorPlan && normalizedScrollMethod === "dom-anchor-fallback-input")
+          fallback_from_dom_anchor: Boolean(anchorPlan && normalizedScrollMethod === "dom-anchor-fallback-input"),
+          wheel_delta_y: scrollDelta.deltaY,
+          wheel_delta_base_y: scrollDelta.base_delta_y,
+          wheel_delta_jitter: scrollDelta.jittered ? scrollDelta : null
         };
       }
       if (settleMs > 0) await sleep(settleMs);
@@ -1031,15 +1126,24 @@ export async function captureScrolledNodeScreenshots(client, nodeId, {
       step_timeout_ms: Math.max(0, Number(stepTimeoutMs) || 0),
       total_timeout_ms: Math.max(0, Number(totalTimeoutMs) || 0),
       scroll_method: normalizedScrollMethod,
-    scroll_anchor_selector: scrollAnchorSelector,
-    scroll_anchor_max_probe_nodes: Math.max(1, Number(scrollAnchorMaxProbeNodes) || 260),
-    scroll_anchor_min_gap: Math.max(0, Number(scrollAnchorMinGap) || 0)
-  },
-  scroll_anchor_plan: anchorPlan,
-  stop_boundary_plan: stopBoundaryPlan,
-  stop_boundary_checks: stopBoundaryChecks,
-  stop_boundary_result: stopBoundaryResult,
-  file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
+      requested_max_screenshots: maxScreenshotCount,
+      effective_max_screenshots: maxCaptureIterations,
+      scroll_anchor_selector: scrollAnchorSelector,
+      scroll_anchor_max_probe_nodes: Math.max(1, Number(scrollAnchorMaxProbeNodes) || 260),
+      scroll_anchor_min_gap: Math.max(0, Number(scrollAnchorMinGap) || 0),
+      scroll_delta_jitter: {
+        enabled: scrollDeltaJitter.enabled,
+        min_ratio: scrollDeltaJitter.min_ratio,
+        max_ratio: scrollDeltaJitter.max_ratio,
+        min_overlap_ratio: scrollDeltaJitter.min_overlap_ratio,
+        preserve_coverage: scrollDeltaJitter.preserve_coverage
+      }
+    },
+    scroll_anchor_plan: anchorPlan,
+    stop_boundary_plan: stopBoundaryPlan,
+    stop_boundary_checks: stopBoundaryChecks,
+    stop_boundary_result: stopBoundaryResult,
+    file_paths: screenshots.map((item) => item.file_path).filter(Boolean),
     screenshots,
     metadata
   };

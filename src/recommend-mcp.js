@@ -46,6 +46,7 @@ import {
 import { getRunsDir } from "./run-state.js";
 import {
   resolveBossConfiguredOutputDir,
+  resolveHumanBehaviorForRun,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
@@ -1221,6 +1222,7 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
   const executePostAction = args.dry_run_post_action === true
     ? false
     : args.execute_post_action !== false;
+  const humanBehavior = resolveHumanBehaviorForRun(args, configResolution?.config || {});
   return {
     client: session.client,
     targetUrl: RECOMMEND_TARGET_URL,
@@ -1268,6 +1270,8 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
       args.llm_image_detail || configResolution?.config?.llmImageDetail || configResolution?.config?.imageDetail
     ) || "low",
     imageOutputDir: resolveBossConfiguredOutputDir("", getRunsDir()),
+    humanRestEnabled: humanBehavior.restEnabled,
+    humanBehavior,
     name: "mcp-recommend-pipeline-run",
     parsed
   };

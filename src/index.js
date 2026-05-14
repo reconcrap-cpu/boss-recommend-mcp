@@ -265,6 +265,27 @@ function createTargetCountInputSchema(description) {
   };
 }
 
+function createHumanBehaviorInputSchema(description = "可选，启用可靠性实验用的人类节奏配置；默认 paced_with_rests/on") {
+  return {
+    type: "object",
+    properties: {
+      enabled: { type: "boolean" },
+      profile: {
+        type: "string",
+        enum: ["baseline", "paced", "paced_with_rests"]
+      },
+      clickMovement: { type: "boolean" },
+      textEntry: { type: "boolean" },
+      listScrollJitter: { type: "boolean" },
+      shortRest: { type: "boolean" },
+      batchRest: { type: "boolean" },
+      actionCooldown: { type: "boolean" }
+    },
+    additionalProperties: false,
+    description
+  };
+}
+
 function getRecommendedPollAfterSec(args = {}) {
   return hasFollowUpChatRequest(args)
     ? getLongRunPollAfterSec()
@@ -609,6 +630,13 @@ function createRunInputSchema() {
               target_count: createTargetCountInputSchema("boss-chat follow-up 本次处理人数上限；支持正整数、all 或 -1（扫到底）"),
               dry_run: { type: "boolean" },
               no_state: { type: "boolean" },
+              human_behavior: createHumanBehaviorInputSchema("可选，follow-up chat 节奏配置；默认 paced_with_rests/on"),
+              humanBehavior: createHumanBehaviorInputSchema("兼容字段；优先使用 human_behavior"),
+              human_behavior_enabled: { type: "boolean" },
+              human_behavior_profile: {
+                type: "string",
+                enum: ["baseline", "paced", "paced_with_rests"]
+              },
               safe_pacing: { type: "boolean" },
               batch_rest_enabled: { type: "boolean" }
             },
@@ -637,6 +665,25 @@ function createRunInputSchema() {
       slow_live: {
         type: "boolean",
         description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
+      },
+      human_behavior: createHumanBehaviorInputSchema("可选，recommend 可靠性实验用节奏配置；默认 paced_with_rests/on"),
+      humanBehavior: createHumanBehaviorInputSchema("兼容字段；优先使用 human_behavior"),
+      human_behavior_enabled: {
+        type: "boolean",
+        description: "兼容字段；true 等同启用 paced 默认配置，false 等同 baseline"
+      },
+      human_behavior_profile: {
+        type: "string",
+        enum: ["baseline", "paced", "paced_with_rests"],
+        description: "可选实验 profile：baseline/paced/paced_with_rests"
+      },
+      safe_pacing: {
+        type: "boolean",
+        description: "兼容字段；true 启用 paced，false 关闭"
+      },
+      batch_rest_enabled: {
+        type: "boolean",
+        description: "兼容字段；true 启用 paced_with_rests 的候选人短休/批次休息"
       },
       max_candidates: createTargetCountInputSchema("本次最多处理候选人数；默认使用确认后的 target_count，未设置时为 5"),
       detail_limit: {
@@ -866,6 +913,17 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       },
       dry_run: { type: "boolean" },
       no_state: { type: "boolean" },
+      human_behavior: createHumanBehaviorInputSchema("可选，chat 可靠性实验用节奏配置；默认 paced_with_rests/on"),
+      humanBehavior: createHumanBehaviorInputSchema("兼容字段；优先使用 human_behavior"),
+      human_behavior_enabled: {
+        type: "boolean",
+        description: "兼容字段；true 等同启用 paced 默认配置，false 等同 baseline"
+      },
+      human_behavior_profile: {
+        type: "string",
+        enum: ["baseline", "paced", "paced_with_rests"],
+        description: "可选实验 profile：baseline/paced/paced_with_rests"
+      },
       safe_pacing: { type: "boolean" },
       batch_rest_enabled: { type: "boolean" }
     },

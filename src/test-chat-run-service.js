@@ -33,6 +33,7 @@ async function testLifecycleDelegation() {
       assert.equal(options.detailSource, "cascade");
       assert.equal(options.detailLimit, 1);
       assert.equal(options.listFallbackPoint, null);
+      assert.equal(options.humanRestEnabled, true);
       for (let processed = 1; processed <= 20; processed += 1) {
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
@@ -56,11 +57,14 @@ async function testLifecycleDelegation() {
     criteria: "算法",
     maxCandidates: 20,
     detailLimit: 1,
-    detailSource: "cascade"
+    detailSource: "cascade",
+    humanRestEnabled: true
   });
   assert.equal(started.context.domain, "chat");
   assert.equal(started.context.detail_source, "cascade");
   assert.equal(started.context.list_fallback_point, null);
+  assert.equal(started.context.human_rest_enabled, true);
+  assert.equal(started.progress.human_rest_enabled, true);
 
   await waitUntil(() => service.getChatRun(started.runId).progress.processed >= 2);
   service.pauseChatRun(started.runId);

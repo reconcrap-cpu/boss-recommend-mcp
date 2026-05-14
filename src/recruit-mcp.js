@@ -34,6 +34,7 @@ import {
 } from "./domains/recruit/index.js";
 import {
   resolveBossConfiguredOutputDir,
+  resolveHumanBehaviorForRun,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
@@ -364,6 +365,27 @@ function createTargetCountSchema(description) {
   };
 }
 
+function createHumanBehaviorInputSchema(description = "可选，search/recruit 可靠性实验用节奏配置；默认 paced_with_rests/on") {
+  return {
+    type: "object",
+    properties: {
+      enabled: { type: "boolean" },
+      profile: {
+        type: "string",
+        enum: ["baseline", "paced", "paced_with_rests"]
+      },
+      clickMovement: { type: "boolean" },
+      textEntry: { type: "boolean" },
+      listScrollJitter: { type: "boolean" },
+      shortRest: { type: "boolean" },
+      batchRest: { type: "boolean" },
+      actionCooldown: { type: "boolean" }
+    },
+    additionalProperties: false,
+    description
+  };
+}
+
 export function createRecruitPipelineInputSchema() {
   return {
     type: "object",
@@ -430,6 +452,25 @@ export function createRecruitPipelineInputSchema() {
       slow_live: {
         type: "boolean",
         description: "VPN/慢页面模式：放宽 live DOM 等待时间"
+      },
+      human_behavior: createHumanBehaviorInputSchema("可选，search/recruit 可靠性实验用节奏配置；默认 paced_with_rests/on"),
+      humanBehavior: createHumanBehaviorInputSchema("兼容字段；优先使用 human_behavior"),
+      human_behavior_enabled: {
+        type: "boolean",
+        description: "兼容字段；true 等同启用 paced 默认配置，false 等同 baseline"
+      },
+      human_behavior_profile: {
+        type: "string",
+        enum: ["baseline", "paced", "paced_with_rests"],
+        description: "可选实验 profile：baseline/paced/paced_with_rests"
+      },
+      safe_pacing: {
+        type: "boolean",
+        description: "兼容字段；true 启用 paced，false 关闭"
+      },
+      batch_rest_enabled: {
+        type: "boolean",
+        description: "兼容字段；true 启用 paced_with_rests 的候选人短休/批次休息"
       },
       max_candidates: createTargetCountSchema("本次最多处理候选人数；默认使用解析出的 target_count"),
       detail_limit: {
@@ -843,6 +884,7 @@ function getRunOptions(args, parsed, session, configResolution = null) {
   const slowLive = args.slow_live === true;
   const targetCount = parsePositiveInteger(args.max_candidates, parsed.screenParams.target_count || 10);
   const screeningMode = normalizeScreeningModeArg(args);
+  const humanBehavior = resolveHumanBehaviorForRun(args, configResolution?.config || {});
   return {
     client: session.client,
     targetUrl: RECRUIT_TARGET_URL,
@@ -873,6 +915,8 @@ function getRunOptions(args, parsed, session, configResolution = null) {
       args.llm_image_detail || configResolution?.config?.llmImageDetail || configResolution?.config?.imageDetail
     ) || "low",
     imageOutputDir: resolveBossConfiguredOutputDir("", getRecruitRunsDir()),
+    humanRestEnabled: humanBehavior.restEnabled,
+    humanBehavior,
     name: "mcp-recruit-pipeline-run"
   };
 }

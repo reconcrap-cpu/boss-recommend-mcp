@@ -336,7 +336,11 @@ async function testChatRequestCvLoadsLlmConfig() {
     assert.equal(options.llmConfig.temperature, 0);
     assert.equal(options.llmConfig.topP, 0.2);
     assert.equal(options.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
-    assert.equal(options.llmConfig.humanRestEnabled, false);
+    assert.equal(options.llmConfig.humanRestEnabled, true);
+    assert.equal(options.humanRestEnabled, true);
+    assert.equal(options.humanBehavior.profile, "paced_with_rests");
+    assert.equal(options.humanBehavior.textEntry, true);
+    assert.equal(options.humanBehavior.listScrollJitter, true);
     assert.equal(options.llmConfig.greetingMessage, "配置招呼语");
     assert.equal(options.greetingText, "配置招呼语");
     runControl.setPhase("chat:test");
@@ -395,6 +399,42 @@ async function testChatRequestCvLoadsLlmConfig() {
   const csv = fs.readFileSync(completed.result.output_csv, "utf8");
   assert.equal(csv.includes("internal reasoning"), true);
   assert.equal(csv.includes("requested"), true);
+}
+
+async function testChatSafePacingCompatibilityControlsHumanBehavior() {
+  installFakeConnector();
+  let observedOptions = null;
+  setChatMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("chat:test-human-behavior");
+    runControl.updateProgress({
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      target_count: options.targetPassCount
+    });
+    return {
+      domain: "chat",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      llm_screened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+  const started = await callTool(TOOL_START, readyArgs({
+    safe_pacing: true,
+    batch_rest_enabled: false,
+    delay_ms: 0
+  }), 10);
+  assert.equal(started.status, "ACCEPTED");
+  await waitForChatRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(observedOptions.humanBehavior.profile, "paced");
+  assert.equal(observedOptions.humanBehavior.enabled, true);
+  assert.equal(observedOptions.humanBehavior.textEntry, true);
+  assert.equal(observedOptions.humanBehavior.restEnabled, false);
+  assert.equal(observedOptions.humanRestEnabled, false);
 }
 
 async function testChatRequestCvCanBeExplicitlyDisabled() {
@@ -539,7 +579,7 @@ async function main() {
     openaiProject: "proj-test",
     temperature: 0,
     topP: 0.2,
-    humanRestEnabled: false
+    humanRestEnabled: true
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
@@ -557,6 +597,8 @@ async function main() {
     await testChatAllTargetCountContext();
     resetChatMcpStateForTests();
     await testChatRequestCvLoadsLlmConfig();
+    resetChatMcpStateForTests();
+    await testChatSafePacingCompatibilityControlsHumanBehavior();
     resetChatMcpStateForTests();
     await testChatRequestCvCanBeExplicitlyDisabled();
     resetChatMcpStateForTests();

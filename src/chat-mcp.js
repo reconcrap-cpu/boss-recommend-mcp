@@ -48,6 +48,7 @@ import {
   normalizeTargetCountInput,
   resolveBossConfiguredOutputDir,
   resolveBossChatRuntimeLayout,
+  resolveHumanBehaviorForRun,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
@@ -1078,6 +1079,7 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
   const shouldRequestResume = shouldRequestChatResume(args);
   const useLlm = shouldUseChatLlm(args);
   const resolvedConfig = configResolution || (useLlm ? resolveBossScreeningConfig(workspaceRoot) : { ok: false });
+  const humanBehavior = resolveHumanBehaviorForRun(args, resolvedConfig?.config || {});
   return {
     client: session.client,
     targetUrl: CHAT_TARGET_URL,
@@ -1124,6 +1126,8 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
     listSettleMs: parsePositiveInteger(args.list_settle_ms, slowLive ? 1800 : 1200),
     listFallbackPoint: null,
     imageOutputDir: resolveBossConfiguredOutputDir("", getChatRunsDir()),
+    humanRestEnabled: humanBehavior.restEnabled,
+    humanBehavior,
     name: "mcp-boss-chat-run"
   };
 }

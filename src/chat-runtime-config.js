@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { normalizeHumanBehaviorOptions } from "./core/browser/index.js";
 
 const BOSS_CHAT_RUNTIME_SUBDIR = "boss-chat";
 const TARGET_COUNT_WRAPPER_KEYS = ["target_count", "targetCount", "value", "count", "limit"];
@@ -238,6 +239,84 @@ function parseConfigBoolean(raw, fallback = false) {
   return fallback;
 }
 
+function readFirstOwn(source, keys = []) {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) return source[key];
+  }
+  return undefined;
+}
+
+function parseOptionalConfigBoolean(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  return parseConfigBoolean(raw, null);
+}
+
+function applyHumanBehaviorProfileDefaults(target, profileRaw) {
+  const defaults = normalizeHumanBehaviorOptions(String(profileRaw || ""));
+  Object.assign(target, {
+    enabled: defaults.enabled,
+    profile: defaults.profile,
+    clickMovement: defaults.clickMovement,
+    textEntry: defaults.textEntry,
+    listScrollJitter: defaults.listScrollJitter,
+    shortRest: defaults.shortRest,
+    batchRest: defaults.batchRest,
+    actionCooldown: defaults.actionCooldown
+  });
+}
+
+export function resolveHumanBehaviorForRun(args = {}, config = {}) {
+  const base = normalizeHumanBehaviorOptions(config.humanBehavior || config.human_behavior || null, {
+    legacyEnabled: config.humanRestEnabled === true
+  });
+  const override = {};
+  const rawBehavior = readFirstOwn(args, ["human_behavior", "humanBehavior"]);
+  if (typeof rawBehavior === "boolean") {
+    override.enabled = rawBehavior;
+  } else if (typeof rawBehavior === "string") {
+    applyHumanBehaviorProfileDefaults(override, rawBehavior);
+  } else if (rawBehavior && typeof rawBehavior === "object" && !Array.isArray(rawBehavior)) {
+    const rawProfile = readFirstOwn(rawBehavior, ["profile", "mode", "behaviorProfile", "behavior_profile"]);
+    if (rawProfile !== undefined) applyHumanBehaviorProfileDefaults(override, rawProfile);
+    Object.assign(override, rawBehavior);
+  }
+
+  const profile = readFirstOwn(args, ["human_behavior_profile", "humanBehaviorProfile"]);
+  if (profile !== undefined) applyHumanBehaviorProfileDefaults(override, profile);
+  const enabled = parseOptionalConfigBoolean(readFirstOwn(args, [
+    "human_behavior_enabled",
+    "humanBehaviorEnabled"
+  ]));
+  if (enabled !== null) {
+    override.enabled = enabled;
+    if (enabled === true && !override.profile) applyHumanBehaviorProfileDefaults(override, "paced");
+  }
+
+  const safePacing = parseOptionalConfigBoolean(readFirstOwn(args, ["safe_pacing", "safePacing"]));
+  if (safePacing === true) {
+    applyHumanBehaviorProfileDefaults(override, "paced");
+  } else if (safePacing === false) {
+    override.enabled = false;
+  }
+
+  const batchRest = parseOptionalConfigBoolean(readFirstOwn(args, [
+    "batch_rest_enabled",
+    "batchRestEnabled",
+    "batch_rest"
+  ]));
+  if (batchRest === true) {
+    applyHumanBehaviorProfileDefaults(override, "paced_with_rests");
+  } else if (batchRest === false) {
+    override.batchRest = false;
+  }
+
+  return normalizeHumanBehaviorOptions({
+    ...base,
+    ...override
+  });
+}
+
 function normalizeLlmThinkingLevel(raw, fallback = "low") {
   const normalized = normalizeText(raw).toLowerCase();
   return LLM_THINKING_LEVELS.has(normalized) ? normalized : fallback;
@@ -455,6 +534,10 @@ export function resolveBossScreeningConfig(workspaceRoot) {
     || parsed.greeting_text
     || parsed.greeting
   );
+  const humanRestEnabled = parseConfigBoolean(parsed.humanRestEnabled, false);
+  const humanBehavior = normalizeHumanBehaviorOptions(parsed.humanBehavior || parsed.human_behavior || null, {
+    legacyEnabled: humanRestEnabled
+  });
   return {
     ok: true,
     config: {
@@ -469,7 +552,8 @@ export function resolveBossScreeningConfig(workspaceRoot) {
       greetingText,
       debugPort: parsePositiveInteger(parsed.debugPort, 9222),
       outputDir: resolveConfigPathValue(parsed.outputDir, configDir),
-      humanRestEnabled: parseConfigBoolean(parsed.humanRestEnabled, false)
+      humanRestEnabled,
+      humanBehavior
     },
     config_path: configPath,
     config_dir: configDir,

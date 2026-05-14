@@ -40,6 +40,212 @@ const BOSS_LOGIN_DOM_SELECTORS = [
   "input[placeholder*='手机号']",
   "input[placeholder*='验证码']"
 ];
+const HUMAN_INTERACTION_CONFIG = new WeakMap();
+const DEFAULT_HUMAN_BEHAVIOR_PROFILE = "paced_with_rests";
+const HUMAN_BEHAVIOR_PROFILES = Object.freeze({
+  baseline: Object.freeze({
+    enabled: false,
+    clickMovement: false,
+    textEntry: false,
+    listScrollJitter: false,
+    shortRest: false,
+    batchRest: false,
+    actionCooldown: false
+  }),
+  paced: Object.freeze({
+    enabled: true,
+    clickMovement: true,
+    textEntry: true,
+    listScrollJitter: true,
+    shortRest: false,
+    batchRest: false,
+    actionCooldown: true
+  }),
+  paced_with_rests: Object.freeze({
+    enabled: true,
+    clickMovement: true,
+    textEntry: true,
+    listScrollJitter: true,
+    shortRest: true,
+    batchRest: true,
+    actionCooldown: true
+  })
+});
+const HUMAN_BEHAVIOR_PROFILE_ALIASES = Object.freeze({
+  off: "baseline",
+  disabled: "baseline",
+  deterministic: "baseline",
+  safe: "paced",
+  safe_pacing: "paced",
+  paced_with_rest: "paced_with_rests",
+  rests: "paced_with_rests",
+  rest: "paced_with_rests"
+});
+
+function clampNumber(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return min;
+  return Math.min(max, Math.max(min, number));
+}
+
+function randomBetween(random, min, max) {
+  const lower = Number(min) || 0;
+  const upper = Number(max) || lower;
+  if (upper <= lower) return lower;
+  return lower + random() * (upper - lower);
+}
+
+function randomIntegerBetween(random, min, max) {
+  return Math.floor(randomBetween(random, min, max + 1));
+}
+
+function normalizePoint(point) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return { x, y };
+}
+
+function normalizeRandom(random) {
+  return typeof random === "function" ? random : Math.random;
+}
+
+function getHumanInteractionConfig(client) {
+  return HUMAN_INTERACTION_CONFIG.get(client) || null;
+}
+
+function normalizeBooleanOption(raw, fallback = null) {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw !== 0;
+  const normalized = String(raw ?? "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (["true", "1", "yes", "y", "on", "enabled"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off", "disabled"].includes(normalized)) return false;
+  return fallback;
+}
+
+function readFirstOption(source, keys = []) {
+  if (!source || typeof source !== "object") return undefined;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) return source[key];
+  }
+  return undefined;
+}
+
+function normalizeFeatureBoolean(raw, fallback) {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return normalizeBooleanOption(readFirstOption(raw, ["enabled", "enable"]), fallback);
+  }
+  return normalizeBooleanOption(raw, fallback);
+}
+
+export function normalizeHumanBehaviorProfile(raw, fallback = "baseline") {
+  const normalized = String(raw || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const profile = HUMAN_BEHAVIOR_PROFILE_ALIASES[normalized] || normalized;
+  return Object.prototype.hasOwnProperty.call(HUMAN_BEHAVIOR_PROFILES, profile)
+    ? profile
+    : fallback;
+}
+
+export function normalizeHumanBehaviorOptions(raw = null, {
+  legacyEnabled = false,
+  safePacing = null,
+  batchRestEnabled = null
+} = {}) {
+  const safePacingFlag = normalizeBooleanOption(safePacing, null);
+  const batchRestFlag = normalizeBooleanOption(batchRestEnabled, null);
+  let source = "default";
+  let rawObject = {};
+  if (typeof raw === "boolean") {
+    rawObject = { enabled: raw };
+    source = "boolean";
+  } else if (typeof raw === "string") {
+    rawObject = { profile: raw };
+    source = "profile";
+  } else if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    rawObject = raw;
+    source = "object";
+  }
+
+  const explicitProfile = readFirstOption(rawObject, ["profile", "mode", "behaviorProfile", "behavior_profile"]);
+  const enabledRaw = readFirstOption(rawObject, ["enabled", "enable", "human_behavior_enabled"]);
+  const explicitEnabled = normalizeBooleanOption(enabledRaw, null);
+  const inferredProfile = (raw === true || explicitEnabled === true) && legacyEnabled !== true && batchRestFlag !== true
+    ? "paced"
+    : legacyEnabled === true || batchRestFlag === true
+    ? "paced_with_rests"
+    : safePacingFlag === true
+      ? "paced"
+      : DEFAULT_HUMAN_BEHAVIOR_PROFILE;
+  const profile = normalizeHumanBehaviorProfile(explicitProfile, inferredProfile);
+  const profileDefaults = {
+    ...HUMAN_BEHAVIOR_PROFILES[profile]
+  };
+  if (legacyEnabled === true && !explicitProfile) {
+    Object.assign(profileDefaults, HUMAN_BEHAVIOR_PROFILES.paced_with_rests);
+  } else if (safePacingFlag === true && !explicitProfile) {
+    Object.assign(profileDefaults, HUMAN_BEHAVIOR_PROFILES.paced);
+  }
+  if (batchRestFlag === true && !explicitProfile) {
+    Object.assign(profileDefaults, HUMAN_BEHAVIOR_PROFILES.paced_with_rests);
+  }
+
+  const hasExplicitEnabled = enabledRaw !== undefined;
+  if (hasExplicitEnabled) {
+    profileDefaults.enabled = normalizeBooleanOption(enabledRaw, profileDefaults.enabled);
+  }
+  if (!hasExplicitEnabled && (safePacingFlag === false || batchRestFlag === false) && !explicitProfile && legacyEnabled !== true) {
+    profileDefaults.enabled = false;
+  }
+  if (!hasExplicitEnabled && (safePacingFlag === true || batchRestFlag === true || legacyEnabled === true)) {
+    profileDefaults.enabled = true;
+  }
+
+  const enabled = profileDefaults.enabled === true;
+  const clickMovement = normalizeFeatureBoolean(
+    readFirstOption(rawObject, ["clickMovement", "click_movement", "click_movement_enabled"]),
+    profileDefaults.clickMovement
+  );
+  const textEntry = normalizeFeatureBoolean(
+    readFirstOption(rawObject, ["textEntry", "text_entry", "text_entry_enabled"]),
+    profileDefaults.textEntry
+  );
+  const listScrollJitter = normalizeFeatureBoolean(
+    readFirstOption(rawObject, ["listScrollJitter", "list_scroll_jitter", "scrollJitter", "scroll_jitter"]),
+    profileDefaults.listScrollJitter
+  );
+  const actionCooldown = normalizeFeatureBoolean(
+    readFirstOption(rawObject, ["actionCooldown", "action_cooldown", "readPause", "read_pause"]),
+    profileDefaults.actionCooldown
+  );
+  let shortRest = normalizeFeatureBoolean(
+    readFirstOption(rawObject, ["shortRest", "short_rest", "randomRest", "random_rest"]),
+    profileDefaults.shortRest
+  );
+  let batchRest = normalizeFeatureBoolean(
+    readFirstOption(rawObject, ["batchRest", "batch_rest", "batchRestEnabled", "batch_rest_enabled"]),
+    profileDefaults.batchRest
+  );
+  if (batchRestFlag !== null) {
+    batchRest = batchRestFlag;
+    if (batchRestFlag === true && readFirstOption(rawObject, ["shortRest", "short_rest", "randomRest", "random_rest"]) === undefined) {
+      shortRest = true;
+    }
+  }
+
+  return {
+    enabled,
+    profile,
+    source,
+    clickMovement: enabled && clickMovement === true,
+    textEntry: enabled && textEntry === true,
+    listScrollJitter: enabled && listScrollJitter === true,
+    shortRest: enabled && shortRest === true,
+    batchRest: enabled && batchRest === true,
+    actionCooldown: enabled && actionCooldown === true,
+    restEnabled: enabled && (shortRest === true || batchRest === true)
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -74,6 +280,200 @@ export function assertNoForbiddenCdpCalls(methodLog = []) {
     const methods = forbidden.map((entry) => entry.method).join(", ");
     throw new Error(`Forbidden CDP methods were used: ${methods}`);
   }
+}
+
+export function humanDelay(baseMs, varianceMs, {
+  minMs = 100,
+  maxMs = 60000,
+  random = Math.random
+} = {}) {
+  const nextRandom = normalizeRandom(random);
+  const base = Math.max(0, Number(baseMs) || 0);
+  const variance = Math.max(0, Number(varianceMs) || 0);
+  const lower = Math.max(0, Number(minMs) || 0);
+  const upper = Math.max(lower, Number(maxMs) || lower);
+  if (variance <= 0) return Math.round(clampNumber(base, lower, upper));
+  const u1 = Math.max(Number.EPSILON, Math.min(1 - Number.EPSILON, nextRandom()));
+  const u2 = Math.max(Number.EPSILON, Math.min(1 - Number.EPSILON, nextRandom()));
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  return Math.round(clampNumber(base + z * variance, lower, upper));
+}
+
+export function generateBezierPath(start, end, {
+  steps = 18,
+  random = Math.random,
+  controlJitterX = 100,
+  controlJitterY = 60
+} = {}) {
+  const startPoint = normalizePoint(start);
+  const endPoint = normalizePoint(end);
+  if (!startPoint || !endPoint) {
+    throw new Error("generateBezierPath requires finite start and end points");
+  }
+  const nextRandom = normalizeRandom(random);
+  const safeSteps = Math.max(1, Math.floor(Number(steps) || 18));
+  const midX = (startPoint.x + endPoint.x) / 2 + (nextRandom() - 0.5) * Math.max(0, Number(controlJitterX) || 0);
+  const midY = (startPoint.y + endPoint.y) / 2 + (nextRandom() - 0.5) * Math.max(0, Number(controlJitterY) || 0);
+  const path = [];
+  for (let index = 0; index <= safeSteps; index += 1) {
+    const t = index / safeSteps;
+    const inverse = 1 - t;
+    path.push({
+      x: inverse * inverse * startPoint.x + 2 * inverse * t * midX + t * t * endPoint.x,
+      y: inverse * inverse * startPoint.y + 2 * inverse * t * midY + t * t * endPoint.y
+    });
+  }
+  return path;
+}
+
+export function configureHumanInteraction(client, {
+  enabled = false,
+  clickMovementEnabled = null,
+  textEntryEnabled = null,
+  safeClickPointEnabled = null,
+  actionCooldownEnabled = null,
+  random = Math.random,
+  sleepFn = null,
+  moveSteps = 18,
+  moveJitterPx = 3,
+  hoverJitterPx = 5,
+  moveDelayMinMs = 5,
+  moveDelayMaxMs = 23,
+  hoverDelayMinMs = 10,
+  hoverDelayMaxMs = 30,
+  prePressBaseMs = 260,
+  prePressVarianceMs = 80,
+  holdVarianceMs = 30,
+  safeClickMinWidth = 44,
+  safeClickMinHeight = 28,
+  safeClickInsetRatio = 0.22,
+  safeClickMinInsetPx = 4,
+  safeClickMaxInsetPx = 18,
+  textChunkMinLength = 1,
+  textChunkMaxLength = 5,
+  textChunkDelayBaseMs = 55,
+  textChunkDelayVarianceMs = 30
+} = {}) {
+  const previous = getHumanInteractionConfig(client);
+  const normalizedEnabled = enabled === true;
+  HUMAN_INTERACTION_CONFIG.set(client, {
+    enabled: normalizedEnabled,
+    clickMovementEnabled: normalizedEnabled && clickMovementEnabled !== false,
+    textEntryEnabled: normalizedEnabled && textEntryEnabled !== false,
+    safeClickPointEnabled: normalizedEnabled && safeClickPointEnabled !== false,
+    actionCooldownEnabled: normalizedEnabled && actionCooldownEnabled !== false,
+    random: normalizeRandom(random),
+    sleepFn: typeof sleepFn === "function" ? sleepFn : sleep,
+    moveSteps: Math.max(1, Math.floor(Number(moveSteps) || 18)),
+    moveJitterPx: Math.max(0, Number(moveJitterPx) || 0),
+    hoverJitterPx: Math.max(0, Number(hoverJitterPx) || 0),
+    moveDelayMinMs: Math.max(0, Number(moveDelayMinMs) || 0),
+    moveDelayMaxMs: Math.max(0, Number(moveDelayMaxMs) || 0),
+    hoverDelayMinMs: Math.max(0, Number(hoverDelayMinMs) || 0),
+    hoverDelayMaxMs: Math.max(0, Number(hoverDelayMaxMs) || 0),
+    prePressBaseMs: Math.max(0, Number(prePressBaseMs) || 0),
+    prePressVarianceMs: Math.max(0, Number(prePressVarianceMs) || 0),
+    holdVarianceMs: Math.max(0, Number(holdVarianceMs) || 0),
+    safeClickMinWidth: Math.max(1, Number(safeClickMinWidth) || 44),
+    safeClickMinHeight: Math.max(1, Number(safeClickMinHeight) || 28),
+    safeClickInsetRatio: clampNumber(safeClickInsetRatio, 0.05, 0.45),
+    safeClickMinInsetPx: Math.max(0, Number(safeClickMinInsetPx) || 0),
+    safeClickMaxInsetPx: Math.max(0, Number(safeClickMaxInsetPx) || 0),
+    textChunkMinLength: Math.max(1, Math.floor(Number(textChunkMinLength) || 1)),
+    textChunkMaxLength: Math.max(1, Math.floor(Number(textChunkMaxLength) || 5)),
+    textChunkDelayBaseMs: Math.max(0, Number(textChunkDelayBaseMs) || 0),
+    textChunkDelayVarianceMs: Math.max(0, Number(textChunkDelayVarianceMs) || 0),
+    lastMousePoint: previous?.lastMousePoint || null
+  });
+  return () => {
+    if (previous) {
+      HUMAN_INTERACTION_CONFIG.set(client, previous);
+    } else {
+      HUMAN_INTERACTION_CONFIG.delete(client);
+    }
+  };
+}
+
+export function createHumanRestController({
+  enabled = false,
+  shortRestEnabled = true,
+  batchRestEnabled = true,
+  random = Math.random,
+  shortRestProbability = 0.08,
+  shortRestMinMs = 3000,
+  shortRestMaxMs = 7000,
+  batchThresholdBase = 25,
+  batchThresholdJitter = 8,
+  batchRestMinMs = 15000,
+  batchRestMaxMs = 30000
+} = {}) {
+  const nextRandom = normalizeRandom(random);
+  const state = {
+    enabled: enabled === true,
+    short_rest_enabled: enabled === true && shortRestEnabled !== false,
+    batch_rest_enabled: enabled === true && batchRestEnabled !== false,
+    rest_counter: 0,
+    rest_threshold: Math.max(1, Math.floor(Number(batchThresholdBase) || 25) + Math.floor(nextRandom() * Math.max(1, Number(batchThresholdJitter) || 1))),
+    rest_count: 0,
+    total_rest_ms: 0
+  };
+
+  function resetThreshold() {
+    state.rest_threshold = Math.max(1, Math.floor(Number(batchThresholdBase) || 25) + Math.floor(nextRandom() * Math.max(1, Number(batchThresholdJitter) || 1)));
+  }
+
+  async function takeBreakIfNeeded({ sleepFn = sleep } = {}) {
+    if (!state.enabled) {
+      return {
+        enabled: false,
+        rested: false,
+        rest_counter: state.rest_counter,
+        rest_threshold: state.rest_threshold,
+        events: []
+      };
+    }
+    const sleeper = typeof sleepFn === "function" ? sleepFn : sleep;
+    state.rest_counter += 1;
+    const events = [];
+    if (state.short_rest_enabled && nextRandom() < Math.max(0, Number(shortRestProbability) || 0)) {
+      const pauseMs = Math.round(randomBetween(nextRandom, shortRestMinMs, shortRestMaxMs));
+      await sleeper(pauseMs);
+      events.push({ kind: "random_rest", pause_ms: pauseMs });
+    }
+    if (state.batch_rest_enabled && state.rest_counter >= state.rest_threshold) {
+      const pauseMs = Math.round(randomBetween(nextRandom, batchRestMinMs, batchRestMaxMs));
+      await sleeper(pauseMs);
+      events.push({
+        kind: "batch_rest",
+        pause_ms: pauseMs,
+        processed_since_last_batch_rest: state.rest_counter
+      });
+      state.rest_counter = 0;
+      resetThreshold();
+    }
+    const pauseMs = events.reduce((sum, event) => sum + event.pause_ms, 0);
+    if (pauseMs > 0) {
+      state.rest_count += events.length;
+      state.total_rest_ms += pauseMs;
+    }
+    return {
+      enabled: true,
+      rested: events.length > 0,
+      pause_ms: pauseMs,
+      rest_counter: state.rest_counter,
+      rest_threshold: state.rest_threshold,
+      rest_count: state.rest_count,
+      total_rest_ms: state.total_rest_ms,
+      events
+    };
+  }
+
+  return {
+    takeBreakIfNeeded,
+    getState() {
+      return { ...state };
+    }
+  };
 }
 
 export function isBossLoginUrl(url) {
@@ -692,15 +1092,179 @@ export async function getNodeBox(client, nodeId) {
   };
 }
 
+export async function simulateHumanClick(client, targetX, targetY, {
+  button = "left",
+  clickCount = 1,
+  delayMs = 80,
+  random = Math.random,
+  sleepFn = sleep,
+  moveSteps = 18,
+  moveJitterPx = 3,
+  hoverJitterPx = 5,
+  moveDelayMinMs = 5,
+  moveDelayMaxMs = 23,
+  hoverDelayMinMs = 10,
+  hoverDelayMaxMs = 30,
+  prePressBaseMs = 260,
+  prePressVarianceMs = 80,
+  holdVarianceMs = 30,
+  startPoint = null
+} = {}) {
+  const target = normalizePoint({ x: targetX, y: targetY });
+  if (!target) throw new Error("simulateHumanClick requires finite target coordinates");
+  const nextRandom = normalizeRandom(random);
+  const interactionConfig = getHumanInteractionConfig(client) || {};
+  const start = normalizePoint(startPoint)
+    || normalizePoint(interactionConfig.lastMousePoint)
+    || {
+      x: Math.max(0, target.x + randomBetween(nextRandom, -140, 140)),
+      y: Math.max(0, target.y + randomBetween(nextRandom, -90, 90))
+    };
+  const path = generateBezierPath(start, target, {
+    steps: moveSteps,
+    random: nextRandom
+  });
+  const sleeper = typeof sleepFn === "function" ? sleepFn : sleep;
+  const moveDelayMin = Math.min(moveDelayMinMs, moveDelayMaxMs);
+  const moveDelayMax = Math.max(moveDelayMinMs, moveDelayMaxMs);
+  const hoverDelayMin = Math.min(hoverDelayMinMs, hoverDelayMaxMs);
+  const hoverDelayMax = Math.max(hoverDelayMinMs, hoverDelayMaxMs);
+  for (const point of path) {
+    await client.Input.dispatchMouseEvent({
+      type: "mouseMoved",
+      x: Math.round(point.x + randomBetween(nextRandom, -moveJitterPx / 2, moveJitterPx / 2)),
+      y: Math.round(point.y + randomBetween(nextRandom, -moveJitterPx / 2, moveJitterPx / 2)),
+      button: "none"
+    });
+    const pauseMs = Math.round(randomBetween(nextRandom, moveDelayMin, moveDelayMax));
+    if (pauseMs > 0) await sleeper(pauseMs);
+  }
+  const hoverSteps = randomIntegerBetween(nextRandom, 3, 6);
+  for (let index = 0; index < hoverSteps; index += 1) {
+    await client.Input.dispatchMouseEvent({
+      type: "mouseMoved",
+      x: Math.round(target.x + randomBetween(nextRandom, -hoverJitterPx / 2, hoverJitterPx / 2)),
+      y: Math.round(target.y + randomBetween(nextRandom, -hoverJitterPx / 2, hoverJitterPx / 2)),
+      button: "none"
+    });
+    const pauseMs = Math.round(randomBetween(nextRandom, hoverDelayMin, hoverDelayMax));
+    if (pauseMs > 0) await sleeper(pauseMs);
+  }
+  const prePressMs = humanDelay(prePressBaseMs, prePressVarianceMs, {
+    minMs: 0,
+    maxMs: Math.max(prePressBaseMs + prePressVarianceMs * 4, prePressBaseMs),
+    random: nextRandom
+  });
+  if (prePressMs > 0) await sleeper(prePressMs);
+  await client.Input.dispatchMouseEvent({ type: "mousePressed", x: target.x, y: target.y, button, clickCount });
+  const holdMs = humanDelay(delayMs, holdVarianceMs, {
+    minMs: 0,
+    maxMs: Math.max(delayMs + holdVarianceMs * 4, delayMs),
+    random: nextRandom
+  });
+  if (holdMs > 0) await sleeper(holdMs);
+  await client.Input.dispatchMouseEvent({ type: "mouseReleased", x: target.x, y: target.y, button, clickCount });
+  const latestConfig = getHumanInteractionConfig(client);
+  if (latestConfig) latestConfig.lastMousePoint = target;
+  return {
+    mode: "human",
+    path_points: path.length,
+    hover_steps: hoverSteps,
+    pre_press_ms: prePressMs,
+    hold_ms: holdMs
+  };
+}
+
+export function resolveHumanClickPointForBox(box, {
+  enabled = true,
+  safeClickPointEnabled = true,
+  random = Math.random,
+  safeClickMinWidth = 44,
+  safeClickMinHeight = 28,
+  safeClickInsetRatio = 0.22,
+  safeClickMinInsetPx = 4,
+  safeClickMaxInsetPx = 18
+} = {}) {
+  const center = normalizePoint(box?.center);
+  if (!center) throw new Error("resolveHumanClickPointForBox requires a box center");
+  const rect = box?.rect || {};
+  const width = Number(rect.width);
+  const height = Number(rect.height);
+  const originX = Number(rect.x);
+  const originY = Number(rect.y);
+  if (
+    enabled !== true
+    || safeClickPointEnabled === false
+    || !Number.isFinite(width)
+    || !Number.isFinite(height)
+    || !Number.isFinite(originX)
+    || !Number.isFinite(originY)
+    || width < Math.max(1, Number(safeClickMinWidth) || 44)
+    || height < Math.max(1, Number(safeClickMinHeight) || 28)
+  ) {
+    return {
+      x: center.x,
+      y: center.y,
+      mode: "center",
+      reason: "small_or_disabled"
+    };
+  }
+
+  const nextRandom = normalizeRandom(random);
+  const insetRatio = clampNumber(safeClickInsetRatio, 0.05, 0.45);
+  const minInset = Math.max(0, Number(safeClickMinInsetPx) || 0);
+  const maxInset = Math.max(minInset, Number(safeClickMaxInsetPx) || minInset);
+  const insetX = Math.min(width / 2 - 1, Math.max(minInset, Math.min(maxInset, width * insetRatio)));
+  const insetY = Math.min(height / 2 - 1, Math.max(minInset, Math.min(maxInset, height * insetRatio)));
+  const usableWidth = Math.max(0, width - insetX * 2);
+  const usableHeight = Math.max(0, height - insetY * 2);
+  if (usableWidth <= 0 || usableHeight <= 0) {
+    return {
+      x: center.x,
+      y: center.y,
+      mode: "center",
+      reason: "insufficient_safe_area"
+    };
+  }
+  return {
+    x: originX + insetX + nextRandom() * usableWidth,
+    y: originY + insetY + nextRandom() * usableHeight,
+    mode: "safe_inset",
+    inset_x: insetX,
+    inset_y: insetY
+  };
+}
+
 export async function clickPoint(client, x, y, {
   button = "left",
   clickCount = 1,
-  delayMs = 80
+  delayMs = 80,
+  humanRestEnabled = null,
+  humanInteraction = null
 } = {}) {
+  const configured = getHumanInteractionConfig(client);
+  const mergedHumanInteraction = {
+    ...(configured || {}),
+    ...(humanInteraction || {})
+  };
+  const humanEnabled = humanRestEnabled === true
+    || humanInteraction?.enabled === true
+    || (humanRestEnabled !== false && configured?.enabled === true);
+  if (humanEnabled && mergedHumanInteraction.clickMovementEnabled !== false) {
+    return simulateHumanClick(client, x, y, {
+      ...mergedHumanInteraction,
+      button,
+      clickCount,
+      delayMs
+    });
+  }
   await client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" });
   await client.Input.dispatchMouseEvent({ type: "mousePressed", x, y, button, clickCount });
   if (delayMs > 0) await sleep(delayMs);
   await client.Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button, clickCount });
+  return {
+    mode: "direct"
+  };
 }
 
 export async function scrollNodeIntoView(client, nodeId) {
@@ -716,7 +1280,20 @@ export async function clickNodeCenter(client, nodeId, {
     await sleep(150);
   }
   const box = await getNodeBox(client, nodeId);
-  await clickPoint(client, box.center.x, box.center.y, clickOptions);
+  const configured = getHumanInteractionConfig(client);
+  const mergedHumanInteraction = {
+    ...(configured || {}),
+    ...(clickOptions.humanInteraction || {})
+  };
+  const humanClickPointEnabled = (
+    clickOptions.humanRestEnabled === true
+    || clickOptions.humanInteraction?.enabled === true
+    || (clickOptions.humanRestEnabled !== false && configured?.enabled === true)
+  ) && mergedHumanInteraction.safeClickPointEnabled !== false;
+  const clickPointTarget = humanClickPointEnabled
+    ? resolveHumanClickPointForBox(box, mergedHumanInteraction)
+    : { ...box.center, mode: "center" };
+  await clickPoint(client, clickPointTarget.x, clickPointTarget.y, clickOptions);
   return box;
 }
 
@@ -746,8 +1323,79 @@ export async function pressKey(client, key, {
   });
 }
 
-export async function insertText(client, text) {
-  await client.Input.insertText({ text: String(text || "") });
+export function chunkHumanText(text, {
+  random = Math.random,
+  minLength = 1,
+  maxLength = 5
+} = {}) {
+  const chars = Array.from(String(text || ""));
+  const min = Math.max(1, Math.floor(Number(minLength) || 1));
+  const max = Math.max(min, Math.floor(Number(maxLength) || min));
+  const nextRandom = normalizeRandom(random);
+  const chunks = [];
+  let index = 0;
+  while (index < chars.length) {
+    const remaining = chars.length - index;
+    const size = Math.min(remaining, randomIntegerBetween(nextRandom, min, max));
+    chunks.push(chars.slice(index, index + size).join(""));
+    index += size;
+  }
+  return chunks;
+}
+
+export async function insertText(client, text, {
+  humanTextEntryEnabled = null,
+  humanInteraction = null
+} = {}) {
+  const value = String(text || "");
+  const configured = getHumanInteractionConfig(client);
+  const mergedHumanInteraction = {
+    ...(configured || {}),
+    ...(humanInteraction || {})
+  };
+  const textEntryEnabled = humanTextEntryEnabled === true
+    || humanInteraction?.textEntryEnabled === true
+    || (humanTextEntryEnabled !== false
+      && configured?.enabled === true
+      && configured?.textEntryEnabled !== false);
+  if (!textEntryEnabled || value.length <= 1) {
+    await client.Input.insertText({ text: value });
+    return {
+      mode: "direct",
+      chunk_count: value ? 1 : 0
+    };
+  }
+  const chunks = chunkHumanText(value, {
+    random: mergedHumanInteraction.random,
+    minLength: mergedHumanInteraction.textChunkMinLength,
+    maxLength: mergedHumanInteraction.textChunkMaxLength
+  });
+  const sleeper = typeof mergedHumanInteraction.sleepFn === "function"
+    ? mergedHumanInteraction.sleepFn
+    : sleep;
+  for (let index = 0; index < chunks.length; index += 1) {
+    await client.Input.insertText({ text: chunks[index] });
+    if (index < chunks.length - 1) {
+      const pauseMs = humanDelay(
+        mergedHumanInteraction.textChunkDelayBaseMs,
+        mergedHumanInteraction.textChunkDelayVarianceMs,
+        {
+          minMs: 0,
+          maxMs: Math.max(
+            mergedHumanInteraction.textChunkDelayBaseMs + mergedHumanInteraction.textChunkDelayVarianceMs * 4,
+            mergedHumanInteraction.textChunkDelayBaseMs
+          ),
+          random: mergedHumanInteraction.random
+        }
+      );
+      if (pauseMs > 0) await sleeper(pauseMs);
+    }
+  }
+  return {
+    mode: "chunked",
+    chunk_count: chunks.length,
+    chunks
+  };
 }
 
 export async function selectAllFocusedText(client) {

@@ -63,7 +63,11 @@ const installConfigDefaults = Object.freeze({
   llmMaxRetries: 3,
   llmImageLimit: 8,
   llmImageDetail: "low",
-  humanRestEnabled: false
+  humanRestEnabled: true,
+  humanBehavior: {
+    enabled: true,
+    profile: "paced_with_rests"
+  }
 });
 const bossChatRuntimeChildDirs = ["logs", "runs", "profiles", "reports", "artifacts", "state"];
 const bossChatCliUnsupportedStartCode = "CHAT_CLI_ASYNC_UNSUPPORTED_CDP_ONLY";
@@ -2687,6 +2691,10 @@ async function runPipelineOnce(options = {}) {
     "action_timeout_ms",
     "action_interval_ms",
     "action_after_click_delay_ms",
+    "human_behavior_enabled",
+    "human_behavior_profile",
+    "safe_pacing",
+    "batch_rest_enabled",
     "llm_timeout_ms",
     "llm_image_limit",
     "llm_image_detail"
@@ -2761,6 +2769,10 @@ function buildBossChatCliInput(options = {}) {
     max_candidates: parseNonNegativeInteger(options["max-candidates"] ?? options.max_candidates),
     dry_run: options["dry-run"] === true || options.dryRun === true,
     no_state: options["no-state"] === true || options.noState === true,
+    human_behavior_enabled: parseBooleanOption(options["human-behavior-enabled"] ?? options.human_behavior_enabled),
+    human_behavior_profile: typeof (options["human-behavior-profile"] ?? options.human_behavior_profile) === "string"
+      ? (options["human-behavior-profile"] ?? options.human_behavior_profile).trim()
+      : undefined,
     safe_pacing: parseBooleanOption(options["safe-pacing"] ?? options.safe_pacing),
     batch_rest_enabled: parseBooleanOption(options["batch-rest"] ?? options.batch_rest_enabled)
   };

@@ -7,6 +7,7 @@ import {
   createInfiniteListState,
   getNextInfiniteListCandidate,
   markInfiniteListCandidateProcessed,
+  resolveInfiniteListScrollTiming,
   resolveInfiniteListFallbackPoint
 } from "./core/infinite-list/index.js";
 import {
@@ -60,6 +61,15 @@ function createFakeScrollClient({
         }
       }
     }
+  };
+}
+
+function createSequenceRandom(values = []) {
+  let index = 0;
+  return () => {
+    const value = values[index] ?? 0.5;
+    index += 1;
+    return value;
   };
 }
 
@@ -121,6 +131,32 @@ function testClassifiesLegacyBottomMarkers() {
   });
   assert.equal(refreshOnly.is_bottom, true);
   assert.equal(refreshOnly.reason, "refresh_button_visible");
+}
+
+function testResolvesListScrollJitterTiming() {
+  const deterministic = resolveInfiniteListScrollTiming({
+    wheelDeltaY: 1000,
+    settleMs: 1000
+  });
+  assert.equal(deterministic.wheelDeltaY, 1000);
+  assert.equal(deterministic.settleMs, 1000);
+  assert.equal(deterministic.wheel_delta_jitter.enabled, false);
+
+  const jittered = resolveInfiniteListScrollTiming({
+    wheelDeltaY: 1000,
+    settleMs: 1000,
+    listScrollJitterEnabled: true,
+    listScrollJitterMinRatio: 0.8,
+    listScrollJitterMaxRatio: 1.2,
+    listSettleJitterMinRatio: 0.9,
+    listSettleJitterMaxRatio: 1.1,
+    random: createSequenceRandom([0, 1])
+  });
+  assert.equal(jittered.wheelDeltaY, 800);
+  assert.equal(jittered.settleMs, 1100);
+  assert.equal(jittered.wheel_delta_jitter.enabled, true);
+  assert.equal(jittered.wheel_delta_jitter.preserve_coverage, true);
+  assert.equal(jittered.settle_jitter.enabled, true);
 }
 
 async function testTraversesAfterVisibleBatchWithoutDuplicates() {
@@ -506,6 +542,7 @@ async function testUsesFallbackResolverAfterStaleAnchors() {
 
 testCandidateKeys();
 testClassifiesLegacyBottomMarkers();
+testResolvesListScrollJitterTiming();
 await testTraversesAfterVisibleBatchWithoutDuplicates();
 await testDetectsStableEndOfList();
 await testDoesNotTreatSlowAppendAsEndAfterOneStableSignature();

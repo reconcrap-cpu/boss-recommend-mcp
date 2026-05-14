@@ -2,7 +2,11 @@ import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
 import { waitForCvCaptureTarget } from "../../core/cv-capture-target/index.js";
 import {
   clickPoint,
+  configureHumanInteraction,
+  createHumanRestController,
   getNodeBox,
+  humanDelay,
+  normalizeHumanBehaviorOptions,
   scrollNodeIntoView,
   sleep
 } from "../../core/browser/index.js";
@@ -685,9 +689,27 @@ export async function runChatWorkflow({
   listWheelDeltaY = 850,
   listSettleMs = 2200,
   listFallbackPoint = null,
-  imageOutputDir = ""
+  imageOutputDir = "",
+  humanRestEnabled = false,
+  humanBehavior = null
 } = {}, runControl) {
   if (!client) throw new Error("runChatWorkflow requires a guarded CDP client");
+  const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
+    legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
+  });
+  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
+  configureHumanInteraction(client, {
+    enabled: effectiveHumanBehavior.enabled,
+    clickMovementEnabled: effectiveHumanBehavior.clickMovement,
+    textEntryEnabled: effectiveHumanBehavior.textEntry,
+    safeClickPointEnabled: effectiveHumanBehavior.clickMovement,
+    actionCooldownEnabled: effectiveHumanBehavior.actionCooldown
+  });
+  const humanRestController = createHumanRestController({
+    enabled: effectiveHumanRestEnabled,
+    shortRestEnabled: effectiveHumanBehavior.shortRest,
+    batchRestEnabled: effectiveHumanBehavior.batchRest
+  });
   const normalizedDetailSource = normalizeDetailSource(detailSource);
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
@@ -732,6 +754,33 @@ export async function runChatWorkflow({
   let requestSatisfiedCount = 0;
   let requestSkippedCount = 0;
   let contextSetup = {};
+  let lastHumanEvent = null;
+
+  function recordHumanEvent(event = null) {
+    if (!event) return lastHumanEvent;
+    lastHumanEvent = {
+      at: new Date().toISOString(),
+      ...event
+    };
+    return lastHumanEvent;
+  }
+
+  async function maybeHumanActionCooldown(phase, timings = {}) {
+    if (!effectiveHumanBehavior.actionCooldown) return null;
+    const pauseMs = humanDelay(280, 90, {
+      minMs: 80,
+      maxMs: 720
+    });
+    if (pauseMs > 0) {
+      await runControl.sleep(pauseMs);
+      addTiming(timings, `human_${phase}_pause_ms`, pauseMs);
+    }
+    return recordHumanEvent({
+      kind: "action_cooldown",
+      phase,
+      pause_ms: pauseMs
+    });
+  }
 
   runControl.setPhase("chat:cleanup");
   let initialTopLevelState = await getChatTopLevelState(client);
@@ -870,7 +919,13 @@ export async function runChatWorkflow({
       scroll_count: compactInfiniteListState(listState).scroll_count,
       list_end_reason: listEndReason,
       viewport_checks: viewportGuard.getStats().checks,
-      viewport_recoveries: viewportGuard.getStats().recoveries
+      viewport_recoveries: viewportGuard.getStats().recoveries,
+      human_behavior_enabled: effectiveHumanBehavior.enabled,
+      human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_enabled: effectiveHumanRestEnabled,
+      human_rest_count: humanRestController.getState().rest_count,
+      human_rest_ms: humanRestController.getState().total_rest_ms,
+      last_human_event: lastHumanEvent
     });
     runControl.setPhase("chat:done");
     return {
@@ -888,6 +943,9 @@ export async function runChatWorkflow({
         stats: viewportGuard.getStats(),
         events: viewportGuard.getEvents()
       },
+      human_behavior: effectiveHumanBehavior,
+      human_rest: humanRestController.getState(),
+      last_human_event: lastHumanEvent,
       list_end_reason: listEndReason,
       target_pass_count: passTarget,
       process_until_list_end: Boolean(processUntilListEnd),
@@ -993,6 +1051,7 @@ export async function runChatWorkflow({
       stableSignatureLimit: listStableSignatureLimit,
       wheelDeltaY: listWheelDeltaY,
       settleMs: listSettleMs,
+      listScrollJitterEnabled: effectiveHumanBehavior.listScrollJitter,
       fallbackPoint: listFallbackResolver,
       findNodeIds: async () => {
         const currentRootState = await ensureChatViewport(await getChatRoots(client), "candidate_find_nodes");
@@ -1074,6 +1133,7 @@ export async function runChatWorkflow({
 
         detailStep = "select_candidate";
         networkRecorder.clear();
+        await maybeHumanActionCooldown("before_detail_open", timings);
         const selected = await measureTiming(timings, "candidate_click_ms", () => selectFreshChatCandidate(client, {
           cardNodeId,
           candidate: cardCandidate,
@@ -1178,6 +1238,7 @@ export async function runChatWorkflow({
           if (!detailResult) {
             detailStep = "open_online_resume";
             networkRecorder.clear();
+            await maybeHumanActionCooldown("before_resume_open", timings);
             const openedResume = await measureTiming(timings, "detail_open_ms", () => openChatOnlineResume(client, {
               timeoutMs: readyTimeoutMs
             }));
@@ -1332,6 +1393,7 @@ export async function runChatWorkflow({
                 wheelDeltaY: imageWheelDeltaY,
                 settleMs: 350,
                 scrollMethod: "dom-anchor-fallback-input",
+                scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
                 stepTimeoutMs: 45000,
                 totalTimeoutMs: 90000,
                 duplicateStopCount: 1,
@@ -1479,6 +1541,7 @@ export async function runChatWorkflow({
               full_cv_evidence: fullCvEvidence
             });
             closeResult = await measureTiming(timings, "close_detail_ms", () => closeChatResumeModal(client));
+            await maybeHumanActionCooldown("after_detail_close", timings);
             if (!closeResult?.closed) {
               closeRecovery = await recoverAndReapplyChatContext(
                 "resume_modal_close_failed:close_resume_modal",
@@ -1575,6 +1638,7 @@ export async function runChatWorkflow({
         : screenCandidate(screeningCandidate, { criteria });
     let postAction = null;
     if (requestResumeForPassed && screening.passed) {
+      await maybeHumanActionCooldown("before_post_action", timings);
       postAction = await measureTiming(timings, "post_action_ms", () => requestChatResumeForPassedCandidate(client, {
         greetingText,
         dryRun: dryRunRequestCv
@@ -1627,6 +1691,12 @@ export async function runChatWorkflow({
       list_end_reason: listEndReason || null,
       viewport_checks: viewportGuard.getStats().checks,
       viewport_recoveries: viewportGuard.getStats().recoveries,
+      human_behavior_enabled: effectiveHumanBehavior.enabled,
+      human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_enabled: effectiveHumanRestEnabled,
+      human_rest_count: humanRestController.getState().rest_count,
+      human_rest_ms: humanRestController.getState().total_rest_ms,
+      last_human_event: lastHumanEvent,
       last_candidate_id: screeningCandidate.id || null,
       last_candidate_key: candidateKey,
       last_score: screening.score
@@ -1649,6 +1719,31 @@ export async function runChatWorkflow({
     });
     addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
 
+    if (effectiveHumanRestEnabled) {
+      const restStarted = Date.now();
+      const restResult = await humanRestController.takeBreakIfNeeded({
+        sleepFn: (ms) => runControl.sleep(ms)
+      });
+      const restElapsed = Date.now() - restStarted;
+      if (restResult.rested) {
+        recordHumanEvent({
+          kind: "rest",
+          pause_ms: restResult.pause_ms || restElapsed,
+          events: restResult.events || []
+        });
+        compactResult.human_rest = restResult;
+        addTiming(compactResult.timings, "human_rest_ms", restElapsed);
+        compactResult.timings.total_ms = Date.now() - candidateStarted;
+        runControl.updateProgress({
+          human_rest_enabled: effectiveHumanRestEnabled,
+          human_rest_count: humanRestController.getState().rest_count,
+          human_rest_ms: humanRestController.getState().total_rest_ms,
+          human_rest_last: restResult,
+          last_human_event: lastHumanEvent
+        });
+      }
+    }
+
     if (delayMs > 0) {
       const sleepStarted = Date.now();
       await runControl.sleep(delayMs);
@@ -1669,6 +1764,9 @@ export async function runChatWorkflow({
       stats: viewportGuard.getStats(),
       events: viewportGuard.getEvents()
     },
+    human_behavior: effectiveHumanBehavior,
+    human_rest: humanRestController.getState(),
+    last_human_event: lastHumanEvent,
     list_end_reason: listEndReason || null,
     target_pass_count: passTarget,
     process_until_list_end: Boolean(processUntilListEnd),
@@ -1730,6 +1828,8 @@ export function createChatRunService({
     listSettleMs = 2200,
     listFallbackPoint = null,
     imageOutputDir = "",
+    humanRestEnabled = false,
+    humanBehavior = null,
     name = "chat-domain-run"
   } = {}) {
     if (!client) throw new Error("startChatRun requires a guarded CDP client");
@@ -1737,6 +1837,10 @@ export function createChatRunService({
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
     const processedLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? processedLimit : Math.max(0, Number(detailLimit) || 0);
+    const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
+      legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
+    });
+    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     return manager.startRun({
       name,
       context: {
@@ -1769,7 +1873,11 @@ export function createChatRunService({
         list_settle_ms: listSettleMs,
         list_fallback_point: listFallbackPoint,
         online_resume_button_timeout_ms: onlineResumeButtonTimeoutMs,
-        image_output_dir: imageOutputDir || ""
+        image_output_dir: imageOutputDir || "",
+        human_behavior_enabled: effectiveHumanBehavior.enabled,
+        human_behavior_profile: effectiveHumanBehavior.profile,
+        human_behavior: effectiveHumanBehavior,
+        human_rest_enabled: effectiveHumanRestEnabled
       },
       progress: {
         card_count: 0,
@@ -1784,7 +1892,13 @@ export function createChatRunService({
         skipped: 0,
         requested: 0,
         request_satisfied: 0,
-        request_skipped: 0
+        request_skipped: 0,
+        human_behavior_enabled: effectiveHumanBehavior.enabled,
+        human_behavior_profile: effectiveHumanBehavior.profile,
+        human_rest_enabled: effectiveHumanRestEnabled,
+        human_rest_count: 0,
+        human_rest_ms: 0,
+        last_human_event: null
       },
       checkpoint: {},
       task: (runControl) => workflow({
@@ -1821,7 +1935,9 @@ export function createChatRunService({
         listWheelDeltaY,
         listSettleMs,
         listFallbackPoint,
-        imageOutputDir
+        imageOutputDir,
+        humanRestEnabled: effectiveHumanRestEnabled,
+        humanBehavior: effectiveHumanBehavior
       }, runControl)
     });
   }

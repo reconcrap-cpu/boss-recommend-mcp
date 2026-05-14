@@ -180,6 +180,83 @@ function normalizePoint(point) {
   return { x, y };
 }
 
+function normalizeRandom(random) {
+  return typeof random === "function" ? random : Math.random;
+}
+
+function randomBetween(random, min, max) {
+  const lower = Number(min) || 0;
+  const upper = Number(max) || lower;
+  if (upper <= lower) return lower;
+  return lower + random() * (upper - lower);
+}
+
+function clampNumber(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return min;
+  return Math.min(max, Math.max(min, number));
+}
+
+export function resolveInfiniteListScrollTiming({
+  wheelDeltaY = 850,
+  settleMs = 1200,
+  listScrollJitterEnabled = false,
+  listScrollJitterMinRatio = 0.85,
+  listScrollJitterMaxRatio = 1.15,
+  listSettleJitterMinRatio = 0.75,
+  listSettleJitterMaxRatio = 1.35,
+  random = Math.random
+} = {}) {
+  const baseDeltaY = Math.max(1, Number(wheelDeltaY) || 850);
+  const baseSettleMs = Math.max(0, Number(settleMs) || 0);
+  if (listScrollJitterEnabled !== true) {
+    return {
+      wheelDeltaY: baseDeltaY,
+      settleMs: baseSettleMs,
+      wheel_delta_jitter: {
+        enabled: false,
+        base_delta_y: baseDeltaY,
+        actual_delta_y: baseDeltaY
+      },
+      settle_jitter: {
+        enabled: false,
+        base_settle_ms: baseSettleMs,
+        actual_settle_ms: baseSettleMs
+      }
+    };
+  }
+  const nextRandom = normalizeRandom(random);
+  const minDeltaRatio = clampNumber(listScrollJitterMinRatio, 0.5, 1.5);
+  const maxDeltaRatio = clampNumber(listScrollJitterMaxRatio, minDeltaRatio, 1.5);
+  const minSettleRatio = clampNumber(listSettleJitterMinRatio, 0.4, 2);
+  const maxSettleRatio = clampNumber(listSettleJitterMaxRatio, minSettleRatio, 2);
+  const deltaRatio = randomBetween(nextRandom, minDeltaRatio, maxDeltaRatio);
+  const settleRatio = randomBetween(nextRandom, minSettleRatio, maxSettleRatio);
+  const actualDeltaY = Math.max(1, Math.round(baseDeltaY * deltaRatio));
+  const actualSettleMs = Math.max(0, Math.round(baseSettleMs * settleRatio));
+  return {
+    wheelDeltaY: actualDeltaY,
+    settleMs: actualSettleMs,
+    wheel_delta_jitter: {
+      enabled: true,
+      preserve_coverage: true,
+      base_delta_y: baseDeltaY,
+      actual_delta_y: actualDeltaY,
+      ratio: deltaRatio,
+      min_ratio: minDeltaRatio,
+      max_ratio: maxDeltaRatio
+    },
+    settle_jitter: {
+      enabled: true,
+      base_settle_ms: baseSettleMs,
+      actual_settle_ms: actualSettleMs,
+      ratio: settleRatio,
+      min_ratio: minSettleRatio,
+      max_ratio: maxSettleRatio
+    }
+  };
+}
+
 function resolveViewportPoint(viewportPoint, viewport) {
   if (!viewportPoint) return null;
   if (viewport && ("xRatio" in viewportPoint || "yRatio" in viewportPoint)) {
@@ -891,7 +968,13 @@ export function firstUnseenInfiniteListItem(state, items = []) {
 export async function scrollInfiniteListByVisibleItems(client, items = [], {
   wheelDeltaY = 850,
   settleMs = 1200,
-  fallbackPoint = null
+  fallbackPoint = null,
+  listScrollJitterEnabled = false,
+  listScrollJitterMinRatio = 0.85,
+  listScrollJitterMaxRatio = 1.15,
+  listSettleJitterMinRatio = 0.75,
+  listSettleJitterMaxRatio = 1.35,
+  random = Math.random
 } = {}) {
   const candidates = items.filter((item) => item?.node_id);
   if (!candidates.length) {
@@ -902,7 +985,18 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
   }
 
   const errors = [];
-  const wheelDelta = Math.max(1, Number(wheelDeltaY) || 850);
+  const scrollTiming = resolveInfiniteListScrollTiming({
+    wheelDeltaY,
+    settleMs,
+    listScrollJitterEnabled,
+    listScrollJitterMinRatio,
+    listScrollJitterMaxRatio,
+    listSettleJitterMinRatio,
+    listSettleJitterMaxRatio,
+    random
+  });
+  const wheelDelta = scrollTiming.wheelDeltaY;
+  const actualSettleMs = scrollTiming.settleMs;
   async function synthesizeGesture(x, y) {
     if (typeof client?.Input?.synthesizeScrollGesture !== "function") return null;
     try {
@@ -941,15 +1035,19 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
         deltaY: wheelDelta
       });
       const gesture = await synthesizeGesture(x, y);
-      if (settleMs > 0) await sleep(settleMs);
+      if (actualSettleMs > 0) await sleep(actualSettleMs);
       return {
         ok: true,
         anchor_key: anchor.key,
         anchor_node_id: anchor.node_id,
         point: { x, y },
         wheel_delta_y: wheelDelta,
+        base_wheel_delta_y: Math.max(1, Number(wheelDeltaY) || 850),
+        wheel_delta_jitter: scrollTiming.wheel_delta_jitter,
         gesture,
-        settle_ms: settleMs,
+        settle_ms: actualSettleMs,
+        base_settle_ms: Math.max(0, Number(settleMs) || 0),
+        settle_jitter: scrollTiming.settle_jitter,
         skipped_stale_anchor_count: errors.length
       };
     } catch (error) {
@@ -994,7 +1092,7 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
       deltaY: wheelDelta
     });
     const gesture = await synthesizeGesture(x, y);
-    if (settleMs > 0) await sleep(settleMs);
+    if (actualSettleMs > 0) await sleep(actualSettleMs);
     return {
       ok: true,
       mode: "fallback_point",
@@ -1010,8 +1108,12 @@ export async function scrollInfiniteListByVisibleItems(client, items = [], {
       assist,
       point: { x, y },
       wheel_delta_y: wheelDelta,
+      base_wheel_delta_y: Math.max(1, Number(wheelDeltaY) || 850),
+      wheel_delta_jitter: scrollTiming.wheel_delta_jitter,
       gesture,
-      settle_ms: settleMs,
+      settle_ms: actualSettleMs,
+      base_settle_ms: Math.max(0, Number(settleMs) || 0),
+      settle_jitter: scrollTiming.settle_jitter,
       skipped_stale_anchor_count: errors.length,
       stale_anchor_errors: errors
     };
@@ -1037,7 +1139,13 @@ export async function getNextInfiniteListCandidate({
   minScrollsBeforeEnd = 3,
   wheelDeltaY = 850,
   settleMs = 1200,
-  fallbackPoint = null
+  fallbackPoint = null,
+  listScrollJitterEnabled = false,
+  listScrollJitterMinRatio = 0.85,
+  listScrollJitterMaxRatio = 1.15,
+  listSettleJitterMinRatio = 0.75,
+  listSettleJitterMaxRatio = 1.35,
+  random = Math.random
 } = {}) {
   if (!client) throw new Error("getNextInfiniteListCandidate requires client");
   if (!state) throw new Error("getNextInfiniteListCandidate requires state");
@@ -1173,7 +1281,13 @@ export async function getNextInfiniteListCandidate({
     const scrollResult = await scrollInfiniteListByVisibleItems(client, items, {
       wheelDeltaY,
       settleMs,
-      fallbackPoint
+      fallbackPoint,
+      listScrollJitterEnabled,
+      listScrollJitterMinRatio,
+      listScrollJitterMaxRatio,
+      listSettleJitterMinRatio,
+      listSettleJitterMaxRatio,
+      random
     });
     state.scroll_count += scrollResult.ok ? 1 : 0;
     attempts[attempts.length - 1].scroll_result = scrollResult;

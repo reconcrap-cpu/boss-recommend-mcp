@@ -9,6 +9,12 @@ import {
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
 import { waitForCvCaptureTarget } from "../../core/cv-capture-target/index.js";
 import {
+  configureHumanInteraction,
+  createHumanRestController,
+  humanDelay,
+  normalizeHumanBehaviorOptions
+} from "../../core/browser/index.js";
+import {
   compactCvAcquisitionState,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
@@ -291,9 +297,27 @@ export async function runRecruitWorkflow({
   llmTimeoutMs = 120000,
   llmImageLimit = 8,
   llmImageDetail = "high",
-  imageOutputDir = ""
+  imageOutputDir = "",
+  humanRestEnabled = false,
+  humanBehavior = null
 } = {}, runControl) {
   if (!client) throw new Error("runRecruitWorkflow requires a guarded CDP client");
+  const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
+    legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
+  });
+  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
+  configureHumanInteraction(client, {
+    enabled: effectiveHumanBehavior.enabled,
+    clickMovementEnabled: effectiveHumanBehavior.clickMovement,
+    textEntryEnabled: effectiveHumanBehavior.textEntry,
+    safeClickPointEnabled: effectiveHumanBehavior.clickMovement,
+    actionCooldownEnabled: effectiveHumanBehavior.actionCooldown
+  });
+  const humanRestController = createHumanRestController({
+    enabled: effectiveHumanRestEnabled,
+    shortRestEnabled: effectiveHumanBehavior.shortRest,
+    batchRestEnabled: effectiveHumanBehavior.batchRest
+  });
   const normalizedSearchParams = normalizeSearchParams(searchParams);
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
@@ -326,6 +350,7 @@ export async function runRecruitWorkflow({
   const candidateRecoveryCounts = new Map();
   let cardNodeIds = [];
   let listEndReason = "";
+  let lastHumanEvent = null;
   const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
     rootNodeId: rootState?.iframe?.documentNodeId,
     containerSelectors: RECRUIT_LIST_CONTAINER_SELECTORS,
@@ -335,9 +360,36 @@ export async function runRecruitWorkflow({
     validateViewportPoint: true
   }));
 
+  function recordHumanEvent(event = null) {
+    if (!event) return lastHumanEvent;
+    lastHumanEvent = {
+      at: new Date().toISOString(),
+      ...event
+    };
+    return lastHumanEvent;
+  }
+
+  async function maybeHumanActionCooldown(phase, timings = {}) {
+    if (!effectiveHumanBehavior.actionCooldown) return null;
+    const pauseMs = humanDelay(280, 90, {
+      minMs: 80,
+      maxMs: 720
+    });
+    if (pauseMs > 0) {
+      await runControl.sleep(pauseMs);
+      addTiming(timings, `human_${phase}_pause_ms`, pauseMs);
+    }
+    return recordHumanEvent({
+      kind: "action_cooldown",
+      phase,
+      pause_ms: pauseMs
+    });
+  }
+
   function updateRecruitProgress(extra = {}) {
     const counts = countRecruitResultStatuses(results);
     const listSnapshot = compactInfiniteListState(listState);
+    const humanRestState = humanRestController.getState();
     runControl.updateProgress({
       card_count: cardNodeIds.length,
       target_count: limit,
@@ -351,6 +403,12 @@ export async function runRecruitWorkflow({
       list_end_reason: listEndReason || null,
       viewport_checks: viewportGuard.getStats().checks,
       viewport_recoveries: viewportGuard.getStats().recoveries,
+      human_behavior_enabled: effectiveHumanBehavior.enabled,
+      human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_enabled: effectiveHumanRestEnabled,
+      human_rest_count: humanRestState.rest_count,
+      human_rest_ms: humanRestState.total_rest_ms,
+      last_human_event: lastHumanEvent,
       ...extra
     });
   }
@@ -519,6 +577,7 @@ export async function runRecruitWorkflow({
       stableSignatureLimit: listStableSignatureLimit,
       wheelDeltaY: listWheelDeltaY,
       settleMs: listSettleMs,
+      listScrollJitterEnabled: effectiveHumanBehavior.listScrollJitter,
       fallbackPoint: listFallbackResolver,
       findNodeIds: async () => {
         let currentRootState = await getRecruitRoots(client);
@@ -622,6 +681,7 @@ export async function runRecruitWorkflow({
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailStep = "open_detail";
         networkRecorder.clear();
+        await maybeHumanActionCooldown("before_detail_open", timings);
         const openedDetail = await openRecruitCardDetail(client, cardNodeId);
         addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
         addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
@@ -693,6 +753,7 @@ export async function runRecruitWorkflow({
                 wheelDeltaY: imageWheelDeltaY,
                 settleMs: 350,
                 scrollMethod: "dom-anchor-fallback-input",
+                scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
                 stepTimeoutMs: 45000,
                 totalTimeoutMs: 90000,
                 duplicateStopCount: 1,
@@ -765,6 +826,7 @@ export async function runRecruitWorkflow({
         screeningCandidate = detailResult.candidate;
         if (closeDetail) {
           detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecruitDetail(client));
+          await maybeHumanActionCooldown("after_detail_close", timings);
           if (!detailResult.close_result?.closed) {
             const closeError = createRecruitCloseFailureError(detailResult.close_result);
             const recovery = await recoverAndReapplyRecruitContext("detail_close_failed", closeError, {
@@ -892,6 +954,27 @@ export async function runRecruitWorkflow({
     });
     addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
 
+    if (effectiveHumanRestEnabled) {
+      const restStarted = Date.now();
+      const restResult = await humanRestController.takeBreakIfNeeded({
+        sleepFn: (ms) => runControl.sleep(ms)
+      });
+      const restElapsed = Date.now() - restStarted;
+      if (restResult.rested) {
+        recordHumanEvent({
+          kind: "rest",
+          pause_ms: restResult.pause_ms || restElapsed,
+          events: restResult.events || []
+        });
+        compactResult.human_rest = restResult;
+        addTiming(compactResult.timings, "human_rest_ms", restElapsed);
+        compactResult.timings.total_ms = Date.now() - candidateStarted;
+        updateRecruitProgress({
+          human_rest_last: restResult
+        });
+      }
+    }
+
     if (delayMs > 0) {
       const sleepStarted = Date.now();
       await runControl.sleep(delayMs);
@@ -911,6 +994,9 @@ export async function runRecruitWorkflow({
       stats: viewportGuard.getStats(),
       events: viewportGuard.getEvents()
     },
+    human_behavior: effectiveHumanBehavior,
+    human_rest: humanRestController.getState(),
+    last_human_event: lastHumanEvent,
     list_end_reason: listEndReason || null,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
@@ -958,6 +1044,8 @@ export function createRecruitRunService({
     llmImageLimit = 8,
     llmImageDetail = "high",
     imageOutputDir = "",
+    humanRestEnabled = false,
+    humanBehavior = null,
     name = "recruit-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecruitRun requires a guarded CDP client");
@@ -965,6 +1053,10 @@ export function createRecruitRunService({
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
+    const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
+      legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
+    });
+    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     return manager.startRun({
       name,
       context: {
@@ -994,7 +1086,11 @@ export function createRecruitRunService({
         llm_timeout_ms: llmTimeoutMs,
         llm_image_limit: llmImageLimit,
         llm_image_detail: llmImageDetail,
-        image_output_dir: imageOutputDir || ""
+        image_output_dir: imageOutputDir || "",
+        human_behavior_enabled: effectiveHumanBehavior.enabled,
+        human_behavior_profile: effectiveHumanBehavior.profile,
+        human_behavior: effectiveHumanBehavior,
+        human_rest_enabled: effectiveHumanRestEnabled
       },
       progress: {
         card_count: 0,
@@ -1007,7 +1103,13 @@ export function createRecruitRunService({
         image_capture_failed: 0,
         detail_open_failed: 0,
         transient_recovered: 0,
-        context_recoveries: 0
+        context_recoveries: 0,
+        human_behavior_enabled: effectiveHumanBehavior.enabled,
+        human_behavior_profile: effectiveHumanBehavior.profile,
+        human_rest_enabled: effectiveHumanRestEnabled,
+        human_rest_count: 0,
+        human_rest_ms: 0,
+        last_human_event: null
       },
       checkpoint: {},
       task: (runControl) => workflow({
@@ -1039,7 +1141,9 @@ export function createRecruitRunService({
         llmTimeoutMs,
         llmImageLimit,
         llmImageDetail,
-        imageOutputDir
+        imageOutputDir,
+        humanRestEnabled: effectiveHumanRestEnabled,
+        humanBehavior: effectiveHumanBehavior
       }, runControl)
     });
   }

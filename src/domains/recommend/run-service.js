@@ -8,7 +8,13 @@ import {
 } from "../../core/run/timing.js";
 import { captureScrolledNodeScreenshots } from "../../core/capture/index.js";
 import { waitForCvCaptureTarget } from "../../core/cv-capture-target/index.js";
-import { sleep } from "../../core/browser/index.js";
+import {
+  configureHumanInteraction,
+  createHumanRestController,
+  humanDelay,
+  normalizeHumanBehaviorOptions,
+  sleep
+} from "../../core/browser/index.js";
 import { GREET_CREDITS_EXHAUSTED_CODE } from "../../core/greet-quota/index.js";
 import {
   compactCvAcquisitionState,
@@ -571,9 +577,27 @@ export async function runRecommendWorkflow({
   llmTimeoutMs = 120000,
   llmImageLimit = 8,
   llmImageDetail = "high",
-  imageOutputDir = ""
+  imageOutputDir = "",
+  humanRestEnabled = false,
+  humanBehavior = null
 } = {}, runControl) {
   if (!client) throw new Error("runRecommendWorkflow requires a guarded CDP client");
+  const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
+    legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
+  });
+  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
+  configureHumanInteraction(client, {
+    enabled: effectiveHumanBehavior.enabled,
+    clickMovementEnabled: effectiveHumanBehavior.clickMovement,
+    textEntryEnabled: effectiveHumanBehavior.textEntry,
+    safeClickPointEnabled: effectiveHumanBehavior.clickMovement,
+    actionCooldownEnabled: effectiveHumanBehavior.actionCooldown
+  });
+  const humanRestController = createHumanRestController({
+    enabled: effectiveHumanRestEnabled,
+    shortRestEnabled: effectiveHumanBehavior.shortRest,
+    batchRestEnabled: effectiveHumanBehavior.batchRest
+  });
   const normalizedFilter = normalizeFilter(filter);
   const normalizedPostAction = normalizeRecommendPostAction(postAction) || "none";
   const requestedPageScope = normalizeRecommendPageScope(pageScope) || "recommend";
@@ -615,6 +639,7 @@ export async function runRecommendWorkflow({
   let filterResult = null;
   let cardNodeIds = [];
   let listEndReason = "";
+  let lastHumanEvent = null;
   const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
     rootNodeId: rootState?.iframe?.documentNodeId,
     containerSelectors: RECOMMEND_LIST_CONTAINER_SELECTORS,
@@ -624,9 +649,36 @@ export async function runRecommendWorkflow({
     validateViewportPoint: true
   }));
 
+  function recordHumanEvent(event = null) {
+    if (!event) return lastHumanEvent;
+    lastHumanEvent = {
+      at: new Date().toISOString(),
+      ...event
+    };
+    return lastHumanEvent;
+  }
+
+  async function maybeHumanActionCooldown(phase, timings = {}) {
+    if (!effectiveHumanBehavior.actionCooldown) return null;
+    const pauseMs = humanDelay(280, 90, {
+      minMs: 80,
+      maxMs: 720
+    });
+    if (pauseMs > 0) {
+      await runControl.sleep(pauseMs);
+      addTiming(timings, `human_${phase}_pause_ms`, pauseMs);
+    }
+    return recordHumanEvent({
+      kind: "action_cooldown",
+      phase,
+      pause_ms: pauseMs
+    });
+  }
+
   function updateRecommendProgress(extra = {}) {
     const counts = countRecommendResultStatuses(results, { greetCount });
     const listSnapshot = compactInfiniteListState(listState);
+    const humanRestState = humanRestController.getState();
     runControl.updateProgress({
       card_count: cardNodeIds.length,
       target_count: targetPassCount,
@@ -641,6 +693,12 @@ export async function runRecommendWorkflow({
       list_end_reason: listEndReason || null,
       viewport_checks: viewportGuard.getStats().checks,
       viewport_recoveries: viewportGuard.getStats().recoveries,
+      human_behavior_enabled: effectiveHumanBehavior.enabled,
+      human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_enabled: effectiveHumanRestEnabled,
+      human_rest_count: humanRestState.rest_count,
+      human_rest_ms: humanRestState.total_rest_ms,
+      last_human_event: lastHumanEvent,
       ...extra
     });
   }
@@ -838,6 +896,7 @@ export async function runRecommendWorkflow({
       stableSignatureLimit: listStableSignatureLimit,
       wheelDeltaY: listWheelDeltaY,
       settleMs: listSettleMs,
+      listScrollJitterEnabled: effectiveHumanBehavior.listScrollJitter,
       fallbackPoint: listFallbackResolver,
       findNodeIds: async () => {
         let currentRootState = await getRecommendRoots(client);
@@ -943,6 +1002,7 @@ export async function runRecommendWorkflow({
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailStep = "open_detail";
         networkRecorder.clear();
+        await maybeHumanActionCooldown("before_detail_open", timings);
         const openedDetail = await openRecommendCardDetailWithFreshRetry(client, {
           cardNodeId,
           candidateKey,
@@ -1026,6 +1086,7 @@ export async function runRecommendWorkflow({
                 wheelDeltaY: imageWheelDeltaY,
                 settleMs: 350,
                 scrollMethod: "dom-anchor-fallback-input",
+                scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
                 stepTimeoutMs: 45000,
                 totalTimeoutMs: 90000,
                 duplicateStopCount: 1,
@@ -1162,6 +1223,7 @@ export async function runRecommendWorkflow({
       await runControl.waitIfPaused();
       runControl.throwIfCanceled();
       runControl.setPhase("recommend:post-action");
+      await maybeHumanActionCooldown("before_post_action", timings);
       actionDiscovery = await waitForRecommendDetailActionControls(client, {
         timeoutMs: actionTimeoutMs,
         intervalMs: actionIntervalMs,
@@ -1184,6 +1246,7 @@ export async function runRecommendWorkflow({
     }
     if (detailResult && closeDetail) {
       detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
+      await maybeHumanActionCooldown("after_detail_close", timings);
       if (!detailResult.close_result?.closed) {
         const closeError = createRecommendCloseFailureError(detailResult.close_result);
         const recovery = await recoverAndReapplyRecommendContext("detail_close_failed", closeError, {
@@ -1258,6 +1321,27 @@ export async function runRecommendWorkflow({
       break;
     }
 
+    if (effectiveHumanRestEnabled) {
+      const restStarted = Date.now();
+      const restResult = await humanRestController.takeBreakIfNeeded({
+        sleepFn: (ms) => runControl.sleep(ms)
+      });
+      const restElapsed = Date.now() - restStarted;
+      if (restResult.rested) {
+        recordHumanEvent({
+          kind: "rest",
+          pause_ms: restResult.pause_ms || restElapsed,
+          events: restResult.events || []
+        });
+        compactResult.human_rest = restResult;
+        addTiming(compactResult.timings, "human_rest_ms", restElapsed);
+        compactResult.timings.total_ms = Date.now() - candidateStarted;
+        updateRecommendProgress({
+          human_rest_last: restResult
+        });
+      }
+    }
+
     if (delayMs > 0) {
       const sleepStarted = Date.now();
       await runControl.sleep(delayMs);
@@ -1279,6 +1363,9 @@ export async function runRecommendWorkflow({
       stats: viewportGuard.getStats(),
       events: viewportGuard.getEvents()
     },
+    human_behavior: effectiveHumanBehavior,
+    human_rest: humanRestController.getState(),
+    last_human_event: lastHumanEvent,
     list_end_reason: listEndReason || null,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
@@ -1335,6 +1422,8 @@ export function createRecommendRunService({
     llmImageLimit = 8,
     llmImageDetail = "high",
     imageOutputDir = "",
+    humanRestEnabled = false,
+    humanBehavior = null,
     name = "recommend-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecommendRun requires a guarded CDP client");
@@ -1343,6 +1432,10 @@ export function createRecommendRunService({
     const requestedPageScope = normalizeRecommendPageScope(pageScope) || "recommend";
     const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+    const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
+      legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
+    });
+    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? null : Math.max(0, Number(detailLimit) || 0);
     return manager.startRun({
@@ -1382,7 +1475,11 @@ export function createRecommendRunService({
         llm_timeout_ms: llmTimeoutMs,
         llm_image_limit: llmImageLimit,
         llm_image_detail: llmImageDetail,
-        image_output_dir: imageOutputDir || ""
+        image_output_dir: imageOutputDir || "",
+        human_behavior_enabled: effectiveHumanBehavior.enabled,
+        human_behavior_profile: effectiveHumanBehavior.profile,
+        human_behavior: effectiveHumanBehavior,
+        human_rest_enabled: effectiveHumanRestEnabled
       },
       progress: {
         card_count: 0,
@@ -1398,7 +1495,13 @@ export function createRecommendRunService({
         image_capture_failed: 0,
         detail_open_failed: 0,
         transient_recovered: 0,
-        context_recoveries: 0
+        context_recoveries: 0,
+        human_behavior_enabled: effectiveHumanBehavior.enabled,
+        human_behavior_profile: effectiveHumanBehavior.profile,
+        human_rest_enabled: effectiveHumanRestEnabled,
+        human_rest_count: 0,
+        human_rest_ms: 0,
+        last_human_event: null
       },
       checkpoint: {},
       task: (runControl) => workflow({
@@ -1437,7 +1540,9 @@ export function createRecommendRunService({
         llmTimeoutMs,
         llmImageLimit,
         llmImageDetail,
-        imageOutputDir
+        imageOutputDir,
+        humanRestEnabled: effectiveHumanRestEnabled,
+        humanBehavior: effectiveHumanBehavior
       }, runControl)
     });
   }

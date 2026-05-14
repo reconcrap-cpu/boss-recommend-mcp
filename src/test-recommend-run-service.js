@@ -142,13 +142,16 @@ async function testPostActionOptionDelegation() {
     executePostAction: false,
     actionTimeoutMs: 1234,
     actionIntervalMs: 234,
-    actionAfterClickDelayMs: 345
+    actionAfterClickDelayMs: 345,
+    humanRestEnabled: true
   });
 
   assert.equal(started.context.post_action, "greet");
   assert.equal(started.context.max_greet_count, 2);
   assert.equal(started.context.execute_post_action, false);
   assert.equal(started.context.action_timeout_ms, 1234);
+  assert.equal(started.context.human_rest_enabled, true);
+  assert.equal(started.progress.human_rest_enabled, true);
 
   const final = await service.waitForRecommendRun(started.runId);
   assert.equal(final.status, "completed");
@@ -158,6 +161,7 @@ async function testPostActionOptionDelegation() {
   assert.equal(observedOptions.actionTimeoutMs, 1234);
   assert.equal(observedOptions.actionIntervalMs, 234);
   assert.equal(observedOptions.actionAfterClickDelayMs, 345);
+  assert.equal(observedOptions.humanRestEnabled, true);
 }
 
 async function testDetailLimitDefaultsToUnlimitedForPassTarget() {

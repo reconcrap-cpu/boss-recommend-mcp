@@ -171,6 +171,40 @@ async function testRecruitDefaultsUseScreeningConfig() {
   assert.equal(observedOptions.llmConfig.temperature, 0);
   assert.equal(observedOptions.llmConfig.topP, 0.2);
   assert.equal(observedOptions.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
+  assert.equal(observedOptions.llmConfig.humanRestEnabled, true);
+  assert.equal(observedOptions.humanRestEnabled, true);
+  assert.equal(observedOptions.humanBehavior.profile, "paced_with_rests");
+  assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
+}
+
+async function testRecruitHumanBehaviorArgsOverrideConfig() {
+  let observedOptions = null;
+  installFakeConnector();
+  setRecruitMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recruit:test-human-behavior");
+    runControl.updateProgress({ processed: 1, screened: 1, passed: 0 });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+  const payload = await callTool(TOOL_RUN, {
+    ...readyArgs({
+      safe_pacing: true,
+      batch_rest_enabled: false
+    }),
+    execution_mode: "sync"
+  }, 21);
+  assert.equal(payload.status, "COMPLETED");
+  assert.equal(observedOptions.humanBehavior.profile, "paced");
+  assert.equal(observedOptions.humanBehavior.enabled, true);
+  assert.equal(observedOptions.humanBehavior.restEnabled, false);
+  assert.equal(observedOptions.humanRestEnabled, false);
 }
 
 async function testRecruitSyncRun() {
@@ -298,7 +332,7 @@ async function main() {
     openaiProject: "proj-test",
     temperature: 0,
     topP: 0.2,
-    humanRestEnabled: false
+    humanRestEnabled: true
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
@@ -306,6 +340,8 @@ async function main() {
     await testRecruitGateBeforeBrowserConnect();
     resetRecruitMcpStateForTests();
     await testRecruitDefaultsUseScreeningConfig();
+    resetRecruitMcpStateForTests();
+    await testRecruitHumanBehaviorArgsOverrideConfig();
     resetRecruitMcpStateForTests();
     await testRecruitSyncRun();
     resetRecruitMcpStateForTests();

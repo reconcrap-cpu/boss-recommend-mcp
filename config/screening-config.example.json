@@ -12,7 +12,17 @@
   "llmImageDetail": "low",
   "debugPort": 9222,
   "outputDir": "",
-  "humanRestEnabled": false,
+  "humanRestEnabled": true,
+  "humanBehavior": {
+    "enabled": true,
+    "profile": "paced_with_rests",
+    "clickMovement": true,
+    "textEntry": true,
+    "listScrollJitter": true,
+    "shortRest": true,
+    "batchRest": true,
+    "actionCooldown": true
+  },
   "openaiOrganization": "optional-org-id",
   "openaiProject": "optional-project-id"
 }
