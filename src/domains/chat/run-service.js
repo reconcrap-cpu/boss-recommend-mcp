@@ -754,6 +754,7 @@ export async function runChatWorkflow({
   let requestSatisfiedCount = 0;
   let requestSkippedCount = 0;
   let contextSetup = {};
+  let contextRecoveryAttempts = 0;
   let lastHumanEvent = null;
 
   function recordHumanEvent(event = null) {
@@ -826,6 +827,7 @@ export async function runChatWorkflow({
     forceRefresh = false
   } = {}) {
     runControl.setPhase("chat:recover_shell");
+    contextRecoveryAttempts += 1;
     const shellRecovery = await recoverChatShell(client, {
       targetUrl,
       timeoutMs: readyTimeoutMs,
@@ -866,6 +868,7 @@ export async function runChatWorkflow({
     const recovery = {
       reason,
       total_refresh: Boolean(forceRefresh),
+      attempt: contextRecoveryAttempts,
       shell: shellRecovery,
       candidate_list: candidateList,
       counters
@@ -917,6 +920,7 @@ export async function runChatWorkflow({
       request_skipped: 0,
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
+      context_recoveries: contextRecoveryAttempts,
       list_end_reason: listEndReason,
       viewport_checks: viewportGuard.getStats().checks,
       viewport_recoveries: viewportGuard.getStats().recoveries,
@@ -960,6 +964,7 @@ export async function runChatWorkflow({
       requested: requestedCount,
       request_satisfied: requestSatisfiedCount,
       request_skipped: requestSkippedCount,
+      context_recoveries: contextRecoveryAttempts,
       results
     };
   }
@@ -981,6 +986,7 @@ export async function runChatWorkflow({
     screening_mode: normalizedScreeningMode,
     unique_seen: compactInfiniteListState(listState).seen_count,
     scroll_count: 0,
+    context_recoveries: contextRecoveryAttempts,
     viewport_checks: viewportGuard.getStats().checks,
     viewport_recoveries: viewportGuard.getStats().recoveries
   });
@@ -1015,6 +1021,18 @@ export async function runChatWorkflow({
         const error = new Error(`CHAT_JOB_GUARD_FAILED: requested=${job}; selected=${jobGuard.selected_label || "unknown"}; reason=${jobGuard.reason || "unknown"}`);
         error.code = "CHAT_JOB_GUARD_FAILED";
         error.chat_job_guard = compactChatJobGuard(jobGuard);
+        runControl.checkpoint({
+          chat_context_step: "job_guard_failed",
+          job_guard: compactChatJobGuard(jobGuard),
+          error: {
+            code: error.code,
+            message: error.message
+          }
+        });
+        if (contextRecoveryAttempts < 2) {
+          await recoverAndReapplyChatContext("job_guard_failed", error, { forceRefresh: true });
+          continue;
+        }
         throw error;
       }
       if (!jobGuard.already_current) {
@@ -1688,6 +1706,7 @@ export async function runChatWorkflow({
       request_skipped: requestSkippedCount,
       unique_seen: compactInfiniteListState(listState).seen_count,
       scroll_count: compactInfiniteListState(listState).scroll_count,
+      context_recoveries: contextRecoveryAttempts,
       list_end_reason: listEndReason || null,
       viewport_checks: viewportGuard.getStats().checks,
       viewport_recoveries: viewportGuard.getStats().recoveries,
@@ -1739,6 +1758,7 @@ export async function runChatWorkflow({
           human_rest_count: humanRestController.getState().rest_count,
           human_rest_ms: humanRestController.getState().total_rest_ms,
           human_rest_last: restResult,
+          context_recoveries: contextRecoveryAttempts,
           last_human_event: lastHumanEvent
         });
       }
@@ -1781,6 +1801,7 @@ export async function runChatWorkflow({
     requested: requestedCount,
     request_satisfied: requestSatisfiedCount,
     request_skipped: requestSkippedCount,
+    context_recoveries: contextRecoveryAttempts,
     results
   };
 }
@@ -1893,6 +1914,7 @@ export function createChatRunService({
         requested: 0,
         request_satisfied: 0,
         request_skipped: 0,
+        context_recoveries: 0,
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_rest_enabled: effectiveHumanRestEnabled,

@@ -147,10 +147,23 @@ function compactRefreshAttempt(refreshAttempt) {
 
 function compactError(error, fallbackCode = "RECRUIT_RUN_ERROR") {
   if (!error) return null;
-  return {
+  const result = {
     code: error.code || fallbackCode,
     message: error.message || String(error)
   };
+  if (error.refresh_attempt) {
+    result.refresh_attempt = error.refresh_attempt;
+  }
+  if (error.list_end_reason) {
+    result.list_end_reason = error.list_end_reason;
+  }
+  if (error.target_count != null) {
+    result.target_count = error.target_count;
+  }
+  if (error.processed_count != null) {
+    result.processed_count = error.processed_count;
+  }
+  return result;
 }
 
 function createRecruitCloseFailureError(closeResult) {
@@ -158,6 +171,34 @@ function createRecruitCloseFailureError(closeResult) {
   error.code = "DETAIL_CLOSE_FAILED";
   error.close_result = closeResult || null;
   return error;
+}
+
+function createRecruitRefreshFailureError(refreshAttempt, {
+  listEndReason = "",
+  targetCount = 0,
+  processedCount = 0
+} = {}) {
+  const reason = refreshAttempt?.application?.post_search_state?.ok === false
+    ? "search_result_not_ready"
+    : refreshAttempt?.application?.post_search_state?.counts?.candidate_card === 0
+      ? "no_cards_after_refresh"
+      : "refresh_failed";
+  const error = new Error(`Recruit/search refresh failed before target was reached (${reason})`);
+  error.code = "RECRUIT_END_REFRESH_FAILED";
+  error.refresh_attempt = refreshAttempt || null;
+  error.list_end_reason = listEndReason || null;
+  error.target_count = targetCount;
+  error.processed_count = processedCount;
+  return error;
+}
+
+function isRefreshableListStall(reason = "") {
+  return new Set([
+    "stable_visible_signature",
+    "max_scrolls_exhausted",
+    "scroll_failed",
+    "scroll_anchor_unavailable"
+  ]).has(String(reason || ""));
 }
 
 export function isStaleRecruitNodeError(error) {
@@ -610,7 +651,7 @@ export async function runRecruitWorkflow({
     if (!nextCandidateResult.ok) {
       listEndReason = nextCandidateResult.reason || "list_exhausted";
       if (
-        nextCandidateResult.end_reached
+        (nextCandidateResult.end_reached || isRefreshableListStall(nextCandidateResult.reason))
         && refreshOnEnd
         && results.length < limit
         && refreshRounds < Math.max(0, Number(maxRefreshRounds) || 0)
@@ -658,6 +699,11 @@ export async function runRecruitWorkflow({
           listEndReason = "";
           continue;
         }
+        throw createRecruitRefreshFailureError(compactRefresh, {
+          listEndReason,
+          targetCount: limit,
+          processedCount: results.length
+        });
       }
       break;
     }

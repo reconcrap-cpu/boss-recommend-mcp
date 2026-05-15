@@ -1,6 +1,7 @@
 import {
   clickNodeCenter,
   countSelectors,
+  DETERMINISTIC_CLICK_OPTIONS,
   findFirstNode,
   getAttributesMap,
   getNodeBox,
@@ -117,12 +118,25 @@ export async function ensureFilterPanelClosed(client, frameNodeId, triggerNodeId
   attempts.push("Escape");
 
   if (await getFilterPanelCount(client, frameNodeId) > 0 && triggerNodeId) {
-    await clickNodeCenter(client, triggerNodeId);
+    await clickNodeCenter(client, triggerNodeId, DETERMINISTIC_CLICK_OPTIONS);
     await sleep(500);
     attempts.push("filter-trigger-toggle");
   }
 
   return attempts;
+}
+
+async function dismissRecommendControlOverlays(client, settleMs = 250) {
+  if (typeof client?.Input?.dispatchKeyEvent !== "function") {
+    return ["Escape-unavailable"];
+  }
+  await pressKey(client, "Escape", {
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+    nativeVirtualKeyCode: 27
+  });
+  if (settleMs > 0) await sleep(settleMs);
+  return ["Escape"];
 }
 
 async function findFilterTriggerCandidates(client, frameNodeId) {
@@ -147,6 +161,7 @@ export async function openFilterPanel(client, frameNodeId) {
     throw new Error("Recommend filter trigger was not found");
   }
 
+  const preOpenDismissalAttempts = await dismissRecommendControlOverlays(client);
   const existingPanelNodeId = await waitForSelector(client, frameNodeId, RECOMMEND_FILTER_SELECTORS.panel, {
     timeoutMs: 300,
     intervalMs: 100
@@ -157,7 +172,7 @@ export async function openFilterPanel(client, frameNodeId) {
       trigger: triggerCandidates[0],
       trigger_box: triggerBox,
       panel_node_id: existingPanelNodeId,
-      initial_close_attempts: [],
+      initial_close_attempts: preOpenDismissalAttempts,
       already_open: true
     };
   }
@@ -169,11 +184,13 @@ export async function openFilterPanel(client, frameNodeId) {
     triggerCandidates = await findFilterTriggerCandidates(client, frameNodeId);
     for (const trigger of triggerCandidates) {
       const triggerBox = await getNodeBox(client, trigger.nodeId);
-      await clickNodeCenter(client, trigger.nodeId);
+      const clickBox = await clickNodeCenter(client, trigger.nodeId, DETERMINISTIC_CLICK_OPTIONS);
       attempts.push({
         selector: trigger.selector,
         node_id: trigger.nodeId,
-        center: triggerBox.center
+        center: triggerBox.center,
+        click_target: clickBox.click_target,
+        click_result: clickBox.click_result
       });
       const panelNodeId = await waitForSelector(client, frameNodeId, RECOMMEND_FILTER_SELECTORS.panel, {
         timeoutMs: 2500,
@@ -184,7 +201,10 @@ export async function openFilterPanel(client, frameNodeId) {
           trigger,
           trigger_box: triggerBox,
           panel_node_id: panelNodeId,
-          initial_close_attempts: closeAttempts,
+          initial_close_attempts: [
+            ...preOpenDismissalAttempts,
+            ...closeAttempts
+          ],
           open_attempts: attempts
         };
       }
@@ -236,7 +256,7 @@ async function clickFirstAvailableNode(client, nodeIds) {
   const errors = [];
   for (const nodeId of nodeIds) {
     try {
-      const box = await clickNodeCenter(client, nodeId);
+      const box = await clickNodeCenter(client, nodeId, DETERMINISTIC_CLICK_OPTIONS);
       return {
         clicked: true,
         node_id: nodeId,
@@ -301,7 +321,10 @@ export async function selectFirstSafeFilterOption(client, frameNodeId, {
     throw new Error("No safe non-active recommend filter option was found");
   }
 
-  const box = await clickNodeCenter(client, selected.node_id, { scrollIntoView: true });
+  const box = await clickNodeCenter(client, selected.node_id, {
+    ...DETERMINISTIC_CLICK_OPTIONS,
+    scrollIntoView: true
+  });
   await sleep(300);
 
   return {
@@ -338,7 +361,10 @@ export async function selectFilterOption(client, frameNodeId, {
     throw new Error(`No matching recommend filter option was found for ${target}`);
   }
 
-  const box = await clickNodeCenter(client, selected.node_id, { scrollIntoView: true });
+  const box = await clickNodeCenter(client, selected.node_id, {
+    ...DETERMINISTIC_CLICK_OPTIONS,
+    scrollIntoView: true
+  });
   await sleep(300);
 
   return {
@@ -409,7 +435,10 @@ export async function selectFilterOptions(client, frameNodeId, {
       continue;
     }
 
-    const box = await clickNodeCenter(client, selected.node_id, { scrollIntoView: true });
+    const box = await clickNodeCenter(client, selected.node_id, {
+      ...DETERMINISTIC_CLICK_OPTIONS,
+      scrollIntoView: true
+    });
     selectedOptions.push({
       group: selected.group,
       label: selected.label,

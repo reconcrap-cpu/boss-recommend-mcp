@@ -42,6 +42,9 @@ const BOSS_LOGIN_DOM_SELECTORS = [
 ];
 const HUMAN_INTERACTION_CONFIG = new WeakMap();
 const DEFAULT_HUMAN_BEHAVIOR_PROFILE = "paced_with_rests";
+export const DETERMINISTIC_CLICK_OPTIONS = Object.freeze({
+  humanRestEnabled: false
+});
 const HUMAN_BEHAVIOR_PROFILES = Object.freeze({
   baseline: Object.freeze({
     enabled: false,
@@ -1293,8 +1296,12 @@ export async function clickNodeCenter(client, nodeId, {
   const clickPointTarget = humanClickPointEnabled
     ? resolveHumanClickPointForBox(box, mergedHumanInteraction)
     : { ...box.center, mode: "center" };
-  await clickPoint(client, clickPointTarget.x, clickPointTarget.y, clickOptions);
-  return box;
+  const clickResult = await clickPoint(client, clickPointTarget.x, clickPointTarget.y, clickOptions);
+  return {
+    ...box,
+    click_target: clickPointTarget,
+    click_result: clickResult
+  };
 }
 
 export async function pressKey(client, key, {

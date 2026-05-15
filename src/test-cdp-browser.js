@@ -295,12 +295,25 @@ async function testHumanClickPointAndChunkedText() {
 
   inserted.length = 0;
   mouseEvents.length = 0;
-  await clickNodeCenter(guarded, 1, { delayMs: 0 });
+  const humanClickBox = await clickNodeCenter(guarded, 1, { delayMs: 0 });
   const press = mouseEvents.find((event) => event.type === "mousePressed");
   assert.equal(inserted.length, 0);
   assert.deepEqual(sleeps, []);
   assert.ok(press);
   assert.notEqual(Math.round(press.x), 50);
+  assert.equal(humanClickBox.click_target.mode, "safe_inset");
+
+  mouseEvents.length = 0;
+  const deterministicClickBox = await clickNodeCenter(guarded, 1, {
+    delayMs: 0,
+    humanRestEnabled: false
+  });
+  const deterministicPress = mouseEvents.find((event) => event.type === "mousePressed");
+  assert.ok(deterministicPress);
+  assert.equal(Math.round(deterministicPress.x), 50);
+  assert.equal(Math.round(deterministicPress.y), 20);
+  assert.equal(deterministicClickBox.click_target.mode, "center");
+  assert.equal(deterministicClickBox.click_result.mode, "direct");
 }
 
 async function testHumanRestController() {

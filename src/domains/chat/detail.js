@@ -2,6 +2,7 @@ import {
   clearFocusedInput,
   clickNodeCenter,
   clickPoint,
+  DETERMINISTIC_CLICK_OPTIONS,
   getFrameDocumentNodeId,
   getAttributesMap,
   getNodeBox,
@@ -572,9 +573,12 @@ export async function selectChatPrimaryLabel(client, {
     }
     if (matched) {
       if (matched.center) {
-        await clickPoint(client, matched.center.x, matched.center.y);
+        await clickPoint(client, matched.center.x, matched.center.y, DETERMINISTIC_CLICK_OPTIONS);
       } else {
-        await clickNodeCenter(client, matched.node_id, { scrollIntoView: true });
+        await clickNodeCenter(client, matched.node_id, {
+          ...DETERMINISTIC_CLICK_OPTIONS,
+          scrollIntoView: true
+        });
       }
       if (settleMs > 0) await sleep(settleMs);
       return {
@@ -633,9 +637,12 @@ export async function selectChatMessageFilter(client, {
     const matched = candidates[0];
     if (matched) {
       if (matched.center) {
-        await clickPoint(client, matched.center.x, matched.center.y);
+        await clickPoint(client, matched.center.x, matched.center.y, DETERMINISTIC_CLICK_OPTIONS);
       } else {
-        await clickNodeCenter(client, matched.node_id, { scrollIntoView: true });
+        await clickNodeCenter(client, matched.node_id, {
+          ...DETERMINISTIC_CLICK_OPTIONS,
+          scrollIntoView: true
+        });
       }
       if (settleMs > 0) await sleep(settleMs);
       return {
@@ -1499,7 +1506,7 @@ export async function closeChatResumeModal(client, {
     const closeTarget = await findVisibleTarget(client, rootState.roots, CHAT_RESUME_CLOSE_SELECTORS);
     if (closeTarget) {
       try {
-        await clickPoint(client, closeTarget.center.x, closeTarget.center.y);
+        await clickPoint(client, closeTarget.center.x, closeTarget.center.y, DETERMINISTIC_CLICK_OPTIONS);
         attempts.push({
           mode: "close-selector",
           selector: closeTarget.selector,

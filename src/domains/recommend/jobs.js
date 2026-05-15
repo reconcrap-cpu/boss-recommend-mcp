@@ -1,12 +1,12 @@
 import {
   clickNodeCenter,
+  DETERMINISTIC_CLICK_OPTIONS,
   getAttributesMap,
   getNodeBox,
   getOuterHTML,
   pressKey,
   querySelectorAll,
-  sleep,
-  waitForSelector
+  sleep
 } from "../../core/browser/index.js";
 import {
   htmlToText,
@@ -108,7 +108,9 @@ export async function waitForRecommendJobTrigger(client, frameNodeId, {
 export async function openRecommendJobDropdown(client, frameNodeId, {
   timeoutMs = 4000,
   triggerTimeoutMs = Math.max(8000, timeoutMs),
-  triggerIntervalMs = 250
+  triggerIntervalMs = 250,
+  dismissBeforeOpen = true,
+  maxAttempts = 3
 } = {}) {
   const trigger = await waitForRecommendJobTrigger(client, frameNodeId, {
     timeoutMs: triggerTimeoutMs,
@@ -118,36 +120,72 @@ export async function openRecommendJobDropdown(client, frameNodeId, {
     throw new Error("Recommend job trigger was not found");
   }
 
-  let optionNodeId = await waitForSelector(client, frameNodeId, RECOMMEND_JOB_SELECTORS.option, {
+  const alreadyOpen = await waitForVisibleRecommendJobOptions(client, frameNodeId, {
     timeoutMs: 300,
     intervalMs: 100
   });
-  if (optionNodeId) {
-    const options = await listRecommendJobOptions(client, frameNodeId, { openDropdown: false });
-    if (options.some((option) => option.visible)) {
+  if (alreadyOpen.visible_options.length) {
+    return {
+      opened: true,
+      already_open: true,
+      trigger,
+      options: alreadyOpen.options
+    };
+  }
+
+  const attempts = [];
+  const attemptLimit = Math.max(1, Math.floor(Number(maxAttempts) || 1));
+  if (dismissBeforeOpen) {
+    await closeRecommendJobDropdown(client);
+  }
+  for (let attempt = 1; attempt <= attemptLimit; attempt += 1) {
+    if (attempt > 1) await closeRecommendJobDropdown(client);
+    const triggerBox = await clickNodeCenter(client, trigger.node_id, DETERMINISTIC_CLICK_OPTIONS);
+    const opened = await waitForVisibleRecommendJobOptions(client, frameNodeId, {
+      timeoutMs,
+      intervalMs: 200
+    });
+    attempts.push({
+      attempt,
+      trigger_box: triggerBox,
+      option_count: opened.options.length,
+      visible_option_count: opened.visible_options.length
+    });
+    if (opened.visible_options.length) {
       return {
         opened: true,
-        already_open: true,
+        already_open: false,
         trigger,
-        options
+        options: opened.options,
+        attempts
       };
     }
   }
+  const error = new Error("Recommend job dropdown did not expose visible options after trigger click");
+  error.job_dropdown_attempts = attempts;
+  throw error;
+}
 
-  await clickNodeCenter(client, trigger.node_id);
-  optionNodeId = await waitForSelector(client, frameNodeId, RECOMMEND_JOB_SELECTORS.option, {
-    timeoutMs,
-    intervalMs: 200
-  });
-  if (!optionNodeId) {
-    throw new Error("Recommend job dropdown did not mount options after trigger click");
+async function waitForVisibleRecommendJobOptions(client, frameNodeId, {
+  timeoutMs = 4000,
+  intervalMs = 200
+} = {}) {
+  const started = Date.now();
+  let lastOptions = [];
+  while (Date.now() - started <= timeoutMs) {
+    lastOptions = await listRecommendJobOptions(client, frameNodeId, { openDropdown: false });
+    const visibleOptions = lastOptions.filter((option) => option.visible);
+    if (visibleOptions.length) {
+      return {
+        options: lastOptions,
+        visible_options: visibleOptions
+      };
+    }
+    await sleep(intervalMs);
   }
-  const options = await listRecommendJobOptions(client, frameNodeId, { openDropdown: false });
   return {
-    opened: true,
-    already_open: false,
-    trigger,
-    options
+    options: lastOptions,
+    visible_options: []
   };
 }
 
@@ -174,12 +212,22 @@ export async function listRecommendJobOptions(client, frameNodeId, {
 }
 
 export async function closeRecommendJobDropdown(client) {
+  if (typeof client?.Input?.dispatchKeyEvent !== "function") {
+    return {
+      ok: false,
+      reason: "dispatch_key_unavailable"
+    };
+  }
   await pressKey(client, "Escape", {
     code: "Escape",
     windowsVirtualKeyCode: 27,
     nativeVirtualKeyCode: 27
   });
   await sleep(300);
+  return {
+    ok: true,
+    reason: "escape"
+  };
 }
 
 export async function selectRecommendJob(client, frameNodeId, {
@@ -205,11 +253,16 @@ export async function selectRecommendJob(client, frameNodeId, {
     ? opened.options
     : await listRecommendJobOptions(client, frameNodeId, { openDropdown: false });
   const visibleOptions = options.filter((option) => option.visible);
-  const match = visibleOptions.find((option) => jobLabelMatches(option.label, target))
-    || options.find((option) => jobLabelMatches(option.label, target));
+  const hiddenMatches = options.filter((option) => !option.visible && jobLabelMatches(option.label, target));
+  const match = visibleOptions.find((option) => jobLabelMatches(option.label, target));
 
   if (!match) {
     await closeRecommendJobDropdown(client);
+    if (hiddenMatches.length) {
+      const error = new Error(`Matched recommend job has no visible clickable option: ${hiddenMatches[0].label}`);
+      error.hidden_job_matches = hiddenMatches.map(compactJobOption);
+      throw error;
+    }
     return {
       requested: target,
       selected: false,
@@ -234,7 +287,7 @@ export async function selectRecommendJob(client, frameNodeId, {
     throw new Error(`Matched recommend job has no clickable center: ${match.label}`);
   }
 
-  const clickedBox = await clickNodeCenter(client, match.node_id);
+  const clickedBox = await clickNodeCenter(client, match.node_id, DETERMINISTIC_CLICK_OPTIONS);
   if (settleMs > 0) await sleep(settleMs);
   return {
     requested: target,

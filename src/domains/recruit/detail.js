@@ -1,6 +1,7 @@
 import {
   clickNodeCenter,
   clickPoint,
+  DETERMINISTIC_CLICK_OPTIONS,
   getFrameDocumentNodeId,
   getNodeBox,
   getOuterHTML,
@@ -305,9 +306,9 @@ export async function closeRecruitDetail(client, {
     if (closeTarget) {
       try {
         if (closeTarget.center) {
-          await clickPoint(client, closeTarget.center.x, closeTarget.center.y);
+          await clickPoint(client, closeTarget.center.x, closeTarget.center.y, DETERMINISTIC_CLICK_OPTIONS);
         } else {
-          await clickNodeCenter(client, closeTarget.node_id);
+          await clickNodeCenter(client, closeTarget.node_id, DETERMINISTIC_CLICK_OPTIONS);
         }
         attempts.push({
           mode: "close-selector",

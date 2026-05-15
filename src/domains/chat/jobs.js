@@ -1,6 +1,7 @@
 import {
   clickNodeCenter,
   clickPoint,
+  DETERMINISTIC_CLICK_OPTIONS,
   getAttributesMap,
   getNodeBox,
   getOuterHTML,
@@ -240,7 +241,7 @@ async function clickFirstVisible(client, rootNodeId, selectors = []) {
       try {
         const box = await getNodeBox(client, nodeId);
         if (box.rect.width <= 2 || box.rect.height <= 2) continue;
-        await clickPoint(client, box.center.x, box.center.y);
+        await clickPoint(client, box.center.x, box.center.y, DETERMINISTIC_CLICK_OPTIONS);
         return {
           clicked: true,
           selector,
@@ -265,6 +266,7 @@ async function openChatJobDropdown(client, rootNodeId, {
   const started = Date.now();
   const triedPoints = new Set();
   const attempts = [];
+  const initialClose = await closeChatJobDropdownQuietly(client, rootNodeId, Math.min(settleMs, 300));
   for (const selector of CHAT_JOB_TRIGGER_SELECTORS) {
     const currentRootNodeId = await freshTopRootNodeId(client, rootNodeId);
     const nodeIds = await safeQuerySelectorAll(client, currentRootNodeId, selector);
@@ -283,7 +285,7 @@ async function openChatJobDropdown(client, rootNodeId, {
           const pointKey = `${nodeId}:${Math.round(x)}:${Math.round(y)}`;
           if (triedPoints.has(pointKey)) continue;
           triedPoints.add(pointKey);
-          await clickPoint(client, x, y);
+          await clickPoint(client, x, y, DETERMINISTIC_CLICK_OPTIONS);
           if (settleMs > 0) await sleep(Math.min(settleMs, 800));
           const remaining = Math.max(300, timeoutMs - (Date.now() - started));
           const optionsResult = await waitForChatJobOptions(client, currentRootNodeId, {
@@ -298,7 +300,8 @@ async function openChatJobDropdown(client, rootNodeId, {
             node_id: nodeId,
             point: pointName,
             center: { x, y },
-            visible_option_count: visibleCount
+            visible_option_count: visibleCount,
+            initial_close: initialClose
           };
           attempts.push(attempt);
           if (visibleCount > 0) {
@@ -548,9 +551,10 @@ export async function selectChatJob(client, rootNodeId, {
   }
 
   if (matched.center) {
-    await clickPoint(client, matched.center.x, matched.center.y);
+    await clickPoint(client, matched.center.x, matched.center.y, DETERMINISTIC_CLICK_OPTIONS);
   } else {
     await clickNodeCenter(client, matched.node_id, {
+      ...DETERMINISTIC_CLICK_OPTIONS,
       scrollIntoView: true
     });
   }

@@ -1,5 +1,6 @@
 import {
   clickNodeCenter,
+  DETERMINISTIC_CLICK_OPTIONS,
   getAttributesMap,
   getNodeBox,
   getOuterHTML,
@@ -220,7 +221,7 @@ export async function selectRecommendPageScope(client, frameNodeId, {
     };
   }
 
-  const clickBox = await clickNodeCenter(client, targetTab.node_id);
+  const clickBox = await clickNodeCenter(client, targetTab.node_id, DETERMINISTIC_CLICK_OPTIONS);
   if (settleMs > 0) await sleep(settleMs);
   const after = await waitForRecommendPageScope(client, frameNodeId, effectiveScope, {
     timeoutMs,

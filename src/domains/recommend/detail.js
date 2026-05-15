@@ -1,6 +1,7 @@
 import {
   clickNodeCenter,
   clickPoint,
+  DETERMINISTIC_CLICK_OPTIONS,
   getFrameDocumentNodeId,
   getNodeBox,
   getOuterHTML,
@@ -508,9 +509,9 @@ export async function closeRecommendDetail(client, {
     if (closeTarget) {
       try {
         if (closeTarget.center) {
-          await clickPoint(client, closeTarget.center.x, closeTarget.center.y);
+          await clickPoint(client, closeTarget.center.x, closeTarget.center.y, DETERMINISTIC_CLICK_OPTIONS);
         } else {
-          await clickNodeCenter(client, closeTarget.node_id);
+          await clickNodeCenter(client, closeTarget.node_id, DETERMINISTIC_CLICK_OPTIONS);
         }
         attempts.push({
           mode: "close-selector",
@@ -732,7 +733,7 @@ async function clickOutsideRecommendDetail(client, detailState) {
       root: target?.root || null
     };
   }
-  await clickPoint(client, point.x, point.y);
+  await clickPoint(client, point.x, point.y, DETERMINISTIC_CLICK_OPTIONS);
   return {
     clicked: true,
     mode: "outside-modal-click",

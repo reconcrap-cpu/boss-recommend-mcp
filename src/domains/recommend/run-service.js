@@ -449,6 +449,18 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   if (error.close_result) {
     result.close_result = compactCloseResult(error.close_result);
   }
+  if (error.refresh_attempt) {
+    result.refresh_attempt = error.refresh_attempt;
+  }
+  if (error.list_end_reason) {
+    result.list_end_reason = error.list_end_reason;
+  }
+  if (error.target_count != null) {
+    result.target_count = error.target_count;
+  }
+  if (error.passed_count != null) {
+    result.passed_count = error.passed_count;
+  }
   return result;
 }
 
@@ -456,6 +468,22 @@ function createRecommendCloseFailureError(closeResult) {
   const error = new Error(closeResult?.reason || "Recommend detail did not close before recovery");
   error.code = "DETAIL_CLOSE_FAILED";
   error.close_result = closeResult || null;
+  return error;
+}
+
+function createRecommendRefreshFailureError(refreshAttempt, {
+  listEndReason = "",
+  targetCount = 0,
+  passedCount = 0
+} = {}) {
+  const reason = refreshAttempt?.reason || "refresh_failed";
+  const detail = refreshAttempt?.error ? `: ${refreshAttempt.error}` : "";
+  const error = new Error(`Recommend refresh failed before target was reached (${reason}${detail})`);
+  error.code = "RECOMMEND_END_REFRESH_FAILED";
+  error.refresh_attempt = refreshAttempt || null;
+  error.list_end_reason = listEndReason || null;
+  error.target_count = targetCount;
+  error.passed_count = passedCount;
   return error;
 }
 
@@ -979,6 +1007,11 @@ export async function runRecommendWorkflow({
           listEndReason = "";
           continue;
         }
+        throw createRecommendRefreshFailureError(compactRefresh, {
+          listEndReason,
+          targetCount: targetPassCount,
+          passedCount: countPassedResults(results)
+        });
       }
       break;
     }

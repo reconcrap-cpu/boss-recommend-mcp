@@ -2,6 +2,7 @@ import {
   clearFocusedInput,
   clickNodeCenter,
   countSelectors,
+  DETERMINISTIC_CLICK_OPTIONS,
   describeNode,
   findFirstNode,
   getAttributesMap,
@@ -315,7 +316,10 @@ async function clickFirstNodeBySelectors(client, rootNodeId, selectors, {
     throw new Error(`Recruit search node was not found for selectors: ${selectors.join(", ")}`);
   }
   try {
-    const box = await clickNodeCenter(client, found.nodeId, { scrollIntoView });
+    const box = await clickNodeCenter(client, found.nodeId, {
+      ...DETERMINISTIC_CLICK_OPTIONS,
+      scrollIntoView
+    });
     await sleep(250);
     return {
       clicked: true,
@@ -335,6 +339,26 @@ async function clickFirstNodeBySelectors(client, rootNodeId, selectors, {
     }
     throw error;
   }
+}
+
+async function dismissRecruitSearchOverlays(client, settleMs = 250) {
+  if (typeof client?.Input?.dispatchKeyEvent !== "function") {
+    return {
+      method: "Escape",
+      skipped: true,
+      reason: "dispatch_key_unavailable"
+    };
+  }
+  await pressKey(client, "Escape", {
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+    nativeVirtualKeyCode: 27
+  });
+  if (settleMs > 0) await sleep(settleMs);
+  return {
+    method: "Escape",
+    settle_ms: settleMs
+  };
 }
 
 export async function getRecruitSearchCounts(client, frameNodeId) {
@@ -495,7 +519,10 @@ export async function setRecruitJobTitle(client, frameNodeId, jobTitle, {
   }
   let box = null;
   if (!lookup.candidate.active) {
-    box = await clickNodeCenter(client, lookup.candidate.node_id, { scrollIntoView: true });
+    box = await clickNodeCenter(client, lookup.candidate.node_id, {
+      ...DETERMINISTIC_CLICK_OPTIONS,
+      scrollIntoView: true
+    });
     await sleep(500);
   }
   return {
@@ -527,7 +554,10 @@ export async function setRecruitDegree(client, frameNodeId, degree) {
   if (!candidate) {
     throw new Error(`Recruit degree option was not found: ${degreeLabel}`);
   }
-  const box = await clickNodeCenter(client, candidate.node_id, { scrollIntoView: true });
+  const box = await clickNodeCenter(client, candidate.node_id, {
+    ...DETERMINISTIC_CLICK_OPTIONS,
+    scrollIntoView: true
+  });
   await sleep(350);
   return {
     applied: true,
@@ -573,7 +603,10 @@ export async function setRecruitDegrees(client, frameNodeId, degrees = []) {
 
     let box = null;
     if (!candidate.active) {
-      box = await clickNodeCenter(client, candidate.node_id, { scrollIntoView: true });
+      box = await clickNodeCenter(client, candidate.node_id, {
+        ...DETERMINISTIC_CLICK_OPTIONS,
+        scrollIntoView: true
+      });
       await sleep(350);
     }
     selected.push({
@@ -638,7 +671,10 @@ export async function setRecruitSchools(client, frameNodeId, schools = []) {
 
     let box = null;
     if (!clickableActive) {
-      box = await clickNodeCenter(client, clickable.node_id, { scrollIntoView: true });
+      box = await clickNodeCenter(client, clickable.node_id, {
+        ...DETERMINISTIC_CLICK_OPTIONS,
+        scrollIntoView: true
+      });
       await sleep(350);
     }
 
@@ -683,7 +719,10 @@ export async function setRecruitRecentViewedFilter(client, frameNodeId, enabled)
 
   let box = null;
   if (candidate.active !== enabled) {
-    box = await clickNodeCenter(client, candidate.node_id, { scrollIntoView: true });
+    box = await clickNodeCenter(client, candidate.node_id, {
+      ...DETERMINISTIC_CLICK_OPTIONS,
+      scrollIntoView: true
+    });
     await sleep(900);
   }
 
@@ -722,7 +761,10 @@ async function selectRecruitNationalCityThroughPicker(client, frameNodeId, {
     { match: "exact", timeoutMs: Math.min(optionTimeoutMs, 6000) }
   );
   if (categoryLookup.candidate) {
-    const box = await clickNodeCenter(client, categoryLookup.candidate.node_id, { scrollIntoView: true });
+    const box = await clickNodeCenter(client, categoryLookup.candidate.node_id, {
+      ...DETERMINISTIC_CLICK_OPTIONS,
+      scrollIntoView: true
+    });
     await sleep(400);
     path.push({
       label: "城市",
@@ -765,7 +807,10 @@ async function selectRecruitNationalCityThroughPicker(client, frameNodeId, {
       discovered_options: summarizeTextCandidates(popularLookup.candidates)
     };
   }
-  const popularBox = await clickNodeCenter(client, popularLookup.candidate.node_id, { scrollIntoView: true });
+  const popularBox = await clickNodeCenter(client, popularLookup.candidate.node_id, {
+    ...DETERMINISTIC_CLICK_OPTIONS,
+    scrollIntoView: true
+  });
   await sleep(400);
   path.push({
     label: "热门",
@@ -801,7 +846,10 @@ async function selectRecruitNationalCityThroughPicker(client, frameNodeId, {
     };
   }
 
-  const nationalBox = await clickNodeCenter(client, nationalLookup.candidate.node_id, { scrollIntoView: true });
+  const nationalBox = await clickNodeCenter(client, nationalLookup.candidate.node_id, {
+    ...DETERMINISTIC_CLICK_OPTIONS,
+    scrollIntoView: true
+  });
   await sleep(700);
   path.push({
     label: "全国",
@@ -953,7 +1001,10 @@ export async function setRecruitCity(client, frameNodeId, city, {
     };
   }
 
-  const box = await clickNodeCenter(client, candidate.node_id, { scrollIntoView: true });
+  const box = await clickNodeCenter(client, candidate.node_id, {
+    ...DETERMINISTIC_CLICK_OPTIONS,
+    scrollIntoView: true
+  });
   await sleep(600);
   return {
     applied: true,
@@ -1057,6 +1108,7 @@ export async function applyRecruitSearchParams(client, {
   if (!controls.ok) {
     throw new Error(`Recruit search controls were not ready after navigation; counts=${JSON.stringify(controls.counts || {})}`);
   }
+  const overlayDismissal = await dismissRecruitSearchOverlays(client);
   const initialRoots = await getRecruitRoots(client);
   let frameNodeId = initialRoots.iframe.documentNodeId;
   const initialFrameNodeId = frameNodeId;
@@ -1137,6 +1189,7 @@ export async function applyRecruitSearchParams(client, {
     applied: true,
     search_params: normalizedSearchParams,
     reset,
+    overlay_dismissal: overlayDismissal,
     controls,
     initial_iframe: {
       selector: initialRoots.iframe.selector,

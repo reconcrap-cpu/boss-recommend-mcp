@@ -103,7 +103,7 @@ function compactFilterReapplyError(error) {
 
 export function isRetryableRecommendJobSelectionError(error) {
   const message = String(error?.message || error || "");
-  return /Recommend job trigger was not found|Recommend job dropdown did not mount options/i.test(message);
+  return /Recommend job trigger was not found|Recommend job dropdown did not mount options|Recommend job dropdown did not expose visible options|Matched recommend job has no clickable center|Matched recommend job has no visible clickable option/i.test(message);
 }
 
 function compactJobSelectionAttempt({

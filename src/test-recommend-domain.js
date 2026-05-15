@@ -15,6 +15,7 @@ import {
   isRecoverableImageCaptureError,
   isRecoverableRecommendDetailError,
   isRetryableRecommendFilterReapplyError,
+  isRetryableRecommendJobSelectionError,
   isSafeFilterOptionLabel,
   isStaleRecommendNodeError,
   jobLabelMatches,
@@ -260,6 +261,62 @@ async function testOpenRecommendJobDropdownWaitsForLateTrigger() {
   assert.equal(triggerPolls >= 3, true);
 }
 
+async function testOpenRecommendJobDropdownRequiresVisibleOptions() {
+  let clickCount = 0;
+  let escapeCount = 0;
+  const optionSelector = ".job-selecter-options .job-item, .job-list .job-item, .job-item";
+  const client = {
+    DOM: {
+      async querySelectorAll({ selector }) {
+        if (selector.includes("job-selecter-wrap")) return { nodeIds: [10] };
+        if (selector === optionSelector) return { nodeIds: [20] };
+        return { nodeIds: [] };
+      },
+      async getBoxModel({ nodeId }) {
+        if (nodeId === 10) {
+          return { model: { border: [10, 10, 130, 10, 130, 44, 10, 44] } };
+        }
+        if (nodeId === 20 && clickCount >= 2) {
+          return { model: { border: [10, 50, 190, 50, 190, 82, 10, 82] } };
+        }
+        throw new Error(`Hidden node ${nodeId}`);
+      },
+      async getAttributes({ nodeId }) {
+        assert.equal(nodeId, 20);
+        return { attributes: ["class", "job-item"] };
+      },
+      async getOuterHTML({ nodeId }) {
+        assert.equal(nodeId, 20);
+        return { outerHTML: '<li class="job-item">AI算法实习生 _ 杭州 150-200元/天</li>' };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") clickCount += 1;
+        return {};
+      },
+      async dispatchKeyEvent(event) {
+        if (event.key === "Escape") escapeCount += 1;
+        return {};
+      }
+    }
+  };
+
+  const result = await openRecommendJobDropdown(client, 99, {
+    timeoutMs: 20,
+    triggerTimeoutMs: 50,
+    triggerIntervalMs: 1,
+    maxAttempts: 2
+  });
+
+  assert.equal(result.opened, true);
+  assert.equal(clickCount, 2);
+  assert.equal(escapeCount >= 2, true);
+  assert.equal(result.options[0].visible, true);
+  assert.equal(result.attempts[0].visible_option_count, 0);
+  assert.equal(result.attempts[1].visible_option_count, 1);
+}
+
 async function testSelectRecommendJobRefreshesStaleFrameRoot() {
   let currentDocumentNodeId = 100;
   let triggerClicked = false;
@@ -339,6 +396,13 @@ function testRetryableRecommendFilterReapplyError() {
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter trigger was not found")), true);
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter confirm button was not found")), true);
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Requested recommend job was not selected after refresh reload")), false);
+}
+
+function testRetryableRecommendJobSelectionError() {
+  assert.equal(isRetryableRecommendJobSelectionError(new Error("Recommend job dropdown did not expose visible options after trigger click")), true);
+  assert.equal(isRetryableRecommendJobSelectionError(new Error("Matched recommend job has no clickable center: AI算法实习生")), true);
+  assert.equal(isRetryableRecommendJobSelectionError(new Error("Matched recommend job has no visible clickable option: AI算法实习生")), true);
+  assert.equal(isRetryableRecommendJobSelectionError(new Error("Requested recommend job was not selected after refresh reload")), false);
 }
 
 function testRecommendCardFieldParser() {
@@ -801,10 +865,12 @@ testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
 testRetryableRecommendFilterReapplyError();
+testRetryableRecommendJobSelectionError();
 testRecommendCardFieldParser();
 await testCardCandidateReader();
 await testRefreshRecoveryFallsBackFromNavigateToReload();
 await testOpenRecommendJobDropdownWaitsForLateTrigger();
+await testOpenRecommendJobDropdownRequiresVisibleOptions();
 await testSelectRecommendJobRefreshesStaleFrameRoot();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
