@@ -129,6 +129,14 @@ function compactRefreshAttempt(refreshAttempt) {
     forced_recent_viewed: Boolean(refreshAttempt.forced_recent_viewed),
     card_count: refreshAttempt.card_count || 0,
     search_params: refreshAttempt.search_params || null,
+    recovery_settle: refreshAttempt.recovery_settle
+      ? {
+          ok: Boolean(refreshAttempt.recovery_settle.ok),
+          status: refreshAttempt.recovery_settle.status || "",
+          reason: refreshAttempt.recovery_settle.reason || "",
+          elapsed_ms: refreshAttempt.recovery_settle.elapsed_ms || 0
+        }
+      : null,
     application: refreshAttempt.application
       ? {
           applied: Boolean(refreshAttempt.application.applied),

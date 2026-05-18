@@ -147,6 +147,29 @@ function compactJobSelection(jobSelection) {
     already_current: Boolean(jobSelection.already_current),
     reason: jobSelection.reason || null,
     selected_option: jobSelection.selected_option || null,
+    menu_close: jobSelection.menu_close
+      ? {
+          ok: Boolean(jobSelection.menu_close.ok),
+          closed: Boolean(jobSelection.menu_close.closed),
+          reason: jobSelection.menu_close.reason || ""
+        }
+      : null,
+    sticky_verification: jobSelection.sticky_verification
+      ? {
+          verified: Boolean(jobSelection.sticky_verification.verified),
+          current_label: jobSelection.sticky_verification.current_label_without_salary
+            || jobSelection.sticky_verification.current_label
+            || "",
+          visible_option_count: jobSelection.sticky_verification.visible_option_count || 0,
+          menu_close: jobSelection.sticky_verification.menu_close
+            ? {
+                ok: Boolean(jobSelection.sticky_verification.menu_close.ok),
+                closed: Boolean(jobSelection.sticky_verification.menu_close.closed),
+                reason: jobSelection.sticky_verification.menu_close.reason || ""
+              }
+            : null
+        }
+      : null,
     options: (jobSelection.options || []).map((option) => ({
       label: option.label,
       label_without_salary: option.label_without_salary,
@@ -368,6 +391,14 @@ function compactRefreshAttempt(refreshAttempt) {
     target_url: refreshAttempt.target_url || null,
     card_count: refreshAttempt.card_count || 0,
     elapsed_ms: refreshAttempt.elapsed_ms || 0,
+    recovery_settle: refreshAttempt.recovery_settle
+      ? {
+          ok: Boolean(refreshAttempt.recovery_settle.ok),
+          status: refreshAttempt.recovery_settle.status || "",
+          reason: refreshAttempt.recovery_settle.reason || "",
+          elapsed_ms: refreshAttempt.recovery_settle.elapsed_ms || 0
+        }
+      : null,
     attempts: (refreshAttempt.attempts || []).map((attempt) => ({
       ok: Boolean(attempt.ok),
       method: attempt.method || "",

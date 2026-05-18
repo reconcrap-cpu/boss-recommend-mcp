@@ -7,6 +7,7 @@ import {
   chooseFilterOptionByLabels,
   chooseFilterOptionsByLabels,
   closeRecommendDetail,
+  closeRecommendJobDropdownFully,
   createRecoverableImageCaptureEvidence,
   chooseFirstSafeFilterOption,
   findRecommendCardNodeForCandidateKey,
@@ -30,7 +31,8 @@ import {
   refreshRecommendListAtEnd,
   selectRecommendJob,
   selectRecommendJobWithRootRefresh,
-  selectRecommendPageScope
+  selectRecommendPageScope,
+  verifyRecommendJobSelection
 } from "./domains/recommend/index.js";
 
 function testFilterOptionHelpers() {
@@ -390,7 +392,7 @@ async function testSelectRecommendJobAcceptsHiddenCurrentOptionAfterDropdownMiss
 
 async function testSelectRecommendJobRefreshesStaleFrameRoot() {
   let currentDocumentNodeId = 100;
-  let triggerClicked = false;
+  let menuOpen = false;
   const optionSelector = ".job-selecter-options .job-item, .job-list .job-item, .job-item";
   const client = {
     DOM: {
@@ -400,7 +402,7 @@ async function testSelectRecommendJobRefreshesStaleFrameRoot() {
       },
       async querySelector({ nodeId, selector }) {
         if (nodeId === 1 && selector.includes("iframe")) return { nodeId: 2 };
-        if (nodeId === 200 && selector === optionSelector && triggerClicked) return { nodeId: 20 };
+        if (nodeId === 200 && selector === optionSelector && menuOpen) return { nodeId: 20 };
         return { nodeId: 0 };
       },
       async describeNode({ nodeId }) {
@@ -412,7 +414,7 @@ async function testSelectRecommendJobRefreshesStaleFrameRoot() {
           return { nodeIds: nodeId === 200 ? [10] : [] };
         }
         if (selector === optionSelector) {
-          return { nodeIds: nodeId === 200 && triggerClicked ? [20] : [] };
+          return { nodeIds: nodeId === 200 ? [20] : [] };
         }
         return { nodeIds: [] };
       },
@@ -421,7 +423,9 @@ async function testSelectRecommendJobRefreshesStaleFrameRoot() {
           return { model: { border: [10, 10, 110, 10, 110, 40, 10, 40] } };
         }
         if (nodeId === 20) {
-          return { model: { border: [10, 50, 190, 50, 190, 80, 10, 80] } };
+          return menuOpen
+            ? { model: { border: [10, 50, 190, 50, 190, 80, 10, 80] } }
+            : { model: { border: [10, 50, 10, 50, 10, 50, 10, 50] } };
         }
         throw new Error(`Unexpected node ${nodeId}`);
       },
@@ -436,7 +440,7 @@ async function testSelectRecommendJobRefreshesStaleFrameRoot() {
     },
     Input: {
       async dispatchMouseEvent(event) {
-        if (event.type === "mouseReleased") triggerClicked = true;
+        if (event.type === "mouseReleased") menuOpen = !menuOpen;
         return {};
       },
       async dispatchKeyEvent() {
@@ -460,6 +464,105 @@ async function testSelectRecommendJobRefreshesStaleFrameRoot() {
   assert.equal(result.attempts.length >= 2, true);
   assert.equal(result.attempts[0].ok, false);
   assert.equal(result.attempts.at(-1).ok, true);
+}
+
+function createRecommendJobDropdownClient({ menuOpen = true, escapeCloses = false } = {}) {
+  const state = {
+    menuOpen: Boolean(menuOpen),
+    escapeCount: 0,
+    triggerClickCount: 0
+  };
+  const labels = {
+    20: "海外用户增长运营专家（AI产品） _ 杭州 25-35K",
+    21: "AI算法实习生 _ 杭州 150-200元/天"
+  };
+  return {
+    state,
+    client: {
+      DOM: {
+        async querySelectorAll({ selector }) {
+          if (selector.includes("job-selecter-wrap")) return { nodeIds: [10] };
+          if (selector === ".job-selecter-options .job-item, .job-list .job-item, .job-item") {
+            return { nodeIds: [20, 21] };
+          }
+          return { nodeIds: [] };
+        },
+        async getBoxModel({ nodeId }) {
+          if (nodeId === 10) {
+            return { model: { border: [10, 10, 210, 10, 210, 44, 10, 44] } };
+          }
+          if (nodeId === 20 || nodeId === 21) {
+            return state.menuOpen
+              ? { model: { border: [10, 50 + nodeId, 230, 50 + nodeId, 230, 80 + nodeId, 10, 80 + nodeId] } }
+              : { model: { border: [10, 50, 10, 50, 10, 50, 10, 50] } };
+          }
+          throw new Error(`Unexpected node ${nodeId}`);
+        },
+        async getAttributes({ nodeId }) {
+          if (nodeId === 10) return { attributes: ["class", "job-selecter-wrap"] };
+          if (nodeId === 20) return { attributes: ["class", "job-item"] };
+          if (nodeId === 21) return { attributes: ["class", "job-item curr"] };
+          return { attributes: [] };
+        },
+        async getOuterHTML({ nodeId }) {
+          if (nodeId === 10) return { outerHTML: '<div class="job-selecter-wrap">AI算法实习生 _ 杭州</div>' };
+          return { outerHTML: `<li>${labels[nodeId] || ""}</li>` };
+        }
+      },
+      Input: {
+        async dispatchKeyEvent(event) {
+          if (event.key === "Escape") {
+            state.escapeCount += 1;
+            if (escapeCloses && event.type === "keyUp") state.menuOpen = false;
+          }
+          return {};
+        },
+        async dispatchMouseEvent(event) {
+          if (event.type !== "mouseReleased") return {};
+          if (Math.abs(event.x - 110) < 2 && Math.abs(event.y - 27) < 2) {
+            state.triggerClickCount += 1;
+            state.menuOpen = !state.menuOpen;
+          }
+          return {};
+        }
+      }
+    }
+  };
+}
+
+async function testCloseRecommendJobDropdownFallsBackToTriggerToggle() {
+  const { client, state } = createRecommendJobDropdownClient({
+    menuOpen: true,
+    escapeCloses: false
+  });
+  const result = await closeRecommendJobDropdownFully(client, 99, {
+    settleMs: 0,
+    timeoutMs: 100
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.closed, true);
+  assert.equal(result.reason, "trigger_toggle");
+  assert.equal(state.menuOpen, false);
+  assert.equal(state.escapeCount > 0, true);
+  assert.equal(state.triggerClickCount, 1);
+}
+
+async function testVerifyRecommendJobSelectionClosesDropdownAfterReadingCurrent() {
+  const { client, state } = createRecommendJobDropdownClient({
+    menuOpen: false,
+    escapeCloses: false
+  });
+  const result = await verifyRecommendJobSelection(client, 99, {
+    jobLabel: "AI算法实习生 _ 杭州",
+    delayMs: 0,
+    dropdownTimeoutMs: 100,
+    closeSettleMs: 0
+  });
+  assert.equal(result.verified, true);
+  assert.equal(result.current_label_without_salary, "AI算法实习生 _ 杭州");
+  assert.equal(result.menu_close.ok, true);
+  assert.equal(result.menu_close.reason, "trigger_toggle");
+  assert.equal(state.menuOpen, false);
 }
 
 function testRetryableRecommendFilterReapplyError() {
@@ -946,6 +1049,8 @@ await testOpenRecommendJobDropdownWaitsForLateTrigger();
 await testOpenRecommendJobDropdownRequiresVisibleOptions();
 await testSelectRecommendJobAcceptsHiddenCurrentOptionAfterDropdownMiss();
 await testSelectRecommendJobRefreshesStaleFrameRoot();
+await testCloseRecommendJobDropdownFallsBackToTriggerToggle();
+await testVerifyRecommendJobSelectionClosesDropdownAfterReadingCurrent();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();

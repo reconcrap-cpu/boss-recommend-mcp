@@ -1,5 +1,6 @@
 import {
   clickNodeCenter,
+  clickPoint,
   DETERMINISTIC_CLICK_OPTIONS,
   getAttributesMap,
   getNodeBox,
@@ -265,6 +266,150 @@ export async function closeRecommendJobDropdown(client) {
   };
 }
 
+async function readVisibleRecommendJobOptions(client, frameNodeId) {
+  const options = await listRecommendJobOptions(client, frameNodeId, {
+    openDropdown: false
+  }).catch(() => []);
+  return {
+    options,
+    visible_options: options.filter((option) => option.visible)
+  };
+}
+
+export async function closeRecommendJobDropdownFully(client, frameNodeId, {
+  settleMs = 300,
+  timeoutMs = 1200
+} = {}) {
+  const before = await readVisibleRecommendJobOptions(client, frameNodeId);
+  const attempts = [];
+  if (!before.visible_options.length) {
+    return {
+      ok: true,
+      closed: false,
+      reason: "already_closed",
+      visible_before_count: 0,
+      visible_after_count: 0,
+      attempts
+    };
+  }
+
+  const started = Date.now();
+  for (let attempt = 1; attempt <= 2 && Date.now() - started <= timeoutMs; attempt += 1) {
+    const close = await closeRecommendJobDropdown(client);
+    if (settleMs > 0) await sleep(settleMs);
+    const afterEscape = await readVisibleRecommendJobOptions(client, frameNodeId);
+    attempts.push({
+      method: "escape",
+      attempt,
+      ok: afterEscape.visible_options.length === 0,
+      visible_after_count: afterEscape.visible_options.length,
+      close
+    });
+    if (!afterEscape.visible_options.length) {
+      return {
+        ok: true,
+        closed: true,
+        reason: "escape",
+        visible_before_count: before.visible_options.length,
+        visible_after_count: 0,
+        attempts
+      };
+    }
+  }
+
+  const trigger = await findRecommendJobTrigger(client, frameNodeId).catch(() => null);
+  if (trigger?.node_id) {
+    const click = await clickNodeCenter(client, trigger.node_id, DETERMINISTIC_CLICK_OPTIONS).catch((error) => ({
+      error: error?.message || String(error || "")
+    }));
+    if (settleMs > 0) await sleep(settleMs);
+    const afterToggle = await readVisibleRecommendJobOptions(client, frameNodeId);
+    attempts.push({
+      method: "trigger_toggle",
+      ok: afterToggle.visible_options.length === 0,
+      visible_after_count: afterToggle.visible_options.length,
+      click
+    });
+    if (!afterToggle.visible_options.length) {
+      return {
+        ok: true,
+        closed: true,
+        reason: "trigger_toggle",
+        visible_before_count: before.visible_options.length,
+        visible_after_count: 0,
+        attempts
+      };
+    }
+  }
+
+  const outside = await clickPoint(client, 12, 12, DETERMINISTIC_CLICK_OPTIONS).catch((error) => ({
+    error: error?.message || String(error || "")
+  }));
+  if (settleMs > 0) await sleep(settleMs);
+  const afterOutside = await readVisibleRecommendJobOptions(client, frameNodeId);
+  attempts.push({
+    method: "outside_click",
+    ok: afterOutside.visible_options.length === 0,
+    visible_after_count: afterOutside.visible_options.length,
+    click: outside
+  });
+
+  return {
+    ok: afterOutside.visible_options.length === 0,
+    closed: afterOutside.visible_options.length === 0,
+    reason: afterOutside.visible_options.length ? "still_visible_after_close_attempts" : "outside_click",
+    visible_before_count: before.visible_options.length,
+    visible_after_count: afterOutside.visible_options.length,
+    attempts,
+    first_visible_after: afterOutside.visible_options[0] ? compactJobOption(afterOutside.visible_options[0]) : null
+  };
+}
+
+export async function verifyRecommendJobSelection(client, frameNodeId, {
+  jobLabel = "",
+  delayMs = 2000,
+  dropdownTimeoutMs = 4000,
+  closeSettleMs = 300
+} = {}) {
+  const requested = normalizeText(jobLabel);
+  if (delayMs > 0) await sleep(delayMs);
+  let options = [];
+  let openError = null;
+  try {
+    options = await listRecommendJobOptions(client, frameNodeId, {
+      openDropdown: true
+    });
+  } catch (error) {
+    openError = error;
+    options = await listRecommendJobOptions(client, frameNodeId, {
+      openDropdown: false
+    }).catch(() => []);
+  }
+  const current = options.find((option) => option.current) || null;
+  const verified = Boolean(current && jobLabelMatches(current.label, requested));
+  const menuClose = await closeRecommendJobDropdownFully(client, frameNodeId, {
+    settleMs: closeSettleMs,
+    timeoutMs: Math.max(1200, Math.min(4000, dropdownTimeoutMs))
+  }).catch((error) => ({
+    ok: false,
+    closed: false,
+    reason: "close_failed",
+    error: error?.message || String(error || "")
+  }));
+  return {
+    verified,
+    requested,
+    current_label: current?.label || "",
+    current_label_without_salary: current?.label_without_salary || "",
+    current_option: current ? compactJobOption(current) : null,
+    option_count: options.length,
+    visible_option_count: options.filter((option) => option.visible).length,
+    options: options.map(compactJobOption),
+    open_error: openError ? (openError?.message || String(openError)) : null,
+    menu_close: menuClose
+  };
+}
+
 export async function selectRecommendJob(client, frameNodeId, {
   jobLabel = "",
   settleMs = 6000,
@@ -294,7 +439,12 @@ export async function selectRecommendJob(client, frameNodeId, {
       option.current && jobLabelMatches(option.label, target)
     ));
     if (currentMatch) {
-      await closeRecommendJobDropdown(client);
+      const menuClose = await closeRecommendJobDropdownFully(client, frameNodeId).catch((closeError) => ({
+        ok: false,
+        closed: false,
+        reason: "close_failed",
+        error: closeError?.message || String(closeError || "")
+      }));
       return {
         requested: target,
         selected: true,
@@ -305,7 +455,8 @@ export async function selectRecommendJob(client, frameNodeId, {
         }),
         options: currentOptions.map(compactJobOption),
         dropdown_error: error?.message || String(error),
-        job_dropdown_attempts: error?.job_dropdown_attempts || []
+        job_dropdown_attempts: error?.job_dropdown_attempts || [],
+        menu_close: menuClose
       };
     }
     throw error;
@@ -333,13 +484,19 @@ export async function selectRecommendJob(client, frameNodeId, {
   }
 
   if (match.current) {
-    await closeRecommendJobDropdown(client);
+    const menuClose = await closeRecommendJobDropdownFully(client, frameNodeId).catch((error) => ({
+      ok: false,
+      closed: false,
+      reason: "close_failed",
+      error: error?.message || String(error || "")
+    }));
     return {
       requested: target,
       selected: true,
       already_current: true,
       selected_option: compactJobOption(match),
-      options: options.map(compactJobOption)
+      options: options.map(compactJobOption),
+      menu_close: menuClose
     };
   }
 
@@ -350,6 +507,12 @@ export async function selectRecommendJob(client, frameNodeId, {
 
   const clickedBox = await clickNodeCenter(client, match.node_id, DETERMINISTIC_CLICK_OPTIONS);
   if (settleMs > 0) await sleep(settleMs);
+  const menuClose = await closeRecommendJobDropdownFully(client, frameNodeId).catch((error) => ({
+    ok: false,
+    closed: false,
+    reason: "close_failed",
+    error: error?.message || String(error || "")
+  }));
   return {
     requested: target,
     selected: true,
@@ -359,7 +522,8 @@ export async function selectRecommendJob(client, frameNodeId, {
       center: clickedBox.center,
       rect: clickedBox.rect
     },
-    options: options.map(compactJobOption)
+    options: options.map(compactJobOption),
+    menu_close: menuClose
   };
 }
 

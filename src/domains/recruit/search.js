@@ -18,6 +18,10 @@ import {
   normalizeText
 } from "../../core/screening/index.js";
 import {
+  createRecoverySettleError,
+  waitForMiniFreshStartSettle
+} from "../common/recovery-settle.js";
+import {
   RECRUIT_CARD_SELECTOR,
   RECRUIT_TARGET_URL,
   RECRUIT_NO_DATA_SELECTORS,
@@ -402,12 +406,30 @@ export async function waitForRecruitSearchControls(client, {
   };
 }
 
+async function settleRecruitSearchAfterReset(client, {
+  timeoutMs = DEFAULT_RECRUIT_RESET_TIMEOUT_MS,
+  settleMs = 5000
+} = {}) {
+  return waitForMiniFreshStartSettle(client, {
+    domain: "search",
+    timeoutMs,
+    intervalMs: 500,
+    settleMs: Math.max(0, Math.min(settleMs || 0, 5000)),
+    readinessLabel: "search_controls_ready",
+    checkReady: ({ remainingMs }) => waitForRecruitSearchControls(client, {
+      timeoutMs: Math.min(Math.max(1, remainingMs), 1500),
+      intervalMs: 300
+    })
+  });
+}
+
 export async function resetRecruitSearchPage(client, {
   url = RECRUIT_TARGET_URL,
   settleMs = 5000,
   timeoutMs = DEFAULT_RECRUIT_RESET_TIMEOUT_MS
 } = {}) {
   const actions = [];
+  let miniFreshStart = null;
   const rootTimeoutMs = Math.min(timeoutMs, 90000);
   async function waitForRootsAfterSettle() {
     await sleep(settleMs);
@@ -430,6 +452,21 @@ export async function resetRecruitSearchPage(client, {
   } else {
     await client.Page.navigate({ url });
     actions.push({ method: "Page.navigate", url });
+  }
+
+  miniFreshStart = await settleRecruitSearchAfterReset(client, {
+    timeoutMs: Math.min(timeoutMs, 90000),
+    settleMs
+  });
+  actions.push({
+    method: "mini_fresh_start_settle",
+    ok: Boolean(miniFreshStart.ok),
+    status: miniFreshStart.status || "",
+    reason: miniFreshStart.reason || "",
+    elapsed_ms: miniFreshStart.elapsed_ms || 0
+  });
+  if (!miniFreshStart.ok) {
+    throw createRecoverySettleError("search", miniFreshStart);
   }
 
   let roots = await waitForRootsAfterSettle();
@@ -459,6 +496,20 @@ export async function resetRecruitSearchPage(client, {
       actions.push(fallbackFrameReset);
       await sleep(settleMs);
     }
+    miniFreshStart = await settleRecruitSearchAfterReset(client, {
+      timeoutMs: Math.min(timeoutMs, 90000),
+      settleMs: Math.min(settleMs, 1500)
+    });
+    actions.push({
+      method: "mini_fresh_start_settle_after_navigate",
+      ok: Boolean(miniFreshStart.ok),
+      status: miniFreshStart.status || "",
+      reason: miniFreshStart.reason || "",
+      elapsed_ms: miniFreshStart.elapsed_ms || 0
+    });
+    if (!miniFreshStart.ok) {
+      throw createRecoverySettleError("search", miniFreshStart);
+    }
     controls = await waitForControls();
   }
   roots = await getRecruitRoots(client, { requireFrame: false });
@@ -473,6 +524,7 @@ export async function resetRecruitSearchPage(client, {
     target_url: url,
     iframe_selector: controls.iframe_selector || roots.iframe.selector,
     iframe_document_node_id: controls.iframe_document_node_id || roots.iframe.documentNodeId,
+    mini_fresh_start: miniFreshStart,
     controls
   };
 }

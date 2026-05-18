@@ -3,6 +3,14 @@ import {
   sleep,
   waitForMainFrameUrl
 } from "../../core/browser/index.js";
+import {
+  buildChatSelfHealConfig,
+  resolveChatSelfHealRoots
+} from "../../core/self-heal/index.js";
+import {
+  createRecoverySettleError,
+  waitForMiniFreshStartSettle
+} from "../common/recovery-settle.js";
 import { CHAT_TARGET_URL } from "./constants.js";
 
 export const CHAT_FORBIDDEN_TOP_LEVEL_RESUME_CODE = "CHAT_FORBIDDEN_TOP_LEVEL_RESUME_NAVIGATION";
@@ -63,7 +71,8 @@ export async function recoverChatShell(client, {
   timeoutMs = 60000,
   intervalMs = 500,
   forceNavigate = false,
-  settleMs = 1200
+  settleMs = 1200,
+  settleAfterNavigate = false
 } = {}) {
   const before = await getChatTopLevelState(client);
   if (before.is_chat_shell && !forceNavigate) {
@@ -85,11 +94,26 @@ export async function recoverChatShell(client, {
     intervalMs
   });
   const after = await getChatTopLevelState(client);
+  let miniFreshStart = null;
+  if (after.is_chat_shell && settleAfterNavigate) {
+    miniFreshStart = await waitForMiniFreshStartSettle(client, {
+      domain: "chat",
+      timeoutMs,
+      intervalMs: Math.max(intervalMs, 800),
+      settleMs: Math.min(settleMs, 5000),
+      selfHealConfig: buildChatSelfHealConfig(),
+      resolveSelfHealRoots: resolveChatSelfHealRoots
+    });
+    if (!miniFreshStart.ok) {
+      throw createRecoverySettleError("chat", miniFreshStart);
+    }
+  }
   return {
     recovered: waited.ok && after.is_chat_shell,
     refreshed: Boolean(forceNavigate && before.is_chat_shell && after.is_chat_shell),
     before,
     after,
+    mini_fresh_start: miniFreshStart,
     wait: waited,
     navigate_result: navigateResult || null,
     navigate_url: targetUrl,

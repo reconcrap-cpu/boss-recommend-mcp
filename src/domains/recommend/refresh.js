@@ -1,5 +1,13 @@
 import { sleep } from "../../core/browser/index.js";
 import {
+  buildRecommendSelfHealConfig,
+  resolveRecommendSelfHealRoots
+} from "../../core/self-heal/index.js";
+import {
+  createRecoverySettleError,
+  waitForMiniFreshStartSettle
+} from "../common/recovery-settle.js";
+import {
   clickRecommendEndRefreshButton,
   waitForRecommendCardNodeIds
 } from "./cards.js";
@@ -8,7 +16,10 @@ import {
   RECOMMEND_TARGET_URL
 } from "./constants.js";
 import { selectAndConfirmFirstSafeFilter } from "./filters.js";
-import { selectRecommendJob } from "./jobs.js";
+import {
+  selectRecommendJob,
+  verifyRecommendJobSelection
+} from "./jobs.js";
 import { selectRecommendPageScope } from "./scopes.js";
 import {
   getRecommendRoots,
@@ -105,7 +116,7 @@ function compactFilterReapplyError(error) {
 export function isRetryableRecommendJobSelectionError(error) {
   if (isStaleRecommendNodeError(error)) return true;
   const message = String(error?.message || error || "");
-  return /Recommend job trigger was not found|Recommend job dropdown did not mount options|Recommend job dropdown did not expose visible options|Matched recommend job has no clickable center|Matched recommend job has no visible clickable option/i.test(message);
+  return /Recommend job trigger was not found|Recommend job dropdown did not mount options|Recommend job dropdown did not expose visible options|Matched recommend job has no clickable center|Matched recommend job has no visible clickable option|Recommend job selection was not sticky|Recommend job dropdown remained open after sticky verification/i.test(message);
 }
 
 function compactJobSelectionAttempt({
@@ -123,8 +134,27 @@ function compactJobSelectionAttempt({
     attempt,
     iframe_document_node_id: iframeDocumentNodeId || 0,
     selected: Boolean(selection?.selected),
-    selection_reason: selection?.reason || null
+    selection_reason: selection?.reason || null,
+    sticky_verified: selection?.sticky_verification?.verified ?? null,
+    sticky_current_label: selection?.sticky_verification?.current_label_without_salary
+      || selection?.sticky_verification?.current_label
+      || null,
+    sticky_menu_closed: selection?.sticky_verification?.menu_close?.ok ?? null
   };
+}
+
+async function waitForRecommendRecoverySettle(client, {
+  reloadSettleMs = 8000,
+  timeoutMs = 90000
+} = {}) {
+  return waitForMiniFreshStartSettle(client, {
+    domain: "recommend",
+    timeoutMs,
+    intervalMs: reloadSettleMs > 10000 ? 1200 : 800,
+    settleMs: Math.max(0, Math.min(reloadSettleMs || 0, 5000)),
+    selfHealConfig: buildRecommendSelfHealConfig(),
+    resolveSelfHealRoots: resolveRecommendSelfHealRoots
+  });
 }
 
 async function waitForFreshRecommendRoots(client, {
@@ -166,6 +196,31 @@ export async function selectRecommendJobWithRootRefresh(client, rootState, {
         settleMs,
         dropdownTimeoutMs
       });
+      if (selection.selected) {
+        const stickyRootState = await waitForFreshRecommendRoots(client, {
+          timeoutMs: Math.min(10000, Math.max(2000, totalTimeoutMs - (Date.now() - started))),
+          intervalMs: 500
+        }) || currentRootState;
+        const stickyFrameNodeId = stickyRootState?.iframe?.documentNodeId || iframeDocumentNodeId;
+        const stickyVerification = await verifyRecommendJobSelection(client, stickyFrameNodeId, {
+          jobLabel,
+          delayMs: 2000,
+          dropdownTimeoutMs,
+          closeSettleMs: 300
+        });
+        selection.sticky_verification = stickyVerification;
+        currentRootState = stickyRootState || currentRootState;
+        if (!stickyVerification.verified) {
+          const stickyError = new Error(`Recommend job selection was not sticky after 2s: requested=${jobLabel}; current=${stickyVerification.current_label_without_salary || stickyVerification.current_label || "unknown"}`);
+          stickyError.sticky_verification = stickyVerification;
+          throw stickyError;
+        }
+        if (stickyVerification.menu_close && stickyVerification.menu_close.ok === false) {
+          const closeError = new Error(`Recommend job dropdown remained open after sticky verification: ${stickyVerification.menu_close.reason || "unknown"}`);
+          closeError.sticky_verification = stickyVerification;
+          throw closeError;
+        }
+      }
       attempts.push(compactJobSelectionAttempt({
         ok: true,
         attempt,
@@ -270,13 +325,20 @@ async function applyRefreshMethod(client, method, {
   let pageScopeResult = null;
   let filterResult = null;
   let filterReapplyAttempts = [];
+  let recoverySettle = null;
   try {
     if (method === "page_navigate") {
       await client.Page.navigate({ url: targetUrl || RECOMMEND_TARGET_URL });
     } else {
       await client.Page.reload({ ignoreCache: true });
     }
-    if (reloadSettleMs > 0) await sleep(reloadSettleMs);
+    recoverySettle = await waitForRecommendRecoverySettle(client, {
+      reloadSettleMs,
+      timeoutMs: Math.max(45000, reloadSettleMs * 6)
+    });
+    if (!recoverySettle.ok) {
+      throw createRecoverySettleError("recommend", recoverySettle);
+    }
     currentRootState = await waitForRecommendRoots(client, {
       timeoutMs: Math.max(45000, reloadSettleMs * 6),
       intervalMs: 500
@@ -337,6 +399,7 @@ async function applyRefreshMethod(client, method, {
       target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
       job_selection_attempts: jobSelectionAttempts,
+      recovery_settle: recoverySettle,
       page_scope: pageScopeResult,
       filter: filterResult,
       filter_reapply_attempts: filterReapplyAttempts,
@@ -354,6 +417,7 @@ async function applyRefreshMethod(client, method, {
       target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
       job_selection_attempts: error?.job_selection_attempts || jobSelectionAttempts,
+      recovery_settle: error?.recovery_settle || recoverySettle,
       page_scope: pageScopeResult,
       filter: filterResult,
       filter_reapply_attempts: error?.filter_reapply_attempts || filterReapplyAttempts,

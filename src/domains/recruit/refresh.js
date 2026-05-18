@@ -39,6 +39,7 @@ export async function refreshRecruitSearchAtEnd(client, {
     forced_recent_viewed: Boolean(forceRecentViewed),
     search_params: refreshSearchParams,
     card_count: cardCount,
+    recovery_settle: application.reset?.mini_fresh_start || null,
     application
   };
 }

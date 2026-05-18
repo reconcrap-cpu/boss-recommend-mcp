@@ -443,6 +443,34 @@ export async function closeChatJobDropdown(client, rootNodeId, {
   });
   if (settleMs > 0) await sleep(settleMs);
   const after = await visibleChatJobOptions(client, rootNodeId);
+  if (after.length) {
+    const currentRootNodeId = await freshTopRootNodeId(client, rootNodeId);
+    for (const selector of CHAT_JOB_TRIGGER_SELECTORS) {
+      const nodeIds = await safeQuerySelectorAll(client, currentRootNodeId, selector);
+      for (const nodeId of nodeIds) {
+        try {
+          const box = await getNodeBox(client, nodeId);
+          if (box.rect.width <= 2 || box.rect.height <= 2) continue;
+          await clickPoint(client, box.center.x, box.center.y, DETERMINISTIC_CLICK_OPTIONS);
+          if (settleMs > 0) await sleep(settleMs);
+          const afterToggle = await visibleChatJobOptions(client, currentRootNodeId);
+          if (!afterToggle.length) {
+            return {
+              ok: true,
+              closed: true,
+              reason: "trigger_toggle",
+              visible_before_count: before.length,
+              visible_after_count: 0,
+              first_visible_before: before[0] || null,
+              first_visible_after: null
+            };
+          }
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
   return {
     ok: after.length === 0,
     closed: after.length === 0,

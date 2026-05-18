@@ -19,6 +19,7 @@ import {
   quickChatResumeModalOpenProbe,
   readChatConversationReadyState,
   readChatCardCandidate,
+  closeChatJobDropdown,
   recoverChatShell,
   requestChatResumeForPassedCandidate,
   selectChatJob,
@@ -353,7 +354,12 @@ async function testUnsafeOnlineResumeLinkIsBlockedBeforeClick() {
   assert.equal(clickCount, 0);
 }
 
-function createFakeChatJobClient({ selectionChanges = true, initialSelectedLabel = "" , initialMenuOpen = false } = {}) {
+function createFakeChatJobClient({
+  selectionChanges = true,
+  initialSelectedLabel = "",
+  initialMenuOpen = false,
+  escapeCloses = true
+} = {}) {
   const requestedLabel = "算法工程师 23-27届实习/校招/早期职业 _ 杭州 25-50K";
   const wrongLabel = "大模型高招岗位 _ 杭州 50-80K";
   const state = {
@@ -451,7 +457,7 @@ function createFakeChatJobClient({ selectionChanges = true, initialSelectedLabel
           if (event.type !== "mouseReleased") return;
           state.clicks.push({ x: event.x, y: event.y });
           if (Math.abs(event.x - centers[20].x) < 1 && Math.abs(event.y - centers[20].y) < 1) {
-            state.menuOpen = true;
+            state.menuOpen = !state.menuOpen;
             return;
           }
           if (Math.abs(event.x - centers[103].x) < 1 && Math.abs(event.y - centers[103].y) < 1) {
@@ -461,7 +467,7 @@ function createFakeChatJobClient({ selectionChanges = true, initialSelectedLabel
         },
         async dispatchKeyEvent(event) {
           state.keyEvents.push(event);
-          if (event.type === "keyUp" && event.key === "Escape") {
+          if (escapeCloses && event.type === "keyUp" && event.key === "Escape") {
             state.menuOpen = false;
           }
         }
@@ -500,6 +506,23 @@ async function testChatJobSelectionClosesOpenDropdownWhenAlreadyCurrent() {
   assert.equal(result.verified, true);
   assert.equal(result.already_current, true);
   assert.equal(result.menu_close.closed, true);
+  assert.equal(state.menuOpen, false);
+  assert.equal(state.keyEvents.some((event) => event.key === "Escape"), true);
+}
+
+async function testChatJobDropdownCloseFallsBackToTriggerToggle() {
+  const requestedLabel = "算法工程师 23-27届实习/校招/早期职业 _ 杭州 25-50K";
+  const { client, state } = createFakeChatJobClient({
+    initialSelectedLabel: requestedLabel,
+    initialMenuOpen: true,
+    escapeCloses: false
+  });
+  const result = await closeChatJobDropdown(client, 1, {
+    settleMs: 0
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.closed, true);
+  assert.equal(result.reason, "trigger_toggle");
   assert.equal(state.menuOpen, false);
   assert.equal(state.keyEvents.some((event) => event.key === "Escape"), true);
 }
@@ -1323,6 +1346,7 @@ await testChatTopLevelPageGuard();
 await testUnsafeOnlineResumeLinkIsBlockedBeforeClick();
 await testChatJobSelectionVerifiesRequestedJob();
 await testChatJobSelectionClosesOpenDropdownWhenAlreadyCurrent();
+await testChatJobDropdownCloseFallsBackToTriggerToggle();
 await testChatJobSelectionFailsWhenUiStaysOnWrongJob();
 await testOnlineResumeButtonRequiresExpectedActiveCandidate();
 await testDisabledAskResumeIsNotAlreadyRequested();

@@ -788,7 +788,8 @@ export async function runChatWorkflow({
   if (!initialTopLevelState.is_chat_shell) {
     const recovery = await recoverChatShell(client, {
       targetUrl,
-      timeoutMs: readyTimeoutMs
+      timeoutMs: readyTimeoutMs,
+      settleAfterNavigate: true
     });
     runControl.checkpoint({
       chat_shell_recovery: {
@@ -831,7 +832,8 @@ export async function runChatWorkflow({
     const shellRecovery = await recoverChatShell(client, {
       targetUrl,
       timeoutMs: readyTimeoutMs,
-      forceNavigate: forceRefresh
+      forceNavigate: forceRefresh,
+      settleAfterNavigate: true
     });
     runControl.checkpoint({
       chat_shell_recovery: {
