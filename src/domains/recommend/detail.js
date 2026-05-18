@@ -312,7 +312,7 @@ export async function readRecommendDetailHtml(client, detailState) {
 
 export function isStaleRecommendNodeError(error) {
   const message = String(error?.message || error || "");
-  return /Could not find node with given id|No node with given id|Node is detached|Cannot find node/i.test(message);
+  return /Could not find node with given id|No node with given id|Node is detached|Cannot find node|Could not compute box model/i.test(message);
 }
 
 export function isRecommendDetailOpenMissError(error) {

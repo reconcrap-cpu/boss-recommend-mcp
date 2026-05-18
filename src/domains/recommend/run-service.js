@@ -1258,6 +1258,8 @@ export async function runRecommendWorkflow({
         : screenCandidate(screeningCandidate, { criteria });
     let actionDiscovery = null;
     let postActionResult = null;
+    let closeFailureError = null;
+    let closeRecoveryFailure = null;
     if (postActionEnabled && detailResult) {
       const postActionStarted = Date.now();
       await runControl.waitIfPaused();
@@ -1288,19 +1290,32 @@ export async function runRecommendWorkflow({
       detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
       await maybeHumanActionCooldown("after_detail_close", timings);
       if (!detailResult.close_result?.closed) {
-        const closeError = createRecommendCloseFailureError(detailResult.close_result);
-        const recovery = await recoverAndReapplyRecommendContext("detail_close_failed", closeError, {
-          forceRecentNotView: true
-        });
-        detailResult.cv_acquisition = {
-          ...(detailResult.cv_acquisition || {}),
-          close_recovery: {
-            ok: Boolean(recovery.ok),
-            method: recovery.method || "",
-            forced_recent_not_view: Boolean(recovery.forced_recent_not_view),
-            card_count: recovery.card_count || 0
-          }
-        };
+        closeFailureError = createRecommendCloseFailureError(detailResult.close_result);
+        try {
+          const recovery = await recoverAndReapplyRecommendContext("detail_close_failed", closeFailureError, {
+            forceRecentNotView: true
+          });
+          detailResult.cv_acquisition = {
+            ...(detailResult.cv_acquisition || {}),
+            close_recovery: {
+              ok: Boolean(recovery.ok),
+              method: recovery.method || "",
+              forced_recent_not_view: Boolean(recovery.forced_recent_not_view),
+              card_count: recovery.card_count || 0
+            }
+          };
+        } catch (error) {
+          closeRecoveryFailure = error;
+          detailResult.cv_acquisition = {
+            ...(detailResult.cv_acquisition || {}),
+            close_recovery: {
+              ok: false,
+              reason: "context_recovery_failed",
+              error: error?.message || String(error),
+              forced_recent_not_view: true
+            }
+          };
+        }
       }
     }
     timings.total_ms = Date.now() - candidateStarted;
@@ -1316,6 +1331,8 @@ export async function runRecommendWorkflow({
       post_action: postActionResult,
       error: recoverableDetailError
         ? compactRecoverableDetailError(recoverableDetailError)
+        : closeRecoveryFailure
+        ? compactError(closeFailureError, "DETAIL_CLOSE_FAILED")
         : detailResult?.image_evidence?.ok === false
         ? compactError({
           code: detailResult.image_evidence.error_code,
@@ -1355,6 +1372,10 @@ export async function runRecommendWorkflow({
       }
     });
     addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
+
+    if (closeRecoveryFailure) {
+      throw closeRecoveryFailure;
+    }
 
     if (postActionResult?.stop_run) {
       listEndReason = postActionResult.reason || "post_action_stop";

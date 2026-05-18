@@ -12,6 +12,7 @@ import {
   htmlToText,
   normalizeText
 } from "../../core/screening/index.js";
+import { isStaleRecommendNodeError } from "./detail.js";
 
 export const RECOMMEND_JOB_SELECTORS = Object.freeze({
   trigger: ".job-selecter-wrap, [class*=\"job-selecter-wrap\"], .ui-dropmenu",
@@ -52,15 +53,26 @@ function isVisibleBox(box) {
 }
 
 async function readJobOption(client, nodeId, index) {
-  const [attributes, outerHTML] = await Promise.all([
-    getAttributesMap(client, nodeId),
-    getOuterHTML(client, nodeId)
-  ]);
+  let attributes = null;
+  let outerHTML = "";
+  try {
+    [attributes, outerHTML] = await Promise.all([
+      getAttributesMap(client, nodeId),
+      getOuterHTML(client, nodeId)
+    ]);
+  } catch (error) {
+    if (isStaleRecommendNodeError(error)) {
+      return null;
+    }
+    throw error;
+  }
   const label = normalizeText(htmlToText(outerHTML));
   let box = null;
   try {
     box = await getNodeBox(client, nodeId);
-  } catch {}
+  } catch (error) {
+    if (!isStaleRecommendNodeError(error)) throw error;
+  }
   const className = attributes.class || "";
   return {
     node_id: nodeId,
@@ -75,19 +87,40 @@ async function readJobOption(client, nodeId, index) {
   };
 }
 
+async function readJobTrigger(client, nodeId) {
+  let box = null;
+  try {
+    box = await getNodeBox(client, nodeId);
+  } catch {}
+  if (!isVisibleBox(box)) return null;
+
+  let label = "";
+  let className = "";
+  try {
+    const outerHTML = await getOuterHTML(client, nodeId);
+    label = normalizeText(htmlToText(outerHTML));
+  } catch {}
+  try {
+    const attributes = await getAttributesMap(client, nodeId);
+    className = attributes.class || "";
+  } catch {}
+
+  return {
+    node_id: nodeId,
+    center: box.center,
+    rect: box.rect,
+    label,
+    label_without_salary: trimSalarySuffix(label),
+    class_name: className,
+    visible: true
+  };
+}
+
 export async function findRecommendJobTrigger(client, frameNodeId) {
   const nodeIds = await querySelectorAll(client, frameNodeId, RECOMMEND_JOB_SELECTORS.trigger);
   for (const nodeId of nodeIds) {
-    try {
-      const box = await getNodeBox(client, nodeId);
-      if (isVisibleBox(box)) {
-        return {
-          node_id: nodeId,
-          center: box.center,
-          rect: box.rect
-        };
-      }
-    } catch {}
+    const trigger = await readJobTrigger(client, nodeId);
+    if (trigger) return trigger;
   }
   return null;
 }
@@ -162,6 +195,7 @@ export async function openRecommendJobDropdown(client, frameNodeId, {
     }
   }
   const error = new Error("Recommend job dropdown did not expose visible options after trigger click");
+  error.trigger = trigger;
   error.job_dropdown_attempts = attempts;
   throw error;
 }
@@ -204,6 +238,7 @@ export async function listRecommendJobOptions(client, frameNodeId, {
     if (seen.has(nodeId)) continue;
     seen.add(nodeId);
     const option = await readJobOption(client, nodeId, index);
+    if (!option) continue;
     if (!option.label) continue;
     if (option.label.length > 120) continue;
     options.push(option);
@@ -245,10 +280,36 @@ export async function selectRecommendJob(client, frameNodeId, {
     };
   }
 
-  const opened = await openRecommendJobDropdown(client, frameNodeId, {
-    timeoutMs: dropdownTimeoutMs,
-    triggerTimeoutMs: dropdownTimeoutMs
-  });
+  let opened = null;
+  try {
+    opened = await openRecommendJobDropdown(client, frameNodeId, {
+      timeoutMs: dropdownTimeoutMs,
+      triggerTimeoutMs: dropdownTimeoutMs
+    });
+  } catch (error) {
+    const currentOptions = await listRecommendJobOptions(client, frameNodeId, {
+      openDropdown: false
+    }).catch(() => []);
+    const currentMatch = currentOptions.find((option) => (
+      option.current && jobLabelMatches(option.label, target)
+    ));
+    if (currentMatch) {
+      await closeRecommendJobDropdown(client);
+      return {
+        requested: target,
+        selected: true,
+        already_current: true,
+        selected_option: compactJobOption({
+          ...currentMatch,
+          source: "current_option_without_visible_dropdown"
+        }),
+        options: currentOptions.map(compactJobOption),
+        dropdown_error: error?.message || String(error),
+        job_dropdown_attempts: error?.job_dropdown_attempts || []
+      };
+    }
+    throw error;
+  }
   const options = opened.options.length
     ? opened.options
     : await listRecommendJobOptions(client, frameNodeId, { openDropdown: false });
@@ -311,6 +372,7 @@ function compactJobOption(option) {
     class_name: option.class_name,
     node_id: option.node_id,
     center: option.center,
-    rect: option.rect
+    rect: option.rect,
+    source: option.source || null
   };
 }

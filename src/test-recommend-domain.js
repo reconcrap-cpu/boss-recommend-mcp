@@ -28,6 +28,7 @@ import {
   readRecommendDetailHtml,
   readRecommendCardCandidate,
   refreshRecommendListAtEnd,
+  selectRecommendJob,
   selectRecommendJobWithRootRefresh,
   selectRecommendPageScope
 } from "./domains/recommend/index.js";
@@ -281,7 +282,10 @@ async function testOpenRecommendJobDropdownRequiresVisibleOptions() {
         if (nodeId === 20 && clickCount >= 2) {
           return { model: { border: [10, 50, 190, 50, 190, 82, 10, 82] } };
         }
-        throw new Error(`Hidden node ${nodeId}`);
+        if (nodeId === 20) {
+          return { model: { border: [10, 50, 10, 50, 10, 50, 10, 50] } };
+        }
+        throw new Error(`Unexpected node ${nodeId}`);
       },
       async getAttributes({ nodeId }) {
         assert.equal(nodeId, 20);
@@ -317,6 +321,71 @@ async function testOpenRecommendJobDropdownRequiresVisibleOptions() {
   assert.equal(result.options[0].visible, true);
   assert.equal(result.attempts[0].visible_option_count, 0);
   assert.equal(result.attempts[1].visible_option_count, 1);
+}
+
+async function testSelectRecommendJobAcceptsHiddenCurrentOptionAfterDropdownMiss() {
+  let clickCount = 0;
+  let escapeCount = 0;
+  const optionSelector = ".job-selecter-options .job-item, .job-list .job-item, .job-item";
+  const client = {
+    DOM: {
+      async querySelectorAll({ selector }) {
+        if (selector.includes("job-selecter-wrap")) return { nodeIds: [10] };
+        if (selector === optionSelector) return { nodeIds: [20, 21] };
+        return { nodeIds: [] };
+      },
+      async getBoxModel({ nodeId }) {
+        if (nodeId === 10) {
+          return { model: { border: [10, 10, 170, 10, 170, 44, 10, 44] } };
+        }
+        if (nodeId === 20 || nodeId === 21) {
+          return { model: { border: [10, 50, 10, 50, 10, 50, 10, 50] } };
+        }
+        throw new Error(`Unexpected node ${nodeId}`);
+      },
+      async getAttributes({ nodeId }) {
+        if (nodeId === 10) return { attributes: ["class", "job-selecter-wrap"] };
+        if (nodeId === 20) return { attributes: ["class", "job-item curr"] };
+        if (nodeId === 21) return { attributes: ["class", "job-item"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML({ nodeId }) {
+        if (nodeId === 10) {
+          return { outerHTML: '<div class="job-selecter-wrap">AI算法实习生 _ 杭州 150-200元/天 大模型高招岗位 _ 杭州 50-80K</div>' };
+        }
+        if (nodeId === 20) {
+          return { outerHTML: '<li class="job-item curr">AI算法实习生 _ 杭州 150-200元/天</li>' };
+        }
+        if (nodeId === 21) {
+          return { outerHTML: '<li class="job-item">大模型高招岗位 _ 杭州 50-80K</li>' };
+        }
+        return { outerHTML: "" };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") clickCount += 1;
+        return {};
+      },
+      async dispatchKeyEvent(event) {
+        if (event.key === "Escape") escapeCount += 1;
+        return {};
+      }
+    }
+  };
+
+  const result = await selectRecommendJob(client, 99, {
+    jobLabel: "AI算法实习生 _ 杭州",
+    settleMs: 0,
+    dropdownTimeoutMs: 20
+  });
+
+  assert.equal(result.selected, true);
+  assert.equal(result.already_current, true);
+  assert.equal(result.selected_option.source, "current_option_without_visible_dropdown");
+  assert.equal(result.options.length, 2);
+  assert.equal(clickCount > 0, true);
+  assert.equal(escapeCount > 0, true);
 }
 
 async function testSelectRecommendJobRefreshesStaleFrameRoot() {
@@ -404,6 +473,8 @@ function testRetryableRecommendJobSelectionError() {
   assert.equal(isRetryableRecommendJobSelectionError(new Error("Recommend job dropdown did not expose visible options after trigger click")), true);
   assert.equal(isRetryableRecommendJobSelectionError(new Error("Matched recommend job has no clickable center: AI算法实习生")), true);
   assert.equal(isRetryableRecommendJobSelectionError(new Error("Matched recommend job has no visible clickable option: AI算法实习生")), true);
+  assert.equal(isRetryableRecommendJobSelectionError(new Error("Could not find node with given id")), true);
+  assert.equal(isRetryableRecommendJobSelectionError(new Error("Could not compute box model.")), true);
   assert.equal(isRetryableRecommendJobSelectionError(new Error("Requested recommend job was not selected after refresh reload")), false);
 }
 
@@ -873,6 +944,7 @@ await testCardCandidateReader();
 await testRefreshRecoveryFallsBackFromNavigateToReload();
 await testOpenRecommendJobDropdownWaitsForLateTrigger();
 await testOpenRecommendJobDropdownRequiresVisibleOptions();
+await testSelectRecommendJobAcceptsHiddenCurrentOptionAfterDropdownMiss();
 await testSelectRecommendJobRefreshesStaleFrameRoot();
 await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();

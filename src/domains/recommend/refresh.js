@@ -14,6 +14,7 @@ import {
   getRecommendRoots,
   waitForRecommendRoots
 } from "./roots.js";
+import { isStaleRecommendNodeError } from "./detail.js";
 
 function normalizeLabels(labels = []) {
   return labels.map((label) => String(label || "").trim()).filter(Boolean);
@@ -102,6 +103,7 @@ function compactFilterReapplyError(error) {
 }
 
 export function isRetryableRecommendJobSelectionError(error) {
+  if (isStaleRecommendNodeError(error)) return true;
   const message = String(error?.message || error || "");
   return /Recommend job trigger was not found|Recommend job dropdown did not mount options|Recommend job dropdown did not expose visible options|Matched recommend job has no clickable center|Matched recommend job has no visible clickable option/i.test(message);
 }
@@ -125,6 +127,17 @@ function compactJobSelectionAttempt({
   };
 }
 
+async function waitForFreshRecommendRoots(client, {
+  timeoutMs = 10000,
+  intervalMs = 500
+} = {}) {
+  const rootState = await waitForRecommendRoots(client, {
+    timeoutMs,
+    intervalMs
+  });
+  return rootState?.iframe?.documentNodeId ? rootState : null;
+}
+
 export async function selectRecommendJobWithRootRefresh(client, rootState, {
   jobLabel = "",
   settleMs = 6000,
@@ -141,7 +154,10 @@ export async function selectRecommendJobWithRootRefresh(client, rootState, {
   while (Date.now() - started <= totalTimeoutMs) {
     attempt += 1;
     if (!currentRootState?.iframe?.documentNodeId) {
-      currentRootState = await getRecommendRoots(client);
+      currentRootState = await waitForFreshRecommendRoots(client, {
+        timeoutMs: Math.min(10000, Math.max(2000, totalTimeoutMs - (Date.now() - started))),
+        intervalMs: 500
+      });
     }
     const iframeDocumentNodeId = currentRootState?.iframe?.documentNodeId || 0;
     try {
@@ -176,7 +192,10 @@ export async function selectRecommendJobWithRootRefresh(client, rootState, {
         break;
       }
       if (retryDelayMs > 0) await sleep(retryDelayMs);
-      currentRootState = await getRecommendRoots(client);
+      currentRootState = await waitForFreshRecommendRoots(client, {
+        timeoutMs: Math.min(10000, Math.max(2000, totalTimeoutMs - (Date.now() - started))),
+        intervalMs: 500
+      });
     }
   }
 
