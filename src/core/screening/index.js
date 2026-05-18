@@ -189,6 +189,44 @@ function normalizeBlockText(input) {
   return String(input ?? "").trim();
 }
 
+function normalizeReasoningKey(input) {
+  return normalizeBlockText(input).replace(/\s+/g, " ");
+}
+
+function collapseRepeatedReasoningText(input) {
+  const text = normalizeBlockText(input);
+  if (!text) return "";
+  const chunks = text.split(/\n{2,}/).map(normalizeBlockText).filter(Boolean);
+  if (chunks.length >= 2 && chunks.length % 2 === 0) {
+    const midpoint = chunks.length / 2;
+    const first = chunks.slice(0, midpoint);
+    const second = chunks.slice(midpoint);
+    if (normalizeReasoningKey(first.join("\n\n")) === normalizeReasoningKey(second.join("\n\n"))) {
+      return first.join("\n\n");
+    }
+  }
+
+  const compacted = normalizeReasoningKey(text);
+  if (compacted.length < 160) return text;
+  const midpoint = Math.floor(compacted.length / 2);
+  for (let offset = -32; offset <= 32; offset += 1) {
+    const split = midpoint + offset;
+    if (split <= 80 || split >= compacted.length - 80) continue;
+    const first = compacted.slice(0, split).trim();
+    const second = compacted.slice(split).trim();
+    if (first && first === second) return first;
+  }
+  return text;
+}
+
+function firstReasoningText(lines) {
+  for (const line of lines) {
+    const cleaned = collapseRepeatedReasoningText(line);
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
 function compact(input) {
   return normalizeText(input).toLowerCase();
 }
@@ -472,7 +510,9 @@ function flattenChatMessageContent(content) {
 
 function collectLlmReasoningText(choice = {}) {
   const message = choice?.message || {};
-  return [
+  const seen = new Set();
+  const unique = [];
+  for (const item of [
     message.reasoning_content,
     message.provider_specific_fields?.reasoning_content,
     message.reasoning,
@@ -489,7 +529,14 @@ function collectLlmReasoningText(choice = {}) {
     choice.provider_specific_fields?.cot,
     choice.chain_of_thought,
     choice.provider_specific_fields?.chain_of_thought
-  ].map(flattenChatMessageContent).map(normalizeBlockText).filter(Boolean).join("\n\n");
+  ]) {
+    const text = collapseRepeatedReasoningText(flattenChatMessageContent(item));
+    const key = normalizeReasoningKey(text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(text);
+  }
+  return collapseRepeatedReasoningText(unique.join("\n\n"));
 }
 
 function mimeTypeForImagePath(filePath) {
@@ -1621,7 +1668,7 @@ async function callScreeningLlmWithProvider({
       const evidence = Array.isArray(parsed?.evidence)
         ? parsed.evidence.map(normalizeText).filter(Boolean)
         : [];
-      const decisionCot = firstUsefulLine([
+      const decisionCot = firstReasoningText([
         parsed?.cot,
         parsed?.decision_cot,
         parsed?.reasoning,

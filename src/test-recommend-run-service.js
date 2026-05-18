@@ -218,6 +218,12 @@ function testRecommendStatusCountersPreserveProgressAfterRecovery() {
     },
     {
       screening: { passed: false },
+      detail: null,
+      llm_screening: null,
+      error: { code: "DETAIL_OPEN_FAILED" }
+    },
+    {
+      screening: { passed: false },
       detail: {
         image_evidence: {
           ok: false,
@@ -230,16 +236,16 @@ function testRecommendStatusCountersPreserveProgressAfterRecovery() {
     greetCount: 1
   });
 
-  assert.equal(counts.processed, 3);
-  assert.equal(counts.screened, 3);
+  assert.equal(counts.processed, 4);
+  assert.equal(counts.screened, 4);
   assert.equal(counts.detail_opened, 2);
   assert.equal(counts.passed, 1);
   assert.equal(counts.llm_screened, 1);
   assert.equal(counts.greet_count, 1);
   assert.equal(counts.post_action_clicked, 1);
-  assert.equal(counts.detail_open_failed, 1);
+  assert.equal(counts.detail_open_failed, 2);
   assert.equal(counts.image_capture_failed, 1);
-  assert.equal(counts.transient_recovered, 2);
+  assert.equal(counts.transient_recovered, 3);
 }
 
 await testLifecycleDelegation();

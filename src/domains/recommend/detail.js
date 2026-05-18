@@ -315,6 +315,11 @@ export function isStaleRecommendNodeError(error) {
   return /Could not find node with given id|No node with given id|Node is detached|Cannot find node/i.test(message);
 }
 
+export function isRecommendDetailOpenMissError(error) {
+  const message = String(error?.message || error || "");
+  return /Candidate detail did not open|no known detail selectors mounted/i.test(message);
+}
+
 export async function findRecommendCardNodeForCandidateKey(client, {
   candidateKey = "",
   rootState = null,
@@ -450,13 +455,15 @@ export async function openRecommendCardDetailWithFreshRetry(client, {
       };
     } catch (error) {
       const stale = isStaleRecommendNodeError(error);
+      const detailOpenMiss = isRecommendDetailOpenMissError(error);
       attempts.push({
         attempt: attemptIndex + 1,
         node_id: currentNodeId,
         stale_node: stale,
+        detail_open_miss: detailOpenMiss,
         error: error?.message || String(error)
       });
-      if (!stale || attemptIndex >= limit - 1 || !candidateKey) {
+      if ((!stale && !detailOpenMiss) || attemptIndex >= limit - 1 || !candidateKey) {
         error.recommend_detail_open_attempts = attempts;
         throw error;
       }

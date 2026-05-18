@@ -60,10 +60,12 @@ function testRecoverableImageCaptureEvidencePreservesPartialPages() {
     const error = new Error("Image fallback capture timed out during capture_screenshot_4 after 45000ms");
     error.code = "IMAGE_CAPTURE_TIMEOUT";
     const staleError = new Error("Could not find node with given id");
+    const detailOpenMiss = new Error("Candidate detail did not open or no known detail selectors mounted");
 
     assert.equal(isRecoverableImageCaptureError(error), true);
     assert.equal(isRecoverableImageCaptureError(staleError), true);
     assert.equal(isRecoverableRecommendDetailError(staleError), true);
+    assert.equal(isRecoverableRecommendDetailError(detailOpenMiss), true);
     assert.equal(isRecoverableRecommendDetailError(new Error("Boss recommend page is not healthy")), false);
     assert.equal(isRecoverableImageCaptureError(new Error("Inspected target navigated or closed")), false);
     const evidence = createRecoverableImageCaptureEvidence(error, {

@@ -549,11 +549,13 @@ async function testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao
             {
               message: {
                 content: "{\"passed\": true}",
+                reasoning_content: "proxy nested reasoning",
                 role: "assistant",
                 provider_specific_fields: {
                   reasoning_content: "proxy nested reasoning"
                 }
               },
+              reasoning_content: "proxy nested reasoning",
               finish_reason: "stop"
             }
           ],
@@ -589,6 +591,58 @@ async function testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao
     assert.equal(result.reasoning_content, "proxy nested reasoning");
     assert.equal(result.cot, "proxy nested reasoning");
     assert.equal(result.provider.reasoning_effort, "low");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmCollapsesRepeatedReasoningBlock() {
+  const originalFetch = globalThis.fetch;
+  const repeatedReasoning = [
+    "用户希望我严格判断候选人是否满足筛选标准。",
+    "",
+    "标准1满足，因为本科院校符合要求。",
+    "标准2满足，因为至少一段学历符合要求。",
+    "标准3满足，因为有计算机视觉算法科研经验。",
+    "标准4满足，因为最高学历毕业年份是2027。"
+  ].join("\n");
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return JSON.stringify({
+        choices: [
+          {
+            message: {
+              content: "{\"passed\": true}",
+              reasoning_content: `${repeatedReasoning}\n\n${repeatedReasoning}`
+            },
+            finish_reason: "stop"
+          }
+        ],
+        usage: { total_tokens: 20 }
+      });
+    }
+  });
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "dedupe-reasoning",
+        text: "张三\n视觉算法\n本科"
+      }),
+      criteria: "算法经验",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5"
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(result.passed, true);
+    assert.equal(result.reasoning_content, repeatedReasoning);
+    assert.equal(result.cot, repeatedReasoning);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -796,6 +850,7 @@ testBuildScreeningLlmMessagesWithImages();
 testBuildScreeningLlmImageInputsPrefersComposedFullCvImages();
 await testCallScreeningLlmDefaultsThinkingLow();
 await testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao();
+await testCallScreeningLlmCollapsesRepeatedReasoningBlock();
 await testCallScreeningLlmUsesConfigThinkingAndBudget();
 await testCallScreeningLlmRetriesTransientFailure();
 await testCallScreeningLlmFallsBackToNextConfiguredModel();

@@ -49,6 +49,7 @@ import {
   closeRecommendDetail,
   createRecommendDetailNetworkRecorder,
   extractRecommendDetailCandidate,
+  isRecommendDetailOpenMissError,
   isStaleRecommendNodeError,
   openRecommendCardDetailWithFreshRetry,
   waitForRecommendDetailNetworkEvents
@@ -419,6 +420,7 @@ export function countRecommendResultStatuses(results = [], {
     )).length,
     transient_recovered: results.filter((item) => (
       item.error?.code === "DETAIL_STALE_NODE"
+      || item.error?.code === "DETAIL_OPEN_FAILED"
       || item.error?.code === "IMAGE_CAPTURE_STALE_NODE"
       || item.error?.code === "IMAGE_CAPTURE_TIMEOUT"
       || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT"
@@ -460,6 +462,9 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   }
   if (error.passed_count != null) {
     result.passed_count = error.passed_count;
+  }
+  if (Array.isArray(error.recommend_detail_open_attempts)) {
+    result.recommend_detail_open_attempts = error.recommend_detail_open_attempts;
   }
   return result;
 }
@@ -549,7 +554,7 @@ function createImageCaptureFailureScreening(candidate, error) {
 }
 
 export function isRecoverableRecommendDetailError(error) {
-  return isStaleRecommendNodeError(error);
+  return isStaleRecommendNodeError(error) || isRecommendDetailOpenMissError(error);
 }
 
 function compactRecoverableDetailError(error) {
@@ -563,6 +568,8 @@ function createRecoverableDetailFailureScreening(candidate, error) {
     score: 0,
     reasons: isStaleRecommendNodeError(error)
       ? ["detail_open_failed", "stale_node"]
+      : isRecommendDetailOpenMissError(error)
+      ? ["detail_open_failed", "detail_open_miss"]
       : ["detail_open_failed"],
     error: compactRecoverableDetailError(error),
     candidate
