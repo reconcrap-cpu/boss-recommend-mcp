@@ -58,6 +58,80 @@ async function testAllowedDomainsAreLogged() {
   assertNoForbiddenCdpCalls(methodLog);
 }
 
+async function testGuardedClientReconnectsClosedTransport() {
+  const calls = [];
+  const methodLog = [];
+  const listener = () => {};
+  function makeClient(name, { failGetBody = false } = {}) {
+    return {
+      Page: {
+        async enable() {
+          calls.push(`${name}:Page.enable`);
+          return {};
+        },
+        async bringToFront() {
+          calls.push(`${name}:Page.bringToFront`);
+          return {};
+        }
+      },
+      Network: {
+        async enable() {
+          calls.push(`${name}:Network.enable`);
+          return {};
+        },
+        async setCacheDisabled(params) {
+          calls.push(`${name}:Network.setCacheDisabled:${params.cacheDisabled}`);
+          return {};
+        },
+        responseReceived(nextListener) {
+          calls.push(`${name}:Network.responseReceived:${nextListener === listener}`);
+        },
+        async getResponseBody() {
+          calls.push(`${name}:Network.getResponseBody`);
+          if (failGetBody) {
+            throw new Error("WebSocket is not open: readyState 3 (CLOSED)");
+          }
+          return { body: name };
+        }
+      },
+      async close() {
+        calls.push(`${name}:close`);
+      }
+    };
+  }
+
+  const first = makeClient("first", { failGetBody: true });
+  const second = makeClient("second");
+  const guarded = createGuardedCdpClient(first, {
+    methodLog,
+    reconnect: async () => second
+  });
+
+  await enableDomains(guarded, ["Page", "Network"]);
+  await guarded.Page.bringToFront();
+  await guarded.Network.setCacheDisabled({ cacheDisabled: true });
+  guarded.Network.responseReceived(listener);
+
+  const result = await guarded.Network.getResponseBody({ requestId: "1" });
+  assert.deepEqual(result, { body: "second" });
+  assert.deepEqual(calls, [
+    "first:Page.enable",
+    "first:Network.enable",
+    "first:Page.bringToFront",
+    "first:Network.setCacheDisabled:true",
+    "first:Network.responseReceived:true",
+    "first:Network.getResponseBody",
+    "second:Page.enable",
+    "second:Network.enable",
+    "second:Page.bringToFront",
+    "second:Network.setCacheDisabled:true",
+    "second:Network.responseReceived:true",
+    "second:Network.getResponseBody"
+  ]);
+  assert.ok(methodLog.some((entry) => entry.method === "Network.getResponseBody:retry_after_reconnect"));
+  assertNoForbiddenCdpCalls(methodLog);
+}
+
 async function testUnexpectedDomainIsRejected() {
   const guarded = createGuardedCdpClient({
     Runtime: {
@@ -387,6 +461,7 @@ async function testBossLoginDomDetection() {
 
 await testRuntimeDomainIsBlockedBeforeTransport();
 await testAllowedDomainsAreLogged();
+await testGuardedClientReconnectsClosedTransport();
 await testUnexpectedDomainIsRejected();
 testBossLoginUrlDetection();
 testBossLoginRequiredErrorShape();

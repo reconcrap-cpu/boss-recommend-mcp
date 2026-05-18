@@ -29,6 +29,7 @@ export const FORBIDDEN_CDP_DOMAINS = new Set(["Runtime"]);
 const BOSS_LOGIN_URL_PATTERN = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhipin\.com|login\.zhipin\.com)/i;
 const BOSS_LOGIN_TEXT_PATTERN = /扫码登录|验证码登录|密码登录|登录后|请登录|登录BOSS直聘|Boss登录|BOSS登录/i;
 const CHROME_DEBUG_UNAVAILABLE_PATTERN = /ECONNREFUSED|ECONNRESET|ENOTFOUND|ETIMEDOUT|connect|socket hang up/i;
+const CDP_CLOSED_TRANSPORT_PATTERN = /WebSocket is not open|readyState\s+\d+\s+\(CLOSED\)|ECONNRESET|socket hang up|Target closed|Session closed|Connection closed/i;
 const BOSS_LOGIN_DOM_SELECTORS = [
   ".login-box",
   ".login-form",
@@ -872,34 +873,143 @@ export async function connectToChromeTargetOrOpen({
   }
 }
 
-export function createGuardedCdpClient(client, { methodLog = [] } = {}) {
-  return new Proxy(client, {
-    get(target, property, receiver) {
+export function isClosedCdpTransportError(error) {
+  return CDP_CLOSED_TRANSPORT_PATTERN.test(String(error?.message || error || ""));
+}
+
+function cloneCdpParams(params = {}) {
+  if (!params || typeof params !== "object" || typeof params === "function") return params;
+  try {
+    return JSON.parse(JSON.stringify(params));
+  } catch {
+    return { ...params };
+  }
+}
+
+function shouldReplayCdpSetupCall(domain, method) {
+  return method === "enable"
+    || (domain === "Network" && method === "setCacheDisabled")
+    || (domain === "Page" && method === "bringToFront");
+}
+
+export function createGuardedCdpClient(client, { methodLog = [], reconnect = null } = {}) {
+  let currentClient = client;
+  let reconnectInFlight = null;
+  const setupCalls = [];
+  const eventSubscriptions = [];
+
+  async function replaySessionSetup(nextClient) {
+    for (const call of setupCalls) {
+      const fn = nextClient?.[call.domain]?.[call.method];
+      if (typeof fn === "function") {
+        await fn.call(nextClient[call.domain], cloneCdpParams(call.params));
+      }
+    }
+    for (const subscription of eventSubscriptions) {
+      const fn = nextClient?.[subscription.domain]?.[subscription.event];
+      if (typeof fn === "function") {
+        fn.call(nextClient[subscription.domain], subscription.listener);
+      }
+    }
+  }
+
+  async function reconnectClient() {
+    if (typeof reconnect !== "function") return null;
+    if (!reconnectInFlight) {
+      reconnectInFlight = Promise.resolve()
+        .then(() => reconnect())
+        .then(async (nextClient) => {
+          if (!nextClient) throw new Error("CDP reconnect returned no client");
+          currentClient = nextClient;
+          await replaySessionSetup(nextClient);
+          return nextClient;
+        })
+        .finally(() => {
+          reconnectInFlight = null;
+        });
+    }
+    return reconnectInFlight;
+  }
+
+  async function invokeWithReconnect({
+    methodNameForLog,
+    invoke,
+    retryable = true
+  }) {
+    recordMethod(methodLog, methodNameForLog);
+    try {
+      return await invoke(currentClient);
+    } catch (error) {
+      if (!retryable || !isClosedCdpTransportError(error) || typeof reconnect !== "function") {
+        throw error;
+      }
+      await reconnectClient();
+      recordMethod(methodLog, `${methodNameForLog}:retry_after_reconnect`);
+      return invoke(currentClient);
+    }
+  }
+
+  return new Proxy({}, {
+    get(_target, property, receiver) {
       if (property === "send") {
         return async (method, params = {}) => {
           if (isForbiddenMethod(method)) {
             throw new Error(`Forbidden CDP method blocked: ${method}`);
           }
-          recordMethod(methodLog, method);
-          return target.send(method, params);
+          return invokeWithReconnect({
+            methodNameForLog: method,
+            invoke: (activeClient) => activeClient.send(method, params)
+          });
         };
       }
 
-      const value = Reflect.get(target, property, receiver);
+      if (property === "close") {
+        return async () => currentClient?.close?.();
+      }
+
+      if (property === "__rawClient") return currentClient;
+
+      const value = Reflect.get(currentClient, property, receiver);
       if (!value || typeof value !== "object") return value;
 
-      return new Proxy(value, {
-        get(domainTarget, method, domainReceiver) {
+      return new Proxy({}, {
+        get(_domainTarget, method, domainReceiver) {
+          const domainTarget = Reflect.get(currentClient, property, receiver);
           const domainValue = Reflect.get(domainTarget, method, domainReceiver);
           if (typeof domainValue !== "function") return domainValue;
 
-          return async (params = {}) => {
+          return (params = {}) => {
             const fullMethod = methodName(property, method);
             if (isForbiddenMethod(fullMethod)) {
               throw new Error(`Forbidden CDP method blocked: ${fullMethod}`);
             }
-            recordMethod(methodLog, fullMethod);
-            return domainValue.call(domainTarget, params);
+            if (typeof params === "function") {
+              eventSubscriptions.push({
+                domain: property,
+                event: method,
+                listener: params
+              });
+              recordMethod(methodLog, fullMethod);
+              return domainValue.call(domainTarget, params);
+            }
+            if (shouldReplayCdpSetupCall(property, method)) {
+              setupCalls.push({
+                domain: property,
+                method,
+                params: cloneCdpParams(params)
+              });
+            }
+            return invokeWithReconnect({
+              methodNameForLog: fullMethod,
+              invoke: (activeClient) => {
+                const activeDomain = activeClient?.[property];
+                const activeMethod = activeDomain?.[method];
+                if (typeof activeMethod !== "function") {
+                  throw new Error(`CDP method is unavailable after reconnect: ${fullMethod}`);
+                }
+                return activeMethod.call(activeDomain, params);
+              }
+            });
           };
         }
       });
@@ -928,14 +1038,37 @@ export async function connectToChromeTarget({
     throw new Error(`No matching Chrome target found on ${host}:${port}.\nAvailable targets:\n${urls}`);
   }
 
-  const rawClient = await CDP({ host, port, target });
+  let rawClient = await CDP({ host, port, target });
+  let activeTarget = target;
   const methodLog = [];
-  const client = createGuardedCdpClient(rawClient, { methodLog });
+  const client = createGuardedCdpClient(rawClient, {
+    methodLog,
+    reconnect: async () => {
+      const latestTargets = await listChromeTargets({ host, port });
+      const nextTarget = activeTarget?.id
+        ? latestTargets.find((item) => item?.id === activeTarget.id)
+        : latestTargets.find(matcher);
+      if (!nextTarget) {
+        const urls = latestTargets.map((item) => item.url).filter(Boolean).join("\n");
+        throw new Error(`No matching Chrome target found while reconnecting to ${host}:${port}.\nAvailable targets:\n${urls}`);
+      }
+      try {
+        await rawClient.close();
+      } catch {}
+      rawClient = await CDP({ host, port, target: nextTarget });
+      activeTarget = nextTarget;
+      return rawClient;
+    }
+  });
 
   return {
     client,
-    rawClient,
-    target,
+    get rawClient() {
+      return rawClient;
+    },
+    get target() {
+      return activeTarget;
+    },
     methodLog,
     async close() {
       await rawClient.close();
