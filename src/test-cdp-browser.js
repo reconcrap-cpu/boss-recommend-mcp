@@ -2,16 +2,21 @@ import assert from "node:assert/strict";
 import {
   assertNoForbiddenCdpCalls,
   assertRuntimeEvaluateBlocked,
+  buildBossChromeLaunchArgs,
   chunkHumanText,
   clickPoint,
   clickNodeCenter,
   configureHumanInteraction,
+  connectToChromeTargetOrOpen,
   createHumanRestController,
   createBossLoginRequiredError,
   createGuardedCdpClient,
+  DEFAULT_REQUIRED_CHROME_FLAGS,
   detectBossLoginState,
   enableDomains,
+  ensureChromeDebugPort,
   generateBezierPath,
+  getMissingRequiredChromeFlags,
   humanDelay,
   insertText,
   isChromeDebugUnavailableError,
@@ -20,6 +25,9 @@ import {
   resolveHumanClickPointForBox,
   simulateHumanClick
 } from "./core/browser/index.js";
+import { CHAT_TARGET_URL } from "./domains/chat/constants.js";
+import { RECOMMEND_TARGET_URL } from "./domains/recommend/constants.js";
+import { RECRUIT_TARGET_URL } from "./domains/recruit/constants.js";
 
 async function testRuntimeDomainIsBlockedBeforeTransport() {
   let runtimeWasCalled = false;
@@ -171,6 +179,323 @@ function testBossLoginRequiredErrorShape() {
 function testChromeDebugUnavailableDetection() {
   assert.equal(isChromeDebugUnavailableError(new Error("connect ECONNREFUSED 127.0.0.1:9222")), true);
   assert.equal(isChromeDebugUnavailableError(new Error("No matching Chrome target found")), false);
+}
+
+function testBossChromeLaunchArgsContainRequiredFlagsOnce() {
+  const args = buildBossChromeLaunchArgs({
+    port: 9555,
+    userDataDir: "C:\\tmp\\boss-profile-9555",
+    url: "https://www.zhipin.com/web/chat/recommend",
+    extraArgs: [
+      ...DEFAULT_REQUIRED_CHROME_FLAGS,
+      "--disable-features=Foo"
+    ]
+  });
+  for (const flag of DEFAULT_REQUIRED_CHROME_FLAGS) {
+    if (flag.startsWith("--disable-features=")) {
+      const disableFeatureArgs = args.filter((arg) => arg.startsWith("--disable-features="));
+      assert.equal(disableFeatureArgs.length, 1, "disable-features should be merged into one switch");
+      assert.ok(disableFeatureArgs[0].includes("CalculateNativeWinOcclusion"));
+      assert.ok(disableFeatureArgs[0].includes("Foo"));
+    } else {
+      assert.equal(args.filter((arg) => arg === flag).length, 1, `${flag} should appear once`);
+    }
+  }
+  assert.deepEqual(getMissingRequiredChromeFlags(args), []);
+}
+
+function testChromeRequiredFlagDetection() {
+  assert.deepEqual(
+    getMissingRequiredChromeFlags([
+      "--remote-debugging-port=9222",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-features=Foo,CalculateNativeWinOcclusion"
+    ]),
+    []
+  );
+  assert.deepEqual(
+    getMissingRequiredChromeFlags(["--remote-debugging-port=9222"]),
+    DEFAULT_REQUIRED_CHROME_FLAGS
+  );
+  assert.deepEqual(
+    getMissingRequiredChromeFlags([
+      "--remote-debugging-port=9222",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-background-timer-throttling",
+      "--disable-renderer-backgrounding",
+      "--disable-features=CalculateNativeWinOcclusion",
+      "--disable-features=Foo"
+    ]),
+    ["--disable-features=CalculateNativeWinOcclusion"]
+  );
+}
+
+async function testEnsureChromeDebugPortLaunchesWhenMissing() {
+  let launched = false;
+  const result = await ensureChromeDebugPort({
+    port: 9555,
+    url: "https://www.zhipin.com/web/chat/recommend",
+    userDataDir: "C:\\tmp\\boss-profile-9555",
+    _deps: {
+      async listChromeTargetsImpl() {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:9555");
+      },
+      async launchChromeDebugInstanceImpl(params) {
+        launched = true;
+        return {
+          launched: true,
+          port: params.port,
+          url: params.url,
+          user_data_dir: params.userDataDir,
+          launch_args: buildBossChromeLaunchArgs({
+            port: params.port,
+            userDataDir: params.userDataDir,
+            url: params.url
+          }),
+          readiness: { elapsed_ms: 1, target_count: 1 }
+        };
+      }
+    }
+  });
+  assert.equal(launched, true);
+  assert.equal(result.launched, true);
+  assert.equal(result.guard_checked, true);
+  assert.equal(result.required_flags_ok, true);
+  assert.equal(result.relaunch.reason, "port_unreachable");
+  assert.deepEqual(result.missing_flags, []);
+}
+
+async function testEnsureChromeDebugPortReusesCompliantChrome() {
+  const result = await ensureChromeDebugPort({
+    port: 9556,
+    _deps: {
+      async listChromeTargetsImpl() {
+        return [{ id: "1", type: "page", url: "https://www.zhipin.com/web/chat/recommend" }];
+      },
+      async inspectChromeDebugCommandLineImpl() {
+        return {
+          ok: true,
+          source: "process_list",
+          arguments: [
+            "--remote-debugging-port=9556",
+            ...DEFAULT_REQUIRED_CHROME_FLAGS
+          ],
+          processes: [{ pid: 1234 }]
+        };
+      },
+      async launchChromeDebugInstanceImpl() {
+        throw new Error("should not launch");
+      }
+    }
+  });
+  assert.equal(result.reused, true);
+  assert.equal(result.replaced, false);
+  assert.equal(result.required_flags_ok, true);
+  assert.deepEqual(result.missing_flags, []);
+  assert.equal(result.command_line_source, "process_list");
+}
+
+async function testEnsureChromeDebugPortReplacesNoncompliantLocalChrome() {
+  let closed = false;
+  let launched = false;
+  const result = await ensureChromeDebugPort({
+    port: 9557,
+    url: "https://www.zhipin.com/web/chat/recommend",
+    userDataDir: "C:\\tmp\\boss-profile-9557",
+    _deps: {
+      async listChromeTargetsImpl() {
+        return [{ id: "1", type: "page", url: "about:blank" }];
+      },
+      async inspectChromeDebugCommandLineImpl() {
+        return {
+          ok: true,
+          source: "process_list",
+          arguments: ["--remote-debugging-port=9557"],
+          processes: [{ pid: 2222 }]
+        };
+      },
+      async closeChromeDebugInstanceImpl(params) {
+        closed = true;
+        assert.deepEqual(params.processes, [{ pid: 2222 }]);
+        return {
+          ok: true,
+          method: "Browser.close",
+          elapsed_ms: 10
+        };
+      },
+      async launchChromeDebugInstanceImpl(params) {
+        launched = true;
+        return {
+          launched: true,
+          port: params.port,
+          url: params.url,
+          user_data_dir: params.userDataDir,
+          launch_args: buildBossChromeLaunchArgs({
+            port: params.port,
+            userDataDir: params.userDataDir,
+            url: params.url
+          }),
+          readiness: { elapsed_ms: 1, target_count: 1 }
+        };
+      }
+    }
+  });
+  assert.equal(closed, true);
+  assert.equal(launched, true);
+  assert.equal(result.replaced, true);
+  assert.equal(result.required_flags_ok, true);
+  assert.equal(result.close_method, "Browser.close");
+  assert.deepEqual(result.missing_flags, DEFAULT_REQUIRED_CHROME_FLAGS);
+  assert.equal(result.relaunch.reason, "missing_required_flags");
+}
+
+async function testEnsureChromeDebugPortReplacesUnknownLocalChrome() {
+  let closed = false;
+  let launched = false;
+  const result = await ensureChromeDebugPort({
+    port: 9559,
+    url: "https://www.zhipin.com/web/chat/recommend",
+    _deps: {
+      async listChromeTargetsImpl() {
+        return [{ id: "1", type: "page", url: "about:blank" }];
+      },
+      async inspectChromeDebugCommandLineImpl() {
+        return {
+          ok: false,
+          source: "process_list",
+          arguments: [],
+          processes: [],
+          error: "No local process could prove the launch flags"
+        };
+      },
+      async closeChromeDebugInstanceImpl(params) {
+        closed = true;
+        assert.deepEqual(params.processes, []);
+        return {
+          ok: true,
+          method: "Browser.close",
+          elapsed_ms: 10
+        };
+      },
+      async launchChromeDebugInstanceImpl(params) {
+        launched = true;
+        return {
+          launched: true,
+          port: params.port,
+          url: params.url,
+          user_data_dir: params.userDataDir,
+          launch_args: buildBossChromeLaunchArgs({
+            port: params.port,
+            userDataDir: params.userDataDir,
+            url: params.url
+          }),
+          readiness: { elapsed_ms: 1, target_count: 1 }
+        };
+      }
+    }
+  });
+  assert.equal(closed, true);
+  assert.equal(launched, true);
+  assert.equal(result.replaced, true);
+  assert.equal(result.command_line_error, "No local process could prove the launch flags");
+  assert.deepEqual(result.missing_flags, DEFAULT_REQUIRED_CHROME_FLAGS);
+}
+
+async function testEnsureChromeDebugPortRejectsNonLocalMissingFlags() {
+  let closed = false;
+  await assert.rejects(
+    () => ensureChromeDebugPort({
+      host: "192.168.1.10",
+      port: 9558,
+      _deps: {
+        async listChromeTargetsImpl() {
+          return [{ id: "1", type: "page", url: "about:blank" }];
+        },
+        async inspectChromeDebugCommandLineImpl() {
+          return {
+            ok: false,
+            source: "cdp_browser_command_line",
+            arguments: [],
+            error: "Browser.getBrowserCommandLine unavailable"
+          };
+        },
+        async closeChromeDebugInstanceImpl() {
+          closed = true;
+          return { ok: true };
+        }
+      }
+    }),
+    (error) => {
+      assert.equal(error.code, "CHROME_REQUIRED_FLAGS_MISSING_NON_LOCAL");
+      assert.equal(error.chrome_guard.missing_flags.length, DEFAULT_REQUIRED_CHROME_FLAGS.length);
+      return /missing required Chrome flags/i.test(error.message);
+    }
+  );
+  assert.equal(closed, false);
+}
+
+async function testConnectToChromeTargetOrOpenRunsGuardForBossTargets() {
+  for (const targetUrl of [RECOMMEND_TARGET_URL, RECRUIT_TARGET_URL, CHAT_TARGET_URL]) {
+    const events = [];
+    const result = await connectToChromeTargetOrOpen({
+      port: 9560,
+      targetUrl,
+      targetUrlIncludes: targetUrl,
+      _deps: {
+        async ensureChromeDebugPortImpl(params) {
+          events.push(`ensure:${params.url}`);
+          return {
+            launched: false,
+            reused: true,
+            port: params.port,
+            guard_checked: true,
+            required_flags: DEFAULT_REQUIRED_CHROME_FLAGS,
+            missing_flags: [],
+            required_flags_ok: true,
+            replaced: false,
+            close_method: null,
+            relaunch: null
+          };
+        },
+        async connectToChromeTargetImpl() {
+          events.push("connect");
+          if (events.filter((event) => event === "connect").length === 1) {
+            throw new Error("No matching Chrome target found");
+          }
+          return {
+            client: {},
+            rawClient: {},
+            target: { id: "opened", type: "page", url: targetUrl },
+            methodLog: [],
+            async close() {}
+          };
+        },
+        async openChromeTargetImpl(params) {
+          events.push(`open:${params.url}`);
+          return {
+            ok: true,
+            method: "PUT",
+            target_id: "opened",
+            url: params.url
+          };
+        }
+      }
+    });
+    assert.deepEqual(events, [
+      `ensure:${targetUrl}`,
+      "connect",
+      `open:${targetUrl}`,
+      "connect"
+    ]);
+    assert.equal(result.target.url, targetUrl);
+    assert.equal(result.chrome.guard_checked, true);
+    assert.equal(result.chrome.required_flags_ok, true);
+    assert.deepEqual(result.chrome.missing_flags, []);
+    assert.equal(result.chrome.target_created, true);
+    assert.equal(result.chrome.open_attempt.url, targetUrl);
+  }
 }
 
 function createSequenceRandom(values = []) {
@@ -466,6 +791,14 @@ await testUnexpectedDomainIsRejected();
 testBossLoginUrlDetection();
 testBossLoginRequiredErrorShape();
 testChromeDebugUnavailableDetection();
+testBossChromeLaunchArgsContainRequiredFlagsOnce();
+testChromeRequiredFlagDetection();
+await testEnsureChromeDebugPortLaunchesWhenMissing();
+await testEnsureChromeDebugPortReusesCompliantChrome();
+await testEnsureChromeDebugPortReplacesNoncompliantLocalChrome();
+await testEnsureChromeDebugPortReplacesUnknownLocalChrome();
+await testEnsureChromeDebugPortRejectsNonLocalMissingFlags();
+await testConnectToChromeTargetOrOpenRunsGuardForBossTargets();
 testHumanDelayAndBezierPath();
 await testSimulateHumanClickUsesOnlyInputCdp();
 await testConfiguredHumanInteractionControlsClickPoint();

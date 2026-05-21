@@ -7,10 +7,10 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import {
   assertNoForbiddenCdpCalls,
-  buildBossChromeLaunchArgs,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
+  ensureChromeDebugPort,
   getDocumentRoot,
   querySelector,
   sleep as sleepMs
@@ -2209,51 +2209,38 @@ async function launchChrome(options = {}) {
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
   process.env.BOSS_RECOMMEND_CHROME_PORT = String(port);
   const timing = getLaunchChromeTiming(options);
-
-  const initialState = await inspectBossRecommendPageStateCdp(port, {
-    timeoutMs: timing.initialTimeoutMs,
-    pollMs: timing.pollMs
-  });
-  if (initialState.state !== "DEBUG_PORT_UNREACHABLE") {
-    console.log(`Reusing existing Chrome debug instance on port ${port}`);
-    const pageState = await ensureBossRecommendPageReadyCdp(port, {
-      attempts: 2,
-      inspectTimeoutMs: timing.inspectTimeoutMs,
-      pollMs: timing.pollMs,
-      settleMs: timing.settleMs
+  const userDataDir = getChromeUserDataDir(port);
+  let chromeGuard = null;
+  try {
+    chromeGuard = await ensureChromeDebugPort({
+      port,
+      url: bossUrl,
+      slowLive: Boolean(options["slow-live"] || options.slowLive),
+      launchIfMissing: true,
+      userDataDir
     });
-    if (pageState.ok) {
-      console.log("Boss recommend page is ready.");
-      const frontResult = await bringBossRecommendTabToFrontCdp(port);
-      if (frontResult.ok) {
-        console.log(`CDP methods: ${frontResult.method_log.join(", ") || "none"}`);
-      }
-    } else {
-      console.log(pageState.page_state?.message || "Boss recommend page is not ready.");
+  } catch (error) {
+    console.error(error?.message || String(error || "Chrome launch failed"));
+    if (error?.chrome_guard) {
+      console.error(JSON.stringify(error.chrome_guard, null, 2));
     }
-    return;
-  }
-
-  const chromePath = getChromeExecutable();
-  if (!chromePath) {
-    console.error("Chrome executable not found. Set BOSS_RECOMMEND_CHROME_PATH or install Google Chrome.");
     process.exitCode = 1;
     return;
   }
 
-  const userDataDir = getChromeUserDataDir(port);
-  const args = buildBossChromeLaunchArgs({ port, userDataDir, url: bossUrl });
-  const child = spawn(chromePath, args, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: false
-  });
-  child.unref();
-  console.log(`Chrome launched with remote debugging port ${port}`);
-  console.log(`User data dir: ${userDataDir}`);
-  await sleepMs(timing.settleMs + 1200);
+  if (chromeGuard.replaced) {
+    console.log(`Replaced Chrome debug instance on port ${port} because required flags were missing: ${chromeGuard.missing_flags.join(", ")}`);
+  } else if (chromeGuard.launched) {
+    console.log(`Chrome launched with remote debugging port ${port}`);
+  } else {
+    console.log(`Reusing existing Chrome debug instance on port ${port} with required flags`);
+  }
+  console.log(`User data dir: ${chromeGuard.user_data_dir || userDataDir}`);
+  if (chromeGuard.launched || chromeGuard.replaced) {
+    await sleepMs(timing.settleMs + 1200);
+  }
   const pageState = await ensureBossRecommendPageReadyCdp(port, {
-    attempts: 6,
+    attempts: chromeGuard.launched || chromeGuard.replaced ? 6 : 2,
     inspectTimeoutMs: timing.inspectTimeoutMs,
     pollMs: timing.pollMs,
     settleMs: timing.settleMs
@@ -2382,15 +2369,30 @@ async function printDoctor(options = {}) {
   const configResolution = getBossScreenConfigResolution(workspaceRoot);
   const calibrationResolution = getFeaturedCalibrationResolutionLocal(workspaceRoot);
   const timing = getLaunchChromeTiming(options);
+  const slowLive = Boolean(options["slow-live"] || options.slowLive);
+  let chromeGuard = null;
+  let chromeGuardError = null;
+  try {
+    chromeGuard = await ensureChromeDebugPort({
+      port,
+      url: bossUrl,
+      slowLive,
+      launchIfMissing: true,
+      userDataDir: getChromeUserDataDir(port)
+    });
+  } catch (error) {
+    chromeGuardError = error;
+    chromeGuard = error?.chrome_guard || null;
+  }
   let pageState = await inspectBossRecommendPageStateCdp(port, {
-    timeoutMs: options["slow-live"] || options.slowLive ? timing.initialTimeoutMs : 2000,
-    pollMs: options["slow-live"] || options.slowLive ? timing.pollMs : 500
+    timeoutMs: slowLive ? timing.initialTimeoutMs : 2000,
+    pollMs: slowLive ? timing.pollMs : 500
   });
   if (pageState.state === "RECOMMEND_READY") {
     pageState = await verifyRecommendPageStableCdp(port, {
-      settleMs: options["slow-live"] || options.slowLive ? timing.settleMs : 800,
-      recheckTimeoutMs: options["slow-live"] || options.slowLive ? timing.inspectTimeoutMs : 3000,
-      pollMs: options["slow-live"] || options.slowLive ? timing.pollMs : 500
+      settleMs: slowLive ? timing.settleMs : 800,
+      recheckTimeoutMs: slowLive ? timing.inspectTimeoutMs : 3000,
+      pollMs: slowLive ? timing.pollMs : 500
     });
   }
   const resolvedConfigPath = configResolution.resolved_path || configResolution.writable_path;
@@ -2406,6 +2408,28 @@ async function printDoctor(options = {}) {
     message: userConfigExists
       ? `检测到配置文件（resolved_path）：${resolvedConfigPath}`
       : "用户配置不存在（可通过 `boss-recommend-mcp init-config` 创建模板，或 `boss-recommend-mcp config set` 写入真实值）"
+  });
+  const requiredFlags = chromeGuard?.required_flags || [];
+  const missingFlags = chromeGuard?.missing_flags || [];
+  const chromeFlagsOk = Boolean(chromeGuard && !chromeGuardError && chromeGuard.required_flags_ok);
+  checks.push({
+    key: "chrome_required_flags",
+    ok: chromeFlagsOk,
+    path: `http://localhost:${port}`,
+    required_flags: requiredFlags,
+    missing_flags: missingFlags,
+    replaced: Boolean(chromeGuard?.replaced),
+    close_method: chromeGuard?.close_method || null,
+    relaunch: chromeGuard?.relaunch || null,
+    message: chromeFlagsOk
+      ? chromeGuard?.replaced
+        ? `Chrome 调试端口 ${port} 原实例缺少必需 flags，已自动关闭并用正确 flags 重新启动。`
+        : chromeGuard?.launched
+          ? `Chrome 调试端口 ${port} 已用必需 flags 启动。`
+          : `Chrome 调试端口 ${port} 已确认包含必需 flags。`
+      : chromeGuardError
+        ? `Chrome 必需 flags 检查失败：${chromeGuardError.message}`
+        : `Chrome 调试端口 ${port} 未确认包含必需 flags。`
   });
   checks.push({
     key: "chrome_debug_port",
