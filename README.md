@@ -134,8 +134,8 @@ node src/cli.js start
 
 全局 npm 安装会自动运行 `boss-recommend-mcp install`。该安装器会在 Windows 和 macOS 上自动检测 Trae / Trae CN / OpenClaw / QClaw 的常见配置目录：
 
-- Windows: `%APPDATA%\Trae*\User\mcp.json`、`%USERPROFILE%\.trae*\mcp.json`、`%USERPROFILE%\.openclaw\mcp.json`、`%APPDATA%\OpenClaw\User\mcp.json`、`%USERPROFILE%\.qclaw\openclaw.json`
-- macOS: `~/Library/Application Support/Trae*/User/mcp.json`、`~/.trae*/mcp.json`、`~/.openclaw/mcp.json`、`~/Library/Application Support/OpenClaw/User/mcp.json`
+- Windows: `%APPDATA%\Trae*\User\mcp.json`、`%USERPROFILE%\.trae*\mcp.json`、`%USERPROFILE%\.openclaw\mcp.json`、`%USERPROFILE%\.openclaw\openclaw.json`、`%APPDATA%\OpenClaw\User\mcp.json`、`%USERPROFILE%\.qclaw\openclaw.json`
+- macOS: `~/Library/Application Support/Trae*/User/mcp.json`、`~/.trae*/mcp.json`、`~/.openclaw/mcp.json`、`~/.openclaw/openclaw.json`、`~/Library/Application Support/OpenClaw/User/mcp.json`
 
 如果检测到 legacy Boss server entries，installer 会：
 

@@ -88,6 +88,10 @@ function getPackageVersion() {
 }
 
 const packageVersion = getPackageVersion();
+const detachedRecommendMcpEnv = {
+  BOSS_RECOMMEND_CDP_DETACHED: "1",
+  BOSS_RECOMMEND_RUN_HEARTBEAT_MS: "10000"
+};
 
 function isInstalledPackageRoot(rootPath = packageRoot) {
   const normalized = path.resolve(String(rootPath || ""))
@@ -726,6 +730,25 @@ function parseMcpClientTargets(rawValue) {
   return unique;
 }
 
+function isPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function shouldDefaultRecommendDetachedMcpEnv(options = {}) {
+  const client = normalizeMcpClientName(options.client);
+  const agent = normalizeAgentName(options.agent);
+  return client === "openclaw"
+    || client === "qclaw"
+    || agent === "openclaw"
+    || agent === "qclaw";
+}
+
+function getDefaultMcpEnv(options = {}) {
+  return shouldDefaultRecommendDetachedMcpEnv(options)
+    ? { ...detachedRecommendMcpEnv }
+    : {};
+}
+
 function getAgentConfigOutputDir(options = {}) {
   if (typeof options["output-dir"] === "string" && options["output-dir"].trim()) {
     return path.resolve(options["output-dir"]);
@@ -745,10 +768,27 @@ function buildMcpLaunchConfig(options = {}) {
       ? ["start"]
       : buildDefaultMcpArgs(options);
   const launchConfig = { command, args: launchArgs };
-  if (env && typeof env === "object" && !Array.isArray(env) && Object.keys(env).length > 0) {
-    launchConfig.env = env;
+  const mergedEnv = {
+    ...getDefaultMcpEnv(options),
+    ...(isPlainObject(env) ? env : {})
+  };
+  if (Object.keys(mergedEnv).length > 0) {
+    launchConfig.env = mergedEnv;
   }
   return launchConfig;
+}
+
+function mergeExistingMcpEntryEnv(existingEntry, launchConfig) {
+  if (!isPlainObject(existingEntry?.env) || !isPlainObject(launchConfig)) {
+    return launchConfig;
+  }
+  return {
+    ...launchConfig,
+    env: {
+      ...existingEntry.env,
+      ...(isPlainObject(launchConfig.env) ? launchConfig.env : {})
+    }
+  };
 }
 
 function buildMcpConfigFileContent(options = {}) {
@@ -872,7 +912,7 @@ function getKnownExternalMcpConfigPathsByAgent() {
     trae: [...traeConfigPaths, path.join(home, ".trae", "mcp.json"), path.join(home, ".trae-cn", "mcp.json")],
     "trae-cn": [...traeConfigPaths, path.join(home, ".trae-cn", "mcp.json"), path.join(home, ".trae", "mcp.json")],
     claude: [path.join(home, ".claude", "mcp.json")],
-    openclaw: [path.join(home, ".openclaw", "mcp.json"), ...openClawConfigPaths],
+    openclaw: [path.join(home, ".openclaw", "mcp.json"), path.join(home, ".openclaw", "openclaw.json"), ...openClawConfigPaths],
     qclaw: [path.join(home, ".qclaw", "openclaw.json")]
   };
 }
@@ -920,9 +960,12 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
   const nextConfig = buildMcpConfigFileContent({ ...options, client: useQClawShape ? "qclaw" : options.client });
   const nextServers = useQClawShape ? nextConfig.mcp?.servers : nextConfig.mcpServers;
   const serverName = Object.keys(nextServers || {})[0] || defaultMcpServerName;
-  const launchConfig = nextServers?.[serverName] || buildMcpLaunchConfig(options);
   const existingServers = getMcpServersFromConfig(current, useQClawShape);
   const existingEntry = existingServers[serverName];
+  const launchConfig = mergeExistingMcpEntryEnv(
+    existingEntry,
+    nextServers?.[serverName] || buildMcpLaunchConfig(options)
+  );
   const retainedServers = {};
   const migratedLegacyServers = [];
   for (const [name, config] of Object.entries(existingServers)) {

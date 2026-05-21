@@ -127,12 +127,49 @@ function testMigratesQClawOpenClawConfigShape() {
     "@reconcrap/boss-recommend-mcp@2.0.1",
     "start"
   ]);
+  assert.deepEqual(updated.mcp.servers["boss-recommend"].env, {
+    BOSS_RECOMMEND_CDP_DETACHED: "1",
+    BOSS_RECOMMEND_RUN_HEARTBEAT_MS: "10000"
+  });
   assert.deepEqual(result.migrated_legacy_servers, ["boss-chat"]);
   assert.deepEqual(updated.agents.list[0].skills, ["boss-recommend-pipeline"]);
 
   const inspected = __testables.inspectMcpServerEntries(qclawPath);
   assert.equal(inspected.has_boss_recommend, true);
   assert.deepEqual(inspected.recommend_server_names, ["boss-recommend"]);
+}
+
+function testOpenClawConfigPreservesExistingEnvAndEnablesDetached() {
+  const tempDir = makeTempDir();
+  const openClawPath = path.join(tempDir, ".openclaw", "openclaw.json");
+  fs.mkdirSync(path.dirname(openClawPath), { recursive: true });
+  fs.writeFileSync(openClawPath, JSON.stringify({
+    mcpServers: {
+      "boss-recommend": {
+        command: "npx",
+        args: ["-y", "@reconcrap/boss-recommend-mcp@latest", "start"],
+        env: {
+          BOSS_WORKSPACE_ROOT: "/tmp/openclaw-workspace",
+          BOSS_RECOMMEND_HOME: "/tmp/boss-recommend"
+        }
+      }
+    }
+  }, null, 2), "utf8");
+
+  const result = __testables.mergeMcpServerConfigFile(openClawPath, {
+    agent: "openclaw",
+    packageVersion: "2.0.1",
+    packageRootPath: path.join(tempDir, "node_modules", "@reconcrap", "boss-recommend-mcp")
+  });
+  const updated = readJson(openClawPath);
+
+  assert.equal(result.config_shape, "mcpServers");
+  assert.deepEqual(updated.mcpServers["boss-recommend"].env, {
+    BOSS_WORKSPACE_ROOT: "/tmp/openclaw-workspace",
+    BOSS_RECOMMEND_HOME: "/tmp/boss-recommend",
+    BOSS_RECOMMEND_CDP_DETACHED: "1",
+    BOSS_RECOMMEND_RUN_HEARTBEAT_MS: "10000"
+  });
 }
 
 async function testRunCliUsesRecommendStartGate() {
@@ -184,6 +221,7 @@ function testDetachedRunCliShellFallback() {
 testMigratesLegacyMcpServers();
 testCreatesCanonicalMcpServerWhenFileMissing();
 testMigratesQClawOpenClawConfigShape();
+testOpenClawConfigPreservesExistingEnvAndEnablesDetached();
 await testRunCliUsesRecommendStartGate();
 testDetachedRunCliShellFallback();
 
