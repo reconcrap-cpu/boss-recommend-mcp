@@ -632,6 +632,60 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
   }
 }
 
+async function testRecommendOpenClawWorkspaceForcesDetachedWorker() {
+  const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  const previousWorkspaceRoot = process.env.BOSS_WORKSPACE_ROOT;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
+  delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  process.env.BOSS_WORKSPACE_ROOT = "/tmp/.openclaw/workspace";
+  let spawnCall = null;
+  let unrefCalled = false;
+  setSpawnProcessImplForTests((command, args, options) => {
+    spawnCall = { command, args, options };
+    return {
+      pid: 567890,
+      unref() {
+        unrefCalled = true;
+      }
+    };
+  });
+  try {
+    const started = await callTool(TOOL_START, readyArgs({
+      delay_ms: 0,
+      debug_test_mode: true,
+      screening_mode: "deterministic",
+      no_filter: true,
+      detail_limit: 1,
+      execute_post_action: false
+    }), 35);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.run.pid, 567890);
+    assert.equal(started.run.state, "queued");
+    assert.equal(unrefCalled, true);
+    assert.equal(spawnCall.args.includes("--detached-worker"), true);
+    assert.equal(spawnCall.args.includes(started.run_id), true);
+    assert.equal(spawnCall.options.detached, true);
+  } finally {
+    setSpawnProcessImplForTests(null);
+    if (previousDetached === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_DETACHED = previousDetached;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+    if (previousWorkspaceRoot === undefined) {
+      delete process.env.BOSS_WORKSPACE_ROOT;
+    } else {
+      process.env.BOSS_WORKSPACE_ROOT = previousWorkspaceRoot;
+    }
+  }
+}
+
 async function testRecommendFailedRunIncludesConstrainedRecoveryGuidance() {
   installFakeConnector();
   setRecommendMcpWorkflowForTests(async (options, runControl) => {
@@ -925,6 +979,8 @@ async function main() {
     await testRecommendDiskRunningRunWithDeadPidIsReconciled();
     resetRecommendMcpStateForTests();
     await testRecommendDetachedStartUsesWorkerProcess();
+    resetRecommendMcpStateForTests();
+    await testRecommendOpenClawWorkspaceForcesDetachedWorker();
     resetRecommendMcpStateForTests();
     await testRecommendFailedRunIncludesConstrainedRecoveryGuidance();
     resetRecommendMcpStateForTests();

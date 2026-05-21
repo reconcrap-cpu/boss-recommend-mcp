@@ -157,7 +157,12 @@ function clonePlain(value, fallback = null) {
   }
 }
 
-function isLikelyAgentRuntime() {
+function hasAgentPathHint(value = "") {
+  const hint = normalizeText(value).toLowerCase();
+  return /(^|[/\\])\.(openclaw|codex)([/\\]|$)|qclaw|openclaw|codex|trae/.test(hint);
+}
+
+function isLikelyAgentRuntime({ workspaceRoot = "" } = {}) {
   for (const key of AGENT_RUNTIME_HINT_KEYS) {
     if (normalizeText(process.env[key] || "")) return true;
   }
@@ -165,13 +170,19 @@ function isLikelyAgentRuntime() {
     normalizeText(process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE || ""),
     normalizeText(process.env.TERM_PROGRAM || "")
   ].join(" ").toLowerCase();
-  return /codex|openclaw|trae/.test(originHints);
+  if (/codex|openclaw|trae/.test(originHints)) return true;
+  return [
+    workspaceRoot,
+    process.env.BOSS_WORKSPACE_ROOT || "",
+    process.env.PWD || "",
+    process.cwd()
+  ].some(hasAgentPathHint);
 }
 
-function shouldStartRecommendDetached() {
+function shouldStartRecommendDetached({ workspaceRoot = "" } = {}) {
   if (normalizeText(process.env.BOSS_RECOMMEND_CDP_INPROC || "") === "1") return false;
   if (normalizeText(process.env.BOSS_RECOMMEND_CDP_DETACHED || "") === "1") return true;
-  return isLikelyAgentRuntime();
+  return isLikelyAgentRuntime({ workspaceRoot });
 }
 
 function isUnlimitedTargetCountToken(value) {
@@ -2155,7 +2166,7 @@ async function runDetachedWorker({ runId, resumeRun = false, workerPid = process
 }
 
 async function handleStartRunTool({ workspaceRoot, args }) {
-  if (!shouldStartRecommendDetached()) {
+  if (!shouldStartRecommendDetached({ workspaceRoot })) {
     return startRecommendPipelineRunTool({ workspaceRoot, args });
   }
 
