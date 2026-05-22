@@ -47,6 +47,7 @@ import {
 } from "../../core/screening/index.js";
 import {
   closeRecommendBlockingPanels,
+  closeRecommendAvatarPreview,
   closeRecommendDetail,
   createRecommendDetailNetworkRecorder,
   extractRecommendDetailCandidate,
@@ -506,6 +507,16 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   if (Array.isArray(error.recommend_detail_open_attempts)) {
     result.recommend_detail_open_attempts = error.recommend_detail_open_attempts;
   }
+  if (Array.isArray(error.click_attempts)) {
+    result.click_attempts = error.click_attempts;
+  }
+  if (error.avatar_preview) {
+    result.avatar_preview = {
+      open: Boolean(error.avatar_preview.open),
+      selector: error.avatar_preview.preview?.selector || null,
+      rect: error.avatar_preview.preview?.rect || null
+    };
+  }
   return result;
 }
 
@@ -907,6 +918,7 @@ export async function runRecommendWorkflow({
 
   runControl.setPhase("recommend:cleanup");
   await closeRecommendDetail(client, { attemptsLimit: 2 });
+  await closeRecommendAvatarPreview(client, { attemptsLimit: 2 });
   await closeRecommendBlockingPanelsForRun("cleanup");
 
   await runControl.waitIfPaused();
@@ -1247,6 +1259,7 @@ export async function runRecommendWorkflow({
                 timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
                 checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
                 await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+                await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
                 await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
                 await recoverAndReapplyRecommendContext(`image_capture:${detailStep}`, error, {
                   forceRecentNotView: true
@@ -1299,6 +1312,7 @@ export async function runRecommendWorkflow({
           timings.detail_recovery_trigger = compactRecoverableDetailError(error);
           checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
           await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
           await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
           await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
             forceRecentNotView: true
@@ -1309,6 +1323,7 @@ export async function runRecommendWorkflow({
         detailResult = null;
         timings.detail_recovered_error = compactRecoverableDetailError(error);
         await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+        await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
         await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
       }
     }

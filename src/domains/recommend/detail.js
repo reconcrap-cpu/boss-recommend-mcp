@@ -7,6 +7,7 @@ import {
   getOuterHTML,
   pressKey,
   querySelectorAll,
+  scrollNodeIntoView,
   sleep
 } from "../../core/browser/index.js";
 import { candidateKeyFromProfile } from "../../core/infinite-list/index.js";
@@ -22,7 +23,9 @@ import {
   DETAIL_CLOSE_SELECTORS,
   DETAIL_NETWORK_PATTERNS,
   DETAIL_POPUP_SELECTORS,
-  DETAIL_RESUME_IFRAME_SELECTORS
+  DETAIL_RESUME_IFRAME_SELECTORS,
+  RECOMMEND_AVATAR_PREVIEW_CLOSE_SELECTORS,
+  RECOMMEND_AVATAR_PREVIEW_SELECTORS
 } from "./constants.js";
 import {
   getRecommendRoots
@@ -91,6 +94,15 @@ export async function closeRecommendBlockingPanels(client, options = {}) {
     resolveRoots: getRecommendRoots,
     ...options
   });
+}
+
+function looksLikeRecommendAvatarPreviewHtml(html = "") {
+  return /\bavatar-preview\b|\bfigure-preview\b/i.test(String(html || ""));
+}
+
+function isRecommendAvatarPreviewOpenError(error) {
+  return error?.code === "RECOMMEND_AVATAR_PREVIEW_OPENED"
+    || /RECOMMEND_AVATAR_PREVIEW_OPENED/i.test(String(error?.message || error || ""));
 }
 
 export async function waitForRecommendDetailNetworkEvents(recorder, {
@@ -199,6 +211,46 @@ export async function waitForRecommendDetailClosed(client, {
   };
 }
 
+export async function readRecommendAvatarPreviewState(client) {
+  const rootState = await getRecommendRoots(client);
+  const topRoot = rootState.rootNodes?.top
+    ? [{ name: "top", nodeId: rootState.rootNodes.top }]
+    : rootState.roots.filter((root) => root?.name === "top");
+  const preview = await findVisibleDetailTarget(client, topRoot, RECOMMEND_AVATAR_PREVIEW_SELECTORS, {
+    includeAvatarPreview: true
+  });
+  return {
+    open: Boolean(preview),
+    root: rootState.topRoot,
+    roots: topRoot,
+    preview
+  };
+}
+
+export async function waitForRecommendAvatarPreviewClosed(client, {
+  timeoutMs = 1200,
+  intervalMs = 120
+} = {}) {
+  const started = Date.now();
+  let state = null;
+  while (Date.now() - started <= timeoutMs) {
+    state = await readRecommendAvatarPreviewState(client);
+    if (!state.open) {
+      return {
+        closed: true,
+        elapsed_ms: Date.now() - started,
+        state
+      };
+    }
+    await sleep(intervalMs);
+  }
+  return {
+    closed: false,
+    elapsed_ms: Date.now() - started,
+    state
+  };
+}
+
 function compactRect(rect) {
   if (!rect) return null;
   return {
@@ -254,7 +306,9 @@ async function verifyRecommendDetailStillOpen(client, {
   };
 }
 
-async function findVisibleDetailTarget(client, roots, selectors) {
+async function findVisibleDetailTarget(client, roots, selectors, {
+  includeAvatarPreview = false
+} = {}) {
   for (const root of roots) {
     if (!root?.nodeId) continue;
     for (const selector of selectors) {
@@ -263,6 +317,14 @@ async function findVisibleDetailTarget(client, roots, selectors) {
         try {
           const box = await getNodeBox(client, nodeId);
           if (box.rect.width > 2 && box.rect.height > 2) {
+            if (!includeAvatarPreview) {
+              try {
+                const html = await getOuterHTML(client, nodeId);
+                if (looksLikeRecommendAvatarPreviewHtml(html)) continue;
+              } catch {
+                // If the node went stale, let the next candidate decide.
+              }
+            }
             return {
               root: root.name,
               root_node_id: root.nodeId,
@@ -332,7 +394,104 @@ export function isStaleRecommendNodeError(error) {
 
 export function isRecommendDetailOpenMissError(error) {
   const message = String(error?.message || error || "");
-  return /Candidate detail did not open|no known detail selectors mounted/i.test(message);
+  return isRecommendAvatarPreviewOpenError(error)
+    || /Candidate detail did not open|no known detail selectors mounted/i.test(message);
+}
+
+export function resolveRecommendCardDetailClickPoint(cardBox, {
+  attemptIndex = 0
+} = {}) {
+  const rect = cardBox?.rect || {};
+  const width = Number(rect.width) || 0;
+  const height = Number(rect.height) || 0;
+  if (width <= 2 || height <= 2) {
+    return {
+      ...(cardBox?.center || { x: 0, y: 0 }),
+      mode: "card-center-fallback",
+      reason: "invalid_card_rect"
+    };
+  }
+
+  const xFractions = [0.22, 0.50, 0.72];
+  const xFraction = xFractions[Math.min(Math.max(0, attemptIndex), xFractions.length - 1)];
+  const minOffsetX = Math.min(width - 12, Math.max(110, Math.min(180, width * 0.18)));
+  const maxOffsetX = Math.max(minOffsetX, width - Math.min(220, Math.max(90, width * 0.22)));
+  const rawOffsetX = width * xFraction;
+  const offsetX = clampPointCoordinate(rawOffsetX, minOffsetX, maxOffsetX);
+  const offsetY = clampPointCoordinate(height * 0.28, Math.min(34, height / 2), Math.max(36, height - 28));
+  return {
+    x: rect.x + offsetX,
+    y: rect.y + offsetY,
+    mode: "card-body-safe-point",
+    attempt_index: attemptIndex,
+    offset_x: Math.round(offsetX),
+    offset_y: Math.round(offsetY)
+  };
+}
+
+async function clickRecommendCardDetailPoint(client, nodeId, {
+  scrollIntoView = true,
+  attemptIndex = 0
+} = {}) {
+  if (scrollIntoView) {
+    try {
+      await scrollNodeIntoView(client, nodeId);
+      await sleep(150);
+    } catch {
+      // Recommend list cards are selected from visible nodes; if this CDP
+      // helper races the virtual list, let the box lookup/retry decide.
+    }
+  }
+  const box = await getNodeBox(client, nodeId);
+  const clickTarget = resolveRecommendCardDetailClickPoint(box, { attemptIndex });
+  const clickResult = await clickPoint(client, clickTarget.x, clickTarget.y, DETERMINISTIC_CLICK_OPTIONS);
+  return {
+    ...box,
+    click_target: clickTarget,
+    click_result: clickResult
+  };
+}
+
+async function waitForRecommendDetailOpenOutcome(client, {
+  timeoutMs = 10000,
+  intervalMs = 250
+} = {}) {
+  const started = Date.now();
+  let detailState = null;
+  let avatarPreview = null;
+  while (Date.now() - started <= timeoutMs) {
+    detailState = await readRecommendDetailState(client);
+    if (detailState?.popup || detailState?.resumeIframe) {
+      return {
+        kind: "detail",
+        elapsed_ms: Date.now() - started,
+        detail_state: detailState
+      };
+    }
+    avatarPreview = await readRecommendAvatarPreviewState(client);
+    if (avatarPreview.open) {
+      return {
+        kind: "avatar_preview",
+        elapsed_ms: Date.now() - started,
+        avatar_preview: avatarPreview
+      };
+    }
+    await sleep(intervalMs);
+  }
+  return {
+    kind: "none",
+    elapsed_ms: Date.now() - started,
+    detail_state: detailState,
+    avatar_preview: avatarPreview
+  };
+}
+
+function makeRecommendAvatarPreviewOpenedError(outcome, clickAttempts = []) {
+  const error = new Error("RECOMMEND_AVATAR_PREVIEW_OPENED: candidate avatar preview opened instead of resume detail");
+  error.code = "RECOMMEND_AVATAR_PREVIEW_OPENED";
+  error.avatar_preview = outcome?.avatar_preview || null;
+  error.click_attempts = clickAttempts;
+  return error;
 }
 
 export async function findRecommendCardNodeForCandidateKey(client, {
@@ -365,7 +524,16 @@ export async function findRecommendCardNodeForCandidateKey(client, {
       };
     }
 
-    const nodeIds = await findRecommendCardNodeIds(client, frameNodeId);
+    let nodeIds = [];
+    try {
+      nodeIds = await findRecommendCardNodeIds(client, frameNodeId);
+    } catch (error) {
+      lastError = error;
+      if (!isStaleRecommendNodeError(error)) throw error;
+      rootState = null;
+      if (intervalMs > 0) await sleep(intervalMs);
+      continue;
+    }
     lastCardCount = nodeIds.length;
     for (let visibleIndex = 0; visibleIndex < nodeIds.length; visibleIndex += 1) {
       const nodeId = nodeIds[visibleIndex];
@@ -417,25 +585,61 @@ export async function openRecommendCardDetail(client, cardNodeId, {
   scrollIntoView = true
 } = {}) {
   const started = Date.now();
-  const clickStarted = Date.now();
-  const cardBox = await clickNodeCenter(client, cardNodeId, { scrollIntoView });
-  const candidateClickMs = Date.now() - clickStarted;
-  const detailStarted = Date.now();
-  const detailState = await waitForRecommendDetail(client, { timeoutMs });
-  const detailOpenMs = Date.now() - detailStarted;
-  if (!detailState?.popup && !detailState?.resumeIframe) {
-    throw new Error("Candidate detail did not open or no known detail selectors mounted");
+  const clickAttempts = [];
+  const maxClickAttempts = 3;
+  let lastOutcome = null;
+  let lastCardBox = null;
+  let candidateClickMs = 0;
+  let detailOpenMs = 0;
+
+  for (let attemptIndex = 0; attemptIndex < maxClickAttempts; attemptIndex += 1) {
+    const clickStarted = Date.now();
+    lastCardBox = await clickRecommendCardDetailPoint(client, cardNodeId, {
+      scrollIntoView: attemptIndex === 0 ? scrollIntoView : false,
+      attemptIndex
+    });
+    candidateClickMs += Date.now() - clickStarted;
+    const detailStarted = Date.now();
+    lastOutcome = await waitForRecommendDetailOpenOutcome(client, {
+      timeoutMs: attemptIndex === 0 ? timeoutMs : Math.max(2500, Math.floor(timeoutMs / 3)),
+      intervalMs: 250
+    });
+    detailOpenMs += Date.now() - detailStarted;
+    clickAttempts.push({
+      attempt: attemptIndex + 1,
+      click_target: lastCardBox.click_target,
+      click_result: lastCardBox.click_result,
+      outcome: lastOutcome.kind,
+      elapsed_ms: lastOutcome.elapsed_ms
+    });
+
+    if (lastOutcome.kind === "detail") {
+      return {
+        card_box: lastCardBox,
+        click_attempts: clickAttempts,
+        detail_state: lastOutcome.detail_state,
+        timings: {
+          candidate_click_ms: candidateClickMs,
+          detail_open_ms: detailOpenMs,
+          open_total_ms: Date.now() - started
+        }
+      };
+    }
+
+    if (lastOutcome.kind === "avatar_preview") {
+      await closeRecommendAvatarPreview(client, { attemptsLimit: 2, waitMs: 350 });
+      throw makeRecommendAvatarPreviewOpenedError(lastOutcome, clickAttempts);
+    }
+    break;
   }
 
-  return {
-    card_box: cardBox,
-    detail_state: detailState,
-    timings: {
-      candidate_click_ms: candidateClickMs,
-      detail_open_ms: detailOpenMs,
-      open_total_ms: Date.now() - started
-    }
-  };
+  if (lastOutcome?.kind === "avatar_preview") {
+    throw makeRecommendAvatarPreviewOpenedError(lastOutcome, clickAttempts);
+  }
+  const error = new Error("Candidate detail did not open or no known detail selectors mounted");
+  error.click_attempts = clickAttempts;
+  error.last_open_outcome = lastOutcome;
+  throw error;
 }
 
 export async function openRecommendCardDetailWithFreshRetry(client, {
@@ -509,6 +713,94 @@ export async function openRecommendCardDetailWithFreshRetry(client, {
   }
 
   throw new Error("Recommend detail retry exhausted");
+}
+
+export async function closeRecommendAvatarPreview(client, {
+  attemptsLimit = 2,
+  waitMs = 500
+} = {}) {
+  const attempts = [];
+  for (let index = 0; index < attemptsLimit; index += 1) {
+    const state = await readRecommendAvatarPreviewState(client);
+    if (!state.open) {
+      return {
+        closed: true,
+        already_closed: true,
+        attempts
+      };
+    }
+
+    const closeTarget = await findVisibleCloseTarget(client, state.roots, RECOMMEND_AVATAR_PREVIEW_CLOSE_SELECTORS);
+    if (closeTarget) {
+      try {
+        if (closeTarget.center) {
+          await clickPoint(client, closeTarget.center.x, closeTarget.center.y, DETERMINISTIC_CLICK_OPTIONS);
+        } else {
+          await clickNodeCenter(client, closeTarget.node_id, DETERMINISTIC_CLICK_OPTIONS);
+        }
+        attempts.push({
+          mode: "avatar-preview-close-selector",
+          selector: closeTarget.selector,
+          root: closeTarget.root
+        });
+      } catch (error) {
+        attempts.push({
+          mode: "avatar-preview-close-selector-error",
+          selector: closeTarget.selector,
+          root: closeTarget.root,
+          error: error?.message || String(error)
+        });
+      }
+    } else {
+      await pressEscape(client);
+      attempts.push({ mode: "avatar-preview-Escape" });
+    }
+
+    const closed = await waitForRecommendAvatarPreviewClosed(client, {
+      timeoutMs: waitMs,
+      intervalMs: 100
+    });
+    attempts.push({
+      mode: "wait-avatar-preview-closed",
+      closed: closed.closed,
+      elapsed_ms: closed.elapsed_ms
+    });
+    if (closed.closed) {
+      return {
+        closed: true,
+        already_closed: false,
+        attempts
+      };
+    }
+
+    await pressEscape(client);
+    attempts.push({ mode: "avatar-preview-Escape-fallback" });
+    const closedAfterEscape = await waitForRecommendAvatarPreviewClosed(client, {
+      timeoutMs: waitMs,
+      intervalMs: 100
+    });
+    attempts.push({
+      mode: "wait-avatar-preview-closed-after-escape",
+      closed: closedAfterEscape.closed,
+      elapsed_ms: closedAfterEscape.elapsed_ms
+    });
+    if (closedAfterEscape.closed) {
+      return {
+        closed: true,
+        already_closed: false,
+        attempts
+      };
+    }
+  }
+
+  const state = await readRecommendAvatarPreviewState(client);
+  return {
+    closed: !state.open,
+    already_closed: false,
+    reason: state.open ? "avatar_preview_still_visible_after_close_attempts" : null,
+    attempts,
+    state
+  };
 }
 
 export async function closeRecommendDetail(client, {

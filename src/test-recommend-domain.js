@@ -7,6 +7,7 @@ import {
   chooseFilterOptionByLabels,
   chooseFilterOptionsByLabels,
   closeRecommendBlockingPanels,
+  closeRecommendAvatarPreview,
   closeRecommendDetail,
   closeRecommendJobDropdownFully,
   createRecoverableImageCaptureEvidence,
@@ -28,12 +29,15 @@ import {
   normalizeRecommendPageScope,
   openRecommendJobDropdown,
   parseRecommendCardFieldsFromHtml,
+  readRecommendAvatarPreviewState,
   readRecommendDetailHtml,
   readRecommendCardCandidate,
   refreshRecommendListAtEnd,
+  resolveRecommendCardDetailClickPoint,
   selectRecommendJob,
   selectRecommendJobWithRootRefresh,
   selectRecommendPageScope,
+  waitForRecommendDetail,
   verifyRecommendJobSelection
 } from "./domains/recommend/index.js";
 
@@ -227,6 +231,114 @@ async function testRecommendAccountRightsPanelUsesSharedSafeClose() {
   assert.equal(result.attempts[0].point.y, 664);
   assert.equal(result.attempts[0].point.mode, "empty-lower-left-sidebar");
   assert.equal(fixture.state.panelOpen, false);
+}
+
+function testRecommendCardDetailClickPointAvoidsAvatar() {
+  const point = resolveRecommendCardDetailClickPoint({
+    rect: { x: 235, y: 402, width: 1008, height: 132 },
+    center: { x: 739, y: 468 }
+  });
+  assert.equal(point.mode, "card-body-safe-point");
+  assert.equal(point.x > 320, true);
+  assert.equal(point.x < 700, true);
+  assert.equal(point.y > 430, true);
+  assert.equal(point.y < 455, true);
+}
+
+function createAvatarPreviewClient() {
+  let avatarOpen = true;
+  let closeClicks = 0;
+  return {
+    get state() {
+      return { avatarOpen, closeClicks };
+    },
+    client: {
+      DOM: {
+        async getDocument() {
+          return { root: { nodeId: 1 } };
+        },
+        async querySelector({ selector }) {
+          if (String(selector || "").includes("iframe")) return { nodeId: 5 };
+          return { nodeId: 0 };
+        },
+        async describeNode({ nodeId }) {
+          if (nodeId === 5) return { node: { contentDocument: { nodeId: 7 } } };
+          return { node: {} };
+        },
+        async querySelectorAll({ nodeId, selector }) {
+          const value = String(selector || "");
+          if (!avatarOpen) return { nodeIds: [] };
+          if (nodeId === 1 && value.includes("dialog-wrap.active") && !value.includes("close")) {
+            return { nodeIds: [20] };
+          }
+          if (nodeId === 1 && value.includes("avatar-preview") && !value.includes("close")) {
+            return { nodeIds: [21] };
+          }
+          if (nodeId === 1 && value.includes("boss-popup__close")) {
+            return { nodeIds: [22] };
+          }
+          return { nodeIds: [] };
+        },
+        async getOuterHTML({ nodeId }) {
+          if (nodeId === 20) {
+            return {
+              outerHTML:
+                '<div class="dialog-wrap active"><div class="boss-dialog__wrapper avatar-preview primitive">'
+                + '<div class="figure-preview"><div class="figure-mask">王旭东</div></div></div></div>'
+            };
+          }
+          if (nodeId === 21) {
+            return {
+              outerHTML:
+                '<div class="boss-dialog__wrapper avatar-preview primitive"><div class="figure-preview">王旭东</div></div>'
+            };
+          }
+          if (nodeId === 22) return { outerHTML: '<div class="boss-popup__close"><i class="icon-close"></i></div>' };
+          return { outerHTML: "" };
+        },
+        async getBoxModel({ nodeId }) {
+          if (nodeId === 22) {
+            return { model: { border: [488, 421, 512, 421, 512, 445, 488, 445] } };
+          }
+          return { model: { border: [257, 416, 517, 416, 517, 676, 257, 676] } };
+        }
+      },
+      Input: {
+        async dispatchMouseEvent(event) {
+          if (event.type === "mouseReleased" && event.x >= 488 && event.x <= 512) {
+            avatarOpen = false;
+            closeClicks += 1;
+          }
+          return {};
+        },
+        async dispatchKeyEvent() {
+          avatarOpen = false;
+          return {};
+        }
+      }
+    }
+  };
+}
+
+async function testRecommendAvatarPreviewIsNotDetailAndCanClose() {
+  const fixture = createAvatarPreviewClient();
+  const detail = await waitForRecommendDetail(fixture.client, {
+    timeoutMs: 20,
+    intervalMs: 1
+  });
+  assert.equal(Boolean(detail?.popup || detail?.resumeIframe), false);
+
+  const avatar = await readRecommendAvatarPreviewState(fixture.client);
+  assert.equal(avatar.open, true);
+  assert.equal(avatar.preview.selector.includes("avatar-preview"), true);
+
+  const close = await closeRecommendAvatarPreview(fixture.client, {
+    attemptsLimit: 1,
+    waitMs: 20
+  });
+  assert.equal(close.closed, true);
+  assert.equal(close.already_closed, false);
+  assert.equal(fixture.state.closeClicks, 1);
 }
 
 async function testCardCandidateReader() {
@@ -1121,6 +1233,8 @@ testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
 await testRecommendAccountRightsPanelUsesSharedSafeClose();
+testRecommendCardDetailClickPointAvoidsAvatar();
+await testRecommendAvatarPreviewIsNotDetailAndCanClose();
 testRetryableRecommendFilterReapplyError();
 testRetryableRecommendJobSelectionError();
 testRecommendCardFieldParser();

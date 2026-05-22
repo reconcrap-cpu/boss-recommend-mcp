@@ -108,6 +108,23 @@ export const DETAIL_RESUME_IFRAME_SELECTORS = Object.freeze([
   'iframe[name*="resume"]'
 ]);
 
+export const RECOMMEND_AVATAR_PREVIEW_SELECTORS = Object.freeze([
+  ".boss-dialog__wrapper.avatar-preview",
+  ".avatar-preview",
+  ".dialog-wrap.active .avatar-preview",
+  ".figure-preview"
+]);
+
+export const RECOMMEND_AVATAR_PREVIEW_CLOSE_SELECTORS = Object.freeze([
+  ".avatar-preview .boss-popup__close",
+  ".dialog-wrap.active .avatar-preview .boss-popup__close",
+  ".dialog-wrap.active .boss-popup__close",
+  ".boss-dialog__wrapper.avatar-preview .boss-popup__close",
+  ".boss-popup__close",
+  ".icon-close",
+  '[class*="close"]'
+]);
+
 export const DETAIL_CLOSE_SELECTORS = Object.freeze([
   ".boss-popup__close",
   ".popup-close",
