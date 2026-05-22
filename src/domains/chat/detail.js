@@ -20,6 +20,8 @@ import {
   CHAT_ACTIVE_CANDIDATE_SELECTORS,
   CHAT_ASK_RESUME_BUTTON_SELECTORS,
   CHAT_ATTACHMENT_RESUME_BUTTON_SELECTORS,
+  CHAT_BLOCKING_PANEL_CLOSE_SELECTORS,
+  CHAT_BLOCKING_PANEL_TEXT_QUERIES,
   CHAT_CONFIRM_REQUEST_RESUME_SELECTORS,
   CHAT_EDITOR_SELECTORS,
   CHAT_MESSAGE_FILTER_SELECTORS,
@@ -733,6 +735,184 @@ export async function quickChatResumeModalOpenProbe(client, {
   };
 }
 
+async function performDomTextSearch(client, query, {
+  limit = 6
+} = {}) {
+  if (typeof client?.DOM?.performSearch !== "function"
+    || typeof client?.DOM?.getSearchResults !== "function") {
+    return [];
+  }
+  const searchOnce = async () => {
+    let searchId = "";
+    try {
+      const search = await client.DOM.performSearch({
+        query,
+        includeUserAgentShadowDOM: true
+      });
+      searchId = search?.searchId || "";
+      const resultCount = Math.min(Number(search?.resultCount) || 0, Math.max(0, Number(limit) || 0));
+      if (!searchId || resultCount <= 0) return [];
+      const results = await client.DOM.getSearchResults({
+        searchId,
+        fromIndex: 0,
+        toIndex: resultCount
+      });
+      return results?.nodeIds || [];
+    } catch {
+      return [];
+    } finally {
+      if (searchId && typeof client?.DOM?.discardSearchResults === "function") {
+        try {
+          await client.DOM.discardSearchResults({ searchId });
+        } catch {
+          // Best-effort cleanup only.
+        }
+      }
+    }
+  };
+
+  const firstPass = await searchOnce();
+  if (!firstPass.length) return [];
+  const firstPassNodeIds = firstPass.filter((nodeId) => Number(nodeId) > 0);
+  if (firstPassNodeIds.length || typeof client?.DOM?.getDocument !== "function") return firstPassNodeIds;
+  try {
+    await client.DOM.getDocument({
+      depth: -1,
+      pierce: true
+    });
+  } catch {
+    return firstPassNodeIds;
+  }
+  return (await searchOnce()).filter((nodeId) => Number(nodeId) > 0);
+}
+
+export async function findChatBlockingPanel(client, {
+  textQueries = CHAT_BLOCKING_PANEL_TEXT_QUERIES
+} = {}) {
+  for (const query of textQueries || []) {
+    const nodeIds = await performDomTextSearch(client, query);
+    for (const nodeId of nodeIds) {
+      try {
+        const box = await getNodeBox(client, nodeId);
+        if (box?.rect?.width > 2 && box?.rect?.height > 2) {
+          return {
+            open: true,
+            reason: "blocking_panel_text_visible",
+            query,
+            node_id: nodeId,
+            rect: box.rect,
+            center: box.center
+          };
+        }
+      } catch {
+        // Hidden or stale text hits are ignored.
+      }
+    }
+  }
+  return {
+    open: false
+  };
+}
+
+function blockingPanelOutsideClickPoint(probe = {}) {
+  const rect = probe?.rect || {};
+  // Click the empty lower-left sidebar area. It is outside the rights drawer
+  // and avoids top nav, chat rows, message controls, and candidate actions.
+  const x = 84;
+  const y = Number.isFinite(Number(rect.y))
+    ? Math.max(560, Math.min(680, Number(rect.y) + 600))
+    : 660;
+  return {
+    x,
+    y,
+    mode: "empty-lower-left-sidebar"
+  };
+}
+
+export async function closeChatBlockingPanels(client, {
+  attemptsLimit = 2
+} = {}) {
+  const attempts = [];
+  let probe = await findChatBlockingPanel(client);
+  if (!probe.open) {
+    return {
+      closed: true,
+      already_closed: true,
+      probe,
+      attempts
+    };
+  }
+
+  for (let index = 0; index < attemptsLimit; index += 1) {
+    const outsidePoint = blockingPanelOutsideClickPoint(probe);
+    try {
+      await clickPoint(client, outsidePoint.x, outsidePoint.y, DETERMINISTIC_CLICK_OPTIONS);
+      attempts.push({
+        mode: "outside-click",
+        point: outsidePoint
+      });
+    } catch (error) {
+      attempts.push({
+        mode: "outside-click-error",
+        point: outsidePoint,
+        error: error?.message || String(error)
+      });
+    }
+    await sleep(700);
+
+    probe = await findChatBlockingPanel(client);
+    if (!probe.open) {
+      return {
+        closed: true,
+        already_closed: false,
+        probe,
+        attempts
+      };
+    }
+
+    const rootState = await getChatRoots(client);
+    const closeTarget = await findVisibleTarget(client, rootState.roots, CHAT_BLOCKING_PANEL_CLOSE_SELECTORS);
+    if (closeTarget) {
+      try {
+        await clickPoint(client, closeTarget.center.x, closeTarget.center.y, DETERMINISTIC_CLICK_OPTIONS);
+        attempts.push({
+          mode: "close-selector",
+          selector: closeTarget.selector,
+          root: closeTarget.root
+        });
+      } catch (error) {
+        attempts.push({
+          mode: "close-selector-error",
+          selector: closeTarget.selector,
+          root: closeTarget.root,
+          error: error?.message || String(error)
+        });
+      }
+    } else {
+      await pressEscape(client);
+      attempts.push({ mode: "Escape" });
+    }
+    await sleep(700);
+
+    probe = await findChatBlockingPanel(client);
+    if (!probe.open) {
+      return {
+        closed: true,
+        already_closed: false,
+        probe,
+        attempts
+      };
+    }
+  }
+
+  return {
+    closed: false,
+    already_closed: false,
+    probe,
+    attempts
+  };
+}
+
 export async function readChatResumeHtml(client, resumeState) {
   let popupHTML = "";
   let contentHTML = "";
@@ -1012,6 +1192,9 @@ export async function readChatConversationReadyState(client) {
     (target) => isSendText(target.label) || /submit/i.test(String(target.attributes?.class || ""))
   );
   const resumeState = await waitForChatResumeModal(client, { timeoutMs: 300 });
+  const blockingPanel = await findChatBlockingPanel(client);
+  const resumeModalOpen = Boolean(resumeState?.popup || resumeState?.content || resumeState?.resumeIframe);
+  const blockingPanelOpen = Boolean(blockingPanel?.open);
   return {
     has_online_resume: Boolean(onlineResume),
     online_resume: onlineResume,
@@ -1026,8 +1209,10 @@ export async function readChatConversationReadyState(client) {
     editor,
     send_button_visible: Boolean(sendButton),
     send_button: sendButton,
-    resume_modal_open: Boolean(resumeState?.popup || resumeState?.content || resumeState?.resumeIframe),
-    panels_closed: !Boolean(resumeState?.popup || resumeState?.content || resumeState?.resumeIframe)
+    resume_modal_open: resumeModalOpen,
+    blocking_panel_open: blockingPanelOpen,
+    blocking_panel: blockingPanelOpen ? blockingPanel : null,
+    panels_closed: !resumeModalOpen && !blockingPanelOpen
   };
 }
 

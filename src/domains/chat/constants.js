@@ -208,6 +208,30 @@ export const CHAT_RESUME_CLOSE_SELECTORS = Object.freeze([
   '[title*="关闭"]'
 ]);
 
+export const CHAT_BLOCKING_PANEL_TEXT_QUERIES = Object.freeze([
+  "我的权益",
+  "VVIP账号-精选版专享权益",
+  "全部账号权益使用量",
+  "职位发布权益总量",
+  "每日使用权益总量"
+]);
+
+export const CHAT_BLOCKING_PANEL_CLOSE_SELECTORS = Object.freeze([
+  ".boss-popup__close",
+  ".boss-dialog__close",
+  ".side-panel-close",
+  ".drawer-close",
+  ".panel-close",
+  ".popup-close",
+  ".modal-close",
+  ".dialog-close",
+  ".close-btn",
+  ".icon-close",
+  "[class*=\"close\"]",
+  '[aria-label*="关闭"]',
+  '[title*="关闭"]'
+]);
+
 export const CHAT_PROFILE_NETWORK_PATTERNS = Object.freeze([
   /\/wapi\/zpjob\/view\/geek\/info(?:\/v2)?\b/i,
   /\/wapi\/zpjob\/chat\/geek\/info\b/i,

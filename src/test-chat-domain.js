@@ -9,7 +9,9 @@ import {
 } from "./core/self-heal/index.js";
 import {
   createChatProfileNetworkRecorder,
+  closeChatBlockingPanels,
   getChatTopLevelState,
+  findChatBlockingPanel,
   isChatShellUrl,
   isForbiddenChatResumeTopLevelUrl,
   isUnsafeChatOnlineResumeLinkError,
@@ -609,6 +611,69 @@ async function testOnlineResumeButtonRequiresExpectedActiveCandidate() {
   assert.equal(matched.ok, true);
   assert.equal(matched.candidate_selection_verified, true);
   assert.equal(matched.active_candidate_id, "candidate-2");
+}
+
+async function testAccountRightsPanelIsTreatedAsBlockingPanel() {
+  let panelOpen = true;
+  let discarded = false;
+  const client = {
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async performSearch(params) {
+        assert.equal(params.includeUserAgentShadowDOM, true);
+        return {
+          searchId: "rights-search",
+          resultCount: panelOpen && params.query === "我的权益" ? 1 : 0
+        };
+      },
+      async getSearchResults() {
+        return { nodeIds: [99] };
+      },
+      async discardSearchResults() {
+        discarded = true;
+      },
+      async querySelectorAll(params) {
+        if (String(params.selector || "").includes("close")) return { nodeIds: [88] };
+        return { nodeIds: [] };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === 88) return { attributes: ["class", "icon-close"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        if (params.nodeId === 88) return { outerHTML: '<button class="icon-close">关闭</button>' };
+        return { outerHTML: "我的权益" };
+      },
+      async getBoxModel(params) {
+        const border = params.nodeId === 88
+          ? [330, 10, 350, 10, 350, 30, 330, 30]
+          : [1085, 64, 1181, 64, 1181, 91, 1085, 91];
+        return { model: { border } };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(params) {
+        if (params.type === "mouseReleased") panelOpen = false;
+      },
+      async dispatchKeyEvent() {}
+    }
+  };
+
+  const open = await findChatBlockingPanel(client);
+  assert.equal(open.open, true);
+  assert.equal(open.query, "我的权益");
+  assert.equal(discarded, true);
+
+  const closeResult = await closeChatBlockingPanels(client, { attemptsLimit: 1 });
+  assert.equal(closeResult.closed, true);
+  assert.equal(closeResult.already_closed, false);
+  assert.equal(closeResult.attempts[0].mode, "outside-click");
+  assert.equal(closeResult.attempts[0].point.x, 84);
+  assert.equal(closeResult.attempts[0].point.y, 664);
+  assert.equal(closeResult.attempts[0].point.mode, "empty-lower-left-sidebar");
+  assert.equal(panelOpen, false);
 }
 
 async function testDisabledAskResumeIsNotAlreadyRequested() {
@@ -1349,6 +1414,7 @@ await testChatJobSelectionClosesOpenDropdownWhenAlreadyCurrent();
 await testChatJobDropdownCloseFallsBackToTriggerToggle();
 await testChatJobSelectionFailsWhenUiStaysOnWrongJob();
 await testOnlineResumeButtonRequiresExpectedActiveCandidate();
+await testAccountRightsPanelIsTreatedAsBlockingPanel();
 await testDisabledAskResumeIsNotAlreadyRequested();
 await testGenericSentMessageIsNotAlreadyRequestedResume();
 await testPlainAttachmentResumeIsNotAskResumeControl();

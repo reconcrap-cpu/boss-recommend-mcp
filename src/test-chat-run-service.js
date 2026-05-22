@@ -9,7 +9,9 @@ import {
   chatDetailSkipReasonFromReadyState,
   countChatResultStatuses,
   createChatRunService,
+  isChatCandidateSelectionMismatchError,
   isChatResumeModalCloseFailureError,
+  makeChatCandidateSelectionMismatchError,
   makeChatResumeModalOpenBeforeCandidateClickError,
   resolveChatDomFallbackWait,
   summarizeChatFullCvEvidence
@@ -120,6 +122,19 @@ function testChatPreDetailAttachmentResumeSkipReason() {
   assert.equal(error.close_result.closed, false);
   assert.equal(isChatResumeModalCloseFailureError(error), true);
   assert.equal(isChatResumeModalCloseFailureError(new Error("different")), false);
+
+  const mismatch = makeChatCandidateSelectionMismatchError({
+    ready: {
+      expected_candidate_id: "expected-1",
+      active_candidate_id: "active-2"
+    }
+  }, {
+    id: "expected-1"
+  });
+  assert.equal(mismatch.code, "CHAT_ACTIVE_CANDIDATE_MISMATCH");
+  assert.equal(mismatch.selection_ready_state.active_candidate_id, "active-2");
+  assert.equal(isChatCandidateSelectionMismatchError(mismatch), true);
+  assert.equal(isChatCandidateSelectionMismatchError(new Error("different")), false);
 }
 
 function testChatResultCountersPreserveCommittedRows() {

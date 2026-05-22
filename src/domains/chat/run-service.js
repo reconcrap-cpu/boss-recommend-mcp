@@ -56,6 +56,7 @@ import {
   waitForChatCandidateNodeIds
 } from "./cards.js";
 import {
+  closeChatBlockingPanels,
   closeChatResumeModal,
   createChatProfileNetworkRecorder,
   extractChatProfileCandidate,
@@ -193,24 +194,60 @@ export function isChatResumeModalCloseFailureError(error) {
     || /CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK/i.test(String(error?.message || error || ""));
 }
 
+export function makeChatCandidateSelectionMismatchError(selected = null, candidate = null) {
+  const expectedId = candidate?.id || selected?.ready?.expected_candidate_id || "";
+  const activeId = selected?.ready?.active_candidate_id || "";
+  const error = new Error(`CHAT_ACTIVE_CANDIDATE_MISMATCH: expected=${expectedId || "unknown"} active=${activeId || "unknown"}`);
+  error.code = "CHAT_ACTIVE_CANDIDATE_MISMATCH";
+  error.selection = selected || null;
+  error.selection_ready_state = selected?.ready || null;
+  error.candidate = candidate || null;
+  return error;
+}
+
+export function isChatCandidateSelectionMismatchError(error) {
+  return error?.code === "CHAT_ACTIVE_CANDIDATE_MISMATCH"
+    || /CHAT_ACTIVE_CANDIDATE_MISMATCH/i.test(String(error?.message || error || ""));
+}
+
 export async function ensureNoOpenChatResumeModalBeforeCandidateClick(client, {
   closeAttempts = 3
 } = {}) {
   const probe = await quickChatResumeModalOpenProbe(client);
   if (!probe.open) {
-    return {
-      closed: true,
-      already_closed: true,
-      probe
-    };
+    const panelCloseResult = await closeChatBlockingPanels(client, { attemptsLimit: closeAttempts });
+    if (panelCloseResult?.closed) {
+      return {
+        closed: true,
+        already_closed: panelCloseResult.already_closed,
+        probe,
+        blocking_panel_close_result: panelCloseResult
+      };
+    }
+    throw makeChatResumeModalOpenBeforeCandidateClickError({
+      closed: false,
+      reason: "blocking_panel_open_before_candidate_click",
+      resume_modal_probe: probe,
+      blocking_panel_close_result: panelCloseResult
+    });
   }
   const closeResult = await closeChatResumeModal(client, { attemptsLimit: closeAttempts });
   if (closeResult?.closed) {
+    const panelCloseResult = await closeChatBlockingPanels(client, { attemptsLimit: closeAttempts });
+    if (!panelCloseResult?.closed) {
+      throw makeChatResumeModalOpenBeforeCandidateClickError({
+        closed: false,
+        reason: "blocking_panel_open_after_resume_modal_close",
+        close_result: closeResult,
+        blocking_panel_close_result: panelCloseResult
+      });
+    }
     return {
       closed: true,
       already_closed: false,
       probe,
-      close_result: closeResult
+      close_result: closeResult,
+      blocking_panel_close_result: panelCloseResult
     };
   }
   throw makeChatResumeModalOpenBeforeCandidateClickError(closeResult);
@@ -353,6 +390,7 @@ function compactChatRuntimeError(error) {
     code: error.code || null,
     message: error.message || String(error),
     close_result: error.close_result || null,
+    selection_ready_state: error.selection_ready_state || null,
     page_state: error.page_state || null
   };
 }
@@ -755,6 +793,7 @@ export async function runChatWorkflow({
   let requestSkippedCount = 0;
   let contextSetup = {};
   let contextRecoveryAttempts = 0;
+  const candidateRecoveryCounts = new Map();
   let lastHumanEvent = null;
 
   function recordHumanEvent(event = null) {
@@ -803,6 +842,7 @@ export async function runChatWorkflow({
     initialTopLevelState = recovery.after;
   }
   await closeChatResumeModal(client, { attemptsLimit: 2 });
+  await closeChatBlockingPanels(client, { attemptsLimit: 2 });
 
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
@@ -847,6 +887,7 @@ export async function runChatWorkflow({
       throw new Error(`Chat shell recovery failed after ${reason}: ${shellRecovery.after?.url || shellRecovery.before?.url || "unknown"}`);
     }
     await closeChatResumeModal(client, { attemptsLimit: 2 });
+    await closeChatBlockingPanels(client, { attemptsLimit: 2 });
     const recoveredSetup = await setupChatRunContext(client, {
       job,
       normalizedStartFrom,
@@ -1182,9 +1223,7 @@ export async function runChatWorkflow({
           if (detailResult) {
             // Already classified by the pre-detail conversation state.
           } else if (selected.ready?.reason === "active_candidate_mismatch") {
-            detailUnavailableReason = "active_candidate_mismatch";
-            detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason);
-            detailResult.cv_acquisition.selection_ready_state = selected.ready;
+            throw makeChatCandidateSelectionMismatchError(selected, cardCandidate);
           } else {
             detailStep = "read_conversation_ready_state";
             if (preActionState.attachment_resume_enabled) {
@@ -1618,6 +1657,26 @@ export async function runChatWorkflow({
             recovery
           });
           continue;
+        } else if (isChatCandidateSelectionMismatchError(error)) {
+          const retryCount = candidateRecoveryCounts.get(candidateKey) || 0;
+          if (retryCount < 1) {
+            candidateRecoveryCounts.set(candidateKey, retryCount + 1);
+            const recovery = await recoverAndReapplyChatContext(
+              "active_candidate_mismatch",
+              error,
+              { forceRefresh: true }
+            );
+            checkpointInProgressCandidate({
+              event: "retry_after_active_candidate_mismatch_recovery",
+              recovery
+            });
+            continue;
+          }
+          detailUnavailableReason = "active_candidate_mismatch";
+          detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
+          detailResult.cv_acquisition.selection_ready_state = error.selection_ready_state || null;
+          detailResult.cv_acquisition.recovery_attempted = true;
+          detailResult.cv_acquisition.recovery_attempt_count = retryCount;
         } else if (isUnsafeChatOnlineResumeLinkError(error)) {
           detailUnavailableReason = "unsafe_online_resume_navigation_link";
           detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
@@ -1630,6 +1689,7 @@ export async function runChatWorkflow({
           detailUnavailableReason = `recoverable_cdp_node_stale:${detailStep}`;
           detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
           await closeChatResumeModal(client, { attemptsLimit: 2 });
+          await closeChatBlockingPanels(client, { attemptsLimit: 2 });
         }
       }
       screeningCandidate = detailResult.candidate;
