@@ -46,6 +46,7 @@ import {
   screenCandidate
 } from "../../core/screening/index.js";
 import {
+  closeRecommendBlockingPanels,
   closeRecommendDetail,
   createRecommendDetailNetworkRecorder,
   extractRecommendDetailCandidate,
@@ -465,12 +466,17 @@ function countPassedResults(results = []) {
 
 function compactCloseResult(closeResult) {
   if (!closeResult) return null;
-  return {
+  const result = {
     closed: Boolean(closeResult.closed),
     reason: closeResult.reason || null,
+    probe: closeResult.probe || null,
     attempts: closeResult.attempts || [],
     verification: closeResult.verification || null
   };
+  if (closeResult.already_closed !== undefined) {
+    result.already_closed = Boolean(closeResult.already_closed);
+  }
+  return result;
 }
 
 function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
@@ -481,6 +487,9 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   };
   if (error.close_result) {
     result.close_result = compactCloseResult(error.close_result);
+  }
+  if (error.phase) {
+    result.phase = error.phase;
   }
   if (error.refresh_attempt) {
     result.refresh_attempt = error.refresh_attempt;
@@ -504,6 +513,14 @@ function createRecommendCloseFailureError(closeResult) {
   const error = new Error(closeResult?.reason || "Recommend detail did not close before recovery");
   error.code = "DETAIL_CLOSE_FAILED";
   error.close_result = closeResult || null;
+  return error;
+}
+
+function createRecommendBlockingPanelCloseFailureError(closeResult, phase = "") {
+  const error = new Error(closeResult?.reason || "Boss account-rights panel did not close before recovery");
+  error.code = "ACCOUNT_RIGHTS_PANEL_CLOSE_FAILED";
+  error.close_result = closeResult || null;
+  error.phase = phase || null;
   return error;
 }
 
@@ -703,6 +720,7 @@ export async function runRecommendWorkflow({
   let jobSelection = null;
   let pageScopeSelection = null;
   let filterResult = null;
+  let rootState = null;
   let cardNodeIds = [];
   let listEndReason = "";
   let lastHumanEvent = null;
@@ -789,6 +807,17 @@ export async function runRecommendWorkflow({
     });
   }
 
+  async function closeRecommendBlockingPanelsForRun(phase = "cleanup") {
+    const result = await closeRecommendBlockingPanels(client, {
+      attemptsLimit: 2,
+      rootState
+    });
+    if (!result?.closed) {
+      throw createRecommendBlockingPanelCloseFailureError(result, phase);
+    }
+    return result;
+  }
+
   async function recoverAndReapplyRecommendContext(reason = "context_recovery", error = null, {
     forceRecentNotView = true
   } = {}) {
@@ -811,11 +840,19 @@ export async function runRecommendWorkflow({
       buttonSettleMs: refreshButtonSettleMs,
       reloadSettleMs: refreshReloadSettleMs
     });
+    let blockingPanelClose = null;
+    if (refreshResult.ok) {
+      blockingPanelClose = await closeRecommendBlockingPanels(client, {
+        attemptsLimit: 2,
+        rootState: refreshResult.root_state || rootState
+      });
+    }
     const compactRefresh = {
       ...compactRefreshAttempt(refreshResult),
       context_recovery: true,
       recovery_reason: reason,
       trigger_error: compactError(error, "RECOMMEND_CONTEXT_RECOVERY_TRIGGER"),
+      account_rights_panel_close: compactCloseResult(blockingPanelClose),
       elapsed_ms: Date.now() - started
     };
     refreshAttempts.push(compactRefresh);
@@ -836,6 +873,11 @@ export async function runRecommendWorkflow({
         recovery_reason: reason
       });
       throw new Error(`Recommend context recovery failed after ${reason}: ${refreshResult.reason || refreshResult.error || "refresh returned no cards"}`);
+    }
+    if (!blockingPanelClose?.closed) {
+      const panelError = createRecommendBlockingPanelCloseFailureError(blockingPanelClose, `recover:${reason}`);
+      panelError.refresh_attempt = compactRefresh;
+      throw panelError;
     }
     rootState = refreshResult.root_state || await getRecommendRoots(client);
     rootState = await ensureRecommendViewport(rootState, "recover_after");
@@ -865,11 +907,12 @@ export async function runRecommendWorkflow({
 
   runControl.setPhase("recommend:cleanup");
   await closeRecommendDetail(client, { attemptsLimit: 2 });
+  await closeRecommendBlockingPanelsForRun("cleanup");
 
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
   runControl.setPhase("recommend:roots");
-  let rootState = await getRecommendRoots(client);
+  rootState = await getRecommendRoots(client);
   rootState = await ensureRecommendViewport(rootState, "roots");
   runControl.checkpoint({
     iframe_selector: rootState.iframe.selector,
@@ -1070,6 +1113,25 @@ export async function runRecommendWorkflow({
         runControl.setPhase("recommend:detail");
         detailStep = "ensure_viewport";
         rootState = await ensureRecommendViewport(rootState, "detail");
+        const blockingPanelClose = await closeRecommendBlockingPanels(client, {
+          attemptsLimit: 2,
+          rootState
+        });
+        if (!blockingPanelClose?.closed) {
+          const panelError = createRecommendBlockingPanelCloseFailureError(
+            blockingPanelClose,
+            "before_detail_open"
+          );
+          timings.account_rights_panel_close = compactCloseResult(blockingPanelClose);
+          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error: panelError });
+          await recoverAndReapplyRecommendContext("account_rights_panel_before_detail", panelError, {
+            forceRecentNotView: true
+          });
+          continue;
+        }
+        if (blockingPanelClose.already_closed === false) {
+          timings.account_rights_panel_close = compactCloseResult(blockingPanelClose);
+        }
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailStep = "open_detail";
         networkRecorder.clear();
@@ -1185,6 +1247,7 @@ export async function runRecommendWorkflow({
                 timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
                 checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
                 await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+                await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
                 await recoverAndReapplyRecommendContext(`image_capture:${detailStep}`, error, {
                   forceRecentNotView: true
                 });
@@ -1236,6 +1299,7 @@ export async function runRecommendWorkflow({
           timings.detail_recovery_trigger = compactRecoverableDetailError(error);
           checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
           await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
           await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
             forceRecentNotView: true
           });
@@ -1245,6 +1309,7 @@ export async function runRecommendWorkflow({
         detailResult = null;
         timings.detail_recovered_error = compactRecoverableDetailError(error);
         await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+        await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
       }
     }
 

@@ -44,6 +44,7 @@ import {
   screenCandidate
 } from "../../core/screening/index.js";
 import {
+  closeRecruitBlockingPanels,
   closeRecruitDetail,
   createRecruitDetailNetworkRecorder,
   extractRecruitDetailCandidate,
@@ -159,6 +160,12 @@ function compactError(error, fallbackCode = "RECRUIT_RUN_ERROR") {
     code: error.code || fallbackCode,
     message: error.message || String(error)
   };
+  if (error.close_result) {
+    result.close_result = compactCloseResult(error.close_result);
+  }
+  if (error.phase) {
+    result.phase = error.phase;
+  }
   if (error.refresh_attempt) {
     result.refresh_attempt = error.refresh_attempt;
   }
@@ -174,10 +181,33 @@ function compactError(error, fallbackCode = "RECRUIT_RUN_ERROR") {
   return result;
 }
 
+function compactCloseResult(closeResult) {
+  if (!closeResult) return null;
+  const result = {
+    closed: Boolean(closeResult.closed),
+    reason: closeResult.reason || null,
+    probe: closeResult.probe || null,
+    attempts: closeResult.attempts || [],
+    verification: closeResult.verification || null
+  };
+  if (closeResult.already_closed !== undefined) {
+    result.already_closed = Boolean(closeResult.already_closed);
+  }
+  return result;
+}
+
 function createRecruitCloseFailureError(closeResult) {
   const error = new Error(closeResult?.reason || "Recruit detail did not close before recovery");
   error.code = "DETAIL_CLOSE_FAILED";
   error.close_result = closeResult || null;
+  return error;
+}
+
+function createRecruitBlockingPanelCloseFailureError(closeResult, phase = "") {
+  const error = new Error(closeResult?.reason || "Boss account-rights panel did not close before recovery");
+  error.code = "ACCOUNT_RIGHTS_PANEL_CLOSE_FAILED";
+  error.close_result = closeResult || null;
+  error.phase = phase || null;
   return error;
 }
 
@@ -397,6 +427,7 @@ export async function runRecruitWorkflow({
   let refreshRounds = 0;
   let contextRecoveryAttempts = 0;
   const candidateRecoveryCounts = new Map();
+  let rootState = null;
   let cardNodeIds = [];
   let listEndReason = "";
   let lastHumanEvent = null;
@@ -482,6 +513,17 @@ export async function runRecruitWorkflow({
     });
   }
 
+  async function closeRecruitBlockingPanelsForRun(phase = "cleanup") {
+    const result = await closeRecruitBlockingPanels(client, {
+      attemptsLimit: 2,
+      rootState
+    });
+    if (!result?.closed) {
+      throw createRecruitBlockingPanelCloseFailureError(result, phase);
+    }
+    return result;
+  }
+
   async function recoverAndReapplyRecruitContext(reason = "context_recovery", error = null, {
     forceRecentViewed = true
   } = {}) {
@@ -499,11 +541,18 @@ export async function runRecruitWorkflow({
       cityOptionTimeoutMs,
       forceRecentViewed
     });
+    let blockingPanelClose = null;
+    if (refreshResult.ok) {
+      blockingPanelClose = await closeRecruitBlockingPanels(client, {
+        attemptsLimit: 2
+      });
+    }
     const compactRefresh = {
       ...compactRefreshAttempt(refreshResult),
       context_recovery: true,
       recovery_reason: reason,
       trigger_error: compactError(error, "RECRUIT_CONTEXT_RECOVERY_TRIGGER"),
+      account_rights_panel_close: compactCloseResult(blockingPanelClose),
       elapsed_ms: Date.now() - started
     };
     refreshAttempts.push(compactRefresh);
@@ -524,6 +573,11 @@ export async function runRecruitWorkflow({
         recovery_reason: reason
       });
       throw new Error(`Recruit context recovery failed after ${reason}: ${refreshResult.application?.reason || "refresh returned no cards"}`);
+    }
+    if (!blockingPanelClose?.closed) {
+      const panelError = createRecruitBlockingPanelCloseFailureError(blockingPanelClose, `recover:${reason}`);
+      panelError.refresh_attempt = compactRefresh;
+      throw panelError;
     }
     rootState = await getRecruitRoots(client);
     rootState = await ensureRecruitViewport(rootState, "recover_after");
@@ -553,11 +607,12 @@ export async function runRecruitWorkflow({
 
   runControl.setPhase("recruit:cleanup");
   await closeRecruitDetail(client, { attemptsLimit: 2 });
+  await closeRecruitBlockingPanelsForRun("cleanup");
 
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
   runControl.setPhase("recruit:roots");
-  let rootState = await getRecruitRoots(client);
+  rootState = await getRecruitRoots(client);
   rootState = await ensureRecruitViewport(rootState, "roots");
   runControl.checkpoint({
     iframe_selector: rootState.iframe.selector,
@@ -732,6 +787,25 @@ export async function runRecruitWorkflow({
         runControl.setPhase("recruit:detail");
         detailStep = "ensure_viewport";
         rootState = await ensureRecruitViewport(rootState, "detail");
+        const blockingPanelClose = await closeRecruitBlockingPanels(client, {
+          attemptsLimit: 2,
+          rootState
+        });
+        if (!blockingPanelClose?.closed) {
+          const panelError = createRecruitBlockingPanelCloseFailureError(
+            blockingPanelClose,
+            "before_detail_open"
+          );
+          timings.account_rights_panel_close = compactCloseResult(blockingPanelClose);
+          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error: panelError });
+          await recoverAndReapplyRecruitContext("account_rights_panel_before_detail", panelError, {
+            forceRecentViewed: true
+          });
+          continue;
+        }
+        if (blockingPanelClose.already_closed === false) {
+          timings.account_rights_panel_close = compactCloseResult(blockingPanelClose);
+        }
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailStep = "open_detail";
         networkRecorder.clear();
@@ -835,6 +909,7 @@ export async function runRecruitWorkflow({
                 timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
                 checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
                 await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+                await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
                 await recoverAndReapplyRecruitContext(`image_capture:${detailStep}`, error, {
                   forceRecentViewed: true
                 });
@@ -907,6 +982,7 @@ export async function runRecruitWorkflow({
           timings.detail_recovery_trigger = compactRecoverableDetailError(error);
           checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
           await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
           await recoverAndReapplyRecruitContext(`detail:${detailStep}`, error, {
             forceRecentViewed: true
           });
@@ -916,6 +992,7 @@ export async function runRecruitWorkflow({
         detailResult = null;
         timings.detail_recovered_error = compactRecoverableDetailError(error);
         await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+        await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
       }
     }
 

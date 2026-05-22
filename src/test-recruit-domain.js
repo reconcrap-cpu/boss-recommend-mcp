@@ -5,10 +5,12 @@ import { RUN_STATUS_COMPLETED } from "./core/run/index.js";
 import {
   buildRecruitJobTitleSearchTerms,
   buildRecruitRefreshSearchParams,
+  closeRecruitBlockingPanels,
   countRecruitResultStatuses,
   createRecruitRunService,
   chooseRecruitTextCandidate,
   clickRecruitActionControl,
+  findRecruitBlockingPanel,
   isRecoverableRecruitDetailError,
   isRecruitNationalCity,
   matchesRecruitDetailNetwork,
@@ -54,6 +56,81 @@ function testNetworkPatterns() {
     true
   );
   assert.equal(matchesRecruitDetailNetwork("https://example.com/static/app.js"), false);
+}
+
+function createAccountRightsPanelClient() {
+  let panelOpen = true;
+  let discarded = 0;
+  const clicks = [];
+  return {
+    get state() {
+      return { panelOpen, discarded, clicks };
+    },
+    client: {
+      DOM: {
+        async getDocument() {
+          return { root: { nodeId: 1 } };
+        },
+        async performSearch(params) {
+          assert.equal(params.includeUserAgentShadowDOM, true);
+          return {
+            searchId: "rights-search",
+            resultCount: panelOpen && params.query === "我的权益" ? 1 : 0
+          };
+        },
+        async getSearchResults() {
+          return { nodeIds: [99] };
+        },
+        async discardSearchResults() {
+          discarded += 1;
+        },
+        async querySelectorAll() {
+          return { nodeIds: [] };
+        },
+        async getBoxModel(params) {
+          assert.equal(params.nodeId, 99);
+          return {
+            model: {
+              border: [1085, 64, 1181, 64, 1181, 91, 1085, 91]
+            }
+          };
+        }
+      },
+      Input: {
+        async dispatchMouseEvent(params) {
+          if (params.type === "mouseReleased") {
+            clicks.push({ x: params.x, y: params.y });
+            if (params.x === 84 && params.y === 664) panelOpen = false;
+          }
+          return {};
+        },
+        async dispatchKeyEvent() {
+          return {};
+        }
+      }
+    }
+  };
+}
+
+async function testRecruitAccountRightsPanelUsesSharedSafeClose() {
+  const fixture = createAccountRightsPanelClient();
+  const open = await findRecruitBlockingPanel(fixture.client);
+  assert.equal(open.open, true);
+  assert.equal(open.query, "我的权益");
+  assert.equal(fixture.state.discarded, 1);
+
+  const result = await closeRecruitBlockingPanels(fixture.client, {
+    attemptsLimit: 1,
+    roots: [{ name: "top", nodeId: 1 }, { name: "search-frame", nodeId: 2 }],
+    waitMs: 0
+  });
+  assert.equal(result.closed, true);
+  assert.equal(result.already_closed, false);
+  assert.equal(result.attempts[0].mode, "outside-click");
+  assert.equal(result.attempts[0].point.x, 84);
+  assert.equal(result.attempts[0].point.y, 664);
+  assert.equal(result.attempts[0].point.mode, "empty-lower-left-sidebar");
+  assert.equal(fixture.state.panelOpen, false);
 }
 
 function testSearchParamHelpers() {
@@ -212,6 +289,7 @@ function testRecruitRecoveryHelpers() {
 
 testParserImportSemantics();
 testNetworkPatterns();
+await testRecruitAccountRightsPanelUsesSharedSafeClose();
 testSearchParamHelpers();
 await testCardCandidateReader();
 await testRunServiceLifecycle();

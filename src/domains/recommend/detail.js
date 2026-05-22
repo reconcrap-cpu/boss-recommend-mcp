@@ -15,6 +15,10 @@ import {
   htmlToText
 } from "../../core/screening/index.js";
 import {
+  closeBossAccountRightsBlockingPanel,
+  findBossAccountRightsBlockingPanel
+} from "../common/account-rights-panel.js";
+import {
   DETAIL_CLOSE_SELECTORS,
   DETAIL_NETWORK_PATTERNS,
   DETAIL_POPUP_SELECTORS,
@@ -76,6 +80,17 @@ export function createRecommendDetailNetworkRecorder(client) {
       events.length = 0;
     }
   };
+}
+
+export async function findRecommendBlockingPanel(client, options = {}) {
+  return findBossAccountRightsBlockingPanel(client, options);
+}
+
+export async function closeRecommendBlockingPanels(client, options = {}) {
+  return closeBossAccountRightsBlockingPanel(client, {
+    resolveRoots: getRecommendRoots,
+    ...options
+  });
 }
 
 export async function waitForRecommendDetailNetworkEvents(recorder, {

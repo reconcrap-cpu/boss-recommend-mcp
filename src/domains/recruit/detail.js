@@ -14,6 +14,10 @@ import {
   htmlToText
 } from "../../core/screening/index.js";
 import {
+  closeBossAccountRightsBlockingPanel,
+  findBossAccountRightsBlockingPanel
+} from "../common/account-rights-panel.js";
+import {
   RECRUIT_DETAIL_CLOSE_SELECTORS,
   RECRUIT_DETAIL_NETWORK_PATTERNS,
   RECRUIT_DETAIL_POPUP_SELECTORS,
@@ -62,6 +66,17 @@ export function createRecruitDetailNetworkRecorder(client) {
       events.length = 0;
     }
   };
+}
+
+export async function findRecruitBlockingPanel(client, options = {}) {
+  return findBossAccountRightsBlockingPanel(client, options);
+}
+
+export async function closeRecruitBlockingPanels(client, options = {}) {
+  return closeBossAccountRightsBlockingPanel(client, {
+    resolveRoots: getRecruitRoots,
+    ...options
+  });
 }
 
 export async function waitForRecruitDetailNetworkEvents(recorder, {

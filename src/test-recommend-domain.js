@@ -6,10 +6,12 @@ import path from "node:path";
 import {
   chooseFilterOptionByLabels,
   chooseFilterOptionsByLabels,
+  closeRecommendBlockingPanels,
   closeRecommendDetail,
   closeRecommendJobDropdownFully,
   createRecoverableImageCaptureEvidence,
   chooseFirstSafeFilterOption,
+  findRecommendBlockingPanel,
   findRecommendCardNodeForCandidateKey,
   getRecommendPageScopeStatus,
   isActiveOption,
@@ -147,6 +149,84 @@ function testNetworkPatterns() {
   assert.equal(matchesRecommendDetailNetwork("https://www.zhipin.com/wapi/zpjob/view/geek/info?id=1"), true);
   assert.equal(matchesRecommendDetailNetwork("https://www.zhipin.com/web/frame/c-resume/foo"), true);
   assert.equal(matchesRecommendDetailNetwork("https://example.com/assets/app.js"), false);
+}
+
+function createAccountRightsPanelClient() {
+  let panelOpen = true;
+  let primed = false;
+  let discarded = 0;
+  const clicks = [];
+  return {
+    get state() {
+      return { panelOpen, primed, discarded, clicks };
+    },
+    client: {
+      DOM: {
+        async getDocument(params = {}) {
+          if (params.depth === -1) primed = true;
+          return { root: { nodeId: 1 } };
+        },
+        async performSearch(params) {
+          assert.equal(params.includeUserAgentShadowDOM, true);
+          return {
+            searchId: "rights-search",
+            resultCount: panelOpen && params.query === "我的权益" ? 1 : 0
+          };
+        },
+        async getSearchResults() {
+          return { nodeIds: primed ? [99] : [0] };
+        },
+        async discardSearchResults() {
+          discarded += 1;
+        },
+        async querySelectorAll() {
+          return { nodeIds: [] };
+        },
+        async getBoxModel(params) {
+          assert.equal(params.nodeId, 99);
+          return {
+            model: {
+              border: [1085, 64, 1181, 64, 1181, 91, 1085, 91]
+            }
+          };
+        }
+      },
+      Input: {
+        async dispatchMouseEvent(params) {
+          if (params.type === "mouseReleased") {
+            clicks.push({ x: params.x, y: params.y });
+            if (params.x === 84 && params.y === 664) panelOpen = false;
+          }
+          return {};
+        },
+        async dispatchKeyEvent() {
+          return {};
+        }
+      }
+    }
+  };
+}
+
+async function testRecommendAccountRightsPanelUsesSharedSafeClose() {
+  const fixture = createAccountRightsPanelClient();
+  const open = await findRecommendBlockingPanel(fixture.client);
+  assert.equal(open.open, true);
+  assert.equal(open.query, "我的权益");
+  assert.equal(fixture.state.primed, true);
+  assert.equal(fixture.state.discarded, 2);
+
+  const result = await closeRecommendBlockingPanels(fixture.client, {
+    attemptsLimit: 1,
+    roots: [{ name: "top", nodeId: 1 }, { name: "recommend-frame", nodeId: 2 }],
+    waitMs: 0
+  });
+  assert.equal(result.closed, true);
+  assert.equal(result.already_closed, false);
+  assert.equal(result.attempts[0].mode, "outside-click");
+  assert.equal(result.attempts[0].point.x, 84);
+  assert.equal(result.attempts[0].point.y, 664);
+  assert.equal(result.attempts[0].point.mode, "empty-lower-left-sidebar");
+  assert.equal(fixture.state.panelOpen, false);
 }
 
 async function testCardCandidateReader() {
@@ -1040,6 +1120,7 @@ testRecoverableImageCaptureEvidencePreservesPartialPages();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
+await testRecommendAccountRightsPanelUsesSharedSafeClose();
 testRetryableRecommendFilterReapplyError();
 testRetryableRecommendJobSelectionError();
 testRecommendCardFieldParser();
