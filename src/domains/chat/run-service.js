@@ -1877,6 +1877,7 @@ export function createChatRunService({
   const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
 
   function startChatRun({
+    runId = "",
     client,
     targetUrl = CHAT_TARGET_URL,
     job = "",
@@ -1925,6 +1926,7 @@ export function createChatRunService({
     });
     const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     return manager.startRun({
+      runId,
       name,
       context: {
         domain: "chat",

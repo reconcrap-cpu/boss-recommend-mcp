@@ -1146,6 +1146,7 @@ export function createRecruitRunService({
   const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
 
   function startRecruitRun({
+    runId = "",
     client,
     targetUrl = "",
     criteria = "",
@@ -1189,6 +1190,7 @@ export function createRecruitRunService({
     });
     const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     return manager.startRun({
+      runId,
       name,
       context: {
         domain: "recruit",

@@ -326,7 +326,7 @@ export async function toggleWindowStateForViewportRecovery(client, {
   const currentInfo = await getCurrentWindowInfo(client);
   const currentState = normalizeText(currentInfo?.bounds?.windowState || "").toLowerCase();
   const sequence = currentState === "normal"
-    ? ["maximized", "normal"]
+    ? ["maximized"]
     : ["normal", "maximized"];
   const attempts = [];
 

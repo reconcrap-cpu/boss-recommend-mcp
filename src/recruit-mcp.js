@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   assertNoForbiddenCdpCalls,
   bringPageToFront,
@@ -18,7 +20,8 @@ import {
   RUN_STATUS_CANCELED,
   RUN_STATUS_COMPLETED,
   RUN_STATUS_FAILED,
-  RUN_STATUS_PAUSED
+  RUN_STATUS_PAUSED,
+  RUN_STATUS_RUNNING
 } from "./core/run/index.js";
 import {
   buildLegacyScreenInputRows,
@@ -46,11 +49,18 @@ const DEFAULT_RECRUIT_HOST = "127.0.0.1";
 const DEFAULT_RECRUIT_PORT = 9222;
 const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screening; scan continues until that many candidates pass or the list ends";
 const DEFAULT_RECRUIT_HOME_DIR = ".boss-recruit-mcp";
+const DETACHED_WORKER_SCRIPT = fileURLToPath(new URL("./detached-worker.js", import.meta.url));
+const DETACHED_WORKER_POLL_MS = 1000;
 
 const TERMINAL_STATUSES = new Set([
   RUN_STATUS_COMPLETED,
   RUN_STATUS_FAILED,
   RUN_STATUS_CANCELED
+]);
+const STALE_PROCESS_STATUSES = new Set([
+  "queued",
+  "running",
+  RUN_STATUS_CANCELING
 ]);
 
 let recruitWorkflowImpl = runRecruitWorkflow;
@@ -141,6 +151,9 @@ function getRecruitRunArtifacts(runId) {
     runs_dir: runsDir,
     output_dir: outputDir,
     run_state_path: path.join(runsDir, `${normalized}.json`),
+    detached_args_path: path.join(runsDir, `${normalized}.detached-args.json`),
+    worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
+    worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
@@ -213,6 +226,162 @@ function readRecruitRunState(runId) {
   const artifacts = getRecruitRunArtifacts(runId);
   if (!artifacts) return null;
   return readJsonFile(artifacts.run_state_path);
+}
+
+function writeRecruitRunState(runId, payload) {
+  const artifacts = getRecruitRunArtifacts(runId);
+  if (!artifacts) return null;
+  writeJsonAtomic(artifacts.run_state_path, payload);
+  return payload;
+}
+
+function createDetachedRecruitRunId() {
+  return `mcp_recruit_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isPidAlive(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) return false;
+  if (numericPid === globalThis.process?.pid) return true;
+  try {
+    globalThis.process.kill(numericPid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function buildInitialRecruitDetachedState(runId, {
+  workspaceRoot = "",
+  args = {},
+  parsed = {},
+  pid = globalThis.process?.pid
+} = {}) {
+  const artifacts = getRecruitRunArtifacts(runId);
+  const now = new Date().toISOString();
+  const targetCount = parsePositiveInteger(args.max_candidates, parsed.screenParams?.target_count || 10);
+  return {
+    run_id: runId,
+    mode: RUN_MODE_ASYNC,
+    state: "queued",
+    status: "queued",
+    stage: "queued",
+    started_at: now,
+    updated_at: now,
+    heartbeat_at: now,
+    completed_at: null,
+    pid: Number.isInteger(pid) && pid > 0 ? pid : globalThis.process?.pid || null,
+    progress: {
+      target_count: targetCount,
+      processed: 0,
+      screened: 0,
+      detail_opened: 0,
+      llm_screened: 0,
+      passed: 0,
+      skipped: 0,
+      greet_count: 0
+    },
+    last_message: "Boss search detached worker is queued.",
+    context: {
+      domain: "recruit",
+      target_url: RECRUIT_TARGET_URL,
+      workspace_root: normalizeText(workspaceRoot) || globalThis.process?.cwd?.() || "",
+      instruction: args.instruction || "",
+      confirmation: clonePlain(args.confirmation || {}, {}),
+      overrides: clonePlain(args.overrides || {}, {}),
+      search_params: clonePlain(parsed.searchParams || {}, {}),
+      criteria_present: Boolean(parsed.screenParams?.criteria),
+      max_candidates: targetCount,
+      target_count_semantics: TARGET_COUNT_SEMANTICS,
+      detached_worker: true,
+      rounds: []
+    },
+    control: {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    },
+    resume: {
+      checkpoint_path: artifacts?.checkpoint_path || null,
+      pause_control_path: artifacts?.run_state_path || null,
+      output_csv: null,
+      worker_stdout_path: artifacts?.worker_stdout_path || null,
+      worker_stderr_path: artifacts?.worker_stderr_path || null,
+      resume_count: 0,
+      last_resumed_at: null,
+      last_paused_at: null
+    },
+    error: null,
+    result: null,
+    summary: null,
+    artifacts
+  };
+}
+
+function patchPersistedRecruitControl(runId, controlPatch = {}, {
+  status = "RUN_STATUS",
+  message = "",
+  lastMessage = ""
+} = {}) {
+  const current = readRecruitRunState(runId);
+  if (!current) return null;
+  const state = normalizeText(current.state || current.status);
+  if (TERMINAL_STATUSES.has(state)) return null;
+  const now = new Date().toISOString();
+  const patched = {
+    ...current,
+    updated_at: now,
+    heartbeat_at: now,
+    last_message: lastMessage || message || current.last_message || "",
+    control: {
+      ...(current.control || {}),
+      ...controlPatch
+    }
+  };
+  writeRecruitRunState(runId, patched);
+  return {
+    status,
+    run: patched,
+    message,
+    persistence: {
+      source: "disk",
+      active_control_available: false,
+      detached_control_requested: true
+    },
+    runtime_evaluate_used: false,
+    method_summary: {},
+    method_log: [],
+    chrome: null
+  };
+}
+
+function launchDetachedRecruitWorker(runId) {
+  const artifacts = getRecruitRunArtifacts(runId);
+  if (!artifacts) throw new Error("Invalid recruit run_id");
+  fs.mkdirSync(path.dirname(artifacts.worker_stdout_path), { recursive: true });
+  const stdoutFd = fs.openSync(artifacts.worker_stdout_path, "a");
+  const stderrFd = fs.openSync(artifacts.worker_stderr_path, "a");
+  let child;
+  try {
+    child = spawn(globalThis.process.execPath, [
+      DETACHED_WORKER_SCRIPT,
+      "--domain",
+      "recruit",
+      "--run-id",
+      runId
+    ], {
+      detached: true,
+      stdio: ["ignore", stdoutFd, stderrFd],
+      windowsHide: true,
+      env: globalThis.process.env
+    });
+  } finally {
+    fs.closeSync(stdoutFd);
+    fs.closeSync(stderrFd);
+  }
+  if (typeof child?.unref === "function") child.unref();
+  return child;
 }
 
 function ensureRecruitRunArtifacts(snapshot) {
@@ -307,6 +476,121 @@ function completionReason(status) {
   return null;
 }
 
+function snapshotFromPersistedRecruitRun(persisted = {}) {
+  return {
+    runId: persisted.run_id || persisted.runId,
+    name: persisted.name || persisted.run_id || persisted.runId,
+    status: persisted.status || persisted.state,
+    phase: persisted.stage || persisted.phase,
+    progress: persisted.progress || {},
+    context: persisted.context || {},
+    checkpoint: persisted.checkpoint || {},
+    startedAt: persisted.started_at || persisted.startedAt,
+    updatedAt: persisted.updated_at || persisted.updatedAt,
+    completedAt: persisted.completed_at || persisted.completedAt || null,
+    error: persisted.error || null,
+    summary: persisted.summary || null
+  };
+}
+
+function attachLegacyArtifactsToPersistedRecruitRun(persisted = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  if (!runId) return persisted;
+  const snapshot = snapshotFromPersistedRecruitRun(persisted);
+  const result = buildLegacyRunResult(snapshot);
+  const artifacts = getRecruitRunArtifacts(runId);
+  const next = {
+    ...persisted,
+    result,
+    resume: {
+      ...(persisted.resume || {}),
+      checkpoint_path: result?.checkpoint_path || persisted.resume?.checkpoint_path || artifacts?.checkpoint_path || null,
+      output_csv: result?.output_csv || persisted.resume?.output_csv || artifacts?.output_csv || null,
+      worker_stdout_path: artifacts?.worker_stdout_path || persisted.resume?.worker_stdout_path || null,
+      worker_stderr_path: artifacts?.worker_stderr_path || persisted.resume?.worker_stderr_path || null
+    },
+    artifacts: artifacts || persisted.artifacts || null
+  };
+  return writeRecruitRunState(runId, next);
+}
+
+function finalizePersistedRecruitRun(persisted = {}, {
+  status = RUN_STATUS_FAILED,
+  error = null,
+  message = ""
+} = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  if (!runId) return persisted;
+  const now = new Date().toISOString();
+  const normalizedError = status === RUN_STATUS_FAILED
+    ? {
+        name: error?.name || "Error",
+        code: error?.code || "STALE_RUN_PROCESS_EXITED",
+        message: error?.message || message || "Boss search run process exited before it wrote a terminal state."
+      }
+    : null;
+  const next = {
+    ...persisted,
+    run_id: runId,
+    state: status,
+    status,
+    stage: persisted.stage || persisted.phase || "recruit:stale",
+    updated_at: now,
+    heartbeat_at: now,
+    completed_at: persisted.completed_at || now,
+    last_message: normalizedError?.message || message || status,
+    control: {
+      ...(persisted.control || {}),
+      cancel_requested: false
+    },
+    error: normalizedError,
+    summary: persisted.summary || null
+  };
+  return attachLegacyArtifactsToPersistedRecruitRun(next);
+}
+
+function reconcilePersistedRecruitRun(persisted = {}, { cancelStale = false } = {}) {
+  const status = persisted.status || persisted.state;
+  if (STALE_PROCESS_STATUSES.has(status) && !isPidAlive(persisted.pid)) {
+    const shouldCancel = cancelStale || status === RUN_STATUS_CANCELING || persisted.control?.cancel_requested === true;
+    return {
+      run: finalizePersistedRecruitRun(persisted, {
+        status: shouldCancel ? RUN_STATUS_CANCELED : RUN_STATUS_FAILED,
+        error: shouldCancel ? null : {
+          code: "STALE_RUN_PROCESS_EXITED",
+          message: `Boss search run process is no longer alive for pid=${persisted.pid || "unknown"}.`
+        },
+        message: shouldCancel
+          ? "Boss search run was canceled after its worker process was no longer active."
+          : `Boss search run process is no longer alive for pid=${persisted.pid || "unknown"}.`
+      }),
+      stale_finalized: true
+    };
+  }
+  return { run: persisted };
+}
+
+export function markBossRecruitDetachedWorkerFailed(runId, error, options = {}) {
+  const normalizedRunId = normalizeRunId(runId);
+  if (!normalizedRunId) return null;
+  const persisted = readRecruitRunState(normalizedRunId) || buildInitialRecruitDetachedState(normalizedRunId, {});
+  const state = normalizeText(persisted.state || persisted.status);
+  if (TERMINAL_STATUSES.has(state)) return persisted;
+  const errorPayload = {
+    name: error?.name || "Error",
+    code: options.code || error?.code || "RECRUIT_WORKER_UNHANDLED_EXCEPTION",
+    message: normalizeText(error?.message || error || options.message) || "Boss search detached worker exited unexpectedly."
+  };
+  if (normalizeText(error?.stack || "")) {
+    errorPayload.stack = String(error.stack).slice(0, 8000);
+  }
+  return finalizePersistedRecruitRun(persisted, {
+    status: RUN_STATUS_FAILED,
+    error: errorPayload,
+    message: errorPayload.message
+  });
+}
+
 function buildLegacyRunResult(snapshot) {
   if (!snapshot) return null;
   const artifacts = ensureRecruitRunArtifacts(snapshot);
@@ -341,6 +625,8 @@ function buildLegacyRunResult(snapshot) {
     duration_sec: secondsBetween(snapshot.startedAt, snapshot.completedAt || snapshot.updatedAt),
     output_csv: summary?.output_csv || meta.outputCsvPath || artifacts?.output_csv || null,
     report_json: summary?.report_json || meta.reportJsonPath || artifacts?.report_json || null,
+    worker_stdout_path: artifacts?.worker_stdout_path || null,
+    worker_stderr_path: artifacts?.worker_stderr_path || null,
     round_count: 1,
     current_round_index: 1,
     checkpoint_path: snapshot.checkpoint?.checkpoint_path
@@ -661,6 +947,8 @@ function normalizeRunSnapshot(snapshot) {
       checkpoint_path: legacyResult?.checkpoint_path || meta.checkpointPath || artifacts?.checkpoint_path || null,
       pause_control_path: artifacts?.run_state_path || null,
       output_csv: legacyResult?.output_csv || null,
+      worker_stdout_path: artifacts?.worker_stdout_path || null,
+      worker_stderr_path: artifacts?.worker_stderr_path || null,
       resume_count: meta.resumeCount || 0,
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
@@ -959,7 +1247,7 @@ function trackRecruitRun(runId) {
     });
 }
 
-async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" } = {}) {
+async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "", runId = "" } = {}) {
   const parsed = parseRecruitPipelineRequest(args);
   const gate = evaluateRecruitPipelineGate(parsed);
   if (gate) return gate;
@@ -1025,7 +1313,10 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "" }
 
   let started;
   try {
-    started = recruitRunService.startRecruitRun(getRunOptions(args, parsed, session, configResolution));
+    started = recruitRunService.startRecruitRun({
+      ...getRunOptions(args, parsed, session, configResolution),
+      runId
+    });
   } catch (error) {
     await session.close?.();
     return {
@@ -1117,6 +1408,179 @@ export async function startRecruitPipelineRunTool({ workspaceRoot = "", args = {
   return attachMethodEvidence(started, started.run_id);
 }
 
+export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", args = {} } = {}) {
+  const normalizedArgs = {
+    ...args,
+    execution_mode: RUN_MODE_ASYNC
+  };
+  const parsed = parseRecruitPipelineRequest(normalizedArgs);
+  const gate = evaluateRecruitPipelineGate(parsed);
+  if (gate) return gate;
+  const configResolution = resolveBossScreeningConfig(workspaceRoot);
+  const screeningMode = normalizeScreeningModeArg(normalizedArgs);
+  const debugTestOptions = collectRecruitDebugTestOptions(normalizedArgs);
+  if (debugTestOptions.length && !isDebugTestMode(normalizedArgs)) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "DEBUG_TEST_MODE_REQUIRED",
+        message: `这些参数属于调试/测试路径，正式 live run 不会默认启用：${debugTestOptions.join(", ")}。如确需测试，请显式传 debug_test_mode=true。`,
+        retryable: false
+      },
+      debug_test_options: debugTestOptions
+    };
+  }
+  if (screeningMode === "llm" && !configResolution.ok) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "SCREEN_CONFIG_ERROR",
+        message: configResolution.error?.message || "screening-config.json is required for LLM screening.",
+        retryable: true
+      },
+      config_path: configResolution.config_path || null,
+      candidate_paths: configResolution.candidate_paths || []
+    };
+  }
+
+  const runId = createDetachedRecruitRunId();
+  const artifacts = getRecruitRunArtifacts(runId);
+  const initial = buildInitialRecruitDetachedState(runId, {
+    workspaceRoot,
+    args: normalizedArgs,
+    parsed,
+    pid: globalThis.process?.pid
+  });
+  try {
+    writeJsonAtomic(artifacts.detached_args_path, {
+      domain: "recruit",
+      run_id: runId,
+      workspace_root: normalizeText(workspaceRoot) || globalThis.process?.cwd?.() || "",
+      args: clonePlain(normalizedArgs, {})
+    });
+    writeRecruitRunState(runId, initial);
+  } catch (error) {
+    return {
+      status: "FAILED",
+      error: {
+        code: "RECRUIT_RUN_STATE_IO_ERROR",
+        message: `Unable to write Boss search detached run state: ${error?.message || error}`,
+        retryable: false
+      }
+    };
+  }
+
+  try {
+    const child = launchDetachedRecruitWorker(runId);
+    const now = new Date().toISOString();
+    const latest = readRecruitRunState(runId) || initial;
+    const latestState = normalizeText(latest.state || latest.status);
+    if (TERMINAL_STATUSES.has(latestState)) {
+      return {
+        status: "FAILED",
+        error: latest.error || {
+          code: "RECRUIT_WORKER_LAUNCH_FAILED",
+          message: "Boss search detached worker exited during launch.",
+          retryable: true
+        },
+        run: latest,
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    const queued = {
+      ...latest,
+      pid: child.pid || globalThis.process?.pid || null,
+      updated_at: now,
+      heartbeat_at: now,
+      last_message: "Boss search detached worker launched."
+    };
+    writeRecruitRunState(runId, queued);
+    return {
+      status: "ACCEPTED",
+      run_id: runId,
+      state: "queued",
+      run: queued,
+      poll_after_sec: DEFAULT_RECRUIT_POLL_AFTER_SEC,
+      review: parsed.review,
+      message: "Boss search run started in a detached worker. It can continue after the MCP host returns or is recycled.",
+      target_count_semantics: TARGET_COUNT_SEMANTICS,
+      detached_worker: true,
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      chrome: null
+    };
+  } catch (error) {
+    const failed = markBossRecruitDetachedWorkerFailed(runId, error, {
+      code: "RECRUIT_WORKER_LAUNCH_FAILED",
+      message: "Unable to launch Boss search detached worker."
+    });
+    return {
+      status: "FAILED",
+      error: failed?.error || {
+        code: "RECRUIT_WORKER_LAUNCH_FAILED",
+        message: error?.message || "Unable to launch Boss search detached worker.",
+        retryable: true
+      },
+      run: failed || readRecruitRunState(runId),
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      chrome: null
+    };
+  }
+}
+
+export async function runBossRecruitDetachedWorker({ runId } = {}) {
+  const normalizedRunId = normalizeRunId(runId);
+  if (!normalizedRunId) return { ok: false, error: "run_id is required" };
+  const artifacts = getRecruitRunArtifacts(normalizedRunId);
+  const spec = readJsonFile(artifacts?.detached_args_path || "");
+  if (!spec) {
+    const error = new Error(`Boss search detached args were not found for run_id=${normalizedRunId}`);
+    markBossRecruitDetachedWorkerFailed(normalizedRunId, error, { code: "RECRUIT_WORKER_ARGS_MISSING" });
+    return { ok: false, error: error.message };
+  }
+
+  const started = await startRecruitPipelineRunInternal({
+    ...(spec.args || {}),
+    execution_mode: RUN_MODE_ASYNC
+  }, {
+    workspaceRoot: spec.workspace_root || "",
+    runId: normalizedRunId
+  });
+  if (started?.status !== "ACCEPTED") {
+    const failedError = started?.error || {
+      code: "RECRUIT_WORKER_START_FAILED",
+      message: started?.status || "Boss search detached worker failed to start.",
+      retryable: true
+    };
+    markBossRecruitDetachedWorkerFailed(normalizedRunId, failedError, {
+      code: failedError.code || "RECRUIT_WORKER_START_FAILED"
+    });
+    return { ok: false, error: failedError.message || "Boss search detached worker failed to start." };
+  }
+
+  while (true) {
+    const payload = getRecruitPipelineRunTool({ args: { run_id: normalizedRunId } });
+    const state = normalizeText(payload?.run?.state || payload?.run?.status || "");
+    if (TERMINAL_STATUSES.has(state)) break;
+    const persisted = readRecruitRunState(normalizedRunId);
+    if (persisted?.control?.cancel_requested === true) {
+      cancelRecruitPipelineRunTool({ args: { run_id: normalizedRunId } });
+    } else if (persisted?.control?.pause_requested === true && state === RUN_STATUS_RUNNING) {
+      pauseRecruitPipelineRunTool({ args: { run_id: normalizedRunId } });
+    } else if (persisted?.control?.pause_requested === false && state === RUN_STATUS_PAUSED) {
+      resumeRecruitPipelineRunTool({ args: { run_id: normalizedRunId } });
+    }
+    await sleep(DETACHED_WORKER_POLL_MS);
+  }
+  return { ok: true };
+}
+
 export function getRecruitPipelineRunTool({ args = {} } = {}) {
   const runId = normalizeText(args.run_id);
   if (!runId) {
@@ -1139,12 +1603,14 @@ export function getRecruitPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecruitRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedRecruitRun(persisted);
       return {
         status: "RUN_STATUS",
-        run: persisted,
+        run: reconciled.run,
         persistence: {
           source: "disk",
-          active_control_available: false
+          active_control_available: false,
+          stale_finalized: reconciled.stale_finalized === true
         },
         runtime_evaluate_used: false,
         method_summary: {},
@@ -1203,6 +1669,20 @@ export function pauseRecruitPipelineRunTool({ args = {} } = {}) {
         chrome: null
       };
     }
+    if (persisted) {
+      const reconciled = reconcilePersistedRecruitRun(persisted);
+      if (reconciled.stale_finalized) return getRecruitPipelineRunTool({ args });
+      return patchPersistedRecruitControl(runId, {
+        pause_requested: true,
+        pause_requested_at: new Date().toISOString(),
+        pause_requested_by: "pause_recruit_pipeline_run",
+        cancel_requested: false
+      }, {
+        status: "PAUSE_REQUESTED",
+        message: "暂停请求已写入 detached search run 控制文件。",
+        lastMessage: "暂停请求已写入 detached search run 控制文件。"
+      }) || getRecruitPipelineRunTool({ args });
+    }
     return getRecruitPipelineRunTool({ args });
   }
 }
@@ -1251,19 +1731,34 @@ export function resumeRecruitPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecruitRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedRecruitRun(persisted);
+      const reconciledState = reconciled.run?.state || reconciled.run?.status;
+      if (!TERMINAL_STATUSES.has(reconciledState)) {
+        return patchPersistedRecruitControl(runId, {
+          pause_requested: false,
+          pause_requested_at: null,
+          pause_requested_by: null,
+          cancel_requested: false
+        }, {
+          status: "RESUME_REQUESTED",
+          message: "恢复请求已写入 detached search run 控制文件。",
+          lastMessage: "恢复请求已写入 detached search run 控制文件。"
+        }) || getRecruitPipelineRunTool({ args });
+      }
       return {
         status: TERMINAL_STATUSES.has(persisted.state) ? "FAILED" : "FAILED",
         error: {
-          code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
-          message: TERMINAL_STATUSES.has(persisted.state)
+          code: TERMINAL_STATUSES.has(reconciledState) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
+          message: TERMINAL_STATUSES.has(reconciledState)
             ? "目标任务已结束，无法继续。"
             : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
-          retryable: !TERMINAL_STATUSES.has(persisted.state)
+          retryable: !TERMINAL_STATUSES.has(reconciledState)
         },
-        run: persisted,
+        run: reconciled.run,
         persistence: {
           source: "disk",
-          active_control_available: false
+          active_control_available: false,
+          stale_finalized: reconciled.stale_finalized === true
         },
         runtime_evaluate_used: false,
         method_summary: {},
@@ -1306,6 +1801,35 @@ export function cancelRecruitPipelineRunTool({ args = {} } = {}) {
         method_log: [],
         chrome: null
       };
+    }
+    if (persisted) {
+      const reconciled = reconcilePersistedRecruitRun(persisted, { cancelStale: true });
+      if (reconciled.stale_finalized) {
+        return {
+          status: "CANCEL_REQUESTED",
+          run: reconciled.run,
+          message: "该 search run 的后台进程已经不在，已将磁盘状态安全标记为 canceled 并生成结果文件。",
+          persistence: {
+            source: "disk",
+            active_control_available: false,
+            stale_finalized: true
+          },
+          runtime_evaluate_used: false,
+          method_summary: {},
+          method_log: [],
+          chrome: null
+        };
+      }
+      return patchPersistedRecruitControl(runId, {
+        pause_requested: true,
+        pause_requested_at: new Date().toISOString(),
+        pause_requested_by: "cancel_recruit_pipeline_run",
+        cancel_requested: true
+      }, {
+        status: "CANCEL_REQUESTED",
+        message: "取消请求已写入 detached search run 控制文件。",
+        lastMessage: "取消请求已写入 detached search run 控制文件。"
+      }) || getRecruitPipelineRunTool({ args });
     }
     return getRecruitPipelineRunTool({ args });
   }

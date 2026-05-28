@@ -743,6 +743,7 @@ export function buildBossChromeLaunchArgs({
     ...LID_CLOSED_SAFE_CHROME_ARGS,
     ...parseExtraChromeArgs(process.env.BOSS_MCP_EXTRA_CHROME_ARGS),
     ...extraArgs,
+    "--start-maximized",
     "--new-window",
     url
   ];

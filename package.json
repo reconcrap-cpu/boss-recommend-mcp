@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "2.0.56",
+  "version": "2.0.57",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -88,6 +88,7 @@
     "src/chat-mcp.js",
     "src/chat-runtime-config.js",
     "src/cli.js",
+    "src/detached-worker.js",
     "src/index.js",
     "src/parser.js",
     "src/recommend-mcp.js",

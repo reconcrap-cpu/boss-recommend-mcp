@@ -21,6 +21,7 @@ import {
   pauseBossChatRunTool,
   prepareBossChatRunTool,
   resumeBossChatRunTool,
+  startBossChatDetachedRunTool,
   startBossChatRunTool
 } from "./chat-mcp.js";
 import {
@@ -34,6 +35,7 @@ import {
   pauseRecruitPipelineRunTool,
   resumeRecruitPipelineRunTool,
   runRecruitPipelineTool,
+  startRecruitPipelineDetachedRunTool,
   startRecruitPipelineRunTool,
   validateRecruitPipelineArgs
 } from "./recruit-mcp.js";
@@ -135,6 +137,8 @@ const recommendTargetUrl = "https://www.zhipin.com/web/chat/recommend";
 let runPipelineImpl = null;
 let runSelfHealImpl = null;
 let spawnProcessImpl = spawn;
+let forceChatInProcForTests = false;
+let forceRecruitInProcForTests = false;
 const TERMINAL_RUN_STATES = new Set([RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_STATE_CANCELED]);
 
 async function getRunPipelineImpl() {
@@ -182,6 +186,20 @@ function isLikelyAgentRuntime({ workspaceRoot = "" } = {}) {
 function shouldStartRecommendDetached({ workspaceRoot = "" } = {}) {
   if (normalizeText(process.env.BOSS_RECOMMEND_CDP_INPROC || "") === "1") return false;
   if (normalizeText(process.env.BOSS_RECOMMEND_CDP_DETACHED || "") === "1") return true;
+  return isLikelyAgentRuntime({ workspaceRoot });
+}
+
+function shouldStartChatDetached({ workspaceRoot = "" } = {}) {
+  if (forceChatInProcForTests) return false;
+  if (normalizeText(process.env.BOSS_CHAT_CDP_INPROC || "") === "1") return false;
+  if (normalizeText(process.env.BOSS_CHAT_CDP_DETACHED || "") === "1") return true;
+  return isLikelyAgentRuntime({ workspaceRoot });
+}
+
+function shouldStartRecruitDetached({ workspaceRoot = "" } = {}) {
+  if (forceRecruitInProcForTests) return false;
+  if (normalizeText(process.env.BOSS_RECRUIT_CDP_INPROC || "") === "1") return false;
+  if (normalizeText(process.env.BOSS_RECRUIT_CDP_DETACHED || "") === "1") return true;
   return isLikelyAgentRuntime({ workspaceRoot });
 }
 
@@ -2468,6 +2486,9 @@ async function handleBossChatPrepareRunTool({ workspaceRoot, args }) {
 }
 
 async function handleBossChatStartRunTool({ workspaceRoot, args }) {
+  if (shouldStartChatDetached({ workspaceRoot })) {
+    return startBossChatDetachedRunTool({ workspaceRoot, args });
+  }
   return startBossChatRunTool({ workspaceRoot, args });
 }
 
@@ -2618,9 +2639,15 @@ async function handleRequest(message, workspaceRoot) {
       } else if (toolName === TOOL_BOSS_CHAT_CANCEL_RUN) {
         payload = await handleBossChatCancelRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_RUN_RECRUIT_PIPELINE) {
-        payload = await runRecruitPipelineTool({ workspaceRoot, args });
+        payload = normalizeText(args.execution_mode || "").toLowerCase() === "sync"
+          ? await runRecruitPipelineTool({ workspaceRoot, args })
+          : shouldStartRecruitDetached({ workspaceRoot })
+            ? await startRecruitPipelineDetachedRunTool({ workspaceRoot, args })
+            : await runRecruitPipelineTool({ workspaceRoot, args });
       } else if (toolName === TOOL_START_RECRUIT_PIPELINE_RUN) {
-        payload = await startRecruitPipelineRunTool({ workspaceRoot, args });
+        payload = shouldStartRecruitDetached({ workspaceRoot })
+          ? await startRecruitPipelineDetachedRunTool({ workspaceRoot, args })
+          : await startRecruitPipelineRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_RECRUIT_PIPELINE_RUN) {
         payload = getRecruitPipelineRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_CANCEL_RECRUIT_PIPELINE_RUN) {
@@ -2781,24 +2808,30 @@ export const __testables = {
     __resetRecommendMcpStateForTests();
   },
   setChatMcpConnectorForTests(nextImpl) {
+    forceChatInProcForTests = typeof nextImpl === "function";
     __setChatMcpConnectorForTests(nextImpl);
   },
   setChatMcpJobReaderForTests(nextImpl) {
     __setChatMcpJobReaderForTests(nextImpl);
   },
   setChatMcpWorkflowForTests(nextImpl) {
+    forceChatInProcForTests = typeof nextImpl === "function";
     __setChatMcpWorkflowForTests(nextImpl);
   },
   resetChatMcpStateForTests() {
+    forceChatInProcForTests = false;
     __resetChatMcpStateForTests();
   },
   setRecruitMcpConnectorForTests(nextImpl) {
+    forceRecruitInProcForTests = typeof nextImpl === "function";
     __setRecruitMcpConnectorForTests(nextImpl);
   },
   setRecruitMcpWorkflowForTests(nextImpl) {
+    forceRecruitInProcForTests = typeof nextImpl === "function";
     __setRecruitMcpWorkflowForTests(nextImpl);
   },
   resetRecruitMcpStateForTests() {
+    forceRecruitInProcForTests = false;
     __resetRecruitMcpStateForTests();
   }
 };

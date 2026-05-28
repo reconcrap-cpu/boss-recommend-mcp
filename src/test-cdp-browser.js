@@ -201,6 +201,7 @@ function testBossChromeLaunchArgsContainRequiredFlagsOnce() {
       assert.equal(args.filter((arg) => arg === flag).length, 1, `${flag} should appear once`);
     }
   }
+  assert.equal(args.includes("--start-maximized"), true);
   assert.deepEqual(getMissingRequiredChromeFlags(args), []);
 }
 
