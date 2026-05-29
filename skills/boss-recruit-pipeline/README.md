@@ -15,3 +15,5 @@ This skill intentionally replaces legacy `boss-recruit-mcp` skill installs. It r
 - `cancel_recruit_pipeline_run`
 
 Do not call the old `@reconcrap/boss-recruit-mcp` package from this skill.
+
+Each run must ask the user to choose `rest_level` (`low` / `medium` / `high`) and pass the answer as `human_behavior.restLevel`; do not pick a default for the user.

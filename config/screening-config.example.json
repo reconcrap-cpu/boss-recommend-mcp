@@ -16,6 +16,7 @@
   "humanBehavior": {
     "enabled": true,
     "profile": "paced_with_rests",
+    "restLevel": "low",
     "clickMovement": true,
     "textEntry": true,
     "listScrollJitter": true,

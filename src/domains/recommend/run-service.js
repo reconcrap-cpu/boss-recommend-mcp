@@ -690,7 +690,8 @@ export async function runRecommendWorkflow({
   const humanRestController = createHumanRestController({
     enabled: effectiveHumanRestEnabled,
     shortRestEnabled: effectiveHumanBehavior.shortRest,
-    batchRestEnabled: effectiveHumanBehavior.batchRest
+    batchRestEnabled: effectiveHumanBehavior.batchRest,
+    restLevel: effectiveHumanBehavior.restLevel
   });
   const normalizedFilter = normalizeFilter(filter);
   const normalizedPostAction = normalizeRecommendPostAction(postAction) || "none";
@@ -790,6 +791,7 @@ export async function runRecommendWorkflow({
       viewport_recoveries: viewportGuard.getStats().recoveries,
       human_behavior_enabled: effectiveHumanBehavior.enabled,
       human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
       human_rest_count: humanRestState.rest_count,
       human_rest_ms: humanRestState.total_rest_ms,
@@ -1509,6 +1511,7 @@ export async function runRecommendWorkflow({
         addTiming(compactResult.timings, "human_rest_ms", restElapsed);
         compactResult.timings.total_ms = Date.now() - candidateStarted;
         updateRecommendProgress({
+          human_rest_level: effectiveHumanBehavior.restLevel,
           human_rest_last: restResult
         });
       }
@@ -1651,6 +1654,7 @@ export function createRecommendRunService({
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_behavior: effectiveHumanBehavior,
+        human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled
       },
       progress: {
@@ -1670,6 +1674,7 @@ export function createRecommendRunService({
         context_recoveries: 0,
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
+        human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
         human_rest_count: 0,
         human_rest_ms: 0,

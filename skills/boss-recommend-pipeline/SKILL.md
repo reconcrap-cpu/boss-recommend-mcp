@@ -20,7 +20,8 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - **确认不可代填（强制）**
   - 禁止 agent 自行“设置合理参数”并代替用户确认。
   - 禁止在用户未明确回复前，把任意 `*_confirmed` 字段设为 `true`。
-  - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job`。
+  - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job/rest_level`。
+  - 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
   - 若工具返回 `pending_questions`，必须逐项向用户提问并等待用户回复；不得跳过提问直接执行。
 
 - **岗位确认时机**
@@ -54,6 +55,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - `target_count`（可空）
 - `post_action`：`favorite|greet|none`
 - `max_greet_count`（仅当 `post_action=greet`）
+- `rest_level`：`low|medium|high`
 
 ### Stage B (页面就绪后)
 
@@ -82,6 +84,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - `gender`: `不限/男/女`
   - `recent_not_view`: `不限/近14天没有`
   - `post_action`: `favorite/greet/none`
+  - `rest_level`: `low/medium/high`
 
 ## Tool Usage
 
@@ -94,6 +97,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - 关键输入：
   - `confirmation`：`page_confirmed/page_value/filters_confirmed/school_tag_confirmed.../job_confirmed/job_value/final_confirmed`
   - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/criteria/job/target_count/post_action/max_greet_count`
+  - `human_behavior`：必须包含本次用户确认的 `restLevel`（例如 `{ "restLevel": "medium" }`）
   - 不要传 `follow_up.chat`；该路径属于 legacy-only 行为
 
 最小策略：

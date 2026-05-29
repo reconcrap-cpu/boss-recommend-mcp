@@ -105,7 +105,8 @@ async function testToolListIncludesChatTools() {
     id: 1,
     method: "tools/list"
   }, process.cwd());
-  const names = new Set((response?.result?.tools || []).map((tool) => tool.name));
+  const tools = response?.result?.tools || [];
+  const names = new Set(tools.map((tool) => tool.name));
   assert.equal(names.has(TOOL_HEALTH), true);
   assert.equal(names.has(TOOL_PREPARE), true);
   assert.equal(names.has(TOOL_START), true);
@@ -113,6 +114,9 @@ async function testToolListIncludesChatTools() {
   assert.equal(names.has(TOOL_PAUSE), true);
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has(TOOL_CANCEL), true);
+  const startTool = tools.find((tool) => tool.name === TOOL_START);
+  assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
+  assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
 }
 
 async function testChatPrepareReadsJobOptions() {
@@ -341,6 +345,7 @@ async function testChatRequestCvLoadsLlmConfig() {
     assert.equal(options.humanBehavior.profile, "paced_with_rests");
     assert.equal(options.humanBehavior.textEntry, true);
     assert.equal(options.humanBehavior.listScrollJitter, true);
+    assert.equal(options.humanBehavior.restLevel, "high");
     assert.equal(options.llmConfig.greetingMessage, "配置招呼语");
     assert.equal(options.greetingText, "配置招呼语");
     runControl.setPhase("chat:test");
@@ -433,6 +438,7 @@ async function testChatSafePacingCompatibilityControlsHumanBehavior() {
   assert.equal(observedOptions.humanBehavior.profile, "paced");
   assert.equal(observedOptions.humanBehavior.enabled, true);
   assert.equal(observedOptions.humanBehavior.textEntry, true);
+  assert.equal(observedOptions.humanBehavior.restLevel, "high");
   assert.equal(observedOptions.humanBehavior.restEnabled, false);
   assert.equal(observedOptions.humanRestEnabled, false);
 }
@@ -579,7 +585,10 @@ async function main() {
     openaiProject: "proj-test",
     temperature: 0,
     topP: 0.2,
-    humanRestEnabled: true
+    humanRestEnabled: true,
+    humanBehavior: {
+      rest_level: "high"
+    }
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {

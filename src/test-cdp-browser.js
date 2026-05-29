@@ -22,6 +22,7 @@ import {
   isChromeDebugUnavailableError,
   isBossLoginUrl,
   normalizeHumanBehaviorOptions,
+  normalizeHumanRestLevel,
   resolveHumanClickPointForBox,
   simulateHumanClick
 } from "./core/browser/index.js";
@@ -508,6 +509,15 @@ function createSequenceRandom(values = []) {
   };
 }
 
+function createPatternRandom() {
+  let index = 0;
+  return () => {
+    const value = ((index * 37) % 100) / 100;
+    index += 1;
+    return value;
+  };
+}
+
 function testHumanDelayAndBezierPath() {
   const delay = humanDelay(260, 0, { minMs: 100, random: createSequenceRandom([0.5]) });
   assert.equal(delay, 260);
@@ -594,6 +604,7 @@ function testHumanBehaviorNormalization() {
   assert.equal(defaultBehavior.enabled, true);
   assert.equal(defaultBehavior.profile, "paced_with_rests");
   assert.equal(defaultBehavior.restEnabled, true);
+  assert.equal(defaultBehavior.restLevel, "low");
   assert.equal(defaultBehavior.clickMovement, true);
   assert.equal(defaultBehavior.textEntry, true);
   assert.equal(defaultBehavior.listScrollJitter, true);
@@ -619,6 +630,22 @@ function testHumanBehaviorNormalization() {
   assert.equal(safePacing.profile, "paced");
   assert.equal(safePacing.actionCooldown, true);
   assert.equal(safePacing.restEnabled, false);
+
+  const mediumRest = normalizeHumanBehaviorOptions({ profile: "paced_with_rests", restLevel: "medium" });
+  assert.equal(mediumRest.restEnabled, true);
+  assert.equal(mediumRest.restLevel, "medium");
+
+  const highRestAlias = normalizeHumanBehaviorOptions({ profile: "paced_with_rests", rest_level: "high" });
+  assert.equal(highRestAlias.restLevel, "high");
+
+  const invalidRest = normalizeHumanBehaviorOptions({ profile: "paced_with_rests", restLevel: "aggressive" });
+  assert.equal(invalidRest.restLevel, "low");
+
+  const pacedHigh = normalizeHumanBehaviorOptions({ profile: "paced", restLevel: "high" });
+  assert.equal(pacedHigh.restLevel, "high");
+  assert.equal(pacedHigh.restEnabled, false);
+
+  assert.equal(normalizeHumanRestLevel("med"), "medium");
 }
 
 async function testHumanClickPointAndChunkedText() {
@@ -760,6 +787,63 @@ async function testHumanRestController() {
   assert.equal(enabled.getState().total_rest_ms, 40);
 }
 
+async function simulateBudgetRestLevel(restLevel, candidateActiveMs) {
+  const sleepCalls = [];
+  const events = [];
+  let now = 0;
+  const controller = createHumanRestController({
+    enabled: true,
+    restLevel,
+    random: createPatternRandom(),
+    nowFn: () => now
+  });
+  for (let index = 0; index < 700; index += 1) {
+    now += candidateActiveMs;
+    const result = await controller.takeBreakIfNeeded({
+      sleepFn: async (ms) => {
+        sleepCalls.push(ms);
+        now += ms;
+      }
+    });
+    if (result.rested) events.push(...result.events);
+  }
+  return {
+    state: controller.getState(),
+    sleepCalls,
+    events
+  };
+}
+
+async function testHumanRestControllerBudgetLevels() {
+  const medium = await simulateBudgetRestLevel("medium", 25000);
+  assert.ok(Math.abs(medium.state.total_rest_ms - 30 * 60 * 1000) <= 90000);
+  assert.ok(medium.events.length >= 25);
+  assert.ok(new Set(medium.events.map((event) => event.processed_since_last_rest)).size > 3);
+  assert.ok(new Set(medium.sleepCalls).size > 10);
+  assert.ok(medium.events.some((event) => event.rest_size === "short"));
+  assert.ok(medium.events.some((event) => event.rest_size === "long"));
+
+  const high = await simulateBudgetRestLevel("high", 25000);
+  assert.ok(Math.abs(high.state.total_rest_ms - 60 * 60 * 1000) <= 150000);
+  assert.ok(high.events.length >= 35);
+  assert.ok(new Set(high.events.map((event) => event.processed_since_last_rest)).size > 3);
+  assert.ok(new Set(high.sleepCalls).size > 10);
+  assert.ok(high.events.some((event) => event.rest_size === "short"));
+  assert.ok(high.events.some((event) => event.rest_size === "long"));
+
+  let now = 0;
+  const clockDriven = createHumanRestController({
+    enabled: true,
+    restLevel: "medium",
+    random: createSequenceRandom(Array.from({ length: 20 }, () => 0.5)),
+    nowFn: () => now
+  });
+  now += 5 * 60 * 60 * 1000;
+  const result = await clockDriven.takeBreakIfNeeded({ sleepFn: async () => {} });
+  assert.equal(result.rested, true);
+  assert.ok(result.events[0].rest_budget_debt_ms >= 30 * 60 * 1000);
+}
+
 async function testBossLoginDomDetection() {
   const queriedSelectors = [];
   const client = {
@@ -806,6 +890,7 @@ await testConfiguredHumanInteractionControlsClickPoint();
 testHumanBehaviorNormalization();
 await testHumanClickPointAndChunkedText();
 await testHumanRestController();
+await testHumanRestControllerBudgetLevels();
 await testBossLoginDomDetection();
 
 console.log("CDP browser guard tests passed");

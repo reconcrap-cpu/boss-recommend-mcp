@@ -259,13 +259,16 @@ config/screening-config.example.json
 - `debugPort`：未显式传 `port` 时，recommend / search / chat CDP-only MCP run 和健康检查默认连接这个 Chrome 调试端口。
 - `outputDir`：recommend / search / chat 完成后的最终 CSV 与 report JSON 会写入这里；run state / checkpoint 仍保留在各自状态目录，方便 pause/resume/cancel。
 - `llmThinkingLevel`：默认 `low`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。
-- `humanBehavior`：默认 `{ "enabled": true, "profile": "paced_with_rests" }`。用于 recommend / search / chat 的可靠性实验，支持：
+- `humanBehavior`：默认 `{ "enabled": true, "profile": "paced_with_rests", "restLevel": "low" }`。用于 recommend / search / chat 的可靠性实验，支持：
   - `profile: "baseline"`：关闭人类节奏，保持确定性行为。
   - `profile: "paced"`：启用 CDP-only Bezier 鼠标移动、较大按钮的安全 inset 点击点、分块 `Input.insertText`、列表 wheel/settle jitter，以及小的动作前后读秒。
   - `profile: "paced_with_rests"`：在 `paced` 基础上启用候选人短休和批次休息。
+  - `restLevel: "low"`：保持旧版休息策略不变，候选人短休 8% 概率暂停 3-7 秒，批次休息约每 25-32 人暂停 15-30 秒。
+  - `restLevel: "medium"`：随机分散短/长休息，平均目标约每 5 小时或 700 位候选人累计休息 30 分钟。
+  - `restLevel: "high"`：随机分散短/长休息，平均目标约每 5 小时或 700 位候选人累计休息 1 小时。
 - `humanRestEnabled`：兼容旧配置。设为 `true` 时等价于 `humanBehavior.profile="paced_with_rests"`；设为 `false` 时不会关闭当前默认节奏。如需关闭，请显式设置 `humanBehavior.enabled=false` 或 `humanBehavior.profile="baseline"`。
   - recommend / search / chat 图片简历 fallback 与主列表滚动都会在启用 `listScrollJitter` 时使用 coverage-safe scroll jitter：每次 wheel delta 在安全范围内变化，并保留截图重叠、重复检测、bottom-marker / stop-boundary 逻辑，实际 delta 和 settle 时间会写入 artifact metadata。
-  - chat/recommend/search run 也兼容显式参数 `safe_pacing` 与 `batch_rest_enabled`：run 参数优先于配置文件。
+  - chat/recommend/search run 也兼容显式参数 `safe_pacing`、`batch_rest_enabled` 与 `human_behavior.restLevel`：run 参数优先于配置文件。AI harness/skill 启动每次 run 前必须让用户明确选择 `low/medium/high`，再把选择写入 `human_behavior.restLevel`。
 
 ## 常用命令
 

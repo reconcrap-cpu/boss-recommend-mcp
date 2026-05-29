@@ -66,7 +66,8 @@ const installConfigDefaults = Object.freeze({
   humanRestEnabled: true,
   humanBehavior: {
     enabled: true,
-    profile: "paced_with_rests"
+    profile: "paced_with_rests",
+    restLevel: "low"
   }
 });
 const bossChatRuntimeChildDirs = ["logs", "runs", "profiles", "reports", "artifacts", "state"];
@@ -620,6 +621,12 @@ function parseBooleanOption(raw, fallback = undefined) {
   if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
   if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
   return fallback;
+}
+
+function parseRestLevelOption(raw) {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const normalized = String(raw).trim().toLowerCase();
+  return ["low", "medium", "high"].includes(normalized) ? normalized : undefined;
 }
 
 function normalizePageScope(value) {
@@ -1279,6 +1286,19 @@ function applyMissingInstallConfigDefaults(config = {}) {
       nextConfig[key] = defaultValue;
       patchedKeys.push(key);
     }
+  }
+  if (
+    nextConfig.humanBehavior
+    && typeof nextConfig.humanBehavior === "object"
+    && !Array.isArray(nextConfig.humanBehavior)
+    && !Object.prototype.hasOwnProperty.call(nextConfig.humanBehavior, "restLevel")
+    && !Object.prototype.hasOwnProperty.call(nextConfig.humanBehavior, "rest_level")
+  ) {
+    nextConfig.humanBehavior = {
+      ...nextConfig.humanBehavior,
+      restLevel: "low"
+    };
+    patchedKeys.push("humanBehavior.restLevel");
   }
   return {
     nextConfig,
@@ -2734,6 +2754,17 @@ async function runPipelineOnce(options = {}) {
     allow_navigate: !(options["no-navigate"] === true || options.noNavigate === true || options.allow_navigate === false),
     slow_live: options["slow-live"] === true || options.slowLive === true || options.slow_live === true
   };
+  const restLevel = parseRestLevelOption(
+    options["rest-level"]
+    ?? options.rest_level
+    ?? options["human-behavior-rest-level"]
+    ?? options.human_behavior_rest_level
+  );
+  if (restLevel) {
+    args.human_behavior = {
+      restLevel
+    };
+  }
 
   const optionalPassthrough = [
     "detail_limit",
@@ -2819,6 +2850,12 @@ function buildBossChatCliInput(options = {}) {
   const greetingText = typeof greetingTextRaw === "string" ? greetingTextRaw.trim() : undefined;
   const targetUrlIncludes = String(options["target-url-includes"] || options.target_url_includes || "").trim();
   const host = String(options.host || "").trim();
+  const restLevel = parseRestLevelOption(
+    options["rest-level"]
+    ?? options.rest_level
+    ?? options["human-behavior-rest-level"]
+    ?? options.human_behavior_rest_level
+  );
   return {
     profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
     job: typeof options.job === "string" ? options.job.trim() : undefined,
@@ -2839,6 +2876,11 @@ function buildBossChatCliInput(options = {}) {
     human_behavior_enabled: parseBooleanOption(options["human-behavior-enabled"] ?? options.human_behavior_enabled),
     human_behavior_profile: typeof (options["human-behavior-profile"] ?? options.human_behavior_profile) === "string"
       ? (options["human-behavior-profile"] ?? options.human_behavior_profile).trim()
+      : undefined,
+    human_behavior: restLevel
+      ? {
+          restLevel
+        }
       : undefined,
     safe_pacing: parseBooleanOption(options["safe-pacing"] ?? options.safe_pacing),
     batch_rest_enabled: parseBooleanOption(options["batch-rest"] ?? options.batch_rest_enabled)

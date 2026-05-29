@@ -27,6 +27,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - `start_from`: `unread|all`
 - `target_count`
 - `criteria`
+- `rest_level`: `low|medium|high`
 
 可选：
 
@@ -37,6 +38,12 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - `no_state`
 - `safe_pacing`
 - `batch_rest_enabled`
+
+启动工具时，把用户确认的休息强度写入 `human_behavior.restLevel`，例如：
+
+```json
+{ "human_behavior": { "restLevel": "medium" } }
+```
 
 `greeting_text` 默认规则：
 
@@ -62,6 +69,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - 若本机找不到 Chrome，可提示用户设置 `BOSS_MCP_CHROME_PATH` 或 `BOSS_RECOMMEND_CHROME_PATH`；非本机 debug host 不自动启动。
 - `job` / `start_from` / `criteria` 缺一不可；缺参时只补缺口。
 - `target_count` 在 chat-only 启动前也是必填项，不能默认省略。
+- 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
 - 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。
 - 参数名必须写 `target_count`（不要写“目标数量”等中文键名）。
 - 当用户选择“扫到底/全部候选人/所有候选人”时，调用参数优先写：`"target_count": "all"`；`-1` 只作为兼容输入和内部 CLI 表示。
@@ -89,5 +97,5 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 
 - 用结构化中文。
 - 首轮建议先调用一次 `prepare_boss_chat_run`（可空参）获取 `job_options` 与 `pending_questions`。
-- 缺参时必须逐项确认：`job`（来自岗位列表）、`start_from`（`unread|all`）、`target_count`、`criteria`。
+- 缺参时必须逐项确认：`job`（来自岗位列表）、`start_from`（`unread|all`）、`target_count`、`criteria`、`rest_level`。
 - 若健康检查失败，明确提示共享配置文件 `screening-config.json` 不可用。

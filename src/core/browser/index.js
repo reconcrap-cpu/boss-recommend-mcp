@@ -86,6 +86,46 @@ const HUMAN_BEHAVIOR_PROFILE_ALIASES = Object.freeze({
   rests: "paced_with_rests",
   rest: "paced_with_rests"
 });
+const DEFAULT_HUMAN_REST_LEVEL = "low";
+const HUMAN_REST_LEVEL_ALIASES = Object.freeze({
+  default: "low",
+  light: "low",
+  normal: "medium",
+  med: "medium",
+  heavy: "high"
+});
+const HUMAN_REST_LEVEL_PROFILES = Object.freeze({
+  medium: Object.freeze({
+    targetRestMs: 30 * 60 * 1000,
+    targetCandidateCount: 700,
+    targetWindowMs: 5 * 60 * 60 * 1000,
+    intervalMin: 4,
+    intervalMax: 16,
+    longRestProbability: 0.22,
+    shortRestMinMs: 8000,
+    shortRestMaxMs: 45000,
+    longRestMinMs: 60000,
+    longRestMaxMs: 180000,
+    minDebtToRestMs: 8000,
+    forceDebtMs: 90000,
+    maxOverspendMs: 15000
+  }),
+  high: Object.freeze({
+    targetRestMs: 60 * 60 * 1000,
+    targetCandidateCount: 700,
+    targetWindowMs: 5 * 60 * 60 * 1000,
+    intervalMin: 3,
+    intervalMax: 12,
+    longRestProbability: 0.28,
+    shortRestMinMs: 12000,
+    shortRestMaxMs: 75000,
+    longRestMinMs: 90000,
+    longRestMaxMs: 300000,
+    minDebtToRestMs: 12000,
+    forceDebtMs: 150000,
+    maxOverspendMs: 25000
+  })
+});
 
 function clampNumber(value, min, max) {
   const number = Number(value);
@@ -149,6 +189,14 @@ export function normalizeHumanBehaviorProfile(raw, fallback = "baseline") {
   const profile = HUMAN_BEHAVIOR_PROFILE_ALIASES[normalized] || normalized;
   return Object.prototype.hasOwnProperty.call(HUMAN_BEHAVIOR_PROFILES, profile)
     ? profile
+    : fallback;
+}
+
+export function normalizeHumanRestLevel(raw, fallback = DEFAULT_HUMAN_REST_LEVEL) {
+  const normalized = String(raw || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  const level = HUMAN_REST_LEVEL_ALIASES[normalized] || normalized;
+  return level === "low" || level === "medium" || level === "high"
+    ? level
     : fallback;
 }
 
@@ -231,6 +279,10 @@ export function normalizeHumanBehaviorOptions(raw = null, {
     readFirstOption(rawObject, ["batchRest", "batch_rest", "batchRestEnabled", "batch_rest_enabled"]),
     profileDefaults.batchRest
   );
+  const restLevel = normalizeHumanRestLevel(
+    readFirstOption(rawObject, ["restLevel", "rest_level"]),
+    DEFAULT_HUMAN_REST_LEVEL
+  );
   if (batchRestFlag !== null) {
     batchRest = batchRestFlag;
     if (batchRestFlag === true && readFirstOption(rawObject, ["shortRest", "short_rest", "randomRest", "random_rest"]) === undefined) {
@@ -248,6 +300,7 @@ export function normalizeHumanBehaviorOptions(raw = null, {
     shortRest: enabled && shortRest === true,
     batchRest: enabled && batchRest === true,
     actionCooldown: enabled && actionCooldown === true,
+    restLevel,
     restEnabled: enabled && (shortRest === true || batchRest === true)
   };
 }
@@ -404,6 +457,8 @@ export function createHumanRestController({
   shortRestEnabled = true,
   batchRestEnabled = true,
   random = Math.random,
+  nowFn = Date.now,
+  restLevel = DEFAULT_HUMAN_REST_LEVEL,
   shortRestProbability = 0.08,
   shortRestMinMs = 3000,
   shortRestMaxMs = 7000,
@@ -413,18 +468,93 @@ export function createHumanRestController({
   batchRestMaxMs = 30000
 } = {}) {
   const nextRandom = normalizeRandom(random);
+  const readNow = typeof nowFn === "function" ? nowFn : Date.now;
+  const normalizedRestLevel = normalizeHumanRestLevel(restLevel);
+  const budgetProfile = (shortRestEnabled !== false || batchRestEnabled !== false)
+    ? HUMAN_REST_LEVEL_PROFILES[normalizedRestLevel] || null
+    : null;
+  const nextBudgetRestInterval = () => budgetProfile
+    ? randomIntegerBetween(nextRandom, budgetProfile.intervalMin, budgetProfile.intervalMax)
+    : 0;
   const state = {
     enabled: enabled === true,
+    rest_level: normalizedRestLevel,
     short_rest_enabled: enabled === true && shortRestEnabled !== false,
     batch_rest_enabled: enabled === true && batchRestEnabled !== false,
     rest_counter: 0,
     rest_threshold: Math.max(1, Math.floor(Number(batchThresholdBase) || 25) + Math.floor(nextRandom() * Math.max(1, Number(batchThresholdJitter) || 1))),
+    processed_count: 0,
+    candidates_since_last_rest: 0,
+    candidates_until_next_rest: nextBudgetRestInterval(),
+    active_elapsed_ms: 0,
+    last_active_at_ms: Number(readNow()) || 0,
     rest_count: 0,
     total_rest_ms: 0
   };
 
   function resetThreshold() {
     state.rest_threshold = Math.max(1, Math.floor(Number(batchThresholdBase) || 25) + Math.floor(nextRandom() * Math.max(1, Number(batchThresholdJitter) || 1)));
+  }
+
+  function updateActiveElapsed() {
+    const now = Number(readNow()) || 0;
+    if (state.last_active_at_ms >= 0 && now >= state.last_active_at_ms) {
+      state.active_elapsed_ms += now - state.last_active_at_ms;
+    }
+    state.last_active_at_ms = now;
+    return now;
+  }
+
+  function getBudgetTargetMs() {
+    if (!budgetProfile) return 0;
+    const candidateTarget = state.processed_count * (budgetProfile.targetRestMs / budgetProfile.targetCandidateCount);
+    const elapsedTarget = state.active_elapsed_ms * (budgetProfile.targetRestMs / budgetProfile.targetWindowMs);
+    return Math.max(candidateTarget, elapsedTarget);
+  }
+
+  function chooseBudgetRestPause(debtMs) {
+    const longRest = nextRandom() < budgetProfile.longRestProbability;
+    const minMs = longRest ? budgetProfile.longRestMinMs : budgetProfile.shortRestMinMs;
+    const maxMs = longRest ? budgetProfile.longRestMaxMs : budgetProfile.shortRestMaxMs;
+    const scaleMin = longRest ? 0.75 : 0.38;
+    const scaleMax = longRest ? 1.1 : 0.78;
+    const desiredMs = debtMs * randomBetween(nextRandom, scaleMin, scaleMax);
+    const randomizedMs = randomBetween(nextRandom, minMs, maxMs);
+    const blendedMs = Math.max(minMs, Math.min(maxMs, (desiredMs + randomizedMs) / 2));
+    const maxAllowedMs = Math.max(minMs, debtMs + budgetProfile.maxOverspendMs);
+    return {
+      pauseMs: Math.round(Math.min(blendedMs, maxAllowedMs)),
+      restSize: longRest ? "long" : "short"
+    };
+  }
+
+  async function takeBudgetBreakIfNeeded(sleeper) {
+    state.processed_count += 1;
+    state.candidates_since_last_rest += 1;
+    state.candidates_until_next_rest -= 1;
+    const debtMs = getBudgetTargetMs() - state.total_rest_ms;
+    const intervalDue = state.candidates_until_next_rest <= 0;
+    const forceDue = debtMs >= budgetProfile.forceDebtMs;
+    if (!intervalDue && !forceDue) {
+      return null;
+    }
+    if (debtMs < budgetProfile.minDebtToRestMs) {
+      if (intervalDue) state.candidates_until_next_rest = nextBudgetRestInterval();
+      return null;
+    }
+    const { pauseMs, restSize } = chooseBudgetRestPause(debtMs);
+    await sleeper(pauseMs);
+    const event = {
+      kind: "random_rest",
+      rest_level: normalizedRestLevel,
+      rest_size: restSize,
+      pause_ms: pauseMs,
+      processed_since_last_rest: state.candidates_since_last_rest,
+      rest_budget_debt_ms: Math.round(Math.max(0, debtMs))
+    };
+    state.candidates_since_last_rest = 0;
+    state.candidates_until_next_rest = nextBudgetRestInterval();
+    return event;
   }
 
   async function takeBreakIfNeeded({ sleepFn = sleep } = {}) {
@@ -438,18 +568,44 @@ export function createHumanRestController({
       };
     }
     const sleeper = typeof sleepFn === "function" ? sleepFn : sleep;
+    updateActiveElapsed();
+    if (budgetProfile) {
+      const budgetEvent = await takeBudgetBreakIfNeeded(sleeper);
+      const pauseMs = budgetEvent?.pause_ms || 0;
+      if (pauseMs > 0) {
+        state.rest_count += 1;
+        state.total_rest_ms += pauseMs;
+        state.last_active_at_ms = Number(readNow()) || state.last_active_at_ms;
+      }
+      return {
+        enabled: true,
+        rested: Boolean(budgetEvent),
+        pause_ms: pauseMs,
+        rest_level: normalizedRestLevel,
+        rest_counter: state.rest_counter,
+        rest_threshold: state.rest_threshold,
+        processed_count: state.processed_count,
+        candidates_until_next_rest: state.candidates_until_next_rest,
+        active_elapsed_ms: state.active_elapsed_ms,
+        rest_count: state.rest_count,
+        total_rest_ms: state.total_rest_ms,
+        events: budgetEvent ? [budgetEvent] : []
+      };
+    }
     state.rest_counter += 1;
+    state.processed_count += 1;
     const events = [];
     if (state.short_rest_enabled && nextRandom() < Math.max(0, Number(shortRestProbability) || 0)) {
       const pauseMs = Math.round(randomBetween(nextRandom, shortRestMinMs, shortRestMaxMs));
       await sleeper(pauseMs);
-      events.push({ kind: "random_rest", pause_ms: pauseMs });
+      events.push({ kind: "random_rest", rest_level: normalizedRestLevel, pause_ms: pauseMs });
     }
     if (state.batch_rest_enabled && state.rest_counter >= state.rest_threshold) {
       const pauseMs = Math.round(randomBetween(nextRandom, batchRestMinMs, batchRestMaxMs));
       await sleeper(pauseMs);
       events.push({
         kind: "batch_rest",
+        rest_level: normalizedRestLevel,
         pause_ms: pauseMs,
         processed_since_last_batch_rest: state.rest_counter
       });
@@ -460,13 +616,17 @@ export function createHumanRestController({
     if (pauseMs > 0) {
       state.rest_count += events.length;
       state.total_rest_ms += pauseMs;
+      state.last_active_at_ms = Number(readNow()) || state.last_active_at_ms;
     }
     return {
       enabled: true,
       rested: events.length > 0,
       pause_ms: pauseMs,
+      rest_level: normalizedRestLevel,
       rest_counter: state.rest_counter,
       rest_threshold: state.rest_threshold,
+      processed_count: state.processed_count,
+      active_elapsed_ms: state.active_elapsed_ms,
       rest_count: state.rest_count,
       total_rest_ms: state.total_rest_ms,
       events

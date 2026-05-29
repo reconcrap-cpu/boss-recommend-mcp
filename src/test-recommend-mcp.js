@@ -146,13 +146,17 @@ async function testToolListIncludesRecommendTools() {
     id: 1,
     method: "tools/list"
   }, process.cwd());
-  const names = new Set((response?.result?.tools || []).map((tool) => tool.name));
+  const tools = response?.result?.tools || [];
+  const names = new Set(tools.map((tool) => tool.name));
   assert.equal(names.has(TOOL_LIST_JOBS), true);
   assert.equal(names.has(TOOL_START), true);
   assert.equal(names.has(TOOL_GET), true);
   assert.equal(names.has(TOOL_PAUSE), true);
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has(TOOL_CANCEL), true);
+  const startTool = tools.find((tool) => tool.name === TOOL_START);
+  assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
+  assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
 }
 
 async function testRecommendJobListTool() {
@@ -322,6 +326,7 @@ async function testRecommendLoadsLlmConfigByDefault() {
   assert.equal(observedOptions.humanBehavior.profile, "paced_with_rests");
   assert.equal(observedOptions.humanBehavior.textEntry, true);
   assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
+  assert.equal(observedOptions.humanBehavior.restLevel, "medium");
   assert.equal(observedOptions.llmConfig.llmModels.length, 2);
   assert.equal(observedOptions.llmConfig.llmModels[1].model, "gpt-4.1-nano");
   assert.equal(observedOptions.llmConfig.llmModels[1].apiKey, "sk-backup-key");
@@ -336,6 +341,7 @@ async function testRecommendHumanBehaviorArgsOverrideConfig() {
   assert.equal(observedOptions.humanBehavior.profile, "paced");
   assert.equal(observedOptions.humanBehavior.enabled, true);
   assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
+  assert.equal(observedOptions.humanBehavior.restLevel, "medium");
   assert.equal(observedOptions.humanBehavior.restEnabled, false);
   assert.equal(observedOptions.humanRestEnabled, false);
 }
@@ -953,7 +959,10 @@ async function main() {
     openaiProject: "proj-test",
     temperature: 0,
     topP: 0.2,
-    humanRestEnabled: true
+    humanRestEnabled: true,
+    humanBehavior: {
+      restLevel: "medium"
+    }
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {

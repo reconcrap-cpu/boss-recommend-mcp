@@ -32,6 +32,7 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 - 若用户提供城市、学历、学校、关键词、过滤已看、人选目标数、筛选条件、post action、max greet 等参数，必须逐项传入或确认。
 - `post_action=greet` 时必须确认 `max_greet_count`；不要默认等于 `target_count`。
 - 搜索页和推荐页一样支持多选筛选条件；不要把多选降级成单选。
+- 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
 
 ## Required Inputs
 
@@ -39,6 +40,7 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 - `keyword` 或用户明确的搜索意图
 - `criteria`
 - `target_count`
+- `rest_level`: `low|medium|high`
 
 常用可选项：
 
@@ -49,6 +51,12 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 - `post_action`
 - `max_greet_count`
 - `port`
+
+启动工具时，把用户确认的休息强度写入 `human_behavior.restLevel`，例如：
+
+```json
+{ "human_behavior": { "restLevel": "medium" } }
+```
 
 ## Response Style
 

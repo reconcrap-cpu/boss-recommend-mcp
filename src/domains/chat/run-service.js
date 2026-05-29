@@ -746,7 +746,8 @@ export async function runChatWorkflow({
   const humanRestController = createHumanRestController({
     enabled: effectiveHumanRestEnabled,
     shortRestEnabled: effectiveHumanBehavior.shortRest,
-    batchRestEnabled: effectiveHumanBehavior.batchRest
+    batchRestEnabled: effectiveHumanBehavior.batchRest,
+    restLevel: effectiveHumanBehavior.restLevel
   });
   const normalizedDetailSource = normalizeDetailSource(detailSource);
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
@@ -969,6 +970,7 @@ export async function runChatWorkflow({
       viewport_recoveries: viewportGuard.getStats().recoveries,
       human_behavior_enabled: effectiveHumanBehavior.enabled,
       human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
       human_rest_count: humanRestController.getState().rest_count,
       human_rest_ms: humanRestController.getState().total_rest_ms,
@@ -1774,6 +1776,7 @@ export async function runChatWorkflow({
       viewport_recoveries: viewportGuard.getStats().recoveries,
       human_behavior_enabled: effectiveHumanBehavior.enabled,
       human_behavior_profile: effectiveHumanBehavior.profile,
+      human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
       human_rest_count: humanRestController.getState().rest_count,
       human_rest_ms: humanRestController.getState().total_rest_ms,
@@ -1817,6 +1820,7 @@ export async function runChatWorkflow({
         compactResult.timings.total_ms = Date.now() - candidateStarted;
         runControl.updateProgress({
           human_rest_enabled: effectiveHumanRestEnabled,
+          human_rest_level: effectiveHumanBehavior.restLevel,
           human_rest_count: humanRestController.getState().rest_count,
           human_rest_ms: humanRestController.getState().total_rest_ms,
           human_rest_last: restResult,
@@ -1962,6 +1966,7 @@ export function createChatRunService({
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_behavior: effectiveHumanBehavior,
+        human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled
       },
       progress: {
@@ -1981,6 +1986,7 @@ export function createChatRunService({
         context_recoveries: 0,
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
+        human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
         human_rest_count: 0,
         human_rest_ms: 0,
