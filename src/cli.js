@@ -25,6 +25,7 @@ import {
 } from "./chat-mcp.js";
 import {
   listRecommendJobsTool,
+  prepareRecommendPipelineRunTool,
   startRecommendPipelineRunTool
 } from "./recommend-mcp.js";
 import {
@@ -2623,6 +2624,7 @@ function printHelp() {
   console.log("Usage:");
   console.log("  boss-recommend-mcp              Start the MCP server");
   console.log("  boss-recommend-mcp start        Start the MCP server");
+  console.log("  boss-recommend-mcp prepare-run  Validate a cron-ready recommend run payload without starting screening");
   console.log("  boss-recommend-mcp run          Start a CDP-only recommend run through the shared run service");
   console.log("  boss-recommend-mcp list-jobs    CDP-only list of exact recommend job names for cron/one-shot inputs");
   console.log("  boss-recommend-mcp chat <subcommand>  Run CDP-only boss-chat health/prepare/status commands");
@@ -2638,6 +2640,7 @@ function printHelp() {
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("");
   console.log("Run command:");
+  console.log("  boss-recommend-mcp prepare-run --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp run --detached --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp list-jobs --slow-live --port 9222");
@@ -2733,12 +2736,11 @@ async function installAll(options = {}) {
   }
 }
 
-async function runPipelineOnce(options = {}) {
+function buildRecommendRunCliInput(options = {}) {
   const instruction = getRunInstruction(options);
   const confirmation = getRunConfirmation(options);
   const overrides = getRunOverrides(options);
   const followUp = getRunFollowUp(options);
-  const workspaceRoot = getWorkspaceRoot(options);
   const port = parsePositivePort(options.port) || parsePositivePort(process.env.BOSS_RECOMMEND_CHROME_PORT) || 9222;
 
   const args = {
@@ -2803,6 +2805,37 @@ async function runPipelineOnce(options = {}) {
     else if (options[kebab] !== undefined) args[key] = options[kebab];
   }
 
+  return {
+    args,
+    port
+  };
+}
+
+async function preparePipelineOnce(options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const { args, port } = buildRecommendRunCliInput(options);
+  const result = prepareRecommendPipelineRunTool({
+    workspaceRoot,
+    args
+  });
+  printJson({
+    ...result,
+    cli: {
+      command: "prepare-run",
+      cdp_only: true,
+      shared_run_service: true,
+      workspace_root: workspaceRoot,
+      port
+    }
+  });
+  if (result.status !== "READY" || result.cron_ready !== true) {
+    process.exitCode = 1;
+  }
+}
+
+async function runPipelineOnce(options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const { args, port } = buildRecommendRunCliInput(options);
   const result = await startRecommendPipelineRunTool({
     workspaceRoot,
     args
@@ -2996,6 +3029,23 @@ export async function runCli(argv = process.argv) {
         process.exitCode = 1;
       }
       break;
+    case "prepare-run":
+    case "prepare":
+      try {
+        await preparePipelineOnce(options);
+      } catch (error) {
+        printJson({
+          status: "FAILED",
+          cron_ready: false,
+          error: {
+            code: "INVALID_CLI_INPUT",
+            message: error.message || "Invalid CLI input",
+            retryable: false
+          }
+        });
+        process.exitCode = 1;
+      }
+      break;
     case "list-jobs":
     case "jobs":
     case "recommend-jobs":
@@ -3155,6 +3205,7 @@ export const __testables = {
   mergeMcpServerConfigFile,
   resolveBossChatRuntimeLayout: resolveCdpBossChatRuntimeLayout,
   runBossChatCliCommand,
+  preparePipelineOnce,
   runPipelineOnce
 };
 

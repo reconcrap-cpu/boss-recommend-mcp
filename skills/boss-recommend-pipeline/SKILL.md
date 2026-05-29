@@ -89,9 +89,13 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 ## Tool Usage
 
 - 岗位发现工具：`list_recommend_jobs`
-  - 用途：当用户需要为 cron / 一次性自动任务提前填写完整参数时，先用它读取推荐页岗位下拉框的全部可用岗位名。
+  - 用途：当用户需要为 cron / 一次性自动任务提前填写完整参数时，先用它读取推荐页岗位下拉框的全部可用岗位名；默认会复用/自动打开本机 9222 Chrome 并导航到推荐页。
   - 输出：优先把 `job_names` 里的值作为后续 `overrides.job` / `confirmation.job_value`。
-  - 限制：只读岗位列表，不启动筛选任务；仍然必须在正式 `start_recommend_pipeline_run` 前完成岗位与最终确认。
+  - 限制：只读岗位列表，不启动筛选任务；若返回 `BOSS_LOGIN_REQUIRED`，必须让用户在自动打开的 Chrome 完成登录后重试，本次 cron 不得创建。
+- Cron 准备工具：`prepare_recommend_pipeline_run`
+  - 用途：只校验参数是否已可用于 cron / 一次性任务，不启动筛选任务。
+  - 要求：只有返回 `status=READY` 且 `cron_ready=true` 后，才允许创建 cron。
+  - 若返回 `NEED_INPUT` / `NEED_CONFIRMATION` / `FAILED`：继续补齐 `pending_questions` 或修复登录/页面/config；不得先创建 cron。
 - 主工具：`start_recommend_pipeline_run`
 - 必填：`instruction`
 - 关键输入：
@@ -106,6 +110,25 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - 已确认值不重复问；仅补缺口。
 - 拿到 `ACCEPTED + run_id` 后默认停止本轮，不自动轮询。
 - 在拿到 `ACCEPTED + run_id` 之前，禁止以“我已帮你确认参数”为由越过必填确认阶段。
+
+## Cron / Scheduled Run Policy
+
+创建 cron 时必须在设置 cron 的当下完成全部交互：
+
+1. 锁定用户原始 instruction，不改写、不摘要，criteria 放入 `overrides.criteria` 时必须逐字保留。
+2. 收集 Stage A 全部筛选项、`target_count`、`post_action`、`max_greet_count`（如需要）和本次 `rest_level`。
+3. 调用 `list_recommend_jobs`；若 Chrome 未打开，工具会尝试自动打开本机 9222 Chrome 并进入推荐页。若返回 `BOSS_LOGIN_REQUIRED` 或页面不可用，停止 cron 创建，让用户登录/修复后重试。
+4. 用 `job_names` 中的精确岗位名完成岗位确认，并完成最终总确认，写入 `job_confirmed=true` 与 `final_confirmed=true`。
+5. 调用 `prepare_recommend_pipeline_run` 传入将来要执行的完整 payload；只有 `READY + cron_ready=true` 才能创建 cron。
+6. cron 到点时只调用 `start_recommend_pipeline_run`，并传入准备阶段验证过的同一份 payload。到点后若 Chrome/登录异常，应作为运行失败处理，不得再向用户追问参数。
+
+Shell-only OpenClaw/QClaw cron 设置同样先运行：
+
+```powershell
+npx -y @reconcrap/boss-recommend-mcp@latest prepare-run --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --slow-live --port 9222
+```
+
+仅当上述命令输出 `READY` 且 `cron_ready=true` 后，才把对应的 detached `run` 命令写入 cron。
 
 ## Async Run Policy
 
@@ -150,13 +173,14 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 推荐做法：
 
 1. 将锁定的用户原文写入 instruction 文件，将已确认参数写入 `overrides` 与 `confirmation` JSON 文件。
-2. 用 detached CLI 启动，让父命令返回启动证据，子进程继续持有 CDP 会话：
+2. 先用 `prepare-run` 校验完整 payload 已 cron-ready；未返回 `READY + cron_ready=true` 不得创建 cron 或启动 run。
+3. 用 detached CLI 启动，让父命令返回启动证据，子进程继续持有 CDP 会话：
 
 ```powershell
 npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --slow-live --port 9222
 ```
 
-3. 若返回 `ACCEPTED + run_id`，即任务已启动；记录 `run_id/stdout_path/stderr_path`。若返回 `NEED_INPUT` 或 `NEED_CONFIRMATION`，只补 `pending_questions`，不要重写已锁定的用户原文。
+4. 若返回 `ACCEPTED + run_id`，即任务已启动；记录 `run_id/stdout_path/stderr_path`。若返回 `NEED_INPUT` 或 `NEED_CONFIRMATION`，说明 cron 设置阶段漏掉了准备门禁，应回到 `prepare-run` 补齐，不能在到点后继续问用户确认。
 
 兼容路径：
 

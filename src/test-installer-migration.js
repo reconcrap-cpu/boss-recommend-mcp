@@ -195,6 +195,30 @@ async function testRunCliUsesRecommendStartGate() {
   process.exitCode = originalExitCode;
 }
 
+async function testPrepareRunCliUsesRecommendPrepareGate() {
+  const originalLog = console.log;
+  const originalExitCode = process.exitCode;
+  const logs = [];
+  console.log = (value = "") => {
+    logs.push(String(value));
+  };
+  try {
+    process.exitCode = undefined;
+    await __testables.preparePipelineOnce({
+      instruction: "推荐页帮我筛候选人"
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const payload = JSON.parse(logs.join("\n"));
+  assert.equal(["NEED_INPUT", "NEED_CONFIRMATION"].includes(payload.status), true);
+  assert.equal(payload.cron_ready, false);
+  assert.equal(payload.cli.command, "prepare-run");
+  assert.equal(payload.cli.cdp_only, true);
+  assert.equal(process.exitCode, 1);
+  process.exitCode = originalExitCode;
+}
+
 function testDetachedRunCliShellFallback() {
   const result = spawnSync(process.execPath, [
     cliPath,
@@ -223,6 +247,7 @@ testCreatesCanonicalMcpServerWhenFileMissing();
 testMigratesQClawOpenClawConfigShape();
 testOpenClawConfigPreservesExistingEnvAndEnablesDetached();
 await testRunCliUsesRecommendStartGate();
+await testPrepareRunCliUsesRecommendPrepareGate();
 testDetachedRunCliShellFallback();
 
 console.log("installer migration tests passed");

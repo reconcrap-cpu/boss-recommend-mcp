@@ -54,6 +54,27 @@ Live gate required:
 
 - Yes, after changing recommend job dropdown selectors or root handling.
 
+### `prepare_recommend_pipeline_run`
+
+Purpose:
+
+- Validate that a recommend-page payload is complete enough for cron/one-shot scheduling without starting screening.
+
+Inputs:
+
+- Same input schema as `start_recommend_pipeline_run`.
+
+Expected behavior:
+
+- Return `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED` with the same parser/config gates as start.
+- Return `READY` with `cron_ready=true` only when all confirmations, exact job, final review, and config gates are satisfied.
+- Do not connect to Chrome for screening and do not create a `run_id`.
+- Intended cron setup flow: call `list_recommend_jobs` first to auto-open/reuse Chrome and verify login/page/job options, then call this prepare tool, then schedule the same ready payload for `start_recommend_pipeline_run`.
+
+Live gate required:
+
+- No, unless readiness gates or public schema semantics change.
+
 ### `start_recommend_pipeline_run`
 
 Purpose:
@@ -671,6 +692,21 @@ Expected behavior:
 - Print JSON payload.
 - Support `--slow-live`, `--port`, `--host`, `--target-url-includes`, `--no-navigate`.
 
+### `boss-recommend-mcp prepare-run`
+
+CLI wrapper for `prepare_recommend_pipeline_run`.
+
+Aliases:
+
+- `prepare`
+
+Expected behavior:
+
+- Print JSON payload.
+- Return `READY` plus `cron_ready=true` only for a schedulable payload.
+- Exit successfully only when the payload is cron-ready; exit non-zero for `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED`.
+- Support `--instruction`, `--instruction-file`, `--confirmation-json`, `--confirmation-file`, `--overrides-json`, `--overrides-file`, `--slow-live`, `--port`, `--host`, `--target-url-includes`, `--no-navigate`, and `--rest-level`.
+
 ### `boss-recommend-mcp run`
 
 Current status:
@@ -760,11 +796,13 @@ Prints package root, skill sources, state/config/calibration paths, and default 
 
 Purpose:
 
-- Route recommend-page tasks to `start_recommend_pipeline_run`.
+- Route normal recommend-page tasks to `start_recommend_pipeline_run`; route cron setup through `list_recommend_jobs` plus `prepare_recommend_pipeline_run` before creating a cron.
 
 Expected behavior:
 
 - Ask two-stage confirmation.
+- For cron setup, create no cron unless `prepare_recommend_pipeline_run` returns `READY` and `cron_ready=true`.
+- Preserve the exact instruction/criteria payload that was prepared when scheduling the later `start_recommend_pipeline_run`.
 - Do not ask for job before page readiness/job options are available.
 - Do not route recommend failures to recruit.
 - Do not use `follow_up.chat`; recommend-to-chat auto-chain is legacy-only.

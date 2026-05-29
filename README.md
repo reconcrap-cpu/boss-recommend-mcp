@@ -20,6 +20,7 @@ Boss 推荐 / 搜索 / 聊天筛选 MCP（stdio）服务。
 MCP 工具：
 
 - `list_recommend_jobs`（只读读取推荐页岗位下拉框，返回可直接用于 cron/一次性任务的 `job_names`）
+- `prepare_recommend_pipeline_run`（只校验完整 payload 是否已可用于 cron/一次性任务；不启动筛选，返回 `READY + cron_ready=true` 后才应创建 cron）
 - `start_recommend_pipeline_run`（异步启动；同样先经过前置门禁，通过后返回 run_id）
 - `get_recommend_pipeline_run`（轮询 run_id 状态）
 - `cancel_recommend_pipeline_run`（取消运行中任务）
@@ -53,10 +54,19 @@ boss-recommend-mcp list-jobs --slow-live --port 9222
 
 返回的 `job_names` 可直接作为后续 `start_recommend_pipeline_run` 的 `confirmation.job_value` / `overrides.job`。
 
+Cron / 一次性定时任务设置建议先在设置阶段完成 Chrome/登录/岗位发现与全部确认：
+
+```bash
+boss-recommend-mcp prepare-run --instruction-file boss-recommend-instruction.txt --overrides-file boss-recommend-overrides.json --confirmation-file boss-recommend-confirmation.json --slow-live --port 9222
+```
+
+只有输出 `status: "READY"` 且 `cron_ready: true` 后，才把同一份 payload 写入 cron 并在到点时调用 `start_recommend_pipeline_run` / `boss-recommend-mcp run --detached`。如果设置阶段返回 `BOSS_LOGIN_REQUIRED`、`NEED_INPUT` 或 `NEED_CONFIRMATION`，先让用户登录或补齐确认，不要创建 cron。
+
 状态机：
 
 - `NEED_INPUT`
 - `NEED_CONFIRMATION`
+- `READY`（仅准备工具）
 - `COMPLETED`
 - `FAILED`
 
@@ -374,6 +384,7 @@ Trae-CN / 长对话防循环建议：
 说明：
 
 - `start_recommend_pipeline_run` 为异步入口，但不会跳过同步确认流程。
+- `prepare_recommend_pipeline_run` / `boss-recommend-mcp prepare-run` 用于 cron 设置阶段；它不启动筛选，只确认 payload 已经不需要到点后再问用户。
 - 定时心跳默认 120 秒一次；`updated_at` 仍会在阶段或进度变化时刷新。
 - 每个 run 会持久化到 `~/.boss-recommend-mcp/runs/<run_id>.json`（可通过 `BOSS_RECOMMEND_HOME` 覆盖）。
 - screen 阶段会持久化 checkpoint：`~/.boss-recommend-mcp/runs/<run_id>.checkpoint.json`。

@@ -89,6 +89,7 @@ import {
 const require = createRequire(import.meta.url);
 const { version: SERVER_VERSION } = require("../package.json");
 
+const TOOL_PREPARE_RUN = "prepare_recommend_pipeline_run";
 const TOOL_START_RUN = "start_recommend_pipeline_run";
 const TOOL_GET_RUN = "get_recommend_pipeline_run";
 const TOOL_CANCEL_RUN = "cancel_recommend_pipeline_run";
@@ -1088,6 +1089,11 @@ function createToolsSchema() {
       name: TOOL_LIST_RECOMMEND_JOBS,
       description: "CDP-only 读取 Boss 推荐页岗位下拉框，返回所有可用岗位完整名称，方便 cron/一次性任务提前填写 job 参数。不会启动筛选任务。",
       inputSchema: createListRecommendJobsInputSchema()
+    },
+    {
+      name: TOOL_PREPARE_RUN,
+      description: "只校验 Boss 推荐页流水线参数是否已可用于 cron/一次性任务；不会启动筛选任务。只有返回 READY/cron_ready=true 后才应创建定时任务。",
+      inputSchema: createRunInputSchema()
     },
     {
       name: TOOL_START_RUN,
@@ -2618,6 +2624,8 @@ async function handleRequest(message, workspaceRoot) {
       let payload;
       if (toolName === TOOL_LIST_RECOMMEND_JOBS) {
         payload = await listRecommendJobsTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_PREPARE_RUN) {
+        payload = prepareRecommendPipelineRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_START_RUN) {
         payload = await handleStartRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_RUN) {

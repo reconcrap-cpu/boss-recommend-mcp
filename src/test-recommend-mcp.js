@@ -17,6 +17,7 @@ const {
 } = __testables;
 
 const TOOL_LIST_JOBS = "list_recommend_jobs";
+const TOOL_PREPARE = "prepare_recommend_pipeline_run";
 const TOOL_START = "start_recommend_pipeline_run";
 const TOOL_GET = "get_recommend_pipeline_run";
 const TOOL_PAUSE = "pause_recommend_pipeline_run";
@@ -149,6 +150,7 @@ async function testToolListIncludesRecommendTools() {
   const tools = response?.result?.tools || [];
   const names = new Set(tools.map((tool) => tool.name));
   assert.equal(names.has(TOOL_LIST_JOBS), true);
+  assert.equal(names.has(TOOL_PREPARE), true);
   assert.equal(names.has(TOOL_START), true);
   assert.equal(names.has(TOOL_GET), true);
   assert.equal(names.has(TOOL_PAUSE), true);
@@ -157,6 +159,8 @@ async function testToolListIncludesRecommendTools() {
   const startTool = tools.find((tool) => tool.name === TOOL_START);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
+  const prepareTool = tools.find((tool) => tool.name === TOOL_PREPARE);
+  assert.deepEqual(prepareTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
 }
 
 async function testRecommendJobListTool() {
@@ -249,6 +253,117 @@ async function testRecommendGateBeforeBrowserConnect() {
   }, 2);
   assert.equal(["NEED_INPUT", "NEED_CONFIRMATION"].includes(payload.status), true);
   assert.equal(connectorCalled, false);
+}
+
+async function testRecommendPrepareGateBeforeBrowserConnect() {
+  let connectorCalled = false;
+  setRecommendMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("prepare should not connect before confirmation gate");
+  });
+  const payload = await callTool(TOOL_PREPARE, {
+    instruction: "推荐页帮我筛候选人"
+  }, 3);
+  assert.equal(["NEED_INPUT", "NEED_CONFIRMATION"].includes(payload.status), true);
+  assert.equal(payload.cron_ready, false);
+  assert.equal(connectorCalled, false);
+}
+
+async function testRecommendPrepareReadyDoesNotStartRun() {
+  let connectorCalled = false;
+  setRecommendMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("prepare should not start or connect");
+  });
+  const payload = await callTool(TOOL_PREPARE, readyArgs({
+    human_behavior: {
+      restLevel: "medium"
+    }
+  }), 4);
+  assert.equal(payload.status, "READY");
+  assert.equal(payload.cron_ready, true);
+  assert.equal(payload.post_action.requested, "none");
+  assert.equal(payload.review.current_screen_params.criteria, readyArgs().overrides.criteria);
+  assert.equal(connectorCalled, false);
+}
+
+async function testRecommendPreparedCronPayloadStartsAccepted() {
+  installFakeConnector();
+  let observedOptions = null;
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recommend:cron-ready");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+
+  const args = readyArgs({
+    delay_ms: 0,
+    human_behavior: {
+      restLevel: "high"
+    }
+  });
+  const prepared = await callTool(TOOL_PREPARE, args, 5);
+  assert.equal(prepared.status, "READY");
+  assert.equal(prepared.cron_ready, true);
+  const started = await callTool(TOOL_START, args, 6);
+  assert.equal(started.status, "ACCEPTED");
+  assert.equal(started.run.context.confirmation.final_confirmed, true);
+  assert.equal(started.run.context.confirmation.job_confirmed, true);
+  await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(observedOptions.humanBehavior.restLevel, "high");
+}
+
+async function testRecommendJobListLoginRequiredBlocksCronSetup() {
+  setRecommendMcpConnectorForTests(async () => {
+    const error = new Error("Boss login is required");
+    error.code = "BOSS_LOGIN_REQUIRED";
+    error.requires_login = true;
+    error.login_url = "https://www.zhipin.com/web/user/?ka=bticket";
+    error.current_url = "https://www.zhipin.com/web/user/?ka=bticket";
+    error.target_url = "https://www.zhipin.com/web/chat/recommend";
+    error.chrome = {
+      launched: true,
+      port: 9222
+    };
+    throw error;
+  });
+  const payload = await callTool(TOOL_LIST_JOBS, {
+    port: 9222,
+    slow_live: true
+  }, 7);
+  assert.equal(payload.status, "FAILED");
+  assert.equal(payload.error.code, "BOSS_LOGIN_REQUIRED");
+  assert.equal(payload.error.requires_login, true);
+  assert.equal(payload.chrome.auto_launch.launched, true);
+}
+
+async function testRecommendPreparePreservesCriteriaVerbatim() {
+  const criteria = "必须同时满足：1）学历门槛：简历可见的任一学历来自双一流建设高校；2）英语可以作为工作语言。";
+  const args = readyArgs({
+    instruction: criteria,
+    overrides: {
+      ...readyArgs().overrides,
+      criteria
+    }
+  });
+  const prepared = await callTool(TOOL_PREPARE, args, 15);
+  assert.equal(prepared.status, "READY");
+  assert.equal(prepared.cron_ready, true);
+  assert.equal(prepared.review.current_screen_params.criteria, criteria);
+  assert.equal(prepared.review.extracted_screen_params.criteria, criteria);
 }
 
 async function observeRecommendWorkflowOptions(args, id) {
@@ -657,14 +772,18 @@ async function testRecommendOpenClawWorkspaceForcesDetachedWorker() {
     };
   });
   try {
-    const started = await callTool(TOOL_START, readyArgs({
+    const startArgs = readyArgs({
       delay_ms: 0,
       debug_test_mode: true,
       screening_mode: "deterministic",
       no_filter: true,
       detail_limit: 1,
       execute_post_action: false
-    }), 35);
+    });
+    const prepared = await callTool(TOOL_PREPARE, startArgs, 35);
+    assert.equal(prepared.status, "READY");
+    assert.equal(prepared.cron_ready, true);
+    const started = await callTool(TOOL_START, startArgs, 36);
     assert.equal(started.status, "ACCEPTED");
     assert.equal(started.run.pid, 567890);
     assert.equal(started.run.state, "queued");
@@ -972,6 +1091,16 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendDefaultsUseScreeningConfig();
     await testRecommendGateBeforeBrowserConnect();
+    resetRecommendMcpStateForTests();
+    await testRecommendPrepareGateBeforeBrowserConnect();
+    resetRecommendMcpStateForTests();
+    await testRecommendPrepareReadyDoesNotStartRun();
+    resetRecommendMcpStateForTests();
+    await testRecommendPreparedCronPayloadStartsAccepted();
+    resetRecommendMcpStateForTests();
+    await testRecommendJobListLoginRequiredBlocksCronSetup();
+    resetRecommendMcpStateForTests();
+    await testRecommendPreparePreservesCriteriaVerbatim();
     resetRecommendMcpStateForTests();
     await testRecommendDetailLimitDefaultsToTargetCount();
     resetRecommendMcpStateForTests();

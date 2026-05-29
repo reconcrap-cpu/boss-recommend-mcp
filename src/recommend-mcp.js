@@ -1466,10 +1466,16 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
 
 export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} } = {}) {
   const prepared = prepareRecommendPipelineStart(args, { workspaceRoot });
-  if (prepared.response) return prepared.response;
+  if (prepared.response) {
+    return {
+      ...prepared.response,
+      cron_ready: false
+    };
+  }
   const { parsed, normalized } = prepared;
   return {
     status: "READY",
+    cron_ready: true,
     review: parsed.review,
     post_action: {
       requested: normalized.postAction,
