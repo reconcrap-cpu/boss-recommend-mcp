@@ -54,6 +54,8 @@ const defaultMcpServerName = "boss-recommend";
 const defaultMcpCommand = "npx";
 const recommendMcpPackageName = "@reconcrap/boss-recommend-mcp";
 const recommendMcpBinaryName = "boss-recommend-mcp";
+const globalMcpWrapperFileName = "boss-recommend-mcp-mcp-server";
+const supportedMcpLaunchModes = ["npx", "global-wrapper"];
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h", "list-jobs", "jobs", "recommend-jobs"]);
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
 const externalSkillDirsEnv = "BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS";
@@ -128,6 +130,13 @@ function getStateHome() {
   return process.env.BOSS_RECOMMEND_HOME
     ? path.resolve(process.env.BOSS_RECOMMEND_HOME)
     : path.join(os.homedir(), ".boss-recommend-mcp");
+}
+
+function getGlobalMcpWrapperPath(options = {}) {
+  if (typeof options["mcp-wrapper-path"] === "string" && options["mcp-wrapper-path"].trim()) {
+    return path.resolve(options["mcp-wrapper-path"].trim());
+  }
+  return path.join(getStateHome(), "bin", globalMcpWrapperFileName);
 }
 
 function ensureDir(targetPath) {
@@ -742,6 +751,48 @@ function isPlainObject(value) {
   return value && typeof value === "object" && !Array.isArray(value);
 }
 
+function normalizeMcpLaunchMode(options = {}) {
+  const raw = String(options["mcp-launch"] || options.mcpLaunch || "").trim().toLowerCase().replace(/_/g, "-");
+  if (!raw) return "npx";
+  if (raw === "default") return "npx";
+  if (raw === "global" || raw === "wrapper") return "global-wrapper";
+  if (supportedMcpLaunchModes.includes(raw)) return raw;
+  throw new Error(`Unsupported --mcp-launch value: ${raw}. Supported: ${supportedMcpLaunchModes.join(", ")}`);
+}
+
+function buildGlobalMcpWrapperScript() {
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+export NVM_DIR="\${NVM_DIR:-$HOME/.nvm}"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  . "$NVM_DIR/nvm.sh"
+elif [ -s "$HOME/.nvm/nvm.sh" ]; then
+  export NVM_DIR="$HOME/.nvm"
+  . "$NVM_DIR/nvm.sh"
+fi
+
+if ! command -v ${recommendMcpBinaryName} >/dev/null 2>&1; then
+  echo "${recommendMcpBinaryName} not found on PATH. Install or reload nvm, then run: npm -g i ${recommendMcpPackageName}@latest" >&2
+  exit 127
+fi
+
+exec ${recommendMcpBinaryName} start "$@"
+`;
+}
+
+function ensureGlobalMcpWrapper(options = {}) {
+  const wrapperPath = getGlobalMcpWrapperPath(options);
+  ensureDir(path.dirname(wrapperPath));
+  fs.writeFileSync(wrapperPath, buildGlobalMcpWrapperScript(), "utf8");
+  try {
+    fs.chmodSync(wrapperPath, 0o755);
+  } catch {
+    // Some filesystems ignore POSIX executable bits; the path is still valid for POSIX hosts.
+  }
+  return wrapperPath;
+}
+
 function shouldDefaultRecommendDetachedMcpEnv(options = {}) {
   const client = normalizeMcpClientName(options.client);
   const agent = normalizeAgentName(options.agent);
@@ -765,6 +816,24 @@ function getAgentConfigOutputDir(options = {}) {
 }
 
 function buildMcpLaunchConfig(options = {}) {
+  const mcpLaunchMode = normalizeMcpLaunchMode(options);
+  if (mcpLaunchMode === "global-wrapper") {
+    const args = parseJsonOption(options["args-json"], "args-json");
+    const env = parseJsonOption(options["env-json"], "env-json");
+    const launchConfig = {
+      command: ensureGlobalMcpWrapper(options),
+      args: Array.isArray(args) ? args : []
+    };
+    const mergedEnv = {
+      ...getDefaultMcpEnv(options),
+      ...(isPlainObject(env) ? env : {})
+    };
+    if (Object.keys(mergedEnv).length > 0) {
+      launchConfig.env = mergedEnv;
+    }
+    return launchConfig;
+  }
+
   const command = typeof options.command === "string" && options.command.trim()
     ? options.command.trim()
     : defaultMcpCommand;
@@ -2638,6 +2707,7 @@ function printHelp() {
   console.log("  boss-recommend-mcp calibrate    Disabled until CDP-only featured calibration is live-verified");
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
+  console.log("  boss-recommend-mcp install --mcp-launch global-wrapper  Use ~/.boss-recommend-mcp/bin wrapper so npm global upgrades affect MCP hosts");
   console.log("");
   console.log("Run command:");
   console.log("  boss-recommend-mcp prepare-run --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
@@ -2669,7 +2739,8 @@ async function installAll(options = {}) {
   const runtimeDirsResult = await ensureRuntimeDirectories(options);
   const skillResults = installSkill();
   const configResult = await ensureUserConfig(options);
-  const mcpTemplateResult = writeMcpConfigFiles({ client: "all" });
+  const mcpLaunchMode = normalizeMcpLaunchMode(options);
+  const mcpTemplateResult = writeMcpConfigFiles({ ...options, agent: undefined, client: "all" });
   const externalMcpResult = installExternalMcpConfigs(options);
   const externalSkillResult = mirrorSkillToExternalDirs(options);
   console.log(
@@ -2703,6 +2774,9 @@ async function installAll(options = {}) {
   console.log(`MCP config templates exported to: ${mcpTemplateResult.outputDir}`);
   for (const item of mcpTemplateResult.files) {
     console.log(`- ${item.client}: ${item.file}`);
+  }
+  if (mcpLaunchMode === "global-wrapper") {
+    console.log(`Upgrade-stable MCP wrapper: ${getGlobalMcpWrapperPath(options)}`);
   }
   if (externalMcpResult.targets.length > 0) {
     console.log(`Auto-configured external MCP files: ${externalMcpResult.applied.length}`);
@@ -3193,6 +3267,8 @@ export const __testables = {
   buildBossChatCliInput,
   buildDefaultMcpArgs,
   buildMcpLaunchConfig,
+  ensureGlobalMcpWrapper,
+  getGlobalMcpWrapperPath,
   collectRuntimeDirectories,
   ensureBossChatRuntimeReady: ensureBossChatRuntimeReadyLocal,
   ensureRuntimeDirectories,

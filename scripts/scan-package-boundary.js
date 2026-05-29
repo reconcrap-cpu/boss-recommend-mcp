@@ -21,7 +21,7 @@ const BLOCKED_PACKAGE_PATTERNS = [
   },
   {
     id: "live-or-scan-script",
-    regex: /^scripts\/(?!postinstall\.cjs$)/i,
+    regex: /^scripts\/(?!(?:postinstall\.cjs|install-macos\.sh)$)/i,
     description: "live test and scanner scripts are development-only"
   },
   {

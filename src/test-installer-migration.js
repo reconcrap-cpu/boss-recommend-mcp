@@ -172,6 +172,53 @@ function testOpenClawConfigPreservesExistingEnvAndEnablesDetached() {
   });
 }
 
+function testGlobalWrapperLaunchConfigSupportsNpmGlobalUpgrades() {
+  const tempDir = makeTempDir();
+  const mcpPath = path.join(tempDir, "mcp.json");
+  const wrapperPath = path.join(tempDir, "bin", "boss-recommend-mcp-mcp-server");
+  fs.writeFileSync(mcpPath, JSON.stringify({
+    mcpServers: {
+      "boss-recruit": {
+        command: "npx",
+        args: ["-y", "@reconcrap/boss-recruit-mcp@latest", "start"]
+      },
+      "other-service": {
+        command: "node",
+        args: ["server.js"]
+      }
+    }
+  }, null, 2), "utf8");
+
+  const result = __testables.mergeMcpServerConfigFile(mcpPath, {
+    agent: "openclaw",
+    "mcp-launch": "global-wrapper",
+    "mcp-wrapper-path": wrapperPath,
+    packageVersion: "2.0.1",
+    packageRootPath: path.join(tempDir, "node_modules", "@reconcrap", "boss-recommend-mcp")
+  });
+  const updated = readJson(mcpPath);
+  const launch = updated.mcpServers["boss-recommend"];
+
+  assert.equal(result.config_shape, "mcpServers");
+  assert.deepEqual(Object.keys(updated.mcpServers).sort(), ["boss-recommend", "other-service"]);
+  assert.deepEqual(result.migrated_legacy_servers, ["boss-recruit"]);
+  assert.equal(launch.command, wrapperPath);
+  assert.deepEqual(launch.args, []);
+  assert.equal(launch.args.includes("@reconcrap/boss-recommend-mcp@2.0.1"), false);
+  assert.deepEqual(launch.env, {
+    BOSS_RECOMMEND_CDP_DETACHED: "1",
+    BOSS_RECOMMEND_RUN_HEARTBEAT_MS: "10000"
+  });
+  assert.ok(fs.existsSync(wrapperPath));
+  const wrapper = fs.readFileSync(wrapperPath, "utf8");
+  assert.match(wrapper, /nvm\.sh/);
+  assert.match(wrapper, /exec boss-recommend-mcp start "\$@"/);
+
+  const inspected = __testables.inspectMcpServerEntries(mcpPath);
+  assert.equal(inspected.has_boss_recommend, true);
+  assert.equal(inspected.has_boss_recruit, false);
+}
+
 async function testRunCliUsesRecommendStartGate() {
   const originalLog = console.log;
   const originalExitCode = process.exitCode;
@@ -246,6 +293,7 @@ testMigratesLegacyMcpServers();
 testCreatesCanonicalMcpServerWhenFileMissing();
 testMigratesQClawOpenClawConfigShape();
 testOpenClawConfigPreservesExistingEnvAndEnablesDetached();
+testGlobalWrapperLaunchConfigSupportsNpmGlobalUpgrades();
 await testRunCliUsesRecommendStartGate();
 await testPrepareRunCliUsesRecommendPrepareGate();
 testDetachedRunCliShellFallback();

@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -82,6 +82,7 @@
     "bin",
     "config/screening-config.example.json",
     "skills",
+    "scripts/install-macos.sh",
     "scripts/postinstall.cjs",
     "src/core",
     "src/domains",

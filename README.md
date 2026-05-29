@@ -7,6 +7,68 @@ Boss 推荐 / 搜索 / 聊天筛选 MCP（stdio）服务。
 - npm: `@reconcrap/boss-recommend-mcp`（https://www.npmjs.com/package/@reconcrap/boss-recommend-mcp）
 - GitHub: `reconcrap-cpu/boss-recommend-mcp`（https://github.com/reconcrap-cpu/boss-recommend-mcp）
 
+## AI harness install entrypoint
+
+如果用户只把这个 GitHub 链接交给 Codex、Claude Code、Cursor、OpenClaw、QClaw、Trae 等 AI harness，并要求“安装这个工具”，请优先执行本节，而不是直接在 macOS 上裸跑 `npm install -g`。
+
+AI harness 不能只完成 npm 安装就结束。安装流程还必须帮助用户完成必填 LLM 配置；如果用户没有提前提供，请向用户索取：
+
+- LLM base URL（默认可用 `https://api.openai.com/v1`）
+- LLM API key
+- LLM model（默认可用 `gpt-4.1-mini`）
+
+然后写入配置：
+
+```bash
+boss-recommend-mcp config set --base-url <baseUrl> --api-key <apiKey> --model <model> --thinking-level low
+boss-recommend-mcp doctor
+```
+
+如果用户用 macOS bootstrap，它会自动尝试交互式询问并写入这些字段。非交互式 AI harness 如果拿不到用户输入，应暂停并询问用户上述三项，不要把安装标记为完成。
+
+macOS 首次安装推荐使用仓库里的 nvm bootstrap。它会把 Node/npm/global packages 放到用户目录，避免首次安装或后续升级时出现：
+
+```text
+EACCES: permission denied, mkdir '/usr/local/lib/node_modules/@reconcrap'
+```
+
+这是 npm global prefix 权限问题，不是 `boss-recommend-mcp` 包内部创建目录失败。
+
+macOS 一键安装：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reconcrap-cpu/boss-recommend-mcp/main/scripts/install-macos.sh | bash
+```
+
+如果要直接配置某个宿主：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reconcrap-cpu/boss-recommend-mcp/main/scripts/install-macos.sh | bash -s -- --agent openclaw
+curl -fsSL https://raw.githubusercontent.com/reconcrap-cpu/boss-recommend-mcp/main/scripts/install-macos.sh | bash -s -- --agent qclaw
+curl -fsSL https://raw.githubusercontent.com/reconcrap-cpu/boss-recommend-mcp/main/scripts/install-macos.sh | bash -s -- --agent trae-cn
+```
+
+安装后，未来升级只需要在同一个 nvm shell 里运行：
+
+```bash
+npm -g i @reconcrap/boss-recommend-mcp@latest
+boss-recommend-mcp where
+```
+
+如果升级前 `npm config get prefix` 返回 `/usr/local`，说明当前 shell 没有使用 nvm Node；请先重新加载 nvm，不要使用 `sudo npm install -g`。
+
+macOS bootstrap 会执行 `boss-recommend-mcp install --mcp-launch global-wrapper`。该模式会把 MCP 宿主配置为启动稳定 wrapper：`~/.boss-recommend-mcp/bin/boss-recommend-mcp-mcp-server`。这个 wrapper 每次启动时都会调用当前全局 `boss-recommend-mcp start`，因此后续 `npm -g i @reconcrap/boss-recommend-mcp@latest` 会更新 MCP 宿主实际运行的版本，不需要每次升级后重写 MCP 配置。
+
+如果 AI harness 已经从用户处拿到 LLM 信息，可以非交互式传给 bootstrap：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reconcrap-cpu/boss-recommend-mcp/main/scripts/install-macos.sh \
+  | BOSS_RECOMMEND_BASE_URL="https://api.openai.com/v1" \
+    BOSS_RECOMMEND_API_KEY="<apiKey>" \
+    BOSS_RECOMMEND_MODEL="gpt-4.1-mini" \
+    bash -s -- --agent openclaw
+```
+
 2.0.0 是 CDP-only 重写版本：活跃浏览器路径只允许 Chrome DevTools Protocol 的 `DOM` / `Input` / `Page` / `Network` / `Accessibility` 等域，不使用 `Runtime.evaluate` 或页面 JS。包内保留 recommend、search/recruit、chat 三条域服务，并共享浏览器、生命周期、筛选、CV 获取、无限滚动、自愈与 CSV 报告层。
 
 安装 `boss-recommend-mcp` 后可以直接：
@@ -125,6 +187,13 @@ npm install -g @reconcrap/boss-recommend-mcp@latest
 boss-recommend-mcp start
 ```
 
+macOS 首次安装如果没有确认 npm prefix 在用户目录，优先使用本文开头的 `scripts/install-macos.sh`。完成 bootstrap 后，后续升级仍然使用同一个 npm 命令：
+
+```bash
+npm -g i @reconcrap/boss-recommend-mcp@latest
+boss-recommend-mcp where
+```
+
 无需安装（npx 直接运行）：
 
 ```bash
@@ -150,7 +219,8 @@ node src/cli.js start
 如果检测到 legacy Boss server entries，installer 会：
 
 - 保留非 Boss MCP server。
-- 写入统一 server：`boss-recommend -> npx -y @reconcrap/boss-recommend-mcp@<installed-version> start`
+- 默认写入统一 server：`boss-recommend -> npx -y @reconcrap/boss-recommend-mcp@<installed-version> start`
+- 如果传入 `--mcp-launch global-wrapper`，写入升级稳定入口：`boss-recommend -> ~/.boss-recommend-mcp/bin/boss-recommend-mcp-mcp-server`。该 wrapper 会加载 `~/.nvm/nvm.sh` 并执行当前全局 `boss-recommend-mcp start`，适合 macOS 上通过 `npm -g i @reconcrap/boss-recommend-mcp@latest` 持续升级。
 - 从同一个 `mcp.json` 删除旧 `boss-recruit-mcp`、standalone `boss-chat`、旧本地 Boss repo 路径，避免 agent 继续调用 legacy 包。
 - 在原文件旁生成 `mcp.json.boss-mcp-migration-*.bak`。
 - 同步外部 skills 目录里的 `boss-recommend-pipeline`、`boss-recruit-pipeline`、`boss-chat`。
@@ -164,6 +234,14 @@ boss-recommend-mcp install --agent qclaw
 boss-recommend-mcp doctor --agent trae-cn
 boss-recommend-mcp doctor --agent openclaw
 boss-recommend-mcp doctor --agent qclaw
+```
+
+macOS 上如果希望 MCP 宿主总是使用全局 npm 最新安装版本：
+
+```bash
+boss-recommend-mcp install --mcp-launch global-wrapper --agent openclaw
+boss-recommend-mcp install --mcp-launch global-wrapper --agent qclaw
+boss-recommend-mcp install --mcp-launch global-wrapper --agent trae-cn
 ```
 
 自定义路径：
