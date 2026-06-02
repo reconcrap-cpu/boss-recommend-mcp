@@ -1,13 +1,13 @@
 ---
 name: "boss-recommend-pipeline"
-description: "Use when users want Boss recommend-page filtering/screening via boss-recommend-mcp. Confirm required params first, then run in two-stage confirmation with strict recommend routing."
+description: "Use when users want Boss recommend-page filtering/screening via boss-recommend-mcp. Gather required params, show one consolidated review, then run or schedule through the recommend MCP tools."
 ---
 
 # Boss Recommend Pipeline Skill
 
 ## Goal
 
-当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`，并按“两阶段确认 -> 页面就绪 -> 岗位确认 -> 最终确认 -> 执行”的顺序完成。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
+当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`；若是稍后/cron 启动，必须走 `schedule_recommend_pipeline_run`。先补齐缺失值并读取岗位列表，然后展示一次包含岗位、筛选项、criteria、目标人数、后置动作、最大招呼数、休息强度和定时信息的总确认；用户确认后设置 `final_confirmed=true` 即可启动或创建定时任务。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
 
 ## Hard Rules (Must Follow)
 
@@ -19,10 +19,11 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 - **确认不可代填（强制）**
   - 禁止 agent 自行“设置合理参数”并代替用户确认。
-  - 禁止在用户未明确回复前，把任意 `*_confirmed` 字段设为 `true`。
+  - 禁止在用户未明确回复前，把 `final_confirmed=true`。
+  - 旧版 `*_confirmed` 字段仍兼容，但新流程不要逐项设置；把规范化后的值写入 `overrides`，总确认后只需要 `confirmation.final_confirmed=true`。
   - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job/rest_level`。
   - 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
-  - 若工具返回 `pending_questions`，必须逐项向用户提问并等待用户回复；不得跳过提问直接执行。
+  - 若工具返回 `pending_questions`，只追问这些缺口；若只返回 `final_review`，不要再拆成逐字段确认。
 
 - **岗位确认时机**
   - 页面未就绪前，禁止询问 `job`。
@@ -30,7 +31,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 - **参数确认**
   - `criteria` 必须是用户开放式自然语言；禁止“严格/宽松执行”等预设替代。
-  - `post_action=greet` 时，必须确认 `max_greet_count`；禁止自动默认为 `target_count`。
+  - `post_action=greet` 时，`max_greet_count` 必须出现在总确认里；禁止未告知用户就自动默认为 `target_count`。
   - 正式执行前必须 `final_confirmed=true`。
   - 真实筛选禁止传 `detail_limit: 0`；recommend 默认必须打开候选人详情/CV。只有用户明确要求“卡片-only 调试”时，才允许同时传 `detail_limit: 0` 和 `allow_card_only_screening: true`。
 
@@ -40,29 +41,29 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 最终执行前逐字回显将提交的 `instruction`；若与锁定值不一致，先修正再执行。
   - 禁止在中途把用户意图拆成“recommend 已默认确认 + chat 单独执行”两条链路。
 
-## Two-Stage Confirmation
+## Single Review Confirmation
 
-### Stage A (页面就绪前，禁止问岗位)
-
-必须确认：
+先收集这些值：
 
 - `page_scope`：`recommend|latest|featured`
-- `school_tag`（多选）
-- `degree`（多选）
-- `gender`
-- `recent_not_view`
+- `school_tag`、`degree`、`gender`、`recent_not_view`
 - `criteria`（开放文本）
 - `target_count`（可空）
 - `post_action`：`favorite|greet|none`
 - `max_greet_count`（仅当 `post_action=greet`）
 - `rest_level`：`low|medium|high`
+- `job`（来自 `list_recommend_jobs` / `job_options` 的精确岗位名）
+- cron/定时任务的启动时间（如适用）
 
-### Stage B (页面就绪后)
+然后只做一次总确认。用户回复“确认 / 全部确认 / 无需调整”后，下一次工具调用写入：
 
-必须确认：
+```json
+{
+  "confirmation": { "final_confirmed": true }
+}
+```
 
-- `job`（来自 `job_options`，必须全量展示）
-- `final_review`（岗位 + 全参数总确认）
+已确认值放在 `overrides` 和 `human_behavior.restLevel`。不要因为工具返回 `final_review` 就再问页面、学历、学校、性别、14天、criteria、目标人数、动作、最大招呼数等逐项确认。
 
 ## Chat Handoff
 
@@ -105,7 +106,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - 主工具：`start_recommend_pipeline_run`
 - 必填：`instruction`
 - 关键输入：
-  - `confirmation`：`page_confirmed/page_value/filters_confirmed/school_tag_confirmed.../job_confirmed/job_value/final_confirmed`
+  - `confirmation`：新流程只需要 `{ "final_confirmed": true }`；旧版 `page_confirmed/page_value/.../job_confirmed/job_value` 仍兼容但不要主动制造逐项确认。
   - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/criteria/job/target_count/post_action/max_greet_count`
   - `human_behavior`：必须包含本次用户确认的 `restLevel`（例如 `{ "restLevel": "medium" }`）
   - 不要传 `follow_up.chat`；该路径属于 legacy-only 行为
@@ -122,9 +123,9 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 创建 cron 时必须在设置 cron 的当下完成全部交互：
 
 1. 锁定用户原始 instruction，不改写、不摘要，criteria 放入 `overrides.criteria` 时必须逐字保留。
-2. 收集 Stage A 全部筛选项、`target_count`、`post_action`、`max_greet_count`（如需要）和本次 `rest_level`。
+2. 收集全部筛选项、`target_count`、`post_action`、`max_greet_count`（如需要）和本次 `rest_level`。
 3. 调用 `list_recommend_jobs`；若 Chrome 未打开，工具会尝试自动打开本机 9222 Chrome 并进入推荐页。若返回 `BOSS_LOGIN_REQUIRED` 或页面不可用，停止 cron 创建，让用户登录/修复后重试。
-4. 用 `job_names` 中的精确岗位名完成岗位确认，并完成最终总确认，写入 `job_confirmed=true` 与 `final_confirmed=true`。
+4. 用 `job_names` 中的精确岗位名填入 `overrides.job`，展示包含启动时间的最终总确认；用户确认后写入 `final_confirmed=true`。
 5. 调用 `prepare_recommend_pipeline_run` 传入将来要执行的完整 payload；只有 `READY + cron_ready=true` 才能继续。
 6. 立即调用 `schedule_recommend_pipeline_run`，传入同一份完整 payload 和 `schedule_delay_minutes` / `schedule_run_at`。禁止让 OpenClaw 自己写 `/tmp/*.log` shell cron、自然语言提醒、或未来对话回调来代替此工具。
 7. 只有拿到 `SCHEDULED + schedule_id` 后才告诉用户定时任务已创建。回复必须包含 `schedule_id`，而不是只说“10 分钟后会启动”。
@@ -192,7 +193,7 @@ npx -y @reconcrap/boss-recommend-mcp@latest schedule-status --schedule-id <sched
 
 推荐做法：
 
-1. 将锁定的用户原文写入 instruction 文件，将已确认参数写入 `overrides` 与 `confirmation` JSON 文件。
+1. 将锁定的用户原文写入 instruction 文件，将已确认参数写入 `overrides` JSON；`confirmation` JSON 只需要 `{ "final_confirmed": true }`。
 2. 先用 `prepare-run` 校验完整 payload 已 cron-ready；未返回 `READY + cron_ready=true` 不得创建定时任务或启动 run。
 3. 若用户要“现在启动”，用 detached CLI 启动，让父命令返回启动证据，子进程继续持有 CDP 会话：
 
@@ -220,8 +221,8 @@ npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\
 ## Response Style
 
 - 用结构化中文。
-- 第一轮确认卡片不出现 `job`。
-- 仅在 `job_options` 出现后给岗位确认卡片，且岗位选项必须全量。
+- 未读取岗位列表前不要要求用户最终确认。
+- 仅在 `job_options` 出现后选择精确岗位；最终确认卡片必须包含岗位和全部参数。
 - 封闭式问题必须带完整标签选项；开放式问题（如 `criteria`）保持自由输入。
 - 页面就绪失败提示必须包含 `debug_port`、recommend URL、以及登录 URL（若未登录）：
   - `https://www.zhipin.com/web/chat/recommend`

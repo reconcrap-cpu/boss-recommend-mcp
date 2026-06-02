@@ -104,7 +104,37 @@ function readyArgs(extra = {}) {
       post_action: "none",
       job: "算法工程师"
     },
+    human_behavior: {
+      restLevel: "medium"
+    },
     delay_ms: 120,
+    no_filter: false,
+    ...extra
+  };
+}
+
+function singleReviewArgs(extra = {}) {
+  return {
+    instruction: "推荐页运行",
+    confirmation: {
+      final_confirmed: true
+    },
+    overrides: {
+      page_scope: "recommend",
+      school_tag: ["985", "211", "双一流院校", "国内外名校"],
+      degree: ["本科", "硕士", "博士"],
+      gender: "不限",
+      recent_not_view: "不限",
+      criteria: "必须同时满足全部条件：1）有算法经验；2）有 AI 项目经历",
+      target_count: 200,
+      post_action: "greet",
+      max_greet_count: 200,
+      job: "AI算法实习生 _ 杭州"
+    },
+    human_behavior: {
+      restLevel: "high"
+    },
+    delay_ms: 0,
     no_filter: false,
     ...extra
   };
@@ -372,6 +402,94 @@ async function testRecommendPreparePreservesCriteriaVerbatim() {
   assert.equal(prepared.cron_ready, true);
   assert.equal(prepared.review.current_screen_params.criteria, criteria);
   assert.equal(prepared.review.extracted_screen_params.criteria, criteria);
+}
+
+async function testRecommendFullySpecifiedPayloadNeedsOnlyFinalReview() {
+  const payload = await callTool(TOOL_PREPARE, singleReviewArgs({
+    confirmation: {}
+  }), 151);
+  assert.equal(payload.status, "NEED_CONFIRMATION");
+  assert.deepEqual(payload.required_confirmations, ["final_review"]);
+  assert.deepEqual(payload.pending_questions.map((item) => item.field), ["final_review"]);
+  assert.equal(payload.pending_questions[0].value.job, "AI算法实习生 _ 杭州");
+  assert.equal(payload.pending_questions[0].value.human_behavior.restLevel, "high");
+  assert.equal(payload.pending_questions[0].value.screen_params.post_action, "greet");
+  assert.equal(payload.pending_questions[0].value.screen_params.max_greet_count, 200);
+}
+
+async function testRecommendFinalConfirmedPayloadStartsAccepted() {
+  installFakeConnector();
+  let observedOptions = null;
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recommend:single-review");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+  const started = await callTool(TOOL_START, singleReviewArgs(), 152);
+  assert.equal(started.status, "ACCEPTED");
+  await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(observedOptions.maxCandidates, 200);
+  assert.equal(observedOptions.postAction, "greet");
+  assert.equal(observedOptions.maxGreetCount, 200);
+  assert.equal(observedOptions.humanBehavior.restLevel, "high");
+}
+
+async function testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler() {
+  let spawnCall = null;
+  setRecommendSchedulerSpawnForTests((command, args, options) => {
+    spawnCall = { command, args, options };
+    return {
+      pid: process.pid,
+      unref() {}
+    };
+  });
+  try {
+    const payload = await callTool(TOOL_SCHEDULE, singleReviewArgs({
+      schedule_delay_seconds: 60
+    }), 153);
+    assert.equal(payload.status, "SCHEDULED");
+    assert.equal(payload.schedule_created, true);
+    assert.equal(payload.cron_ready, true);
+    assert.equal(payload.prepare.status, "READY");
+    assert.ok(spawnCall.args.includes("--schedule-worker"));
+    assert.equal(payload.schedule.args.confirmation.final_confirmed, true);
+    assert.equal(payload.schedule.args.confirmation.page_confirmed, undefined);
+    assert.equal(payload.schedule.args.human_behavior.restLevel, "high");
+  } finally {
+    setRecommendSchedulerSpawnForTests(null);
+  }
+}
+
+async function testRecommendMissingRestLevelBlocksWithRestQuestion() {
+  const args = singleReviewArgs();
+  delete args.human_behavior;
+  const payload = await callTool(TOOL_PREPARE, args, 154);
+  assert.equal(payload.status, "NEED_CONFIRMATION");
+  assert.deepEqual(payload.required_confirmations, ["rest_level"]);
+  assert.deepEqual(payload.pending_questions.map((item) => item.field), ["rest_level"]);
+  assert.deepEqual(payload.pending_questions[0].options.map((item) => item.value), ["low", "medium", "high"]);
+}
+
+async function testRecommendMissingJobStillBlocksBeforeFinalReview() {
+  const args = singleReviewArgs();
+  delete args.overrides.job;
+  const payload = await callTool(TOOL_PREPARE, args, 155);
+  assert.equal(payload.status, "NEED_CONFIRMATION");
+  assert.deepEqual(payload.required_confirmations, ["job"]);
+  assert.deepEqual(payload.pending_questions.map((item) => item.field), ["job"]);
 }
 
 async function testRecommendScheduleIncompletePayloadDoesNotSpawn() {
@@ -1223,6 +1341,16 @@ async function main() {
     await testRecommendJobListLoginRequiredBlocksCronSetup();
     resetRecommendMcpStateForTests();
     await testRecommendPreparePreservesCriteriaVerbatim();
+    resetRecommendMcpStateForTests();
+    await testRecommendFullySpecifiedPayloadNeedsOnlyFinalReview();
+    resetRecommendMcpStateForTests();
+    await testRecommendFinalConfirmedPayloadStartsAccepted();
+    resetRecommendMcpStateForTests();
+    await testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler();
+    resetRecommendMcpStateForTests();
+    await testRecommendMissingRestLevelBlocksWithRestQuestion();
+    resetRecommendMcpStateForTests();
+    await testRecommendMissingJobStillBlocksBeforeFinalReview();
     resetRecommendMcpStateForTests();
     await testRecommendScheduleIncompletePayloadDoesNotSpawn();
     resetRecommendMcpStateForTests();

@@ -116,9 +116,9 @@ MCP 工具：
 boss-recommend-mcp list-jobs --slow-live --port 9222
 ```
 
-返回的 `job_names` 可直接作为后续 `start_recommend_pipeline_run` 的 `confirmation.job_value` / `overrides.job`。
+返回的 `job_names` 可直接作为后续 `start_recommend_pipeline_run` 的 `overrides.job`；旧版 `confirmation.job_value` 仍兼容。
 
-Cron / 一次性定时任务设置建议先在设置阶段完成 Chrome/登录/岗位发现与全部确认：
+Cron / 一次性定时任务设置建议先在设置阶段完成 Chrome/登录/岗位发现与一次总确认；确认文件推荐只包含 `{ "final_confirmed": true }`：
 
 ```bash
 boss-recommend-mcp prepare-run --instruction-file boss-recommend-instruction.txt --overrides-file boss-recommend-overrides.json --confirmation-file boss-recommend-confirmation.json --slow-live --port 9222
@@ -158,18 +158,16 @@ boss-recommend-mcp schedule-status --schedule-id <schedule_id>
 - 学校标签支持多选语义：如“985、211”会同时勾选这两项
 - 学校标签对“混合输入”按容错处理：如“985、211、qs100”会忽略无效项 `qs100`，保留并应用有效项；仅当全部无效或用户明确“不限”时才回落到“不限”
 - 学历支持单选与多选语义：如“本科及以上”会展开为 `本科/硕士/博士`；如“大专、本科”只勾选这两项
-- 执行前会逐项确认筛选参数：学校标签 / 学历 / 性别 / 是否过滤近14天已看
-- 页面就绪（已登录且在 recommend 页）后，会先提取岗位栏全部岗位并要求用户确认本次岗位；确认后先点击岗位，再执行 search/screen
-- 在真正开始 search/screen 前，会进行最后一轮全参数总确认（岗位 + 全部筛选参数 + criteria + target_count + post_action + max_greet_count）
+- 执行前会先补齐筛选值、岗位、后置动作和休息强度，然后只做一次总确认
+- 页面就绪（已登录且在 recommend 页）后，会先提取岗位栏全部岗位，使用精确岗位名填入 run payload，再进入总确认
+- 在真正开始 search/screen 或创建 cron 前，总确认需包含岗位、全部筛选参数、criteria、target_count、post_action、max_greet_count、restLevel 和定时信息（如适用）
 - npm 全局安装后会自动执行 install：生成 skill、导出 MCP 模板，并自动尝试写入已检测到的外部 agent MCP 配置（含 Trae / trae-cn / Cursor / Claude / OpenClaw）
 - 2.x installer 会迁移已存在的 legacy Boss MCP 配置：把 `boss-recommend` 指向统一 `@reconcrap/boss-recommend-mcp`，并从同一个 `mcp.json` 中移除旧 `boss-recruit-mcp` / standalone `boss-chat` / 本地 legacy Boss 路径；写入前会生成 `.boss-mcp-migration-*.bak` 备份
 - 2.x installer 会刷新外部 agent skills：`boss-recommend-pipeline`、`boss-recruit-pipeline`、`boss-chat` 都来自当前包，旧 recruit/chat skill 会被覆盖为统一 MCP 路由
 - npm / npx 安装后会自动初始化 `screening-config.json` 模板（优先写入 workspace 的 `config/`，不可写时回退到用户目录）
 - npm 安装流程会预创建运行目录（跨平台）：`~/.boss-recommend-mcp`、`~/.boss-recommend-mcp/runs`、`~/.boss-recommend-mcp/boss-chat` 及其 `logs/runs/profiles/reports/artifacts/state`
-- `post_action` 必须在每次完整运行开始时确认一次
-- `target_count` 会在每次运行开始时询问一次（可留空，不设上限）
-- 当 `post_action=greet` 时，必须在运行开始时确认 `max_greet_count`
-- 若检测到 `max_greet_count` 可能由 agent 自动默认（例如与 `target_count` 相同且原始指令未明确），会强制再次向用户确认
+- `post_action`、`target_count` 和 `max_greet_count`（当 `post_action=greet`）通过同一次总确认锁定
+- 新流程中 `confirmation.final_confirmed=true` 是总确认；旧版逐字段 `*_confirmed` JSON 仍兼容但不是推荐写法
 - 一旦确认 `post_action`，本次运行内所有通过人选都统一按该动作执行
 - 若达到 `max_greet_count` 但流程仍需继续，后续通过人选会自动改为收藏
 - 不会对每位候选人重复确认
@@ -492,27 +490,10 @@ Trae-CN / 长对话防循环建议：
 {
   "instruction": "推荐页筛选211女生，近14天没有，有 AI Agent 经验，符合标准的直接沟通",
   "confirmation": {
-    "filters_confirmed": true,
-    "school_tag_confirmed": true,
-    "school_tag_value": ["985", "211"],
-    "degree_confirmed": true,
-    "degree_value": ["本科", "硕士", "博士"],
-    "gender_confirmed": true,
-    "gender_value": "女",
-    "recent_not_view_confirmed": true,
-    "recent_not_view_value": "近14天没有",
-    "criteria_confirmed": true,
-    "target_count_confirmed": true,
-    "target_count_value": 20,
-    "post_action_confirmed": true,
-    "post_action_value": "greet",
-    "final_confirmed": true,
-    "job_confirmed": true,
-    "job_value": "算法工程师（视频/图像模型方向） _ 杭州",
-    "max_greet_count_confirmed": true,
-    "max_greet_count_value": 10
+    "final_confirmed": true
   },
   "overrides": {
+    "page_scope": "recommend",
     "school_tag": ["985", "211"],
     "degree": ["本科", "硕士", "博士"],
     "gender": "女",
@@ -523,17 +504,13 @@ Trae-CN / 长对话防循环建议：
     "post_action": "greet",
     "max_greet_count": 10
   },
-  "follow_up": {
-    "chat": {
-      "criteria": "继续在聊天页处理有 AI Agent 或 MCP 项目经验的人选",
-      "start_from": "unread",
-      "target_count": 20,
-      "profile": "default",
-      "safe_pacing": true
-    }
+  "human_behavior": {
+    "restLevel": "medium"
   }
 }
 ```
+
+`confirmation.final_confirmed=true` 表示用户已经看过并确认总览。旧版 `page_confirmed`、`school_tag_confirmed`、`job_confirmed` 等逐字段布尔值仍兼容，但新流程不需要主动生成它们。
 
 ## 测试
 

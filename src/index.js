@@ -520,6 +520,7 @@ function createRunInputSchema() {
       },
       confirmation: {
         type: "object",
+        description: "推荐页确认状态。新流程推荐只在用户看过总览后传 final_confirmed=true；逐字段 *_confirmed 为兼容旧调用保留。",
         properties: {
           page_confirmed: { type: "boolean" },
           page_value: {
@@ -584,7 +585,10 @@ function createRunInputSchema() {
             type: "string",
             enum: ["favorite", "greet", "none"]
           },
-          final_confirmed: { type: "boolean" },
+          final_confirmed: {
+            type: "boolean",
+            description: "用户已确认包含岗位、筛选项、criteria、目标、动作、最大招呼数和 restLevel 的总览。"
+          },
           job_confirmed: { type: "boolean" },
           job_value: { type: "string" },
           max_greet_count_confirmed: { type: "boolean" },
@@ -714,8 +718,8 @@ function createRunInputSchema() {
         type: "boolean",
         description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
       },
-      human_behavior: createHumanBehaviorInputSchema("可选，recommend 可靠性实验用节奏配置；默认 paced_with_rests/on"),
-      humanBehavior: createHumanBehaviorInputSchema("兼容字段；优先使用 human_behavior"),
+      human_behavior: createHumanBehaviorInputSchema("recommend 运行必须显式包含本次用户确认的 restLevel: low|medium|high；其他节奏配置可选"),
+      humanBehavior: createHumanBehaviorInputSchema("兼容字段；优先使用 human_behavior；recommend 运行同样必须显式包含 restLevel"),
       human_behavior_enabled: {
         type: "boolean",
         description: "兼容字段；true 等同启用 paced 默认配置，false 等同 baseline"

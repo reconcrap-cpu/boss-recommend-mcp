@@ -546,7 +546,7 @@ function buildCriteria({ instruction, rawInstruction, overrideCriteria }) {
   };
 }
 
-function resolvePostAction({ instruction, confirmation, overrides }) {
+function resolvePostAction({ instruction, confirmation, overrides, finalConfirmed = false }) {
   const confirmed = confirmation?.post_action_confirmed === true;
   const confirmationValue = normalizePostAction(confirmation?.post_action_value);
   const overrideValue = normalizePostAction(overrides?.post_action);
@@ -557,40 +557,34 @@ function resolvePostAction({ instruction, confirmation, overrides }) {
         ? "greet"
         : /什么也不做|不做任何操作|不操作|仅筛选|只筛选/.test(instruction)
           ? "none"
-        : null;
+          : null;
   const proposed = overrideValue || confirmationValue || instructionValue || null;
 
-  if (confirmed && confirmationValue) {
-    return {
-      post_action: confirmationValue,
-      proposed_post_action: confirmationValue,
-      needs_post_action_confirmation: false
-    };
-  }
-
   return {
-    post_action: confirmed ? confirmationValue || proposed : null,
+    post_action: (confirmed || finalConfirmed) && proposed ? proposed : null,
     proposed_post_action: proposed,
-    needs_post_action_confirmation: true
+    needs_post_action_confirmation: !proposed
   };
 }
 
-function resolveTargetCount({ instruction, confirmation, overrides }) {
+function resolveTargetCount({ instruction, confirmation, overrides, finalConfirmed = false }) {
   const confirmed = confirmation?.target_count_confirmed === true;
   const overrideValue = parsePositiveIntegerValue(overrides?.target_count);
   const confirmationValue = parsePositiveIntegerValue(confirmation?.target_count_value);
   const instructionValue = extractTargetCount(instruction);
   const proposed = overrideValue || confirmationValue || instructionValue || null;
-  const resolved = overrideValue || (confirmed ? confirmationValue : null);
+  const resolved = (confirmed || finalConfirmed)
+    ? (overrideValue || confirmationValue || instructionValue || null)
+    : null;
 
   return {
     target_count: resolved,
     proposed_target_count: proposed,
-    needs_target_count_confirmation: !confirmed
+    needs_target_count_confirmation: false
   };
 }
 
-function resolveMaxGreetCount({ instruction, confirmation, overrides, postActionResolution }) {
+function resolveMaxGreetCount({ instruction, confirmation, overrides, postActionResolution, finalConfirmed = false }) {
   const actionHint = postActionResolution.post_action || postActionResolution.proposed_post_action;
   if (actionHint !== "greet") {
     return {
@@ -612,9 +606,12 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
     || null
   );
   const proposed = confirmationValue || overrideValue || instructionValue || null;
-  const resolved = confirmed ? (confirmationValue || overrideValue || null) : null;
+  const resolved = (confirmed || finalConfirmed)
+    ? (confirmationValue || overrideValue || instructionValue || null)
+    : null;
   const suspiciousAutoFill = Boolean(
     !confirmed
+    && !finalConfirmed
     && Number.isInteger(proposed)
     && proposed > 0
     && !Number.isInteger(instructionValue)
@@ -622,32 +619,31 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
     && targetCountHint > 0
     && proposed === targetCountHint
   );
-  const needsConfirmation = (
-    !(Number.isInteger(resolved) && resolved > 0)
-  );
+  const hasProposedValue = Number.isInteger(proposed) && proposed > 0;
+  const needsConfirmation = !hasProposedValue;
 
   return {
-    max_greet_count: needsConfirmation ? null : resolved,
+    max_greet_count: (confirmed || finalConfirmed) && hasProposedValue ? resolved : null,
     proposed_max_greet_count: proposed,
     needs_max_greet_count_confirmation: needsConfirmation,
     suspicious_auto_fill: suspiciousAutoFill
   };
 }
 
-function resolvePageScope({ instruction, confirmation, overrides }) {
+function resolvePageScope({ instruction, confirmation, overrides, finalConfirmed = false }) {
   const confirmed = confirmation?.page_confirmed === true;
   const confirmationValue = normalizePageScope(confirmation?.page_value);
   const overrideValue = normalizePageScope(overrides?.page_scope);
   const instructionValue = extractPageScope(instruction);
   const proposed = overrideValue || confirmationValue || instructionValue || "recommend";
   return {
-    page_scope: confirmed && confirmationValue ? confirmationValue : null,
+    page_scope: (confirmed && confirmationValue) || finalConfirmed ? proposed : null,
     proposed_page_scope: proposed,
-    needs_page_confirmation: !(confirmed && Boolean(confirmationValue))
+    needs_page_confirmation: !proposed
   };
 }
 
-function collectSuspiciousFields({ invalidOverrideSchoolTags, maxGreetCountResolution }) {
+function collectSuspiciousFields({ invalidOverrideSchoolTags }) {
   const suspicious = [];
   if (Array.isArray(invalidOverrideSchoolTags) && invalidOverrideSchoolTags.length > 0) {
     suspicious.push({
@@ -656,19 +652,13 @@ function collectSuspiciousFields({ invalidOverrideSchoolTags, maxGreetCountResol
       reason: `已忽略无效学校标签：${invalidOverrideSchoolTags.join(" / ")}；仅保留可识别选项。`
     });
   }
-  if (maxGreetCountResolution?.suspicious_auto_fill) {
-    suspicious.push({
-      field: "max_greet_count",
-      value: maxGreetCountResolution.proposed_max_greet_count,
-      reason: "检测到 max_greet_count 与 target_count 相同且原始指令未明确该值，可能是自动填充，需用户再次确认。"
-    });
-  }
   return suspicious;
 }
 
 export function parseRecommendInstruction({ instruction, confirmation, overrides }) {
   const rawInstruction = String(instruction || "");
   const text = normalizeText(rawInstruction);
+  const finalConfirmed = confirmation?.final_confirmed === true;
   const detectedSchoolTags = extractSchoolTags(text);
   const detectedDegrees = extractDegrees(text);
   const schoolTagAudit = auditSchoolTagSelections(overrides?.school_tag);
@@ -692,7 +682,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     || extractJobSelectionHint(rawInstruction)
     || ""
   );
-  const pageScopeResolution = resolvePageScope({ instruction: text, confirmation, overrides });
+  const pageScopeResolution = resolvePageScope({ instruction: text, confirmation, overrides, finalConfirmed });
 
   const inferredSchoolTag = detectedSchoolTags.length > 0
     ? sortSchoolTagSelections(detectedSchoolTags)
@@ -717,15 +707,16 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     post_action: null,
     max_greet_count: null
   };
-  const targetCountResolution = resolveTargetCount({ instruction: text, confirmation, overrides });
+  const targetCountResolution = resolveTargetCount({ instruction: text, confirmation, overrides, finalConfirmed });
   screenParams.target_count = targetCountResolution.target_count;
-  const postActionResolution = resolvePostAction({ instruction: text, confirmation, overrides });
+  const postActionResolution = resolvePostAction({ instruction: text, confirmation, overrides, finalConfirmed });
   screenParams.post_action = postActionResolution.post_action;
   const maxGreetCountResolution = resolveMaxGreetCount({
     instruction: text,
     confirmation,
     overrides,
-    postActionResolution
+    postActionResolution,
+    finalConfirmed
   });
   screenParams.max_greet_count = maxGreetCountResolution.max_greet_count;
 
@@ -735,37 +726,23 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   }
 
   const suspicious_fields = collectSuspiciousFields({
-    invalidOverrideSchoolTags: schoolTagAudit.invalid,
-    maxGreetCountResolution
+    invalidOverrideSchoolTags: schoolTagAudit.invalid
   });
-  const hasConfirmedSchoolTagValue = Array.isArray(confirmationSchoolTag) && confirmationSchoolTag.length > 0;
-  const hasConfirmedDegreeValue = Array.isArray(confirmationDegrees) && confirmationDegrees.length > 0;
-  const hasConfirmedGenderValue = Boolean(confirmationGender);
-  const hasConfirmedRecentNotViewValue = Boolean(confirmationRecentNotView);
-  const needs_school_tag_confirmation = (
-    confirmation?.school_tag_confirmed !== true
-    || !hasConfirmedSchoolTagValue
-  );
-  const needs_degree_confirmation = (
-    confirmation?.degree_confirmed !== true
-    || !hasConfirmedDegreeValue
-  );
-  const needs_gender_confirmation = (
-    confirmation?.gender_confirmed !== true
-    || !hasConfirmedGenderValue
-  );
-  const needs_recent_not_view_confirmation = (
-    confirmation?.recent_not_view_confirmed !== true
-    || !hasConfirmedRecentNotViewValue
-  );
+  const hasResolvedSchoolTagValue = Array.isArray(searchParams.school_tag) && searchParams.school_tag.length > 0;
+  const hasResolvedDegreeValue = Array.isArray(searchParams.degree) && searchParams.degree.length > 0;
+  const hasResolvedGenderValue = Boolean(searchParams.gender);
+  const hasResolvedRecentNotViewValue = Boolean(searchParams.recent_not_view);
+  const needs_school_tag_confirmation = !hasResolvedSchoolTagValue;
+  const needs_degree_confirmation = !hasResolvedDegreeValue;
+  const needs_gender_confirmation = !hasResolvedGenderValue;
+  const needs_recent_not_view_confirmation = !hasResolvedRecentNotViewValue;
   const needs_filters_confirmation = (
-    confirmation?.filters_confirmed !== true
-    || needs_school_tag_confirmation
+    needs_school_tag_confirmation
     || needs_degree_confirmation
     || needs_gender_confirmation
     || needs_recent_not_view_confirmation
   );
-  const needs_criteria_confirmation = confirmation?.criteria_confirmed !== true;
+  const needs_criteria_confirmation = !screenParams.criteria;
   const needs_target_count_confirmation = targetCountResolution.needs_target_count_confirmation;
   const needs_post_action_confirmation = postActionResolution.needs_post_action_confirmation;
   const needs_max_greet_count_confirmation = maxGreetCountResolution.needs_max_greet_count_confirmation;

@@ -67,7 +67,7 @@ Inputs:
 Expected behavior:
 
 - Return `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED` with the same parser/config gates as start.
-- Return `READY` with `cron_ready=true` only when all confirmations, exact job, final review, and config gates are satisfied.
+- Return `READY` with `cron_ready=true` only when all values, exact job, explicit `human_behavior.restLevel`, final review, and config gates are satisfied.
 - Do not connect to Chrome for screening and do not create a `run_id`.
 - Intended cron setup flow: call `list_recommend_jobs` first to auto-open/reuse Chrome and verify login/page/job options, then call this prepare tool, then schedule the same ready payload for `start_recommend_pipeline_run`.
 
@@ -136,29 +136,20 @@ Inputs:
 
 Important confirmation fields:
 
-- `page_confirmed`, `page_value`
-- `filters_confirmed`
-- `school_tag_confirmed`, `school_tag_value`
-- `degree_confirmed`, `degree_value`
-- `gender_confirmed`, `gender_value`
-- `recent_not_view_confirmed`, `recent_not_view_value`
-- `criteria_confirmed`
-- `target_count_confirmed`, `target_count_value`
-- `post_action_confirmed`, `post_action_value`
-- `max_greet_count_confirmed`, `max_greet_count_value`
-- `job_confirmed`, `job_value`
-- `final_confirmed`
+- New recommended shape: put normalized values in `overrides`, put explicit rest level in `human_behavior.restLevel`, and set only `confirmation.final_confirmed=true` after the user confirms the consolidated review.
+- Legacy shape remains compatible: `page_confirmed`, `school_tag_confirmed`, `degree_confirmed`, `gender_confirmed`, `recent_not_view_confirmed`, `criteria_confirmed`, `target_count_confirmed`, `post_action_confirmed`, `max_greet_count_confirmed`, and `job_confirmed`.
 
 Expected behavior:
 
 - Reject missing `instruction`.
 - Parse request with `parseRecommendInstruction`.
-- Return `NEED_CONFIRMATION` until all required filters, criteria, target, post action, and max greet fields are confirmed.
+- Return value-specific `NEED_INPUT` / `NEED_CONFIRMATION` only for missing or invalid values such as criteria, job, post action, max greet count when greeting, invalid school tags, or missing/invalid rest level.
+- If all values are present but `final_confirmed` is not true, return one `NEED_CONFIRMATION` with a single `final_review` question.
 - Connect to Chrome only after enough preflight state is available.
 - If the default local debug port is closed, automatically open Chrome and navigate to the recommend page.
 - If Boss login is detected by URL or DOM-only login panel probes, stop before any run mutation and return `BOSS_LOGIN_REQUIRED`.
-- Read job options and ask user to choose job if not confirmed.
-- Require final confirmation before starting.
+- Read job options and require an exact job value before starting.
+- Require `human_behavior.restLevel` and `final_confirmed=true` before starting.
 - Start the shared recommend run service.
 - Return `ACCEPTED` with `run_id`, artifact paths, normalized input, and poll guidance.
 
@@ -750,6 +741,7 @@ Expected behavior:
 - Return `READY` plus `cron_ready=true` only for a schedulable payload.
 - Exit successfully only when the payload is cron-ready; exit non-zero for `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED`.
 - Support `--instruction`, `--instruction-file`, `--confirmation-json`, `--confirmation-file`, `--overrides-json`, `--overrides-file`, `--slow-live`, `--port`, `--host`, `--target-url-includes`, `--no-navigate`, and `--rest-level`.
+- For the simplified flow, `--confirmation-file` can contain only `{ "final_confirmed": true }` once the user has confirmed the consolidated review.
 
 ### `boss-recommend-mcp schedule-run`
 
@@ -870,7 +862,8 @@ Purpose:
 
 Expected behavior:
 
-- Ask two-stage confirmation.
+- Gather missing values, read exact job options, then show one consolidated final review.
+- After the user confirms, submit normalized values in `overrides`, explicit `human_behavior.restLevel`, and `confirmation.final_confirmed=true`; do not manufacture the old per-field booleans unless preserving an existing legacy payload.
 - For cron setup, create no timer unless `prepare_recommend_pipeline_run` returns `READY` and `cron_ready=true`, then `schedule_recommend_pipeline_run` returns `SCHEDULED`.
 - Preserve the exact instruction/criteria payload that was prepared when passing it into the package-owned scheduler.
 - Do not hand-write shell cron or natural-language future reminders for recommend runs.
@@ -1264,8 +1257,8 @@ Important exports:
 
 Expected behavior:
 
-- Extract filters, criteria, target count, post action, page scope, and job from user instruction/confirmation/overrides.
-- Return confirmation flags and pending requirements.
+- Extract filters, criteria, target count, post action, page scope, and job from user instruction, `overrides`, and legacy confirmation values.
+- Return missing-value flags and pending requirements; final review is handled by the recommend MCP gate.
 
 ## Domain Module Dictionary
 

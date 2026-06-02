@@ -56,6 +56,8 @@ const DEFAULT_RECOMMEND_PORT = 9222;
 const DEFAULT_RECOMMEND_POLL_AFTER_SEC = 10;
 const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screening; scan continues until that many candidates pass or the list ends";
 const RUN_MODE_ASYNC = "async";
+const REST_LEVEL_OPTIONS = ["low", "medium", "high"];
+const REST_LEVEL_SET = new Set(REST_LEVEL_OPTIONS);
 
 const TERMINAL_STATUSES = new Set([
   RUN_STATUS_COMPLETED,
@@ -1027,6 +1029,57 @@ function parseRecommendPipelineRequest(args = {}) {
   });
 }
 
+function readOwn(source, keys = []) {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return undefined;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key)) return source[key];
+  }
+  return undefined;
+}
+
+function getExplicitRestLevel(args = {}) {
+  const behavior = readOwn(args, ["human_behavior", "humanBehavior"]);
+  const raw = readOwn(behavior, ["restLevel", "rest_level"]);
+  const normalized = normalizeText(raw).toLowerCase();
+  return {
+    raw: raw ?? null,
+    restLevel: REST_LEVEL_SET.has(normalized) ? normalized : null,
+    valid: REST_LEVEL_SET.has(normalized),
+    missing: raw === undefined || raw === null || normalizeText(raw) === ""
+  };
+}
+
+function buildReviewScreenParams(parsed) {
+  return {
+    ...(parsed.screenParams || {}),
+    criteria: parsed.screenParams?.criteria || null,
+    criteria_normalized: parsed.criteria_normalized || null,
+    target_count: parsed.screenParams?.target_count ?? parsed.proposed_target_count ?? null,
+    post_action: parsed.screenParams?.post_action || parsed.proposed_post_action || null,
+    max_greet_count: parsed.screenParams?.max_greet_count ?? parsed.proposed_max_greet_count ?? null
+  };
+}
+
+function buildReviewPageScope(parsed) {
+  return parsed.page_scope || parsed.proposed_page_scope || "recommend";
+}
+
+function buildReviewJob(args = {}) {
+  return normalizeText(args.confirmation?.job_value || args.overrides?.job || "") || null;
+}
+
+function buildScheduleReview(args = {}) {
+  const scheduleRunAt = normalizeText(args.schedule_run_at || args.scheduleRunAt || args.run_at || args.runAt);
+  const scheduleDelayMinutes = args.schedule_delay_minutes ?? args.scheduleDelayMinutes;
+  const scheduleDelaySeconds = args.schedule_delay_seconds ?? args.scheduleDelaySeconds;
+  if (!scheduleRunAt && scheduleDelayMinutes === undefined && scheduleDelaySeconds === undefined) return null;
+  return {
+    schedule_run_at: scheduleRunAt || null,
+    schedule_delay_minutes: scheduleDelayMinutes ?? null,
+    schedule_delay_seconds: scheduleDelaySeconds ?? null
+  };
+}
+
 function buildRequiredConfirmations(parsed, args = {}) {
   const required = [];
   if (parsed.needs_page_confirmation) required.push("page_scope");
@@ -1043,8 +1096,11 @@ function buildRequiredConfirmations(parsed, args = {}) {
 
   const confirmation = args.confirmation || {};
   const jobValue = normalizeText(confirmation.job_value || args.overrides?.job || "");
-  if (confirmation.job_confirmed !== true || !jobValue) required.push("job");
-  if (confirmation.final_confirmed !== true) required.push("final_review");
+  if (!jobValue) required.push("job");
+  const restLevel = getExplicitRestLevel(args);
+  if (!restLevel.valid) required.push("rest_level");
+  const blocksFinalReview = required.some((field) => field !== "rest_level");
+  if (confirmation.final_confirmed !== true && !blocksFinalReview) required.push("final_review");
   return Array.from(new Set(required));
 }
 
@@ -1057,23 +1113,52 @@ function buildJobPendingQuestion(args = {}) {
   };
 }
 
-function buildFinalReviewQuestion(parsed) {
+function buildRestLevelPendingQuestion(args = {}) {
+  const restLevel = getExplicitRestLevel(args);
+  return {
+    field: "rest_level",
+    question: restLevel.missing
+      ? "请确认本次运行休息强度 rest_level。"
+      : "rest_level 只能是 low / medium / high，请重新确认本次运行休息强度。",
+    value: restLevel.restLevel || restLevel.raw || null,
+    options: REST_LEVEL_OPTIONS.map((value) => ({
+      label: value,
+      value
+    }))
+  };
+}
+
+function buildSuspiciousFieldsQuestion(parsed) {
+  return {
+    field: "suspicious_fields",
+    question: "检测到需要修正或明确确认的异常字段，请先修正后再启动。",
+    value: parsed.suspicious_fields || []
+  };
+}
+
+function buildFinalReviewQuestion(parsed, args = {}) {
+  const restLevel = getExplicitRestLevel(args);
   return {
     field: "final_review",
-    question: "请最终确认本次推荐页筛选参数无误，并明确 final_confirmed=true 后再启动。",
+    question: "请最终确认本次推荐页筛选参数无误；确认后设置 final_confirmed=true 即可启动或创建定时任务。",
     value: {
-      page_scope: parsed.page_scope,
+      page_scope: buildReviewPageScope(parsed),
+      job: buildReviewJob(args),
       search_params: parsed.searchParams,
-      screen_params: parsed.screenParams
+      screen_params: buildReviewScreenParams(parsed),
+      human_behavior: {
+        restLevel: restLevel.restLevel || null
+      },
+      schedule: buildScheduleReview(args)
     }
   };
 }
 
-function buildNeedInputResponse(parsed) {
+function buildNeedInputResponse(parsed, args = {}) {
   return {
     status: "NEED_INPUT",
     missing_fields: parsed.missing_fields,
-    required_confirmations: buildRequiredConfirmations(parsed),
+    required_confirmations: buildRequiredConfirmations(parsed, args),
     search_params: parsed.searchParams,
     screen_params: parsed.screenParams,
     pending_questions: parsed.pending_questions,
@@ -1088,18 +1173,24 @@ function buildNeedInputResponse(parsed) {
 
 function buildNeedConfirmationResponse(parsed, args, requiredConfirmations) {
   const pending = [...(parsed.pending_questions || [])];
+  if (requiredConfirmations.includes("suspicious_fields") && !pending.some((item) => item.field === "suspicious_fields")) {
+    pending.push(buildSuspiciousFieldsQuestion(parsed));
+  }
   if (requiredConfirmations.includes("job") && !pending.some((item) => item.field === "job")) {
     pending.push(buildJobPendingQuestion(args));
   }
+  if (requiredConfirmations.includes("rest_level") && !pending.some((item) => item.field === "rest_level")) {
+    pending.push(buildRestLevelPendingQuestion(args));
+  }
   if (requiredConfirmations.includes("final_review") && !pending.some((item) => item.field === "final_review")) {
-    pending.push(buildFinalReviewQuestion(parsed));
+    pending.push(buildFinalReviewQuestion(parsed, args));
   }
   return {
     status: "NEED_CONFIRMATION",
     required_confirmations: requiredConfirmations,
-    page_scope: parsed.page_scope,
+    page_scope: buildReviewPageScope(parsed),
     search_params: parsed.searchParams,
-    screen_params: parsed.screenParams,
+    screen_params: buildReviewScreenParams(parsed),
     pending_questions: pending,
     review: {
       ...(parsed.review || {}),
@@ -1109,7 +1200,7 @@ function buildNeedConfirmationResponse(parsed, args, requiredConfirmations) {
 }
 
 function evaluateRecommendPipelineGate(parsed, args = {}) {
-  if (parsed.missing_fields?.length) return buildNeedInputResponse(parsed);
+  if (parsed.missing_fields?.length) return buildNeedInputResponse(parsed, args);
   const requiredConfirmations = buildRequiredConfirmations(parsed, args);
   if (requiredConfirmations.length) {
     return buildNeedConfirmationResponse(parsed, args, requiredConfirmations);

@@ -27,13 +27,14 @@ function testNeedConfirmationIncludesPostAction() {
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
   assert.equal(result.screenParams.criteria, "有大模型平台经验");
   assert.equal(result.proposed_post_action, "favorite");
-  assert.equal(result.needs_filters_confirmation, true);
-  assert.equal(result.needs_school_tag_confirmation, true);
-  assert.equal(result.needs_degree_confirmation, true);
-  assert.equal(result.needs_gender_confirmation, true);
-  assert.equal(result.needs_recent_not_view_confirmation, true);
-  assert.equal(result.needs_criteria_confirmation, true);
-  assert.equal(result.needs_post_action_confirmation, true);
+  assert.equal(result.needs_filters_confirmation, false);
+  assert.equal(result.needs_school_tag_confirmation, false);
+  assert.equal(result.needs_degree_confirmation, false);
+  assert.equal(result.needs_gender_confirmation, false);
+  assert.equal(result.needs_recent_not_view_confirmation, false);
+  assert.equal(result.needs_criteria_confirmation, false);
+  assert.equal(result.needs_post_action_confirmation, false);
+  assert.deepEqual(result.pending_questions, []);
 }
 
 function testConfirmedPostActionAndOverrides() {
@@ -84,7 +85,7 @@ function testConfirmedPostActionAndOverrides() {
   assert.equal(result.needs_max_greet_count_confirmation, false);
 }
 
-function testMissingRecentNotViewValueShouldRequireReconfirmation() {
+function testMissingRecentNotViewValueCanBeRecoveredFromInstruction() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选985男生，近14天没有，有销售经验，符合标准收藏",
     confirmation: {
@@ -104,11 +105,12 @@ function testMissingRecentNotViewValueShouldRequireReconfirmation() {
     overrides: null
   });
 
-  assert.equal(result.needs_recent_not_view_confirmation, true);
-  assert.equal(result.pending_questions.some((q) => q.field === "recent_not_view"), true);
+  assert.equal(result.searchParams.recent_not_view, "近14天没有");
+  assert.equal(result.needs_recent_not_view_confirmation, false);
+  assert.equal(result.pending_questions.some((q) => q.field === "recent_not_view"), false);
 }
 
-function testFilterConfirmedWithoutExplicitValuesShouldRequireReconfirmation() {
+function testDefaultFilterValuesDoNotRequireFieldConfirmation() {
   const result = parseRecommendInstruction({
     instruction: "通过boss推荐skill帮我找人",
     confirmation: {
@@ -131,11 +133,11 @@ function testFilterConfirmedWithoutExplicitValuesShouldRequireReconfirmation() {
   assert.deepEqual(result.searchParams.degree, ["不限"]);
   assert.equal(result.searchParams.gender, "不限");
   assert.equal(result.searchParams.recent_not_view, "不限");
-  assert.equal(result.needs_school_tag_confirmation, true);
-  assert.equal(result.needs_degree_confirmation, true);
-  assert.equal(result.needs_gender_confirmation, true);
-  assert.equal(result.needs_recent_not_view_confirmation, true);
-  assert.equal(result.needs_filters_confirmation, true);
+  assert.equal(result.needs_school_tag_confirmation, false);
+  assert.equal(result.needs_degree_confirmation, false);
+  assert.equal(result.needs_gender_confirmation, false);
+  assert.equal(result.needs_recent_not_view_confirmation, false);
+  assert.equal(result.needs_filters_confirmation, false);
 }
 
 function testFilterConfirmedWithExplicitConfirmationValuesShouldNotFallbackToUnlimited() {
@@ -395,10 +397,11 @@ function testGreetMaxGreetCountCanComeFromOverrides() {
 
   assert.equal(result.screenParams.post_action, "greet");
   assert.equal(result.screenParams.max_greet_count, null);
-  assert.equal(result.needs_max_greet_count_confirmation, true);
+  assert.equal(result.needs_max_greet_count_confirmation, false);
+  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
 }
 
-function testGreetAutoFilledMaxGreetCountShouldRequireReconfirmationWhenNotExplicitlyConfirmed() {
+function testGreetAutoFilledMaxGreetCountIsHandledByFinalReview() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选985男生，有大模型工程经验，目标3人，符合标准直接沟通",
     confirmation: {
@@ -420,9 +423,9 @@ function testGreetAutoFilledMaxGreetCountShouldRequireReconfirmationWhenNotExpli
 
   assert.equal(result.screenParams.post_action, "greet");
   assert.equal(result.screenParams.max_greet_count, null);
-  assert.equal(result.needs_max_greet_count_confirmation, true);
-  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), true);
-  assert.equal(result.suspicious_fields.some((item) => item.field === "max_greet_count"), true);
+  assert.equal(result.needs_max_greet_count_confirmation, false);
+  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
+  assert.equal(result.suspicious_fields.some((item) => item.field === "max_greet_count"), false);
 }
 
 function testGreetMaxGreetCountEqualTargetShouldPassAfterExplicitConfirmation() {
@@ -451,7 +454,7 @@ function testGreetMaxGreetCountEqualTargetShouldPassAfterExplicitConfirmation() 
   assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
 }
 
-function testTargetCountNeedsConfirmationEvenWhenOptional() {
+function testTargetCountCanBeReviewedWithoutFieldConfirmation() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选985男生，有大模型平台经验，符合标准收藏",
     confirmation: {
@@ -467,8 +470,8 @@ function testTargetCountNeedsConfirmationEvenWhenOptional() {
     overrides: null
   });
 
-  assert.equal(result.needs_target_count_confirmation, true);
-  assert.equal(result.pending_questions.some((q) => q.field === "target_count"), true);
+  assert.equal(result.needs_target_count_confirmation, false);
+  assert.equal(result.pending_questions.some((q) => q.field === "target_count"), false);
 }
 
 function testTargetCountCanBeSkippedAfterConfirmation() {
@@ -547,32 +550,23 @@ function testFeaturedKeywordShouldProposeFeaturedPageScope() {
   });
 
   assert.equal(result.proposed_page_scope, "featured");
-  assert.equal(result.needs_page_confirmation, true);
-  assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
+  assert.equal(result.needs_page_confirmation, false);
+  assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), false);
 }
 
-function testClosedQuestionsShouldExposeStructuredOptions() {
+function testMissingPostActionShouldExposeStructuredOptions() {
   const result = parseRecommendInstruction({
-    instruction: "推荐页筛选候选人，有 Agent 经验，符合标准收藏",
+    instruction: "推荐页筛选候选人，有 Agent 经验",
     confirmation: null,
     overrides: null
   });
-  const schoolTagQuestion = result.pending_questions.find((item) => item.field === "school_tag");
-  const recentNotViewQuestion = result.pending_questions.find((item) => item.field === "recent_not_view");
-  const filtersQuestion = result.pending_questions.find((item) => item.field === "filters");
+  const postActionQuestion = result.pending_questions.find((item) => item.field === "post_action");
 
-  assert.equal(Boolean(schoolTagQuestion), true);
-  assert.equal(Array.isArray(schoolTagQuestion.options), true);
-  assert.equal(schoolTagQuestion.options.some((item) => item.value === "国内外名校"), true);
-  assert.equal(schoolTagQuestion.options.every((item) => typeof item.label === "string" && typeof item.value === "string"), true);
-
-  assert.equal(Boolean(recentNotViewQuestion), true);
-  assert.equal(Array.isArray(recentNotViewQuestion.options), true);
-  assert.equal(recentNotViewQuestion.options.some((item) => item.value === "近14天没有"), true);
-
-  assert.equal(Boolean(filtersQuestion), true);
-  assert.equal(Array.isArray(filtersQuestion.options), true);
-  assert.equal(filtersQuestion.options.some((item) => item.value === "confirm"), true);
+  assert.equal(Boolean(postActionQuestion), true);
+  assert.equal(Array.isArray(postActionQuestion.options), true);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "favorite"), true);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "greet"), true);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "none"), true);
 }
 
 function testLatestKeywordShouldProposeLatestPageScope() {
@@ -583,11 +577,9 @@ function testLatestKeywordShouldProposeLatestPageScope() {
   });
 
   assert.equal(result.proposed_page_scope, "latest");
-  assert.equal(result.needs_page_confirmation, true);
+  assert.equal(result.needs_page_confirmation, false);
   const pageQuestion = result.pending_questions.find((item) => item.field === "page_scope");
-  assert.equal(Boolean(pageQuestion), true);
-  assert.equal(Array.isArray(pageQuestion.options), true);
-  assert.equal(pageQuestion.options.some((item) => item.value === "latest"), true);
+  assert.equal(Boolean(pageQuestion), false);
 }
 
 function testConfirmedPageScopeShouldBeResolved() {
@@ -615,8 +607,8 @@ function testPageScopeOverrideShouldNotBypassConfirmation() {
 
   assert.equal(result.proposed_page_scope, "featured");
   assert.equal(result.page_scope, null);
-  assert.equal(result.needs_page_confirmation, true);
-  assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), true);
+  assert.equal(result.needs_page_confirmation, false);
+  assert.equal(result.pending_questions.some((item) => item.field === "page_scope"), false);
 }
 
 function testExplicitCriteriaBlockShouldKeepAllCoreRulesAndExcludeMetaFields() {
@@ -701,8 +693,8 @@ function testMetaHintsShouldBeProposedFromInstruction() {
 function main() {
   testNeedConfirmationIncludesPostAction();
   testConfirmedPostActionAndOverrides();
-  testMissingRecentNotViewValueShouldRequireReconfirmation();
-  testFilterConfirmedWithoutExplicitValuesShouldRequireReconfirmation();
+  testMissingRecentNotViewValueCanBeRecoveredFromInstruction();
+  testDefaultFilterValuesDoNotRequireFieldConfirmation();
   testFilterConfirmedWithExplicitConfirmationValuesShouldNotFallbackToUnlimited();
   testMultipleSchoolTagsMarkedSuspicious();
   testDegreeCanBeExtracted();
@@ -720,14 +712,14 @@ function main() {
   testMcpMentionShouldStayInCriteria();
   testGreetNeedsMaxGreetCountConfirmation();
   testGreetMaxGreetCountCanComeFromOverrides();
-  testGreetAutoFilledMaxGreetCountShouldRequireReconfirmationWhenNotExplicitlyConfirmed();
+  testGreetAutoFilledMaxGreetCountIsHandledByFinalReview();
   testGreetMaxGreetCountEqualTargetShouldPassAfterExplicitConfirmation();
-  testTargetCountNeedsConfirmationEvenWhenOptional();
+  testTargetCountCanBeReviewedWithoutFieldConfirmation();
   testTargetCountCanBeSkippedAfterConfirmation();
   testPostActionNoneCanBeConfirmed();
   testJobSelectionHintCanComeFromOverrides();
   testFeaturedKeywordShouldProposeFeaturedPageScope();
-  testClosedQuestionsShouldExposeStructuredOptions();
+  testMissingPostActionShouldExposeStructuredOptions();
   testLatestKeywordShouldProposeLatestPageScope();
   testConfirmedPageScopeShouldBeResolved();
   testPageScopeOverrideShouldNotBypassConfirmation();
