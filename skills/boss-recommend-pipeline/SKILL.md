@@ -7,7 +7,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 ## Goal
 
-当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`；若是稍后/cron 启动，必须走 `schedule_recommend_pipeline_run`。先补齐缺失值并读取岗位列表，然后展示一次包含岗位、筛选项、criteria、目标人数、后置动作、最大招呼数、休息强度和定时信息的总确认；用户确认后设置 `final_confirmed=true` 即可启动或创建定时任务。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
+当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`；若是稍后/cron 启动，必须走 `schedule_recommend_pipeline_run`。先补齐缺失值并读取岗位列表，然后展示一次包含岗位、筛选项、criteria、目标人数、后置动作、可选最大招呼数、休息强度和定时信息的总确认；用户确认后设置 `final_confirmed=true` 即可启动或创建定时任务。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
 
 ## Hard Rules (Must Follow)
 
@@ -31,7 +31,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 - **参数确认**
   - `criteria` 必须是用户开放式自然语言；禁止“严格/宽松执行”等预设替代。
-  - `post_action=greet` 时，`max_greet_count` 必须出现在总确认里；禁止未告知用户就自动默认为 `target_count`。
+  - `max_greet_count` 仅是可选的 `post_action=greet` 上限；禁止未告知用户就自动默认为 `target_count`。
   - 正式执行前必须 `final_confirmed=true`。
   - 真实筛选禁止传 `detail_limit: 0`；recommend 默认必须打开候选人详情/CV。只有用户明确要求“卡片-only 调试”时，才允许同时传 `detail_limit: 0` 和 `allow_card_only_screening: true`。
 
@@ -49,8 +49,8 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - `school_tag`、`degree`、`gender`、`recent_not_view`
 - `criteria`（开放文本）
 - `target_count`（可空）
-- `post_action`：`favorite|greet|none`
-- `max_greet_count`（仅当 `post_action=greet`）
+- `post_action`：`greet|none`
+- `max_greet_count`（可选，仅当 `post_action=greet`）
 - `rest_level`：`low|medium|high`
 - `job`（来自 `list_recommend_jobs` / `job_options` 的精确岗位名）
 - cron/定时任务的启动时间（如适用）
@@ -84,7 +84,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - `degree`: `不限/初中及以下/中专/中技/高中/大专/本科/硕士/博士`
   - `gender`: `不限/男/女`
   - `recent_not_view`: `不限/近14天没有`
-  - `post_action`: `favorite/greet/none`
+  - `post_action`: `greet/none`
   - `rest_level`: `low/medium/high`
 
 ## Tool Usage
@@ -123,7 +123,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 创建 cron 时必须在设置 cron 的当下完成全部交互：
 
 1. 锁定用户原始 instruction，不改写、不摘要，criteria 放入 `overrides.criteria` 时必须逐字保留。
-2. 收集全部筛选项、`target_count`、`post_action`、`max_greet_count`（如需要）和本次 `rest_level`。
+2. 收集全部筛选项、`target_count`、`post_action`、可选 `max_greet_count` 和本次 `rest_level`。
 3. 调用 `list_recommend_jobs`；若 Chrome 未打开，工具会尝试自动打开本机 9222 Chrome 并进入推荐页。若返回 `BOSS_LOGIN_REQUIRED` 或页面不可用，停止 cron 创建，让用户登录/修复后重试。
 4. 用 `job_names` 中的精确岗位名填入 `overrides.job`，展示包含启动时间的最终总确认；用户确认后写入 `final_confirmed=true`。
 5. 调用 `prepare_recommend_pipeline_run` 传入将来要执行的完整 payload；只有 `READY + cron_ready=true` 才能继续。

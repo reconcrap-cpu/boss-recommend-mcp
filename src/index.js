@@ -583,11 +583,11 @@ function createRunInputSchema() {
           post_action_confirmed: { type: "boolean" },
           post_action_value: {
             type: "string",
-            enum: ["favorite", "greet", "none"]
+            enum: ["greet", "none"]
           },
           final_confirmed: {
             type: "boolean",
-            description: "用户已确认包含岗位、筛选项、criteria、目标、动作、最大招呼数和 restLevel 的总览。"
+            description: "用户已确认包含岗位、筛选项、criteria、目标、动作、可选最大招呼数和 restLevel 的总览。"
           },
           job_confirmed: { type: "boolean" },
           job_value: { type: "string" },
@@ -654,7 +654,7 @@ function createRunInputSchema() {
           max_greet_count: { type: "integer", minimum: 1 },
           post_action: {
             type: "string",
-            enum: ["favorite", "greet", "none"]
+            enum: ["greet", "none"]
           }
         },
         additionalProperties: false
@@ -781,26 +781,26 @@ function createRunInputSchema() {
       },
       execute_post_action: {
         type: "boolean",
-        description: "可选，是否实际执行通过后的 recommend 后置动作 favorite/greet；默认 true"
+        description: "可选，是否实际执行通过后的 recommend 后置动作 greet；默认 true"
       },
       dry_run_post_action: {
         type: "boolean",
-        description: "可选，只验证 recommend 后置动作发现/配额/可点击路径，不实际点击 favorite/greet"
+        description: "可选，只验证 recommend 打招呼动作发现/配额/可点击路径，不实际点击"
       },
       action_timeout_ms: {
         type: "integer",
         minimum: 1000,
-        description: "可选，等待详情页 favorite/greet 控件出现的超时时间"
+        description: "可选，等待详情页 greet 控件出现的超时时间"
       },
       action_interval_ms: {
         type: "integer",
         minimum: 100,
-        description: "可选，轮询详情页 favorite/greet 控件的间隔"
+        description: "可选，轮询详情页 greet 控件的间隔"
       },
       action_after_click_delay_ms: {
         type: "integer",
         minimum: 0,
-        description: "可选，点击 favorite/greet 后等待页面状态稳定的时间"
+        description: "可选，点击 greet 后等待页面状态稳定的时间"
       },
       no_filter: {
         type: "boolean",
@@ -2437,7 +2437,7 @@ async function handleRunFeaturedCalibrationTool({ workspaceRoot, args }) {
     calibration_resolution: getFeaturedCalibrationResolution(workspaceRoot),
     guidance: {
       current_workaround: "Use an existing favorite-calibration.json if present; get_featured_calibration_status reports whether it is usable.",
-      next_development_task: "Implement CDP-only featured calibration with explicit user approval for any mutating favorite/greet action."
+      next_development_task: "Implement CDP-only featured calibration with explicit user approval for any calibration click."
     }
   };
 }

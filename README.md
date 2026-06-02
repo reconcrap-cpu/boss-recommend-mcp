@@ -160,16 +160,16 @@ boss-recommend-mcp schedule-status --schedule-id <schedule_id>
 - 学历支持单选与多选语义：如“本科及以上”会展开为 `本科/硕士/博士`；如“大专、本科”只勾选这两项
 - 执行前会先补齐筛选值、岗位、后置动作和休息强度，然后只做一次总确认
 - 页面就绪（已登录且在 recommend 页）后，会先提取岗位栏全部岗位，使用精确岗位名填入 run payload，再进入总确认
-- 在真正开始 search/screen 或创建 cron 前，总确认需包含岗位、全部筛选参数、criteria、target_count、post_action、max_greet_count、restLevel 和定时信息（如适用）
+- 在真正开始 search/screen 或创建 cron 前，总确认需包含岗位、全部筛选参数、criteria、target_count、post_action、可选 max_greet_count、restLevel 和定时信息（如适用）
 - npm 全局安装后会自动执行 install：生成 skill、导出 MCP 模板，并自动尝试写入已检测到的外部 agent MCP 配置（含 Trae / trae-cn / Cursor / Claude / OpenClaw）
 - 2.x installer 会迁移已存在的 legacy Boss MCP 配置：把 `boss-recommend` 指向统一 `@reconcrap/boss-recommend-mcp`，并从同一个 `mcp.json` 中移除旧 `boss-recruit-mcp` / standalone `boss-chat` / 本地 legacy Boss 路径；写入前会生成 `.boss-mcp-migration-*.bak` 备份
 - 2.x installer 会刷新外部 agent skills：`boss-recommend-pipeline`、`boss-recruit-pipeline`、`boss-chat` 都来自当前包，旧 recruit/chat skill 会被覆盖为统一 MCP 路由
 - npm / npx 安装后会自动初始化 `screening-config.json` 模板（优先写入 workspace 的 `config/`，不可写时回退到用户目录）
 - npm 安装流程会预创建运行目录（跨平台）：`~/.boss-recommend-mcp`、`~/.boss-recommend-mcp/runs`、`~/.boss-recommend-mcp/boss-chat` 及其 `logs/runs/profiles/reports/artifacts/state`
-- `post_action`、`target_count` 和 `max_greet_count`（当 `post_action=greet`）通过同一次总确认锁定
+- `post_action`、`target_count` 和可选 `max_greet_count` 通过同一次总确认锁定
 - 新流程中 `confirmation.final_confirmed=true` 是总确认；旧版逐字段 `*_confirmed` JSON 仍兼容但不是推荐写法
 - 一旦确认 `post_action`，本次运行内所有通过人选都统一按该动作执行
-- 若达到 `max_greet_count` 但流程仍需继续，后续通过人选会自动改为收藏
+- 若达到可选 `max_greet_count` 但流程仍需继续，后续通过人选会继续筛选但不再执行打招呼动作
 - 不会对每位候选人重复确认
 - 推荐页详情处理完成后，会强制关闭详情页并确认已关闭
 - 简历提取优先使用 Network 响应；没有可解析 Network CV 时，回退到完整滚动截图序列再交给多模态模型判断
@@ -501,8 +501,7 @@ Trae-CN / 长对话防循环建议：
     "criteria": "候选人需要有 AI Agent 或 MCP 工具开发经验",
     "job": "算法工程师（视频/图像模型方向） _ 杭州",
     "target_count": 20,
-    "post_action": "greet",
-    "max_greet_count": 10
+    "post_action": "greet"
   },
   "human_behavior": {
     "restLevel": "medium"

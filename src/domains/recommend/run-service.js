@@ -288,12 +288,12 @@ async function runRecommendPostAction({
     return result;
   }
   if (plan.effective === "none") {
-    result.reason = "post_action_none";
+    result.reason = plan.reason === "greet_limit_reached" ? "greet_limit_reached" : "post_action_none";
     return result;
   }
 
   const summary = actionDiscovery?.summary || {};
-  const control = plan.effective === "favorite" ? summary.favorite : summary.greet;
+  const control = summary.greet;
   if (!control?.found) {
     result.reason = `${plan.effective}_control_not_found`;
     return result;
@@ -313,11 +313,6 @@ async function runRecommendPostAction({
   }
   if (plan.effective === "greet" && control.available === false) {
     result.reason = "greet_control_not_available";
-    return result;
-  }
-  if (plan.effective === "favorite" && control.active) {
-    result.reason = "already_favorited";
-    result.already_favorited = true;
     return result;
   }
   if (control.disabled) {
@@ -360,18 +355,13 @@ async function runRecommendPostAction({
       requireAny: false
     });
     const afterSummary = afterDiscovery?.summary || {};
-    const afterControl = plan.effective === "favorite" ? afterSummary.favorite : afterSummary.greet;
+    const afterControl = afterSummary.greet;
     result.action_discovery_after = compactActionDiscovery(afterDiscovery);
     result.control_after = afterControl || null;
     if (plan.effective === "greet") {
       result.verified_after_click = Boolean(
         afterControl?.continue_chat
         || String(afterControl?.label || "").includes("继续沟通")
-      );
-    } else if (plan.effective === "favorite") {
-      result.verified_after_click = Boolean(
-        afterControl?.active
-        || String(afterControl?.label || "").includes("已")
       );
     }
   } catch (error) {

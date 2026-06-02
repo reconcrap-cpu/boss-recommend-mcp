@@ -90,7 +90,7 @@ function parseArgs(argv) {
     targetCount: 5,
     maxScreened: 20,
     postAction: "greet",
-    maxGreetCount: 5,
+    maxGreetCount: null,
     initialGreetCount: 0,
     executePostAction: false,
     allowNavigate: true,
@@ -600,12 +600,12 @@ async function runPostAction({
     return result;
   }
   if (plan.effective === "none") {
-    result.reason = "post_action_none";
+    result.reason = plan.reason === "greet_limit_reached" ? "greet_limit_reached" : "post_action_none";
     return result;
   }
 
   const summary = actionDiscovery?.summary || {};
-  const control = plan.effective === "favorite" ? summary.favorite : summary.greet;
+  const control = summary.greet;
   if (!control?.found) {
     result.reason = `${plan.effective}_control_not_found`;
     return result;
@@ -699,6 +699,9 @@ async function callScreeningLlmWithRetry({
 
 async function run() {
   const options = parseArgs(process.argv.slice(2));
+  if (!["greet", "none"].includes(options.postAction)) {
+    throw new Error(`Unsupported recommend post action: ${options.postAction}. Use greet or none.`);
+  }
   const startedAt = Date.now();
   let session;
   const result = {
@@ -990,9 +993,11 @@ async function run() {
     const actionAttemptedCount = results.filter((item) => item.post_action?.action_attempted).length;
     const actionClickedCount = results.filter((item) => item.post_action?.action_clicked).length;
     const targetCount = Math.max(1, Number(options.targetCount) || 1);
-    const maxGreetCount = Math.max(1, Number(options.maxGreetCount) || targetCount);
+    const maxGreetCount = Number.isInteger(options.maxGreetCount) && options.maxGreetCount > 0
+      ? options.maxGreetCount
+      : null;
     const requiredGreetCount = options.executePostAction && options.postAction === "greet"
-      ? Math.min(targetCount, maxGreetCount)
+      ? Math.min(targetCount, maxGreetCount || targetCount)
       : 0;
 
     result.summary = {

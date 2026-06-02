@@ -32,7 +32,7 @@ function parseArgs(argv) {
     saveReport: ".live-artifacts/recommend-actions-discovery-live.json",
     postAction: "greet",
     greetCount: 0,
-    maxGreetCount: 1,
+    maxGreetCount: null,
     closeDetail: true,
     allowNavigate: true
   };
@@ -95,6 +95,9 @@ async function connectToRecommendSession(options) {
 
 async function run() {
   const options = parseArgs(process.argv.slice(2));
+  if (!["greet", "none"].includes(options.postAction)) {
+    throw new Error(`Unsupported recommend post action: ${options.postAction}. Use greet or none.`);
+  }
   let session;
   const result = {
     status: "UNKNOWN",
@@ -178,11 +181,9 @@ async function run() {
       maxGreetCount: Number.isInteger(options.maxGreetCount) ? options.maxGreetCount : null
     });
 
-    const requiredForPlan = plan.effective === "favorite"
-      ? actionDiscovery.summary.favorite.found
-      : plan.effective === "greet"
-        ? actionDiscovery.summary.greet.found
-        : true;
+    const requiredForPlan = plan.effective === "greet"
+      ? actionDiscovery.summary.greet.found
+      : true;
     if (!requiredForPlan) {
       throw new Error(`Planned action ${plan.effective} has no discovered control`);
     }

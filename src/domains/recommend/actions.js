@@ -22,7 +22,7 @@ import {
 import { waitForRecommendDetail } from "./detail.js";
 import { getRecommendRoots } from "./roots.js";
 
-const POST_ACTIONS = new Set(["none", "favorite", "greet"]);
+const POST_ACTIONS = new Set(["none", "greet"]);
 const GREET_EXACT_LABEL_PATTERN = /^(?:打招呼|聊一聊|立即沟通(?:[\(（]\d+\s*[/／]\s*\d+[\)）])?|沟通)$/i;
 export const RECOMMEND_DETAIL_ACTION_TEXT_SELECTORS = Object.freeze([
   "button",
@@ -94,7 +94,6 @@ function bestControl(controls, exactLabelPattern) {
 export function normalizeRecommendPostAction(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (["", "none", "skip", "no", "不执行", "无"].includes(normalized)) return "none";
-  if (["favorite", "fav", "collect", "收藏", "感兴趣"].includes(normalized)) return "favorite";
   if (["greet", "chat", "打招呼", "直接沟通", "沟通"].includes(normalized)) return "greet";
   return POST_ACTIONS.has(normalized) ? normalized : "";
 }
@@ -110,7 +109,7 @@ export function resolveRecommendPostAction({
   if (requested === "greet" && limit !== null && currentGreetCount >= limit) {
     return {
       requested,
-      effective: "favorite",
+      effective: "none",
       reason: "greet_limit_reached",
       greet_count: currentGreetCount,
       max_greet_count: limit

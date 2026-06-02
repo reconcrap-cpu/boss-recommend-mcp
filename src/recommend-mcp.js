@@ -1091,7 +1091,6 @@ function buildRequiredConfirmations(parsed, args = {}) {
   if (parsed.needs_criteria_confirmation) required.push("criteria");
   if (parsed.needs_target_count_confirmation) required.push("target_count");
   if (parsed.needs_post_action_confirmation) required.push("post_action");
-  if (parsed.needs_max_greet_count_confirmation) required.push("max_greet_count");
   if ((parsed.suspicious_fields || []).length) required.push("suspicious_fields");
 
   const confirmation = args.confirmation || {};

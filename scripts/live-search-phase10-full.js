@@ -113,7 +113,7 @@ function parseArgs(argv) {
     targetCount: 3,
     maxScreened: 20,
     postAction: "greet",
-    maxGreetCount: 3,
+    maxGreetCount: null,
     initialGreetCount: 0,
     executePostAction: false,
     allowNavigate: true,
@@ -708,7 +708,7 @@ async function runPostAction({
     result.reason = "post_action_none_or_unsupported";
     return result;
   }
-  if (greetCount >= options.maxGreetCount) {
+  if (Number.isInteger(options.maxGreetCount) && options.maxGreetCount > 0 && greetCount >= options.maxGreetCount) {
     result.reason = "max_greet_count_reached";
     return result;
   }
@@ -791,6 +791,9 @@ function writePhase10CsvFile(filePath, result = {}, options = {}) {
 
 async function run() {
   const options = parseArgs(process.argv.slice(2));
+  if (!["greet", "none"].includes(options.postAction)) {
+    throw new Error(`Unsupported search post action: ${options.postAction}. Use greet or none.`);
+  }
   const startedAt = Date.now();
   let session;
   const searchParams = searchParamsFromOptions(options);
@@ -894,7 +897,11 @@ async function run() {
     while (
       results.length < Math.max(1, Number(options.maxScreened) || 1)
       && newGreetCount < Math.max(1, Number(options.targetCount) || 1)
-      && greetCount < Math.max(1, Number(options.maxGreetCount) || 1)
+      && (
+        !Number.isInteger(options.maxGreetCount)
+        || options.maxGreetCount <= 0
+        || greetCount < options.maxGreetCount
+      )
     ) {
       const nextCandidateResult = await getNextInfiniteListCandidate({
         client,
@@ -1143,9 +1150,11 @@ async function run() {
     const actionAttemptedCount = results.filter((item) => item.post_action?.action_attempted).length;
     const actionClickedCount = results.filter((item) => item.post_action?.action_clicked).length;
     const targetCount = Math.max(1, Number(options.targetCount) || 1);
-    const maxGreetCount = Math.max(1, Number(options.maxGreetCount) || targetCount);
+    const maxGreetCount = Number.isInteger(options.maxGreetCount) && options.maxGreetCount > 0
+      ? options.maxGreetCount
+      : null;
     const requiredGreetCount = options.executePostAction && options.postAction === "greet"
-      ? Math.min(targetCount, maxGreetCount)
+      ? Math.min(targetCount, maxGreetCount || targetCount)
       : 0;
 
     result.summary = {

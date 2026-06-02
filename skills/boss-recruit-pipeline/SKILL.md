@@ -29,8 +29,7 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 - 只有工具返回 `BOSS_LOGIN_REQUIRED` / `requires_login=true` 时，才要求用户在自动打开的 Chrome 窗口人工登录 Boss 后重试；不要把“没开 9222 Chrome”当作缺参。
 - 若本机找不到 Chrome，可提示用户设置 `BOSS_MCP_CHROME_PATH` 或 `BOSS_RECOMMEND_CHROME_PATH`；非本机 debug host 不自动启动。
 - 若用户未提供岗位，必须先询问岗位。搜索页岗位选择在关键词输入框旁边；不要猜测默认岗位。
-- 若用户提供城市、学历、学校、关键词、过滤已看、人选目标数、筛选条件、post action、max greet 等参数，必须逐项传入或确认。
-- `post_action=greet` 时必须确认 `max_greet_count`；不要默认等于 `target_count`。
+- 若用户提供城市、学历、学校、关键词、过滤已看、人选目标数、筛选条件等参数，必须逐项传入或确认。
 - 搜索页和推荐页一样支持多选筛选条件；不要把多选降级成单选。
 - 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
 
@@ -48,8 +47,6 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 - `degree`
 - `school_tag`
 - `recent_not_view`
-- `post_action`
-- `max_greet_count`
 - `port`
 
 启动工具时，把用户确认的休息强度写入 `human_behavior.restLevel`，例如：

@@ -65,7 +65,8 @@ async function testGreetQuotaClickGuard() {
 }
 
 function testPostActionResolution() {
-  assert.equal(normalizeRecommendPostAction("收藏"), "favorite");
+  assert.equal(normalizeRecommendPostAction("收藏"), "");
+  assert.equal(normalizeRecommendPostAction("favorite"), "");
   assert.equal(normalizeRecommendPostAction("直接沟通"), "greet");
   assert.equal(normalizeRecommendPostAction("none"), "none");
 
@@ -75,7 +76,7 @@ function testPostActionResolution() {
     maxGreetCount: 3
   });
   assert.equal(limited.requested, "greet");
-  assert.equal(limited.effective, "favorite");
+  assert.equal(limited.effective, "none");
   assert.equal(limited.reason, "greet_limit_reached");
 }
 

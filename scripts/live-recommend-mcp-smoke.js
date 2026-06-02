@@ -154,10 +154,11 @@ function assertNoRuntime(methodLog = []) {
 
 function buildRecommendArgs(options) {
   const degreeValue = options.degreeLabels.length ? options.degreeLabels : "不限";
-  const maxGreetCount = options.maxGreetCount || options.targetCount;
-  const postAction = ["favorite", "greet", "none"].includes(options.postAction)
-    ? options.postAction
-    : "none";
+  if (!["greet", "none"].includes(options.postAction)) {
+    throw new Error(`Unsupported recommend post action: ${options.postAction}. Use greet or none.`);
+  }
+  const maxGreetCount = options.maxGreetCount;
+  const postAction = options.postAction;
   const confirmation = {
     page_confirmed: true,
     page_value: options.pageScope,
@@ -190,7 +191,7 @@ function buildRecommendArgs(options) {
     post_action: postAction,
     job: options.job
   };
-  if (postAction === "greet") {
+  if (postAction === "greet" && maxGreetCount !== null) {
     confirmation.max_greet_count_confirmed = true;
     confirmation.max_greet_count_value = maxGreetCount;
     overrides.max_greet_count = maxGreetCount;

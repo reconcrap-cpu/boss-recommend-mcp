@@ -195,6 +195,8 @@ async function testToolListIncludesRecommendTools() {
   const startTool = tools.find((tool) => tool.name === TOOL_START);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
+  assert.deepEqual(startTool.inputSchema.properties.confirmation.properties.post_action_value.enum, ["greet", "none"]);
+  assert.deepEqual(startTool.inputSchema.properties.overrides.properties.post_action.enum, ["greet", "none"]);
   const prepareTool = tools.find((tool) => tool.name === TOOL_PREPARE);
   assert.deepEqual(prepareTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
   const scheduleTool = tools.find((tool) => tool.name === TOOL_SCHEDULE);
@@ -415,6 +417,23 @@ async function testRecommendFullySpecifiedPayloadNeedsOnlyFinalReview() {
   assert.equal(payload.pending_questions[0].value.human_behavior.restLevel, "high");
   assert.equal(payload.pending_questions[0].value.screen_params.post_action, "greet");
   assert.equal(payload.pending_questions[0].value.screen_params.max_greet_count, 200);
+}
+
+async function testRecommendGreetWithoutMaxGreetCountIsReady() {
+  const base = readyArgs();
+  const payload = await callTool(TOOL_PREPARE, readyArgs({
+    confirmation: {
+      ...base.confirmation,
+      post_action_value: "greet"
+    },
+    overrides: {
+      ...base.overrides,
+      post_action: "greet"
+    }
+  }), 154);
+  assert.equal(payload.status, "READY");
+  assert.equal(payload.post_action.requested, "greet");
+  assert.equal(payload.post_action.max_greet_count, null);
 }
 
 async function testRecommendFinalConfirmedPayloadStartsAccepted() {
@@ -1343,6 +1362,8 @@ async function main() {
     await testRecommendPreparePreservesCriteriaVerbatim();
     resetRecommendMcpStateForTests();
     await testRecommendFullySpecifiedPayloadNeedsOnlyFinalReview();
+    resetRecommendMcpStateForTests();
+    await testRecommendGreetWithoutMaxGreetCountIsReady();
     resetRecommendMcpStateForTests();
     await testRecommendFinalConfirmedPayloadStartsAccepted();
     resetRecommendMcpStateForTests();

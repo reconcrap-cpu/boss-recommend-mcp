@@ -32,9 +32,8 @@ const FILTER_CONFIRM_OPTIONS = [
   { label: "筛选项无误，继续", value: "confirm" },
   { label: "筛选项需要调整", value: "revise" }
 ];
-const POST_ACTION_OPTIONS = ["favorite", "greet", "none"];
+const POST_ACTION_OPTIONS = ["greet", "none"];
 const POST_ACTION_LABELS = {
-  favorite: "收藏",
   greet: "直接沟通",
   none: "什么也不做"
 };
@@ -306,7 +305,6 @@ function normalizeRecentNotView(value) {
 function normalizePostAction(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
-  if (["favorite", "fav", "收藏"].includes(normalized)) return "favorite";
   if (["greet", "chat", "打招呼", "直接沟通", "沟通"].includes(normalized)) return "greet";
   if (["none", "noop", "no-op", "什么也不做", "不做任何操作", "不操作", "仅筛选", "只筛选"].includes(normalized)) {
     return "none";
@@ -551,9 +549,7 @@ function resolvePostAction({ instruction, confirmation, overrides, finalConfirme
   const confirmationValue = normalizePostAction(confirmation?.post_action_value);
   const overrideValue = normalizePostAction(overrides?.post_action);
   const instructionValue =
-    /收藏/.test(instruction) && !/取消收藏/.test(instruction)
-      ? "favorite"
-      : /打招呼|直接沟通|沟通/.test(instruction)
+    /打招呼|直接沟通|沟通/.test(instruction)
         ? "greet"
         : /什么也不做|不做任何操作|不操作|仅筛选|只筛选/.test(instruction)
           ? "none"
@@ -596,37 +592,16 @@ function resolveMaxGreetCount({ instruction, confirmation, overrides, postAction
   }
 
   const overrideValue = parsePositiveIntegerValue(overrides?.max_greet_count);
-  const confirmed = confirmation?.max_greet_count_confirmed === true;
   const confirmationValue = parsePositiveIntegerValue(confirmation?.max_greet_count_value);
   const instructionValue = extractMaxGreetCount(instruction);
-  const targetCountHint = (
-    parsePositiveIntegerValue(confirmation?.target_count_value)
-    || parsePositiveIntegerValue(overrides?.target_count)
-    || extractTargetCount(instruction)
-    || null
-  );
   const proposed = confirmationValue || overrideValue || instructionValue || null;
-  const resolved = (confirmed || finalConfirmed)
-    ? (confirmationValue || overrideValue || instructionValue || null)
-    : null;
-  const suspiciousAutoFill = Boolean(
-    !confirmed
-    && !finalConfirmed
-    && Number.isInteger(proposed)
-    && proposed > 0
-    && !Number.isInteger(instructionValue)
-    && Number.isInteger(targetCountHint)
-    && targetCountHint > 0
-    && proposed === targetCountHint
-  );
-  const hasProposedValue = Number.isInteger(proposed) && proposed > 0;
-  const needsConfirmation = !hasProposedValue;
+  const resolved = confirmationValue || overrideValue || instructionValue || null;
 
   return {
-    max_greet_count: (confirmed || finalConfirmed) && hasProposedValue ? resolved : null,
+    max_greet_count: resolved,
     proposed_max_greet_count: proposed,
-    needs_max_greet_count_confirmation: needsConfirmation,
-    suspicious_auto_fill: suspiciousAutoFill
+    needs_max_greet_count_confirmation: false,
+    suspicious_auto_fill: false
   };
 }
 
@@ -838,7 +813,6 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       question: "请确认本次运行对通过人选统一执行的动作。",
       value: postActionResolution.proposed_post_action,
       options: [
-        { label: POST_ACTION_LABELS.favorite, value: "favorite" },
         { label: POST_ACTION_LABELS.greet, value: "greet" },
         { label: POST_ACTION_LABELS.none, value: "none" }
       ]
@@ -850,7 +824,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
       field: "max_greet_count",
       question: maxGreetCountResolution.suspicious_auto_fill
         ? "检测到最大打招呼人数可能是自动默认值，请明确确认本次最多打招呼多少位候选人（必须为正整数）。"
-        : "本次选择直接沟通时，最多打招呼多少位候选人？达到上限后会自动改为收藏。",
+        : "本次选择直接沟通时，最多打招呼多少位候选人？可留空表示不单独限制打招呼人数。",
       value: maxGreetCountResolution.proposed_max_greet_count
     });
   }

@@ -14,7 +14,7 @@ const REPRODUCTION_INSTRUCTION = `启动boss推荐任务。条件如下：
 岗位：研发工程师（AI应用方向）-2026届校招 _ 杭州；
 筛选条件：需同时满足全部条件：1）如果有本科学历，本科学历必须为 211 及以上或 QS 前 500 海外院校；2）至少一段学历为 985、QS 前 100 海外院校或中科院；3）具备大模型 / AI / 图形学 / 计算机视觉 / 3D相关的算法或工程经验（实习、项目、科研均可）。学校是否是985、211、qs排名等判断如果简历内没有明确标明，需要通过学校名称来判断；4）必须是25年应届生或者26年应届生或者27年应届生，除了标签以外需要通过人选最高学历的求学年份判断（比如：本科简历里写了2021 - 2025，应该理解为25年毕业，属于25年应届生）；5）年龄必须35岁以内。`;
 
-function testNeedConfirmationIncludesPostAction() {
+function testFavoriteInstructionRequiresPostActionChoice() {
   const result = parseRecommendInstruction({
     instruction: "推荐页上筛选985男生，近14天没有，有大模型平台经验，符合标准的收藏",
     confirmation: null,
@@ -26,15 +26,19 @@ function testNeedConfirmationIncludesPostAction() {
   assert.equal(result.searchParams.gender, "男");
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
   assert.equal(result.screenParams.criteria, "有大模型平台经验");
-  assert.equal(result.proposed_post_action, "favorite");
+  assert.equal(result.proposed_post_action, null);
   assert.equal(result.needs_filters_confirmation, false);
   assert.equal(result.needs_school_tag_confirmation, false);
   assert.equal(result.needs_degree_confirmation, false);
   assert.equal(result.needs_gender_confirmation, false);
   assert.equal(result.needs_recent_not_view_confirmation, false);
   assert.equal(result.needs_criteria_confirmation, false);
-  assert.equal(result.needs_post_action_confirmation, false);
-  assert.deepEqual(result.pending_questions, []);
+  assert.equal(result.needs_post_action_confirmation, true);
+  const postActionQuestion = result.pending_questions.find((item) => item.field === "post_action");
+  assert.equal(Boolean(postActionQuestion), true);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "favorite"), false);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "greet"), true);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "none"), true);
 }
 
 function testConfirmedPostActionAndOverrides() {
@@ -100,7 +104,7 @@ function testMissingRecentNotViewValueCanBeRecoveredFromInstruction() {
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: null
   });
@@ -122,7 +126,7 @@ function testDefaultFilterValuesDoNotRequireFieldConfirmation() {
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: {
       criteria: "必须有至少3年工作经验，且做过算法"
@@ -157,7 +161,7 @@ function testFilterConfirmedWithExplicitConfirmationValuesShouldNotFallbackToUnl
       target_count_confirmed: true,
       target_count_value: 3,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: {
       criteria: "必须有至少3年工作经验，且做过算法"
@@ -185,7 +189,7 @@ function testMultipleSchoolTagsMarkedSuspicious() {
       recent_not_view_confirmed: true,
       criteria_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: null
   });
@@ -321,7 +325,7 @@ function testCriteriaCanBeProvidedViaOverrides() {
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: {
       criteria: "候选人需要有 AI Agent 或 MCP 工具开发经验"
@@ -344,7 +348,7 @@ function testMissingCriteriaTriggersNeedInput() {
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: null
   });
@@ -353,7 +357,7 @@ function testMissingCriteriaTriggersNeedInput() {
   assert.equal(result.pending_questions.some((q) => q.field === "criteria"), true);
 }
 
-function testGreetNeedsMaxGreetCountConfirmation() {
+function testGreetDoesNotNeedMaxGreetCountConfirmation() {
   const result = parseRecommendInstruction({
     instruction: "推荐页筛选985男生，有大模型工程经验，符合标准直接沟通",
     confirmation: {
@@ -372,8 +376,8 @@ function testGreetNeedsMaxGreetCountConfirmation() {
 
   assert.equal(result.screenParams.post_action, "greet");
   assert.equal(result.screenParams.max_greet_count, null);
-  assert.equal(result.needs_max_greet_count_confirmation, true);
-  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), true);
+  assert.equal(result.needs_max_greet_count_confirmation, false);
+  assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
 }
 
 function testGreetMaxGreetCountCanComeFromOverrides() {
@@ -396,7 +400,7 @@ function testGreetMaxGreetCountCanComeFromOverrides() {
   });
 
   assert.equal(result.screenParams.post_action, "greet");
-  assert.equal(result.screenParams.max_greet_count, null);
+  assert.equal(result.screenParams.max_greet_count, 5);
   assert.equal(result.needs_max_greet_count_confirmation, false);
   assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
 }
@@ -422,7 +426,7 @@ function testGreetAutoFilledMaxGreetCountIsHandledByFinalReview() {
   });
 
   assert.equal(result.screenParams.post_action, "greet");
-  assert.equal(result.screenParams.max_greet_count, null);
+  assert.equal(result.screenParams.max_greet_count, 3);
   assert.equal(result.needs_max_greet_count_confirmation, false);
   assert.equal(result.pending_questions.some((q) => q.field === "max_greet_count"), false);
   assert.equal(result.suspicious_fields.some((item) => item.field === "max_greet_count"), false);
@@ -465,7 +469,7 @@ function testTargetCountCanBeReviewedWithoutFieldConfirmation() {
       recent_not_view_confirmed: true,
       criteria_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: null
   });
@@ -486,7 +490,7 @@ function testTargetCountCanBeSkippedAfterConfirmation() {
       criteria_confirmed: true,
       target_count_confirmed: true,
       post_action_confirmed: true,
-      post_action_value: "favorite"
+      post_action_value: "none"
     },
     overrides: null
   });
@@ -564,7 +568,7 @@ function testMissingPostActionShouldExposeStructuredOptions() {
 
   assert.equal(Boolean(postActionQuestion), true);
   assert.equal(Array.isArray(postActionQuestion.options), true);
-  assert.equal(postActionQuestion.options.some((item) => item.value === "favorite"), true);
+  assert.equal(postActionQuestion.options.some((item) => item.value === "favorite"), false);
   assert.equal(postActionQuestion.options.some((item) => item.value === "greet"), true);
   assert.equal(postActionQuestion.options.some((item) => item.value === "none"), true);
 }
@@ -687,11 +691,11 @@ function testMetaHintsShouldBeProposedFromInstruction() {
   assert.equal(result.job_selection_hint, "研发工程师（AI应用方向）-2026届校招 _ 杭州");
   assert.equal(result.screenParams.target_count, null);
   assert.equal(result.screenParams.post_action, null);
-  assert.equal(result.screenParams.max_greet_count, null);
+  assert.equal(result.screenParams.max_greet_count, 3);
 }
 
 function main() {
-  testNeedConfirmationIncludesPostAction();
+  testFavoriteInstructionRequiresPostActionChoice();
   testConfirmedPostActionAndOverrides();
   testMissingRecentNotViewValueCanBeRecoveredFromInstruction();
   testDefaultFilterValuesDoNotRequireFieldConfirmation();
@@ -710,7 +714,7 @@ function main() {
   testCriteriaCanBeProvidedViaOverrides();
   testMissingCriteriaTriggersNeedInput();
   testMcpMentionShouldStayInCriteria();
-  testGreetNeedsMaxGreetCountConfirmation();
+  testGreetDoesNotNeedMaxGreetCountConfirmation();
   testGreetMaxGreetCountCanComeFromOverrides();
   testGreetAutoFilledMaxGreetCountIsHandledByFinalReview();
   testGreetMaxGreetCountEqualTargetShouldPassAfterExplicitConfirmation();
