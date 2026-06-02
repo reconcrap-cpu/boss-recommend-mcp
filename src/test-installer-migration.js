@@ -266,6 +266,31 @@ async function testPrepareRunCliUsesRecommendPrepareGate() {
   process.exitCode = originalExitCode;
 }
 
+async function testScheduleRunCliUsesRecommendScheduleGate() {
+  const originalLog = console.log;
+  const originalExitCode = process.exitCode;
+  const logs = [];
+  console.log = (value = "") => {
+    logs.push(String(value));
+  };
+  try {
+    process.exitCode = undefined;
+    await __testables.schedulePipelineOnce({
+      instruction: "推荐页帮我筛候选人",
+      "schedule-delay-seconds": 60
+    });
+  } finally {
+    console.log = originalLog;
+  }
+  const payload = JSON.parse(logs.join("\n"));
+  assert.equal(["NEED_INPUT", "NEED_CONFIRMATION"].includes(payload.status), true);
+  assert.equal(payload.schedule_created, false);
+  assert.equal(payload.cli.command, "schedule-run");
+  assert.equal(payload.cli.package_owned_scheduler, true);
+  assert.equal(process.exitCode, 1);
+  process.exitCode = originalExitCode;
+}
+
 function testDetachedRunCliShellFallback() {
   const result = spawnSync(process.execPath, [
     cliPath,
@@ -296,6 +321,7 @@ testOpenClawConfigPreservesExistingEnvAndEnablesDetached();
 testGlobalWrapperLaunchConfigSupportsNpmGlobalUpgrades();
 await testRunCliUsesRecommendStartGate();
 await testPrepareRunCliUsesRecommendPrepareGate();
+await testScheduleRunCliUsesRecommendScheduleGate();
 testDetachedRunCliShellFallback();
 
 console.log("installer migration tests passed");

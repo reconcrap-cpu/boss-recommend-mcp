@@ -75,6 +75,50 @@ Live gate required:
 
 - No, unless readiness gates or public schema semantics change.
 
+### `schedule_recommend_pipeline_run`
+
+Purpose:
+
+- Create a package-owned delayed recommend run after the payload is cron-ready.
+- Avoid external AI harnesses reconstructing shell cron commands and losing confirmation JSON/file arguments.
+
+Inputs:
+
+- Same input schema as `start_recommend_pipeline_run`.
+- One scheduling field is required: `schedule_run_at`, `schedule_delay_minutes`, or `schedule_delay_seconds`.
+- Optional `schedule_id`.
+
+Expected behavior:
+
+- Internally run the same prepare gate first.
+- If prepare is not `READY + cron_ready=true`, return the prepare gate payload with `schedule_created=false`.
+- Persist the exact stripped run payload under `~/.boss-recommend-mcp/schedules/<schedule_id>.json`.
+- Launch a detached scheduler worker immediately and return `SCHEDULED` with `schedule_id`, `run_at`, worker log paths, and the saved schedule.
+- At due time, the worker calls `start_recommend_pipeline_run` directly in package code and keeps polling until the inner run is terminal.
+
+Live gate required:
+
+- Mock tests are enough for schema/payload persistence. A live delayed run is recommended after changing worker launch or poll behavior.
+
+### `get_recommend_scheduled_run`
+
+Purpose:
+
+- Inspect a package-owned scheduled recommend run.
+
+Inputs:
+
+- `schedule_id`: required.
+
+Expected behavior:
+
+- Return the saved schedule state, including worker state, `run_id` once launched, and the current/terminal run snapshot.
+- Mark non-terminal schedules failed if the scheduler worker pid has exited.
+
+Live gate required:
+
+- No for status-shape changes; yes if liveness semantics change.
+
 ### `start_recommend_pipeline_run`
 
 Purpose:
@@ -707,6 +751,32 @@ Expected behavior:
 - Exit successfully only when the payload is cron-ready; exit non-zero for `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED`.
 - Support `--instruction`, `--instruction-file`, `--confirmation-json`, `--confirmation-file`, `--overrides-json`, `--overrides-file`, `--slow-live`, `--port`, `--host`, `--target-url-includes`, `--no-navigate`, and `--rest-level`.
 
+### `boss-recommend-mcp schedule-run`
+
+CLI wrapper for `schedule_recommend_pipeline_run`.
+
+Aliases:
+
+- `schedule`
+
+Expected behavior:
+
+- Print JSON payload.
+- Return `SCHEDULED` only after a package-owned detached scheduler worker is launched.
+- Support the same run payload inputs as `prepare-run`, plus `--schedule-delay-minutes`, `--schedule-delay-seconds`, `--schedule-run-at`, and optional `--schedule-id`.
+
+### `boss-recommend-mcp schedule-status`
+
+CLI wrapper for `get_recommend_scheduled_run`.
+
+Aliases:
+
+- `scheduled-run`
+
+Expected behavior:
+
+- Print JSON schedule state for `--schedule-id`.
+
 ### `boss-recommend-mcp run`
 
 Current status:
@@ -796,13 +866,14 @@ Prints package root, skill sources, state/config/calibration paths, and default 
 
 Purpose:
 
-- Route normal recommend-page tasks to `start_recommend_pipeline_run`; route cron setup through `list_recommend_jobs` plus `prepare_recommend_pipeline_run` before creating a cron.
+- Route normal recommend-page tasks to `start_recommend_pipeline_run`; route delayed/cron setup through `list_recommend_jobs` plus `prepare_recommend_pipeline_run` plus `schedule_recommend_pipeline_run`.
 
 Expected behavior:
 
 - Ask two-stage confirmation.
-- For cron setup, create no cron unless `prepare_recommend_pipeline_run` returns `READY` and `cron_ready=true`.
-- Preserve the exact instruction/criteria payload that was prepared when scheduling the later `start_recommend_pipeline_run`.
+- For cron setup, create no timer unless `prepare_recommend_pipeline_run` returns `READY` and `cron_ready=true`, then `schedule_recommend_pipeline_run` returns `SCHEDULED`.
+- Preserve the exact instruction/criteria payload that was prepared when passing it into the package-owned scheduler.
+- Do not hand-write shell cron or natural-language future reminders for recommend runs.
 - Do not ask for job before page readiness/job options are available.
 - Do not route recommend failures to recruit.
 - Do not use `follow_up.chat`; recommend-to-chat auto-chain is legacy-only.

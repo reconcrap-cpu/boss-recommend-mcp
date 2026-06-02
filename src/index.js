@@ -40,6 +40,12 @@ import {
   validateRecruitPipelineArgs
 } from "./recruit-mcp.js";
 import {
+  __setRecommendSchedulerSpawnForTests,
+  getRecommendScheduledRunTool,
+  runScheduledRecommendWorker,
+  scheduleRecommendPipelineRunTool
+} from "./recommend-scheduler.js";
+import {
   __resetRecommendMcpStateForTests,
   __setRecommendMcpConnectorForTests,
   __setRecommendMcpJobReaderForTests,
@@ -90,6 +96,8 @@ const require = createRequire(import.meta.url);
 const { version: SERVER_VERSION } = require("../package.json");
 
 const TOOL_PREPARE_RUN = "prepare_recommend_pipeline_run";
+const TOOL_SCHEDULE_RUN = "schedule_recommend_pipeline_run";
+const TOOL_GET_SCHEDULED_RUN = "get_recommend_scheduled_run";
 const TOOL_START_RUN = "start_recommend_pipeline_run";
 const TOOL_GET_RUN = "get_recommend_pipeline_run";
 const TOOL_CANCEL_RUN = "cancel_recommend_pipeline_run";
@@ -1083,6 +1091,36 @@ function createListRecommendJobsInputSchema() {
   };
 }
 
+function createScheduleRunInputSchema() {
+  const base = createRunInputSchema();
+  return {
+    ...base,
+    properties: {
+      ...base.properties,
+      schedule_id: {
+        type: "string",
+        description: "可选，自定义定时任务 id；默认自动生成"
+      },
+      schedule_run_at: {
+        type: "string",
+        description: "ISO 时间字符串；到点后由 package-owned detached scheduler 启动已准备好的 payload"
+      },
+      schedule_delay_minutes: {
+        type: "number",
+        minimum: 0,
+        description: "从现在开始延迟多少分钟后启动；适合 OpenClaw cron/定时任务设置"
+      },
+      schedule_delay_seconds: {
+        type: "number",
+        minimum: 0,
+        description: "从现在开始延迟多少秒后启动；主要用于短延迟或测试"
+      }
+    },
+    required: ["instruction"],
+    additionalProperties: false
+  };
+}
+
 function createToolsSchema() {
   return [
     {
@@ -1094,6 +1132,23 @@ function createToolsSchema() {
       name: TOOL_PREPARE_RUN,
       description: "只校验 Boss 推荐页流水线参数是否已可用于 cron/一次性任务；不会启动筛选任务。只有返回 READY/cron_ready=true 后才应创建定时任务。",
       inputSchema: createRunInputSchema()
+    },
+    {
+      name: TOOL_SCHEDULE_RUN,
+      description: "创建 package-owned Boss 推荐页定时任务：先校验 READY/cron_ready，再保存完整 payload，并由 detached scheduler 到点直接启动，不再依赖 AI harness 自己拼 shell cron。",
+      inputSchema: createScheduleRunInputSchema()
+    },
+    {
+      name: TOOL_GET_SCHEDULED_RUN,
+      description: "查询 package-owned 推荐页定时任务状态；返回 schedule_id、worker 状态、到点后启动的 run_id 与运行快照。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          schedule_id: { type: "string" }
+        },
+        required: ["schedule_id"],
+        additionalProperties: false
+      }
     },
     {
       name: TOOL_START_RUN,
@@ -2626,6 +2681,10 @@ async function handleRequest(message, workspaceRoot) {
         payload = await listRecommendJobsTool({ workspaceRoot, args });
       } else if (toolName === TOOL_PREPARE_RUN) {
         payload = prepareRecommendPipelineRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_SCHEDULE_RUN) {
+        payload = await scheduleRecommendPipelineRunTool({ workspaceRoot, args });
+      } else if (toolName === TOOL_GET_SCHEDULED_RUN) {
+        payload = getRecommendScheduledRunTool({ args });
       } else if (toolName === TOOL_START_RUN) {
         payload = await handleStartRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_RUN) {
@@ -2824,6 +2883,12 @@ export const __testables = {
   },
   resetRecommendMcpStateForTests() {
     __resetRecommendMcpStateForTests();
+  },
+  setRecommendSchedulerSpawnForTests(nextImpl) {
+    __setRecommendSchedulerSpawnForTests(nextImpl);
+  },
+  runScheduledRecommendWorkerForTests(options = {}) {
+    return runScheduledRecommendWorker(options);
   },
   setChatMcpConnectorForTests(nextImpl) {
     forceChatInProcForTests = typeof nextImpl === "function";

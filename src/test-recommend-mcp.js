@@ -10,14 +10,18 @@ const {
   handleRequest,
   resetRecommendMcpStateForTests,
   runDetachedWorkerForTests,
+  runScheduledRecommendWorkerForTests,
   setRecommendMcpConnectorForTests,
   setRecommendMcpJobReaderForTests,
   setRecommendMcpWorkflowForTests,
+  setRecommendSchedulerSpawnForTests,
   setSpawnProcessImplForTests
 } = __testables;
 
 const TOOL_LIST_JOBS = "list_recommend_jobs";
 const TOOL_PREPARE = "prepare_recommend_pipeline_run";
+const TOOL_SCHEDULE = "schedule_recommend_pipeline_run";
+const TOOL_GET_SCHEDULE = "get_recommend_scheduled_run";
 const TOOL_START = "start_recommend_pipeline_run";
 const TOOL_GET = "get_recommend_pipeline_run";
 const TOOL_PAUSE = "pause_recommend_pipeline_run";
@@ -151,6 +155,8 @@ async function testToolListIncludesRecommendTools() {
   const names = new Set(tools.map((tool) => tool.name));
   assert.equal(names.has(TOOL_LIST_JOBS), true);
   assert.equal(names.has(TOOL_PREPARE), true);
+  assert.equal(names.has(TOOL_SCHEDULE), true);
+  assert.equal(names.has(TOOL_GET_SCHEDULE), true);
   assert.equal(names.has(TOOL_START), true);
   assert.equal(names.has(TOOL_GET), true);
   assert.equal(names.has(TOOL_PAUSE), true);
@@ -161,6 +167,8 @@ async function testToolListIncludesRecommendTools() {
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
   const prepareTool = tools.find((tool) => tool.name === TOOL_PREPARE);
   assert.deepEqual(prepareTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
+  const scheduleTool = tools.find((tool) => tool.name === TOOL_SCHEDULE);
+  assert.equal(scheduleTool.inputSchema.properties.schedule_delay_minutes.type, "number");
 }
 
 async function testRecommendJobListTool() {
@@ -364,6 +372,120 @@ async function testRecommendPreparePreservesCriteriaVerbatim() {
   assert.equal(prepared.cron_ready, true);
   assert.equal(prepared.review.current_screen_params.criteria, criteria);
   assert.equal(prepared.review.extracted_screen_params.criteria, criteria);
+}
+
+async function testRecommendScheduleIncompletePayloadDoesNotSpawn() {
+  let spawnCalled = false;
+  setRecommendSchedulerSpawnForTests(() => {
+    spawnCalled = true;
+    throw new Error("should not spawn for incomplete schedule");
+  });
+  try {
+    const payload = await callTool(TOOL_SCHEDULE, {
+      instruction: "推荐页帮我筛候选人",
+      schedule_delay_seconds: 60
+    }, 16);
+    assert.equal(["NEED_INPUT", "NEED_CONFIRMATION"].includes(payload.status), true);
+    assert.equal(payload.schedule_created, false);
+    assert.equal(payload.cron_ready, false);
+    assert.equal(spawnCalled, false);
+  } finally {
+    setRecommendSchedulerSpawnForTests(null);
+  }
+}
+
+async function testRecommendScheduleReadyPayloadUsesPackageOwnedWorker() {
+  let spawnCall = null;
+  let unrefCalled = false;
+  setRecommendSchedulerSpawnForTests((command, args, options) => {
+    spawnCall = { command, args, options };
+    return {
+      pid: process.pid,
+      unref() {
+        unrefCalled = true;
+      }
+    };
+  });
+  try {
+    const args = readyArgs({
+      schedule_delay_seconds: 60,
+      human_behavior: {
+        restLevel: "high"
+      }
+    });
+    const payload = await callTool(TOOL_SCHEDULE, args, 17);
+    assert.equal(payload.status, "SCHEDULED");
+    assert.equal(payload.schedule_created, true);
+    assert.equal(payload.cron_ready, true);
+    assert.equal(payload.prepare.status, "READY");
+    assert.equal(unrefCalled, true);
+    assert.ok(spawnCall.args.includes("--schedule-worker"));
+    assert.ok(spawnCall.args.includes(payload.schedule_id));
+    assert.equal(spawnCall.options.detached, true);
+    assert.equal(payload.schedule.args.confirmation.final_confirmed, true);
+    assert.equal(payload.schedule.args.confirmation.job_confirmed, true);
+    assert.equal(payload.schedule.args.human_behavior.restLevel, "high");
+
+    const status = await callTool(TOOL_GET_SCHEDULE, {
+      schedule_id: payload.schedule_id
+    }, 18);
+    assert.equal(status.status, "OK");
+    assert.equal(status.schedule.state, "scheduled");
+    assert.equal(status.schedule.args.overrides.criteria, readyArgs().overrides.criteria);
+  } finally {
+    setRecommendSchedulerSpawnForTests(null);
+  }
+}
+
+async function testRecommendScheduleWorkerStartsSavedPayload() {
+  setRecommendSchedulerSpawnForTests(() => ({
+    pid: process.pid,
+    unref() {}
+  }));
+  installFakeConnector();
+  let observedOptions = null;
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recommend:scheduled-worker");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+  try {
+    const payload = await callTool(TOOL_SCHEDULE, readyArgs({
+      delay_ms: 0,
+      schedule_delay_seconds: 0,
+      human_behavior: {
+        restLevel: "medium"
+      }
+    }), 19);
+    assert.equal(payload.status, "SCHEDULED");
+    const workerResult = await runScheduledRecommendWorkerForTests({
+      scheduleId: payload.schedule_id
+    });
+    assert.equal(workerResult.ok, true);
+    const status = await callTool(TOOL_GET_SCHEDULE, {
+      schedule_id: payload.schedule_id
+    }, 20);
+    assert.equal(status.status, "OK");
+    assert.equal(status.schedule.state, "completed");
+    assert.ok(status.schedule.run_id);
+    assert.equal(status.schedule.run.state, "completed");
+    assert.equal(observedOptions.humanBehavior.restLevel, "medium");
+  } finally {
+    setRecommendSchedulerSpawnForTests(null);
+  }
 }
 
 async function observeRecommendWorkflowOptions(args, id) {
@@ -1101,6 +1223,12 @@ async function main() {
     await testRecommendJobListLoginRequiredBlocksCronSetup();
     resetRecommendMcpStateForTests();
     await testRecommendPreparePreservesCriteriaVerbatim();
+    resetRecommendMcpStateForTests();
+    await testRecommendScheduleIncompletePayloadDoesNotSpawn();
+    resetRecommendMcpStateForTests();
+    await testRecommendScheduleReadyPayloadUsesPackageOwnedWorker();
+    resetRecommendMcpStateForTests();
+    await testRecommendScheduleWorkerStartsSavedPayload();
     resetRecommendMcpStateForTests();
     await testRecommendDetailLimitDefaultsToTargetCount();
     resetRecommendMcpStateForTests();

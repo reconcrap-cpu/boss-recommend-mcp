@@ -29,6 +29,10 @@ import {
   startRecommendPipelineRunTool
 } from "./recommend-mcp.js";
 import {
+  getRecommendScheduledRunTool,
+  scheduleRecommendPipelineRunTool
+} from "./recommend-scheduler.js";
+import {
   getBossScreenConfigResolution,
   resolveBossChatRuntimeLayout as resolveCdpBossChatRuntimeLayout,
   resolveBossScreeningConfig
@@ -2694,6 +2698,8 @@ function printHelp() {
   console.log("  boss-recommend-mcp              Start the MCP server");
   console.log("  boss-recommend-mcp start        Start the MCP server");
   console.log("  boss-recommend-mcp prepare-run  Validate a cron-ready recommend run payload without starting screening");
+  console.log("  boss-recommend-mcp schedule-run Create a package-owned delayed recommend run");
+  console.log("  boss-recommend-mcp schedule-status Check a package-owned delayed recommend run");
   console.log("  boss-recommend-mcp run          Start a CDP-only recommend run through the shared run service");
   console.log("  boss-recommend-mcp list-jobs    CDP-only list of exact recommend job names for cron/one-shot inputs");
   console.log("  boss-recommend-mcp chat <subcommand>  Run CDP-only boss-chat health/prepare/status commands");
@@ -2711,6 +2717,8 @@ function printHelp() {
   console.log("");
   console.log("Run command:");
   console.log("  boss-recommend-mcp prepare-run --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
+  console.log("  boss-recommend-mcp schedule-run --schedule-delay-minutes 10 --instruction-file boss-recommend-instruction.txt --overrides-file overrides.json --confirmation-file confirmation.json");
+  console.log("  boss-recommend-mcp schedule-status --schedule-id <id>");
   console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp run --detached --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
   console.log("  boss-recommend-mcp list-jobs --slow-live --port 9222");
@@ -2903,6 +2911,62 @@ async function preparePipelineOnce(options = {}) {
     }
   });
   if (result.status !== "READY" || result.cron_ready !== true) {
+    process.exitCode = 1;
+  }
+}
+
+function addScheduleOptions(args, options = {}) {
+  const scheduleId = String(options["schedule-id"] || options.schedule_id || options.scheduleId || "").trim();
+  if (scheduleId) args.schedule_id = scheduleId;
+  const runAt = String(options["schedule-run-at"] || options.schedule_run_at || options.scheduleRunAt || options["run-at"] || options.run_at || "").trim();
+  if (runAt) args.schedule_run_at = runAt;
+  const delayMinutes = parseNonNegativeInteger(options["schedule-delay-minutes"] ?? options.schedule_delay_minutes ?? options.scheduleDelayMinutes);
+  if (delayMinutes !== undefined) args.schedule_delay_minutes = delayMinutes;
+  const delaySeconds = parseNonNegativeInteger(options["schedule-delay-seconds"] ?? options.schedule_delay_seconds ?? options.scheduleDelaySeconds);
+  if (delaySeconds !== undefined) args.schedule_delay_seconds = delaySeconds;
+  return args;
+}
+
+async function schedulePipelineOnce(options = {}) {
+  const workspaceRoot = getWorkspaceRoot(options);
+  const { args, port } = buildRecommendRunCliInput(options);
+  addScheduleOptions(args, options);
+  const result = await scheduleRecommendPipelineRunTool({
+    workspaceRoot,
+    args
+  });
+  printJson({
+    ...result,
+    cli: {
+      ...(result.cli || {}),
+      command: "schedule-run",
+      cdp_only: true,
+      package_owned_scheduler: true,
+      workspace_root: workspaceRoot,
+      port
+    }
+  });
+  if (result.status !== "SCHEDULED") {
+    process.exitCode = 1;
+  }
+}
+
+function scheduleStatusCli(options = {}) {
+  const scheduleId = String(options["schedule-id"] || options.schedule_id || options.scheduleId || "").trim();
+  const result = getRecommendScheduledRunTool({
+    args: {
+      schedule_id: scheduleId
+    }
+  });
+  printJson({
+    ...result,
+    cli: {
+      command: "schedule-status",
+      cdp_only: true,
+      package_owned_scheduler: true
+    }
+  });
+  if (result.status !== "OK") {
     process.exitCode = 1;
   }
 }
@@ -3120,6 +3184,39 @@ export async function runCli(argv = process.argv) {
         process.exitCode = 1;
       }
       break;
+    case "schedule-run":
+    case "schedule":
+      try {
+        await schedulePipelineOnce(options);
+      } catch (error) {
+        printJson({
+          status: "FAILED",
+          schedule_created: false,
+          error: {
+            code: "INVALID_CLI_INPUT",
+            message: error.message || "Invalid CLI input",
+            retryable: false
+          }
+        });
+        process.exitCode = 1;
+      }
+      break;
+    case "schedule-status":
+    case "scheduled-run":
+      try {
+        scheduleStatusCli(options);
+      } catch (error) {
+        printJson({
+          status: "FAILED",
+          error: {
+            code: "INVALID_CLI_INPUT",
+            message: error.message || "Invalid CLI input",
+            retryable: false
+          }
+        });
+        process.exitCode = 1;
+      }
+      break;
     case "list-jobs":
     case "jobs":
     case "recommend-jobs":
@@ -3282,6 +3379,8 @@ export const __testables = {
   resolveBossChatRuntimeLayout: resolveCdpBossChatRuntimeLayout,
   runBossChatCliCommand,
   preparePipelineOnce,
+  schedulePipelineOnce,
+  scheduleStatusCli,
   runPipelineOnce
 };
 
