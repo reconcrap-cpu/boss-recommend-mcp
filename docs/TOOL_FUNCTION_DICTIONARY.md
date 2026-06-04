@@ -58,7 +58,7 @@ Live gate required:
 
 Purpose:
 
-- Validate that a recommend-page payload is complete enough for cron/one-shot scheduling without starting screening.
+- Validate that a recommend-page payload is complete enough for immediate run or cron/one-shot scheduling without starting screening.
 
 Inputs:
 
@@ -69,7 +69,8 @@ Expected behavior:
 - Return `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED` with the same parser/config gates as start.
 - Return `READY` with `cron_ready=true` only when all values, exact job, explicit `human_behavior.restLevel`, final review, and config gates are satisfied.
 - Do not connect to Chrome for screening and do not create a `run_id`.
-- Intended cron setup flow: call `list_recommend_jobs` first to auto-open/reuse Chrome and verify login/page/job options, then call this prepare tool, then schedule the same ready payload for `start_recommend_pipeline_run`.
+- Intended immediate-run flow: after `READY + cron_ready=true`, call MCP `run_recommend` or `start_recommend_pipeline_run` with the same payload. Do not switch to shell/CLI fallback when MCP tools are available.
+- Intended cron setup flow: call `list_recommend_jobs` first to auto-open/reuse Chrome and verify login/page/job options, then call this prepare tool, then schedule the same ready payload with `schedule_recommend_pipeline_run`.
 
 Live gate required:
 
@@ -119,11 +120,32 @@ Live gate required:
 
 - No for status-shape changes; yes if liveness semantics change.
 
+### `run_recommend`
+
+Purpose:
+
+- Short MCP alias for `start_recommend_pipeline_run`.
+- Give Trae/Trae-CN and other agents an obvious `run` tool to call after `prepare_recommend_pipeline_run` returns `READY`.
+
+Inputs:
+
+- Same input schema as `start_recommend_pipeline_run`.
+
+Expected behavior:
+
+- Route through the same implementation as `start_recommend_pipeline_run`.
+- Return `NEED_INPUT`, `NEED_CONFIRMATION`, `FAILED`, or `ACCEPTED` with the same payload shapes.
+- When the MCP runtime needs detachment, use the package-owned detached worker inside the MCP call. Do not ask agents to reconstruct the run through CLI unless they have no MCP tool access at all.
+
+Live gate required:
+
+- No, because this is an alias over the existing start tool.
+
 ### `start_recommend_pipeline_run`
 
 Purpose:
 
-- Asynchronously start a recommend-page screening run after parser, confirmation, page readiness, job selection, and final-review gates.
+- Asynchronously start a recommend-page screening run after parser, confirmation, page readiness, job selection, and final-review gates. `run_recommend` is an MCP alias for this tool.
 
 Inputs:
 
@@ -858,7 +880,7 @@ Prints package root, skill sources, state/config/calibration paths, and default 
 
 Purpose:
 
-- Route normal recommend-page tasks to `start_recommend_pipeline_run`; route delayed/cron setup through `list_recommend_jobs` plus `prepare_recommend_pipeline_run` plus `schedule_recommend_pipeline_run`.
+- Route normal recommend-page tasks to `run_recommend` or `start_recommend_pipeline_run`; route delayed/cron setup through `list_recommend_jobs` plus `prepare_recommend_pipeline_run` plus `schedule_recommend_pipeline_run`.
 
 Expected behavior:
 

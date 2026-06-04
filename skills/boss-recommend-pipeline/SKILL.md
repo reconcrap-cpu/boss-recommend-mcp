@@ -7,7 +7,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 ## Goal
 
-当用户要在 Boss 推荐页筛人时，必须走 `start_recommend_pipeline_run`；若是稍后/cron 启动，必须走 `schedule_recommend_pipeline_run`。先补齐缺失值并读取岗位列表，然后展示一次包含岗位、筛选项、criteria、目标人数、后置动作、可选最大招呼数、休息强度和定时信息的总确认；用户确认后设置 `final_confirmed=true` 即可启动或创建定时任务。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
+当用户要在 Boss 推荐页筛人时，必须走 MCP 工具 `run_recommend`（短别名）或 `start_recommend_pipeline_run`；若是稍后/cron 启动，必须走 `schedule_recommend_pipeline_run`。先补齐缺失值并读取岗位列表，然后展示一次包含岗位、筛选项、criteria、目标人数、后置动作、可选最大招呼数、休息强度和定时信息的总确认；用户确认后设置 `final_confirmed=true` 即可启动或创建定时任务。2.0 CDP-only 路径不再支持 legacy recommend -> chat 自动衔接；若用户要聊天页筛选或求简历，必须在推荐页任务完成后显式改用 `boss-chat` 工具。
 
 ## Hard Rules (Must Follow)
 
@@ -93,9 +93,9 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 用途：当用户需要为 cron / 一次性自动任务提前填写完整参数时，先用它读取推荐页岗位下拉框的全部可用岗位名；默认会复用/自动打开本机 9222 Chrome 并导航到推荐页。
   - 输出：优先把 `job_names` 里的值作为后续 `overrides.job` / `confirmation.job_value`。
   - 限制：只读岗位列表，不启动筛选任务；若返回 `BOSS_LOGIN_REQUIRED`，必须让用户在自动打开的 Chrome 完成登录后重试，本次 cron 不得创建。
-- Cron 准备工具：`prepare_recommend_pipeline_run`
-  - 用途：只校验参数是否已可用于 cron / 一次性任务，不启动筛选任务。
-  - 要求：只有返回 `status=READY` 且 `cron_ready=true` 后，才允许继续创建定时任务。
+- 准备/门禁工具：`prepare_recommend_pipeline_run`
+  - 用途：只校验参数是否完整，不启动筛选任务。
+  - 要求：若用户要“现在启动”，返回 `status=READY` 且 `cron_ready=true` 后，下一步必须调用 MCP 工具 `run_recommend` 或 `start_recommend_pipeline_run`，禁止改用 CLI fallback。只有用户要“稍后/cron/定时启动”时，才继续创建定时任务。
   - 若返回 `NEED_INPUT` / `NEED_CONFIRMATION` / `FAILED`：继续补齐 `pending_questions` 或修复登录/页面/config；不得先创建 cron。
 - Cron 创建工具：`schedule_recommend_pipeline_run`
   - 用途：保存已经 READY 的完整 payload，并启动 package-owned detached scheduler；到点后由包内 worker 直接调用 `start_recommend_pipeline_run`。
@@ -103,7 +103,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 成功标准：必须返回 `status=SCHEDULED`、`schedule_created=true`、`schedule_id`、`run_at`。只有这个返回后，才可以告诉用户定时任务已创建。
 - Cron 查询工具：`get_recommend_scheduled_run`
   - 用途：用户问“任务是否启动/进度”时，先查 `schedule_id`。若到点后已启动，会返回内层 `run_id` 和 run 快照。
-- 主工具：`start_recommend_pipeline_run`
+- 主工具：`run_recommend` / `start_recommend_pipeline_run`
 - 必填：`instruction`
 - 关键输入：
   - `confirmation`：新流程只需要 `{ "final_confirmed": true }`；旧版 `page_confirmed/page_value/.../job_confirmed/job_value` 仍兼容但不要主动制造逐项确认。
@@ -189,7 +189,7 @@ npx -y @reconcrap/boss-recommend-mcp@latest schedule-status --schedule-id <sched
 
 ## QClaw / Shell-Only Fallback
 
-当 QClaw/OpenClaw 变体只暴露 shell、没有原生 MCP tool list 时，禁止停在“请使用 `start_recommend_pipeline_run` 工具”。必须用 shell 继续启动。
+当 QClaw/OpenClaw 变体只暴露 shell、没有原生 MCP tool list 时，禁止停在“请使用 `run_recommend` / `start_recommend_pipeline_run` 工具”。必须用 shell 继续启动。
 
 推荐做法：
 
@@ -207,11 +207,11 @@ npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\
 兼容路径：
 
 - 若 `--detached` 不可用，或返回 `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`，说明 npm/QClaw 仍在使用旧包；先运行 `npx -y @reconcrap/boss-recommend-mcp@latest install --agent qclaw` 并重启 QClaw。
-- 在包更新未生效时，可以使用已验证过的直接 MCP stdio JSON-RPC 方式调用 `start_recommend_pipeline_run`；该方式等价于原生 MCP tool 调用，不能改用 recruit/search 路径。
+- 在包更新未生效时，可以使用已验证过的直接 MCP stdio JSON-RPC 方式调用 `run_recommend` / `start_recommend_pipeline_run`；该方式等价于原生 MCP tool 调用，不能改用 recruit/search 路径。
 
 普通 MCP 可用时：
 
-`start_recommend_pipeline_run` 仍是首选。
+`run_recommend` / `start_recommend_pipeline_run` 仍是首选。`prepare_recommend_pipeline_run` 返回 READY 后，若用户要现在启动，必须继续调用这两个 MCP 工具之一；不要声称“prepare 覆盖了 MCP run 调用”，也不要切到 CLI detached fallback。
 
 禁止错误回退：
 

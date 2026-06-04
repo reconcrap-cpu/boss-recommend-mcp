@@ -98,6 +98,7 @@ const { version: SERVER_VERSION } = require("../package.json");
 const TOOL_PREPARE_RUN = "prepare_recommend_pipeline_run";
 const TOOL_SCHEDULE_RUN = "schedule_recommend_pipeline_run";
 const TOOL_GET_SCHEDULED_RUN = "get_recommend_scheduled_run";
+const TOOL_RUN_RECOMMEND = "run_recommend";
 const TOOL_START_RUN = "start_recommend_pipeline_run";
 const TOOL_GET_RUN = "get_recommend_pipeline_run";
 const TOOL_CANCEL_RUN = "cancel_recommend_pipeline_run";
@@ -1134,7 +1135,7 @@ function createToolsSchema() {
     },
     {
       name: TOOL_PREPARE_RUN,
-      description: "只校验 Boss 推荐页流水线参数是否已可用于 cron/一次性任务；不会启动筛选任务。只有返回 READY/cron_ready=true 后才应创建定时任务。",
+      description: "只校验 Boss 推荐页流水线参数是否完整；不会启动筛选任务。若用户要现在运行，返回 READY/cron_ready=true 后必须继续调用 MCP 工具 run_recommend 或 start_recommend_pipeline_run；只有定时/稍后运行才调用 schedule_recommend_pipeline_run。不要因为 prepare READY 而改用 shell/CLI fallback。",
       inputSchema: createRunInputSchema()
     },
     {
@@ -1155,8 +1156,13 @@ function createToolsSchema() {
       }
     },
     {
+      name: TOOL_RUN_RECOMMEND,
+      description: "立即通过 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名，适合 Trae/Trae-CN 等代理在 prepare_recommend_pipeline_run 返回 READY 后继续正式运行；MCP 内部会按需使用包内 detached worker，普通 MCP 可用时不要改用 CLI fallback。",
+      inputSchema: createRunInputSchema()
+    },
+    {
       name: TOOL_START_RUN,
-      description: "异步启动 Boss 推荐页流水线（含同步门禁预检）；只有在前置确认与页面就绪通过后才返回 run_id。",
+      description: "立即通过 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）；prepare_recommend_pipeline_run 返回 READY 后，如果用户要现在运行就调用本工具或 run_recommend。MCP 内部会按需使用包内 detached worker，普通 MCP 可用时不要改用 CLI fallback。",
       inputSchema: createRunInputSchema()
     },
     {
@@ -2625,7 +2631,7 @@ async function handleRequest(message, workspaceRoot) {
     const toolName = params?.name;
     const args = params?.arguments || {};
 
-    if (toolName === TOOL_START_RUN) {
+    if ([TOOL_RUN_RECOMMEND, TOOL_START_RUN].includes(toolName)) {
       const inputError = validateRunArgs(args);
       if (inputError) {
         return createJsonRpcError(id, -32602, inputError);
@@ -2689,7 +2695,7 @@ async function handleRequest(message, workspaceRoot) {
         payload = await scheduleRecommendPipelineRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_SCHEDULED_RUN) {
         payload = getRecommendScheduledRunTool({ args });
-      } else if (toolName === TOOL_START_RUN) {
+      } else if ([TOOL_RUN_RECOMMEND, TOOL_START_RUN].includes(toolName)) {
         payload = await handleStartRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_RUN) {
         payload = handleGetRunTool(args);

@@ -22,6 +22,7 @@ const TOOL_LIST_JOBS = "list_recommend_jobs";
 const TOOL_PREPARE = "prepare_recommend_pipeline_run";
 const TOOL_SCHEDULE = "schedule_recommend_pipeline_run";
 const TOOL_GET_SCHEDULE = "get_recommend_scheduled_run";
+const TOOL_RUN_RECOMMEND = "run_recommend";
 const TOOL_START = "start_recommend_pipeline_run";
 const TOOL_GET = "get_recommend_pipeline_run";
 const TOOL_PAUSE = "pause_recommend_pipeline_run";
@@ -187,17 +188,28 @@ async function testToolListIncludesRecommendTools() {
   assert.equal(names.has(TOOL_PREPARE), true);
   assert.equal(names.has(TOOL_SCHEDULE), true);
   assert.equal(names.has(TOOL_GET_SCHEDULE), true);
+  assert.equal(names.has(TOOL_RUN_RECOMMEND), true);
   assert.equal(names.has(TOOL_START), true);
   assert.equal(names.has(TOOL_GET), true);
   assert.equal(names.has(TOOL_PAUSE), true);
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has(TOOL_CANCEL), true);
   const startTool = tools.find((tool) => tool.name === TOOL_START);
+  const runRecommendTool = tools.find((tool) => tool.name === TOOL_RUN_RECOMMEND);
+  assert.equal(runRecommendTool.description.includes("start_recommend_pipeline_run"), true);
+  assert.equal(runRecommendTool.description.includes("CLI fallback"), true);
+  assert.equal(runRecommendTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
+  assert.equal(runRecommendTool.inputSchema.properties.human_behavior.properties.restLevel.enum[1], "medium");
+  assert.equal(startTool.description.includes("run_recommend"), true);
+  assert.equal(startTool.description.includes("CLI fallback"), true);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.confirmation.properties.post_action_value.enum, ["greet", "none"]);
   assert.deepEqual(startTool.inputSchema.properties.overrides.properties.post_action.enum, ["greet", "none"]);
   const prepareTool = tools.find((tool) => tool.name === TOOL_PREPARE);
+  assert.equal(prepareTool.description.includes("run_recommend"), true);
+  assert.equal(prepareTool.description.includes("start_recommend_pipeline_run"), true);
+  assert.equal(prepareTool.description.includes("CLI fallback"), true);
   assert.deepEqual(prepareTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
   const scheduleTool = tools.find((tool) => tool.name === TOOL_SCHEDULE);
   assert.equal(scheduleTool.inputSchema.properties.schedule_delay_minutes.type, "number");
@@ -463,6 +475,34 @@ async function testRecommendFinalConfirmedPayloadStartsAccepted() {
   assert.equal(observedOptions.maxCandidates, 200);
   assert.equal(observedOptions.postAction, "greet");
   assert.equal(observedOptions.maxGreetCount, 200);
+  assert.equal(observedOptions.humanBehavior.restLevel, "high");
+}
+
+async function testRunRecommendAliasStartsAccepted() {
+  installFakeConnector();
+  let observedOptions = null;
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recommend:run-alias");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+  const started = await callTool(TOOL_RUN_RECOMMEND, singleReviewArgs(), 156);
+  assert.equal(started.status, "ACCEPTED");
+  await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(observedOptions.maxCandidates, 200);
   assert.equal(observedOptions.humanBehavior.restLevel, "high");
 }
 
@@ -1366,6 +1406,8 @@ async function main() {
     await testRecommendGreetWithoutMaxGreetCountIsReady();
     resetRecommendMcpStateForTests();
     await testRecommendFinalConfirmedPayloadStartsAccepted();
+    resetRecommendMcpStateForTests();
+    await testRunRecommendAliasStartsAccepted();
     resetRecommendMcpStateForTests();
     await testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler();
     resetRecommendMcpStateForTests();
