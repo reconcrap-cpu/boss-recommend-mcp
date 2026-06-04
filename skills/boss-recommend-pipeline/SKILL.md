@@ -96,6 +96,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 - 准备/门禁工具：`prepare_recommend_pipeline_run`
   - 用途：只校验参数是否完整，不启动筛选任务。
   - 要求：若用户要“现在启动”，返回 `status=READY` 且 `cron_ready=true` 后，下一步必须调用 MCP 工具 `run_recommend` 或 `start_recommend_pipeline_run`，禁止改用 CLI fallback。只有用户要“稍后/cron/定时启动”时，才继续创建定时任务。
+  - READY 响应会带 `prepared_only=true`、`run_started=false`、`recommended_next_tool=start_recommend_pipeline_run`、`alternate_next_tool=run_recommend`、`next_action.do_not_call_prepare_again=true`；必须照这些字段继续，不得再次调用 prepare。
   - 若返回 `NEED_INPUT` / `NEED_CONFIRMATION` / `FAILED`：继续补齐 `pending_questions` 或修复登录/页面/config；不得先创建 cron。
 - Cron 创建工具：`schedule_recommend_pipeline_run`
   - 用途：保存已经 READY 的完整 payload，并启动 package-owned detached scheduler；到点后由包内 worker 直接调用 `start_recommend_pipeline_run`。

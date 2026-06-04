@@ -334,6 +334,18 @@ async function testRecommendPrepareReadyDoesNotStartRun() {
   }), 4);
   assert.equal(payload.status, "READY");
   assert.equal(payload.cron_ready, true);
+  assert.equal(payload.prepared_only, true);
+  assert.equal(payload.run_started, false);
+  assert.equal(payload.recommended_next_tool, TOOL_START);
+  assert.equal(payload.alternate_next_tool, TOOL_RUN_RECOMMEND);
+  assert.equal(payload.next_action.immediate_run.recommended_next_tool, TOOL_START);
+  assert.equal(payload.next_action.immediate_run.alternate_next_tool, TOOL_RUN_RECOMMEND);
+  assert.equal(payload.next_action.immediate_run.same_arguments, true);
+  assert.equal(payload.next_action.scheduled_run.recommended_next_tool, TOOL_SCHEDULE);
+  assert.equal(payload.next_action.do_not_call_prepare_again, true);
+  assert.equal(payload.next_action.do_not_use_cli_fallback_when_mcp_tools_available, true);
+  assert.equal(payload.message.includes("did not start a run"), true);
+  assert.equal(payload.message.includes("Do not call prepare_recommend_pipeline_run again"), true);
   assert.equal(payload.post_action.requested, "none");
   assert.equal(payload.review.current_screen_params.criteria, readyArgs().overrides.criteria);
   assert.equal(connectorCalled, false);
@@ -370,6 +382,8 @@ async function testRecommendPreparedCronPayloadStartsAccepted() {
   const prepared = await callTool(TOOL_PREPARE, args, 5);
   assert.equal(prepared.status, "READY");
   assert.equal(prepared.cron_ready, true);
+  assert.equal(prepared.recommended_next_tool, TOOL_START);
+  assert.equal(prepared.alternate_next_tool, TOOL_RUN_RECOMMEND);
   const started = await callTool(TOOL_START, args, 6);
   assert.equal(started.status, "ACCEPTED");
   assert.equal(started.run.context.confirmation.final_confirmed, true);

@@ -1563,9 +1563,29 @@ export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} 
     };
   }
   const { parsed, normalized } = prepared;
+  const nextAction = {
+    immediate_run: {
+      recommended_next_tool: "start_recommend_pipeline_run",
+      alternate_next_tool: "run_recommend",
+      same_arguments: true
+    },
+    scheduled_run: {
+      recommended_next_tool: "schedule_recommend_pipeline_run",
+      same_arguments: true,
+      requires_schedule_field: true
+    },
+    do_not_call_prepare_again: true,
+    do_not_use_cli_fallback_when_mcp_tools_available: true
+  };
   return {
     status: "READY",
     cron_ready: true,
+    prepared_only: true,
+    run_started: false,
+    recommended_next_tool: nextAction.immediate_run.recommended_next_tool,
+    alternate_next_tool: nextAction.immediate_run.alternate_next_tool,
+    next_action: nextAction,
+    message: "READY only means the payload passed validation; prepare_recommend_pipeline_run did not start a run. To start now, call start_recommend_pipeline_run or run_recommend with the same arguments. Do not call prepare_recommend_pipeline_run again, and do not use CLI fallback when MCP tools are available.",
     review: parsed.review,
     post_action: {
       requested: normalized.postAction,

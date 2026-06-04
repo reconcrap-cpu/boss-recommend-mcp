@@ -477,6 +477,7 @@ Trae-CN / 长对话防循环建议：
 
 - `run_recommend` 与 `start_recommend_pipeline_run` 是同一个异步 MCP 启动入口，但不会跳过同步确认流程。
 - `prepare_recommend_pipeline_run` / `boss-recommend-mcp prepare-run` 只做参数门禁；它不启动筛选。普通 MCP 宿主现在运行时，prepare READY 后继续调用 `run_recommend` / `start_recommend_pipeline_run`，不要改用 CLI fallback。
+- `prepare_recommend_pipeline_run` 的 READY 响应会带 `prepared_only=true`、`run_started=false`、`recommended_next_tool=start_recommend_pipeline_run`、`alternate_next_tool=run_recommend` 和 `next_action.do_not_call_prepare_again=true`；agent 应直接照这个字段继续下一步。
 - `schedule_recommend_pipeline_run` / `boss-recommend-mcp schedule-run` 是推荐页定时启动的唯一推荐路径；它创建真实 package-owned detached scheduler，并返回 `schedule_id`。
 - 定时心跳默认 120 秒一次；`updated_at` 仍会在阶段或进度变化时刷新。
 - 每个 run 会持久化到 `~/.boss-recommend-mcp/runs/<run_id>.json`（可通过 `BOSS_RECOMMEND_HOME` 覆盖）。

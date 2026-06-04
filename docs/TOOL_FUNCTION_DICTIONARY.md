@@ -68,6 +68,7 @@ Expected behavior:
 
 - Return `NEED_INPUT`, `NEED_CONFIRMATION`, or `FAILED` with the same parser/config gates as start.
 - Return `READY` with `cron_ready=true` only when all values, exact job, explicit `human_behavior.restLevel`, final review, and config gates are satisfied.
+- A READY response must include machine-readable next-step guidance: `prepared_only=true`, `run_started=false`, `recommended_next_tool=start_recommend_pipeline_run`, `alternate_next_tool=run_recommend`, `next_action.do_not_call_prepare_again=true`, and `next_action.do_not_use_cli_fallback_when_mcp_tools_available=true`.
 - Do not connect to Chrome for screening and do not create a `run_id`.
 - Intended immediate-run flow: after `READY + cron_ready=true`, call MCP `run_recommend` or `start_recommend_pipeline_run` with the same payload. Do not switch to shell/CLI fallback when MCP tools are available.
 - Intended cron setup flow: call `list_recommend_jobs` first to auto-open/reuse Chrome and verify login/page/job options, then call this prepare tool, then schedule the same ready payload with `schedule_recommend_pipeline_run`.
