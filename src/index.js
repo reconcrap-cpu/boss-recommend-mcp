@@ -101,6 +101,7 @@ const TOOL_GET_SCHEDULED_RUN = "get_recommend_scheduled_run";
 const TOOL_RUN_RECOMMEND = "run_recommend";
 const TOOL_START_RUN = "start_recommend_pipeline_run";
 const TOOL_GET_RUN = "get_recommend_pipeline_run";
+const TOOL_LIST_RUNS = "list_recommend_pipeline_runs";
 const TOOL_CANCEL_RUN = "cancel_recommend_pipeline_run";
 const TOOL_PAUSE_RUN = "pause_recommend_pipeline_run";
 const TOOL_RESUME_RUN = "resume_recommend_pipeline_run";
@@ -371,6 +372,68 @@ function getRunArtifacts(runId) {
   };
 }
 
+function isShutdownLikeError(error = {}) {
+  const text = normalizeText([
+    error?.code || "",
+    error?.message || error || ""
+  ].join(" "));
+  return /socket hang up|ECONNREFUSED|ECONNRESET|WebSocket is not open|Target closed|Session closed|Connection closed|RUN_PROCESS_EXITED|DETACHED_WORKER|RUN_WORKER/i.test(text);
+}
+
+function buildCanceledResultFromExisting(existing = {}, errorPayload = null, message = "流水线已取消。") {
+  const previousResult = existing.result && typeof existing.result === "object" ? existing.result : {};
+  const previousError = previousResult.error || existing.error || errorPayload || null;
+  return {
+    ...previousResult,
+    status: "CANCELED",
+    completion_reason: "canceled_by_user",
+    error: {
+      code: "PIPELINE_CANCELED",
+      message,
+      retryable: true,
+      shutdown_error: previousError || undefined
+    }
+  };
+}
+
+function finalizeRawRunStateAsCanceled(runId, existing = {}, {
+  errorPayload = null,
+  message = "流水线已取消。"
+} = {}) {
+  const normalizedRunId = normalizeText(runId);
+  if (!normalizedRunId) return null;
+  const now = new Date().toISOString();
+  const current = existing && typeof existing === "object" ? existing : {};
+  const result = buildCanceledResultFromExisting(current, errorPayload, message);
+  return writeRawRunState(normalizedRunId, {
+    ...current,
+    run_id: normalizedRunId,
+    mode: current.mode || RUN_MODE_ASYNC,
+    state: RUN_STATE_CANCELED,
+    status: RUN_STATE_CANCELED,
+    stage: current.stage || RUN_STAGE_PREFLIGHT,
+    started_at: current.started_at || now,
+    updated_at: now,
+    heartbeat_at: now,
+    completed_at: current.completed_at || now,
+    pid: Number.isInteger(current.pid) && current.pid > 0 ? current.pid : process.pid,
+    progress: current.progress || {},
+    last_message: message,
+    context: current.context || {},
+    control: {
+      ...(current.control || {}),
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    },
+    resume: current.resume || {},
+    artifacts: current.artifacts || undefined,
+    error: result.error,
+    result
+  });
+}
+
 function writeRawRunState(runId, payload) {
   const artifacts = getRunArtifacts(runId);
   fs.mkdirSync(path.dirname(artifacts.run_state_path), { recursive: true });
@@ -388,6 +451,110 @@ function readRawRunState(runId) {
   } catch {
     return null;
   }
+}
+
+function getRunSortTime(run = {}, fallbackMs = 0) {
+  for (const key of ["updated_at", "heartbeat_at", "completed_at", "started_at", "updatedAt", "completedAt", "startedAt"]) {
+    const ms = Date.parse(run?.[key] || "");
+    if (Number.isFinite(ms)) return ms;
+  }
+  return fallbackMs;
+}
+
+function compactRunForList(run = {}) {
+  const state = normalizeText(run.state || run.status);
+  const result = run.result && typeof run.result === "object" ? run.result : null;
+  const error = run.error || result?.error || null;
+  return {
+    run_id: normalizeText(run.run_id || run.runId),
+    state,
+    status: state,
+    stage: normalizeText(run.stage || run.phase),
+    mode: normalizeText(run.mode),
+    started_at: run.started_at || run.startedAt || null,
+    updated_at: run.updated_at || run.updatedAt || null,
+    heartbeat_at: run.heartbeat_at || null,
+    completed_at: run.completed_at || run.completedAt || null,
+    pid: Number.isInteger(run.pid) && run.pid > 0 ? run.pid : null,
+    progress: run.progress || {},
+    last_message: normalizeText(run.last_message || error?.message || ""),
+    control: {
+      pause_requested: run.control?.pause_requested === true,
+      cancel_requested: run.control?.cancel_requested === true
+    },
+    error: error ? {
+      code: normalizeText(error.code || ""),
+      message: normalizeText(error.message || error || "")
+    } : null,
+    result: result ? {
+      status: normalizeText(result.status || ""),
+      completion_reason: normalizeText(result.completion_reason || ""),
+      output_csv: normalizeText(result.output_csv || result.result?.output_csv || ""),
+      report_json: normalizeText(result.report_json || result.result?.report_json || ""),
+      checkpoint_path: normalizeText(result.checkpoint_path || result.result?.checkpoint_path || "")
+    } : null,
+    resume: {
+      checkpoint_path: normalizeText(run.resume?.checkpoint_path || ""),
+      output_csv: normalizeText(run.resume?.output_csv || ""),
+      worker_stdout_path: normalizeText(run.resume?.worker_stdout_path || ""),
+      worker_stderr_path: normalizeText(run.resume?.worker_stderr_path || "")
+    }
+  };
+}
+
+function normalizeRunStateFilter(args = {}) {
+  const rawStates = Array.isArray(args.states)
+    ? args.states
+    : args.state === undefined
+      ? []
+      : [args.state];
+  return new Set(rawStates.map((item) => normalizeText(item)).filter(Boolean));
+}
+
+function handleListRunsTool(args = {}) {
+  const limit = Math.max(1, Math.min(100, Number.parseInt(String(args.limit || 20), 10) || 20));
+  const stateFilter = normalizeRunStateFilter(args);
+  const runsDir = getRunsDir();
+  if (!fs.existsSync(runsDir)) {
+    return {
+      status: "OK",
+      runs: [],
+      latest_run: null,
+      count: 0,
+      total_matching: 0,
+      message: "No recommend run state directory exists yet."
+    };
+  }
+  const entries = fs.readdirSync(runsDir, { withFileTypes: true });
+  const runs = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name.endsWith(".checkpoint.json")) continue;
+    const filePath = path.join(runsDir, entry.name);
+    const runId = entry.name.replace(/\.json$/, "");
+    const raw = readRawRunState(runId);
+    if (!raw) continue;
+    const state = normalizeText(raw.state || raw.status);
+    if (stateFilter.size > 0 && !stateFilter.has(state)) continue;
+    const stat = fs.statSync(filePath);
+    runs.push({
+      sort_ms: getRunSortTime(raw, Number(stat.mtimeMs || 0)),
+      run: compactRunForList(raw)
+    });
+  }
+  runs.sort((a, b) => b.sort_ms - a.sort_ms);
+  const compacted = runs.slice(0, limit).map((item) => item.run);
+  return {
+    status: "OK",
+    runs: compacted,
+    latest_run: compacted[0] || null,
+    count: compacted.length,
+    total_matching: runs.length,
+    limit,
+    filters: {
+      states: Array.from(stateFilter)
+    },
+    message: "Use latest_run.run_id with get_recommend_pipeline_run, cancel_recommend_pipeline_run, pause_recommend_pipeline_run, or resume_recommend_pipeline_run. In Trae-CN, do not use terminal, PowerShell, CLI, or filesystem scraping to recover run status."
+  };
 }
 
 function patchRawRunState(runId, patch) {
@@ -1134,18 +1301,18 @@ function createToolsSchema() {
       inputSchema: createListRecommendJobsInputSchema()
     },
     {
-      name: TOOL_PREPARE_RUN,
-      description: "只校验 Boss 推荐页流水线参数是否完整；不会启动筛选任务。若用户要现在运行，返回 READY/cron_ready=true 后必须继续调用本 MCP server 的 run_recommend 或 start_recommend_pipeline_run；只有定时/稍后运行才调用 schedule_recommend_pipeline_run。prepare 能返回结果就证明原生 MCP 可用，禁止改用 terminal/shell/run_command/CLI/manual JSON-RPC。",
-      inputSchema: createRunInputSchema()
-    },
-    {
       name: TOOL_RUN_RECOMMEND,
-      description: "立即通过原生 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名，适合 Trae/Trae-CN 等代理在 prepare_recommend_pipeline_run 返回 READY 后继续正式运行；必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      description: "立即通过原生 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名；用户已经确认并要现在启动时，优先调用本工具，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
       inputSchema: createRunInputSchema()
     },
     {
       name: TOOL_START_RUN,
-      description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）；prepare_recommend_pipeline_run 返回 READY 后，如果用户要现在运行就调用本工具或 run_recommend。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）。用户已经确认并要现在启动时，优先调用本工具或 run_recommend，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      inputSchema: createRunInputSchema()
+    },
+    {
+      name: TOOL_PREPARE_RUN,
+      description: "只校验 Boss 推荐页流水线参数是否完整；不会启动筛选任务。主要用于显式预检或稍后/cron/定时启动前校验。若用户要现在运行，READY/cron_ready=true 后必须继续调用本 MCP server 的 run_recommend 或 start_recommend_pipeline_run；prepare 能返回结果就证明原生 MCP 可用，禁止改用 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC，也禁止再次调用 prepare 试图启动。",
       inputSchema: createRunInputSchema()
     },
     {
@@ -1167,13 +1334,42 @@ function createToolsSchema() {
     },
     {
       name: TOOL_GET_RUN,
-      description: "按 run_id 查询异步/同步流水线运行状态快照。",
+      description: "按已知 run_id 查询异步/同步流水线运行状态快照。若忘记 run_id，请先调用 list_recommend_pipeline_runs 找 latest_run；在 Trae-CN 中禁止用 terminal/PowerShell/CLI/filesystem scraping 查看 run JSON。",
       inputSchema: {
         type: "object",
         properties: {
           run_id: { type: "string" }
         },
         required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_LIST_RUNS,
+      description: "只读列出最近的 Boss 推荐页 run 状态摘要，并返回 latest_run。用于忘记 run_id 后恢复状态/取消/暂停；摘要不会包含大体积候选人 results。Trae-CN 中必须用本工具恢复 run_id，禁止用 terminal/PowerShell/CLI/Get-Content 读取 ~/.boss-recommend-mcp/runs。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: {
+            type: "integer",
+            minimum: 1,
+            maximum: 100,
+            description: "最多返回多少条最近 run；默认 20，最大 100。"
+          },
+          state: {
+            type: "string",
+            enum: ["queued", "running", "paused", "completed", "failed", "canceled"],
+            description: "可选，只返回某个状态。"
+          },
+          states: {
+            type: "array",
+            items: {
+              type: "string",
+              enum: ["queued", "running", "paused", "completed", "failed", "canceled"]
+            },
+            description: "可选，只返回这些状态；与 state 同时传时取并集。"
+          }
+        },
         additionalProperties: false
       }
     },
@@ -1779,6 +1975,12 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
     ...errorToDetachedWorkerPayload(error, options.message),
     ...(options.code ? { code: options.code } : {})
   };
+  if (existing.control?.cancel_requested === true && isShutdownLikeError(errorPayload)) {
+    return finalizeRawRunStateAsCanceled(normalizedRunId, existing, {
+      errorPayload,
+      message: "流水线已取消；detached worker 在取消收尾时关闭了浏览器连接。"
+    });
+  }
   const previousResult = existing.result && typeof existing.result === "object" ? existing.result : {};
   const result = {
     ...previousResult,
@@ -1876,7 +2078,8 @@ function buildWorkerLaunchFailedPayload(message) {
 
 function finalizeCanceledRun(runId, snapshot) {
   const canceledResult = {
-    status: "FAILED",
+    status: "CANCELED",
+    completion_reason: "canceled_by_user",
     error: {
       code: "PIPELINE_CANCELED",
       message: "流水线已取消。",
@@ -2047,14 +2250,23 @@ async function executeTrackedPipeline({
       }
     );
   } catch (error) {
-    const canceled = Boolean(signal?.aborted) || error?.code === "PIPELINE_ABORTED";
+    const canceled = Boolean(signal?.aborted)
+      || error?.code === "PIPELINE_ABORTED"
+      || (isRunCancelRequested(runId) && isShutdownLikeError(error));
     if (canceled) {
       const canceledResult = {
-        status: "FAILED",
+        status: "CANCELED",
+        completion_reason: "canceled_by_user",
         error: {
           code: "PIPELINE_CANCELED",
           message: "流水线已取消。",
-          retryable: true
+          retryable: true,
+          shutdown_error: isShutdownLikeError(error)
+            ? {
+                code: error?.code || "SHUTDOWN_ERROR",
+                message: error?.message || String(error)
+              }
+            : undefined
         }
       };
       safeUpdateRunState(runId, {
@@ -2105,9 +2317,14 @@ async function executeTrackedPipeline({
     };
   }
 
-  const terminalState = result?.status === "FAILED"
-    ? RUN_STATE_FAILED
-    : result?.status === "PAUSED"
+  const failedAfterCancel = result?.status === "FAILED"
+    && isRunCancelRequested(runId)
+    && isShutdownLikeError(result?.error || result);
+  const terminalState = failedAfterCancel
+    ? RUN_STATE_CANCELED
+    : result?.status === "FAILED"
+      ? RUN_STATE_FAILED
+      : result?.status === "PAUSED"
       ? (isRunCancelRequested(runId) ? RUN_STATE_CANCELED : RUN_STATE_PAUSED)
       : RUN_STATE_COMPLETED;
   const outputCsv = getOutputCsvFromResult(result) || resumeConfig.output_csv;
@@ -2116,9 +2333,18 @@ async function executeTrackedPipeline({
     ? {
         code: "PIPELINE_CANCELED",
         message: "流水线已取消。",
-        retryable: true
+        retryable: true,
+        shutdown_error: failedAfterCancel ? (result?.error || null) : undefined
       }
     : null;
+  const finalResult = failedAfterCancel
+    ? {
+        ...(result || {}),
+        status: "CANCELED",
+        completion_reason: "canceled_by_user",
+        error: canceledError
+      }
+    : result || null;
   safeUpdateRunState(runId, {
     mode,
     state: terminalState,
@@ -2147,10 +2373,10 @@ async function executeTrackedPipeline({
       : terminalState === RUN_STATE_CANCELED
         ? canceledError
         : null,
-    result: result || null
+    result: finalResult
   });
   return {
-    result,
+    result: finalResult,
     lastStage: runtimeCallbacks.getLastStage(),
     state: terminalState
   };
@@ -2699,6 +2925,8 @@ async function handleRequest(message, workspaceRoot) {
         payload = await handleStartRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_GET_RUN) {
         payload = handleGetRunTool(args);
+      } else if (toolName === TOOL_LIST_RUNS) {
+        payload = handleListRunsTool(args);
       } else if (toolName === TOOL_CANCEL_RUN) {
         payload = handleCancelRunTool(args);
       } else if (toolName === TOOL_PAUSE_RUN) {

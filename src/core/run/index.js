@@ -32,6 +32,16 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function errorDiagnostic(error) {
+  if (!error) return null;
+  const diagnostic = {
+    name: error?.name || "Error",
+    message: error?.message || String(error)
+  };
+  if (error?.code) diagnostic.code = error.code;
+  return diagnostic;
+}
+
 function createDeferred() {
   let resolve;
   let reject;
@@ -192,16 +202,13 @@ export function createRunLifecycleManager({
       if (error instanceof RunCanceledError || entry.controller.signal.aborted || entry.cancelRequested) {
         setStatus(entry, RUN_STATUS_CANCELED, {
           completedAt: now(),
-          error: null
+          error: error instanceof RunCanceledError ? null : errorDiagnostic(error)
         });
         return;
       }
       setStatus(entry, RUN_STATUS_FAILED, {
         completedAt: now(),
-        error: {
-          name: error?.name || "Error",
-          message: error?.message || String(error)
-        }
+        error: errorDiagnostic(error)
       });
     }
   }

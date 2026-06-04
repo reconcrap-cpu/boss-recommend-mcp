@@ -18,6 +18,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - recommend 失败时（如 `JOB_TRIGGER_NOT_FOUND/NO_RECOMMEND_IFRAME/BOSS_LOGIN_REQUIRED`）禁止降级到 recruit；先修 recommend 页面就绪/登录态。
 
 - **Trae-CN / 原生 MCP 启动强制规则**
+  - 用户完成总确认并要求“现在启动”时，优先直接调用 `boss-recommend/run_recommend` 或 `boss-recommend/start_recommend_pipeline_run`；不要为了即时启动先调用 prepare。
   - 如果当前会话里已经成功调用过 `boss-recommend/prepare_recommend_pipeline_run`，说明 Trae-CN 已经具备原生 MCP tool call 能力；下一步必须继续调用 `boss-recommend/start_recommend_pipeline_run` 或 `boss-recommend/run_recommend`。
   - `prepare_recommend_pipeline_run` 返回 `READY` 只代表参数校验通过，不代表已经启动；严禁再次调用 prepare 试图启动。
   - 在 Trae-CN、Trae、Codex、Cursor、Claude Code 等普通 MCP 宿主中，严禁用 `run_command`、终端、PowerShell、`npx ... run --detached`、手写 `tools/call` JSON-RPC 或任何 CLI fallback 启动 recommend run。
@@ -100,8 +101,18 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 用途：当用户需要为 cron / 一次性自动任务提前填写完整参数时，先用它读取推荐页岗位下拉框的全部可用岗位名；默认会复用/自动打开本机 9222 Chrome 并导航到推荐页。
   - 输出：优先把 `job_names` 里的值作为后续 `overrides.job` / `confirmation.job_value`。
   - 限制：只读岗位列表，不启动筛选任务；若返回 `BOSS_LOGIN_REQUIRED`，必须让用户在自动打开的 Chrome 完成登录后重试，本次 cron 不得创建。
+- 主工具：`run_recommend` / `start_recommend_pipeline_run`
+  - 用途：用户完成最终总确认并要“现在启动”时调用；这是即时运行的首选入口，不需要先 prepare。
+  - 必填：`instruction`
+  - 关键输入：
+    - `confirmation`：新流程只需要 `{ "final_confirmed": true }`；旧版 `page_confirmed/page_value/.../job_confirmed/job_value` 仍兼容但不要主动制造逐项确认。
+    - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/criteria/job/target_count/post_action/max_greet_count`
+    - `human_behavior`：必须包含本次用户确认的 `restLevel`（例如 `{ "restLevel": "medium" }`）
+    - 不要传 `follow_up.chat`；该路径属于 legacy-only 行为
+  - 若返回 `ACCEPTED + run_id`：记录 `run_id` 并停止本轮，不自动轮询。
+  - 若返回 `NEED_INPUT` 或 `NEED_CONFIRMATION`：只追问 `pending_questions`。
 - 准备/门禁工具：`prepare_recommend_pipeline_run`
-  - 用途：只校验参数是否完整，不启动筛选任务。
+  - 用途：只校验参数是否完整，不启动筛选任务；主要用于用户明确要求预检，或 cron/稍后/定时启动前校验。
   - 要求：若用户要“现在启动”，返回 `status=READY` 且 `cron_ready=true` 后，下一步必须调用 MCP 工具 `run_recommend` 或 `start_recommend_pipeline_run`，禁止改用 terminal/shell/run_command/CLI/manual JSON-RPC。只有用户要“稍后/cron/定时启动”时，才继续创建定时任务。
   - READY 响应会带 `prepared_only=true`、`run_started=false`、`recommended_next_tool=start_recommend_pipeline_run`、`alternate_next_tool=run_recommend`、`next_action.do_not_call_prepare_again=true`、`agent_guidance.native_mcp_required_after_prepare=true`；必须照这些字段继续，不得再次调用 prepare。
   - 若返回 `NEED_INPUT` / `NEED_CONFIRMATION` / `FAILED`：继续补齐 `pending_questions` 或修复登录/页面/config；不得先创建 cron。
@@ -112,13 +123,10 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 成功标准：必须返回 `status=SCHEDULED`、`schedule_created=true`、`schedule_id`、`run_at`。只有这个返回后，才可以告诉用户定时任务已创建。
 - Cron 查询工具：`get_recommend_scheduled_run`
   - 用途：用户问“任务是否启动/进度”时，先查 `schedule_id`。若到点后已启动，会返回内层 `run_id` 和 run 快照。
-- 主工具：`run_recommend` / `start_recommend_pipeline_run`
-- 必填：`instruction`
-- 关键输入：
-  - `confirmation`：新流程只需要 `{ "final_confirmed": true }`；旧版 `page_confirmed/page_value/.../job_confirmed/job_value` 仍兼容但不要主动制造逐项确认。
-  - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/criteria/job/target_count/post_action/max_greet_count`
-  - `human_behavior`：必须包含本次用户确认的 `restLevel`（例如 `{ "restLevel": "medium" }`）
-  - 不要传 `follow_up.chat`；该路径属于 legacy-only 行为
+- 状态恢复工具：`list_recommend_pipeline_runs`
+  - 用途：忘记 `run_id` 或用户问“刚才那个任务怎么样”但上下文里没有 run_id 时调用；读取最近 run 摘要并返回 `latest_run`。
+  - 限制：只返回紧凑摘要，不包含大体积候选人 `results`；拿到 `latest_run.run_id` 后再用 `get_recommend_pipeline_run` / `cancel_recommend_pipeline_run`。
+  - 在 Trae-CN 中禁止用 `run_command`、PowerShell、`Get-Content`、CLI 或直接读取 `~/.boss-recommend-mcp/runs/*.json` 来恢复 run_id 或状态。
 
 最小策略：
 
@@ -164,6 +172,7 @@ npx -y @reconcrap/boss-recommend-mcp@latest schedule-status --schedule-id <sched
 
 - 用户未明确要求“持续跟进”时，不自动 `sleep + get_recommend_pipeline_run`。
 - 用户要求查进度时，再用 `get_recommend_pipeline_run`。
+- 如果当前对话已经丢失 `run_id`，先调用 `list_recommend_pipeline_runs`，再用 `latest_run.run_id` 调用 `get_recommend_pipeline_run`；不要改用终端读 JSON。
 - **长任务轮询节奏（强制）**：
   - 推荐任务可能运行数小时，禁止高频轮询。
   - 默认最小轮询间隔为 **30 分钟**（除非用户明确要求更频繁）。

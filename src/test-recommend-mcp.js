@@ -25,6 +25,7 @@ const TOOL_GET_SCHEDULE = "get_recommend_scheduled_run";
 const TOOL_RUN_RECOMMEND = "run_recommend";
 const TOOL_START = "start_recommend_pipeline_run";
 const TOOL_GET = "get_recommend_pipeline_run";
+const TOOL_LIST_RUNS = "list_recommend_pipeline_runs";
 const TOOL_PAUSE = "pause_recommend_pipeline_run";
 const TOOL_RESUME = "resume_recommend_pipeline_run";
 const TOOL_CANCEL = "cancel_recommend_pipeline_run";
@@ -191,19 +192,22 @@ async function testToolListIncludesRecommendTools() {
   assert.equal(names.has(TOOL_RUN_RECOMMEND), true);
   assert.equal(names.has(TOOL_START), true);
   assert.equal(names.has(TOOL_GET), true);
+  assert.equal(names.has(TOOL_LIST_RUNS), true);
   assert.equal(names.has(TOOL_PAUSE), true);
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has(TOOL_CANCEL), true);
   const toolOrder = tools.map((tool) => tool.name);
-  assert.equal(toolOrder.indexOf(TOOL_PREPARE) < toolOrder.indexOf(TOOL_RUN_RECOMMEND), true);
-  assert.equal(toolOrder.indexOf(TOOL_PREPARE) < toolOrder.indexOf(TOOL_START), true);
+  assert.equal(toolOrder.indexOf(TOOL_RUN_RECOMMEND) < toolOrder.indexOf(TOOL_PREPARE), true);
+  assert.equal(toolOrder.indexOf(TOOL_START) < toolOrder.indexOf(TOOL_PREPARE), true);
   assert.equal(toolOrder.indexOf(TOOL_RUN_RECOMMEND) < toolOrder.indexOf(TOOL_SCHEDULE), true);
   assert.equal(toolOrder.indexOf(TOOL_START) < toolOrder.indexOf(TOOL_SCHEDULE), true);
+  assert.equal(toolOrder.indexOf(TOOL_GET) < toolOrder.indexOf(TOOL_LIST_RUNS), true);
   const startTool = tools.find((tool) => tool.name === TOOL_START);
   const runRecommendTool = tools.find((tool) => tool.name === TOOL_RUN_RECOMMEND);
   assert.equal(runRecommendTool.description.includes("start_recommend_pipeline_run"), true);
   assert.equal(runRecommendTool.description.includes("原生 MCP"), true);
   assert.equal(runRecommendTool.description.includes("terminal/shell/run_command"), true);
+  assert.equal(runRecommendTool.description.includes("不需要先调用 prepare_recommend_pipeline_run"), true);
   assert.equal(runRecommendTool.description.includes("不要用 schedule_recommend_pipeline_run 冒充立即启动"), true);
   assert.equal(runRecommendTool.description.includes("CLI fallback"), false);
   assert.equal(runRecommendTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
@@ -211,6 +215,7 @@ async function testToolListIncludesRecommendTools() {
   assert.equal(startTool.description.includes("run_recommend"), true);
   assert.equal(startTool.description.includes("原生 MCP"), true);
   assert.equal(startTool.description.includes("terminal/shell/run_command"), true);
+  assert.equal(startTool.description.includes("不需要先调用 prepare_recommend_pipeline_run"), true);
   assert.equal(startTool.description.includes("不要用 schedule_recommend_pipeline_run 冒充立即启动"), true);
   assert.equal(startTool.description.includes("CLI fallback"), false);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
@@ -222,8 +227,13 @@ async function testToolListIncludesRecommendTools() {
   assert.equal(prepareTool.description.includes("start_recommend_pipeline_run"), true);
   assert.equal(prepareTool.description.includes("原生 MCP"), true);
   assert.equal(prepareTool.description.includes("terminal/shell/run_command"), true);
+  assert.equal(prepareTool.description.includes("再次调用 prepare"), true);
   assert.equal(prepareTool.description.includes("CLI fallback"), false);
   assert.deepEqual(prepareTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
+  const listRunsTool = tools.find((tool) => tool.name === TOOL_LIST_RUNS);
+  assert.equal(listRunsTool.description.includes("latest_run"), true);
+  assert.equal(listRunsTool.description.includes("Get-Content"), true);
+  assert.equal(listRunsTool.inputSchema.properties.limit.maximum, 100);
   const scheduleTool = tools.find((tool) => tool.name === TOOL_SCHEDULE);
   assert.equal(scheduleTool.description.includes("只用于用户明确要求稍后/cron/定时启动"), true);
   assert.equal(scheduleTool.description.includes("不要用短延迟 schedule 冒充立即启动"), true);
@@ -987,6 +997,194 @@ async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
   assert.equal(fs.existsSync(payload.run.result.report_json), true);
 }
 
+async function testRecommendDiskCancelRequestedDeadPidIsReconciledAsCanceled() {
+  resetRecommendMcpStateForTests();
+  const runId = "mcp_recommend_deadpid_canceled_test";
+  const runsDir = path.join(process.env.BOSS_RECOMMEND_HOME, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const statePath = path.join(runsDir, `${runId}.json`);
+  const checkpointPath = path.join(runsDir, `${runId}.checkpoint.json`);
+  const startedAt = new Date(Date.now() - 45_000).toISOString();
+  fs.writeFileSync(checkpointPath, `${JSON.stringify({
+    updatedAt: startedAt,
+    results: [
+      {
+        index: 0,
+        candidate: { identity: { name: "候选人C" } },
+        screening: { passed: false, status: "fail", score: 10 }
+      }
+    ]
+  }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    run_id: runId,
+    state: "running",
+    status: "running",
+    stage: "recommend:detail",
+    started_at: startedAt,
+    updated_at: startedAt,
+    heartbeat_at: startedAt,
+    pid: 987654320,
+    progress: {
+      target_count: 3,
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      skipped: 1,
+      greet_count: 0
+    },
+    context: {
+      instruction: "推荐页筛选算法候选人",
+      confirmation: { job_value: "算法工程师" },
+      overrides: {
+        job: "算法工程师",
+        criteria: "候选人具备算法经验",
+        target_count: 3,
+        post_action: "none"
+      }
+    },
+    control: {
+      pause_requested: true,
+      pause_requested_at: startedAt,
+      pause_requested_by: "cancel_recommend_pipeline_run",
+      cancel_requested: true
+    },
+    resume: {
+      checkpoint_path: checkpointPath
+    },
+    result: null,
+    error: null
+  }, null, 2)}\n`, "utf8");
+
+  const payload = await callTool(TOOL_GET, { run_id: runId }, 321);
+  assert.equal(payload.status, "RUN_STATUS");
+  assert.equal(payload.run.state, "canceled");
+  assert.equal(payload.run.status, "canceled");
+  assert.equal(payload.run.result.status, "CANCELED");
+  assert.equal(payload.run.result.completion_reason, "canceled_by_user");
+  assert.equal(payload.run.error.code, "PIPELINE_CANCELED");
+  assert.equal(payload.run.error.shutdown_error.code, "RUN_PROCESS_EXITED");
+  assert.equal(payload.persistence.stale_process_reconciled, true);
+}
+
+async function testRecommendListRunsReturnsCompactLatest() {
+  resetRecommendMcpStateForTests();
+  const runsDir = path.join(process.env.BOSS_RECOMMEND_HOME, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const olderAt = new Date(Date.now() + 10_000).toISOString();
+  const newerAt = new Date(Date.now() + 20_000).toISOString();
+  const olderId = "mcp_recommend_list_old_test";
+  const newerId = "mcp_recommend_list_new_test";
+  for (const [runId, updatedAt] of [[olderId, olderAt], [newerId, newerAt]]) {
+    fs.writeFileSync(path.join(runsDir, `${runId}.json`), `${JSON.stringify({
+      run_id: runId,
+      state: "paused",
+      status: "paused",
+      stage: "recommend:detail",
+      started_at: updatedAt,
+      updated_at: updatedAt,
+      heartbeat_at: updatedAt,
+      pid: process.pid,
+      progress: {
+        processed: runId === newerId ? 2 : 1,
+        passed: 0,
+        skipped: 0,
+        greet_count: 0
+      },
+      control: {
+        pause_requested: true,
+        cancel_requested: false
+      },
+      result: {
+        status: "PAUSED",
+        completion_reason: "paused",
+        results: [
+          { candidate: { identity: { name: "large payload should not appear" } } }
+        ],
+        output_csv: `C:/tmp/${runId}.csv`
+      }
+    }, null, 2)}\n`, "utf8");
+  }
+
+  const payload = await callTool(TOOL_LIST_RUNS, { state: "paused", limit: 1 }, 322);
+  assert.equal(payload.status, "OK");
+  assert.equal(payload.count, 1);
+  assert.equal(payload.latest_run.run_id, newerId);
+  assert.equal(payload.runs[0].run_id, newerId);
+  assert.equal(payload.runs[0].result.output_csv, `C:/tmp/${newerId}.csv`);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.runs[0].result, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.runs[0], "run_state_path"), false);
+  assert.equal(JSON.stringify(payload).includes("large payload should not appear"), false);
+  assert.equal(payload.message.includes("PowerShell"), true);
+}
+
+async function testRecommendDetachedCancelSocketFailureFinalizesCanceled() {
+  const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
+  process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  setSpawnProcessImplForTests(() => ({
+    pid: 456790,
+    unref() {}
+  }));
+  try {
+    installFakeConnector();
+    setRecommendMcpWorkflowForTests(async (options, runControl) => {
+      runControl.setPhase("recommend:detail");
+      runControl.updateProgress({
+        card_count: 1,
+        target_count: options.maxCandidates,
+        processed: 1,
+        screened: 1,
+        passed: 0,
+        greet_count: 0
+      });
+      await sleep(20);
+      const error = new Error("socket hang up");
+      error.code = "ECONNRESET";
+      throw error;
+    });
+
+    const started = await callTool(TOOL_START, readyArgs({
+      delay_ms: 0,
+      debug_test_mode: true,
+      screening_mode: "deterministic",
+      no_filter: true,
+      detail_limit: 1,
+      execute_post_action: false
+    }), 323);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.run.state, "queued");
+
+    const cancelPayload = await callTool(TOOL_CANCEL, { run_id: started.run_id }, 324);
+    assert.equal(cancelPayload.status, "CANCEL_REQUESTED");
+
+    const workerResult = await runDetachedWorkerForTests({
+      runId: started.run_id,
+      workerPid: 456790
+    });
+    assert.equal(workerResult.ok, true);
+    const payload = await callTool(TOOL_GET, { run_id: started.run_id }, 325);
+    assert.equal(payload.run.state, "canceled");
+    assert.equal(payload.run.result.status, "CANCELED");
+    assert.equal(payload.run.result.completion_reason, "canceled_by_user");
+    assert.equal(payload.run.error.code, "PIPELINE_CANCELED");
+    assert.equal(payload.run.error.shutdown_error.message, "socket hang up");
+    assert.equal(payload.run.control.cancel_requested, false);
+  } finally {
+    setSpawnProcessImplForTests(null);
+    if (previousDetached === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_DETACHED = previousDetached;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+  }
+}
+
 async function testRecommendDetachedStartUsesWorkerProcess() {
   const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
   const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
@@ -1470,6 +1668,12 @@ async function main() {
     await testRecommendActiveRunPersistsProgressToDisk();
     resetRecommendMcpStateForTests();
     await testRecommendDiskRunningRunWithDeadPidIsReconciled();
+    resetRecommendMcpStateForTests();
+    await testRecommendDiskCancelRequestedDeadPidIsReconciledAsCanceled();
+    resetRecommendMcpStateForTests();
+    await testRecommendListRunsReturnsCompactLatest();
+    resetRecommendMcpStateForTests();
+    await testRecommendDetachedCancelSocketFailureFinalizesCanceled();
     resetRecommendMcpStateForTests();
     await testRecommendDetachedStartUsesWorkerProcess();
     resetRecommendMcpStateForTests();

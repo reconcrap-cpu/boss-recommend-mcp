@@ -361,6 +361,11 @@ function classifyRecommendRecovery(error = {}) {
   return null;
 }
 
+function isCancelShutdownError(error = {}) {
+  const text = normalizeErrorText(error);
+  return /socket hang up|ECONNREFUSED|ECONNRESET|WebSocket is not open|Target closed|Session closed|Connection closed|RUN_PROCESS_EXITED|DETACHED_WORKER|RUN_WORKER/i.test(text);
+}
+
 function buildConstrainedAgentRecovery(snapshot = {}, meta = {}, artifacts = null) {
   const error = snapshot?.error || snapshot?.result?.error || null;
   const classification = classifyRecommendRecovery(error);
@@ -578,8 +583,24 @@ function mergePersistedControlRequest(normalized, existing) {
   const control = {
     ...(normalized?.control || {})
   };
-  if (!normalized || TERMINAL_STATUSES.has(normalized.state)) return control;
   const existingControl = plainRecord(existing?.control);
+  if (!normalized) return control;
+  if (TERMINAL_STATUSES.has(normalized.state)) {
+    if (
+      normalized.state === RUN_STATUS_FAILED
+      && existingControl.cancel_requested === true
+      && isCancelShutdownError(normalized.error || normalized.result?.error || "")
+    ) {
+      return {
+        ...control,
+        pause_requested: true,
+        pause_requested_at: existingControl.pause_requested_at || control.pause_requested_at || new Date().toISOString(),
+        pause_requested_by: existingControl.pause_requested_by || control.pause_requested_by || "cancel_recommend_pipeline_run",
+        cancel_requested: true
+      };
+    }
+    return control;
+  }
   if (existingControl.cancel_requested === true) {
     return {
       ...control,
@@ -609,15 +630,74 @@ function mergePersistedControlRequest(normalized, existing) {
   return control;
 }
 
+function cancelErrorFromShutdown(shutdownError = null) {
+  return {
+    code: "PIPELINE_CANCELED",
+    message: "流水线已取消。",
+    retryable: true,
+    shutdown_error: shutdownError || undefined
+  };
+}
+
+function coerceCanceledTerminalSnapshot(normalized, existing) {
+  const existingControl = plainRecord(existing?.control);
+  const shutdownError = normalized?.error || normalized?.result?.error || null;
+  const shouldWrapCanceledShutdown = (
+    normalized
+    && (
+      (
+        normalized.state === RUN_STATUS_FAILED
+        && existingControl.cancel_requested === true
+      )
+      || normalized.state === RUN_STATUS_CANCELED
+    )
+    && isCancelShutdownError(shutdownError || "")
+  );
+  if (
+    !shouldWrapCanceledShutdown
+  ) {
+    return normalized;
+  }
+  const canceledError = cancelErrorFromShutdown(shutdownError);
+  return {
+    ...normalized,
+    state: RUN_STATUS_CANCELED,
+    status: RUN_STATUS_CANCELED,
+    last_message: "流水线已取消；取消收尾时浏览器连接已关闭。",
+    control: {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    },
+    error: canceledError,
+    result: normalized.result ? {
+      ...normalized.result,
+      status: "CANCELED",
+      completion_reason: "canceled_by_user",
+      error: canceledError
+    } : {
+      status: "CANCELED",
+      completion_reason: "canceled_by_user",
+      error: canceledError,
+      run_id: normalized.run_id,
+      processed_count: normalized.progress?.processed || 0,
+      screened_count: normalized.progress?.screened || normalized.progress?.processed || 0,
+      passed_count: normalized.progress?.passed || 0
+    }
+  };
+}
+
 function persistRecommendRunSnapshot(snapshot, {
   persistActiveCheckpoint = false
 } = {}) {
-  const normalized = normalizeRunSnapshot(snapshot);
+  let normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
   const existing = readJsonFile(artifacts.run_state_path);
   normalized.control = mergePersistedControlRequest(normalized, existing);
+  normalized = coerceCanceledTerminalSnapshot(normalized, existing);
   if (persistActiveCheckpoint) {
     persistRecommendCheckpointSnapshot(normalized);
   }
@@ -647,6 +727,29 @@ function persistRecommendRunSnapshot(snapshot, {
   return normalized;
 }
 
+function patchPersistedRecommendRunControl(runId, controlPatch = {}, {
+  message = ""
+} = {}) {
+  const artifacts = getRecommendRunArtifacts(runId);
+  if (!artifacts) return null;
+  const current = readJsonFile(artifacts.run_state_path);
+  const state = normalizeText(current?.state || current?.status || "");
+  if (!current || TERMINAL_STATUSES.has(state)) return null;
+  const now = new Date().toISOString();
+  const patched = {
+    ...current,
+    updated_at: now,
+    heartbeat_at: current.heartbeat_at || now,
+    last_message: message || current.last_message || "",
+    control: {
+      ...(current.control || {}),
+      ...controlPatch
+    }
+  };
+  writeJsonAtomic(artifacts.run_state_path, patched);
+  return patched;
+}
+
 function reconcilePersistedRecommendRunIfNeeded(persisted) {
   if (!persisted || typeof persisted !== "object") return persisted;
   const persistedState = normalizeText(persisted.state || persisted.status);
@@ -657,15 +760,22 @@ function reconcilePersistedRecommendRunIfNeeded(persisted) {
   const artifacts = getRecommendRunArtifacts(runId);
   const checkpoint = artifacts?.checkpoint_path ? readJsonFile(artifacts.checkpoint_path) : null;
   const now = new Date().toISOString();
-  const error = {
+  const cancelRequested = persisted.control?.cancel_requested === true;
+  const processExitedError = {
     code: "RUN_PROCESS_EXITED",
-    message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}），已自动标记为失败。`,
+    message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}）。`,
     retryable: true
   };
+  const error = cancelRequested
+    ? cancelErrorFromShutdown(processExitedError)
+    : {
+        ...processExitedError,
+        message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}），已自动标记为失败。`
+      };
   return persistRecommendRunSnapshot({
     runId,
     name: persisted.name || runId,
-    status: RUN_STATUS_FAILED,
+    status: cancelRequested ? RUN_STATUS_CANCELED : RUN_STATUS_FAILED,
     phase: persisted.stage || persisted.phase || "recommend:orphaned",
     progress: persisted.progress || {},
     context: persisted.context || {},
@@ -1818,6 +1928,31 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
         status: "CANCEL_IGNORED",
         run: persisted,
         message: "目标任务已结束，无需取消。",
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+    const cancelMessage = "已收到取消请求，将由 detached worker 在下一个安全边界停止。";
+    const patched = patchPersistedRecommendRunControl(runId, {
+      pause_requested: true,
+      pause_requested_at: new Date().toISOString(),
+      pause_requested_by: "cancel_recommend_pipeline_run",
+      cancel_requested: true
+    }, {
+      message: cancelMessage
+    });
+    if (patched) {
+      return {
+        status: "CANCEL_REQUESTED",
+        run: patched,
+        message: cancelMessage,
+        persistence: {
+          source: "disk",
+          active_control_available: false,
+          detached_control_requested: true
+        },
         runtime_evaluate_used: false,
         method_summary: {},
         method_log: [],

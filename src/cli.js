@@ -24,8 +24,12 @@ import {
   resumeBossChatRunTool
 } from "./chat-mcp.js";
 import {
+  cancelRecommendPipelineRunTool,
+  getRecommendPipelineRunTool,
   listRecommendJobsTool,
+  pauseRecommendPipelineRunTool,
   prepareRecommendPipelineRunTool,
+  resumeRecommendPipelineRunTool,
   startRecommendPipelineRunTool
 } from "./recommend-mcp.js";
 import {
@@ -2971,6 +2975,33 @@ function scheduleStatusCli(options = {}) {
   }
 }
 
+function isTerminalRecommendCliState(state) {
+  return ["completed", "failed", "canceled"].includes(String(state || "").trim().toLowerCase());
+}
+
+async function monitorDetachedRecommendCliRunControls(runId) {
+  const normalizedRunId = String(runId || "").trim();
+  if (!normalizedRunId) return;
+  while (true) {
+    const payload = getRecommendPipelineRunTool({
+      args: {
+        run_id: normalizedRunId
+      }
+    });
+    const state = String(payload?.run?.state || payload?.run?.status || "").trim().toLowerCase();
+    if (isTerminalRecommendCliState(state)) return;
+    const control = payload?.run?.control || {};
+    if (control.cancel_requested === true) {
+      cancelRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    } else if (control.pause_requested === true && state === "running") {
+      pauseRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    } else if (control.pause_requested === false && state === "paused") {
+      resumeRecommendPipelineRunTool({ args: { run_id: normalizedRunId } });
+    }
+    await sleepMs(1000);
+  }
+}
+
 async function runPipelineOnce(options = {}) {
   const workspaceRoot = getWorkspaceRoot(options);
   const { args, port } = buildRecommendRunCliInput(options);
@@ -2990,6 +3021,8 @@ async function runPipelineOnce(options = {}) {
   });
   if (result.status !== "ACCEPTED") {
     process.exitCode = 1;
+  } else if (process.env[detachedRecommendRunChildEnv] === "1") {
+    await monitorDetachedRecommendCliRunControls(result.run_id);
   }
 }
 
