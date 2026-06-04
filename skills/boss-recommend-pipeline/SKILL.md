@@ -17,6 +17,12 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 只有用户**明确**说搜索页（`search/搜索页//web/chat/search`）时，才可转 `boss-recruit-pipeline`。
   - recommend 失败时（如 `JOB_TRIGGER_NOT_FOUND/NO_RECOMMEND_IFRAME/BOSS_LOGIN_REQUIRED`）禁止降级到 recruit；先修 recommend 页面就绪/登录态。
 
+- **Trae-CN / 原生 MCP 启动强制规则**
+  - 如果当前会话里已经成功调用过 `boss-recommend/prepare_recommend_pipeline_run`，说明 Trae-CN 已经具备原生 MCP tool call 能力；下一步必须继续调用 `boss-recommend/start_recommend_pipeline_run` 或 `boss-recommend/run_recommend`。
+  - `prepare_recommend_pipeline_run` 返回 `READY` 只代表参数校验通过，不代表已经启动；严禁再次调用 prepare 试图启动。
+  - 在 Trae-CN、Trae、Codex、Cursor、Claude Code 等普通 MCP 宿主中，严禁用 `run_command`、终端、PowerShell、`npx ... run --detached`、手写 `tools/call` JSON-RPC 或任何 CLI fallback 启动 recommend run。
+  - 不要说“prepare 覆盖了 MCP run 调用”。正确说法是：prepare 没有启动，下一步是原生 MCP tool call。
+
 - **确认不可代填（强制）**
   - 禁止 agent 自行“设置合理参数”并代替用户确认。
   - 禁止在用户未明确回复前，把 `final_confirmed=true`。
@@ -95,8 +101,8 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 限制：只读岗位列表，不启动筛选任务；若返回 `BOSS_LOGIN_REQUIRED`，必须让用户在自动打开的 Chrome 完成登录后重试，本次 cron 不得创建。
 - 准备/门禁工具：`prepare_recommend_pipeline_run`
   - 用途：只校验参数是否完整，不启动筛选任务。
-  - 要求：若用户要“现在启动”，返回 `status=READY` 且 `cron_ready=true` 后，下一步必须调用 MCP 工具 `run_recommend` 或 `start_recommend_pipeline_run`，禁止改用 CLI fallback。只有用户要“稍后/cron/定时启动”时，才继续创建定时任务。
-  - READY 响应会带 `prepared_only=true`、`run_started=false`、`recommended_next_tool=start_recommend_pipeline_run`、`alternate_next_tool=run_recommend`、`next_action.do_not_call_prepare_again=true`；必须照这些字段继续，不得再次调用 prepare。
+  - 要求：若用户要“现在启动”，返回 `status=READY` 且 `cron_ready=true` 后，下一步必须调用 MCP 工具 `run_recommend` 或 `start_recommend_pipeline_run`，禁止改用 terminal/shell/run_command/CLI/manual JSON-RPC。只有用户要“稍后/cron/定时启动”时，才继续创建定时任务。
+  - READY 响应会带 `prepared_only=true`、`run_started=false`、`recommended_next_tool=start_recommend_pipeline_run`、`alternate_next_tool=run_recommend`、`next_action.do_not_call_prepare_again=true`、`agent_guidance.native_mcp_required_after_prepare=true`；必须照这些字段继续，不得再次调用 prepare。
   - 若返回 `NEED_INPUT` / `NEED_CONFIRMATION` / `FAILED`：继续补齐 `pending_questions` 或修复登录/页面/config；不得先创建 cron。
 - Cron 创建工具：`schedule_recommend_pipeline_run`
   - 用途：保存已经 READY 的完整 payload，并启动 package-owned detached scheduler；到点后由包内 worker 直接调用 `start_recommend_pipeline_run`。
@@ -132,10 +138,10 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 7. 只有拿到 `SCHEDULED + schedule_id` 后才告诉用户定时任务已创建。回复必须包含 `schedule_id`，而不是只说“10 分钟后会启动”。
 8. 到点后由 package-owned detached scheduler 启动；若 Chrome/登录异常，应作为 schedule/run 失败处理，不得再向用户追问参数。
 
-Shell-only OpenClaw/QClaw cron 设置同样先运行 prepare：
+Shell-only OpenClaw/QClaw cron 设置同样先运行 prepare，并显式带上用户已确认的休息强度：
 
 ```powershell
-npx -y @reconcrap/boss-recommend-mcp@latest prepare-run --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --slow-live --port 9222
+npx -y @reconcrap/boss-recommend-mcp@latest prepare-run --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --rest-level <low|medium|high> --slow-live --port 9222
 ```
 
 仅当上述命令输出 `READY` 且 `cron_ready=true` 后，才允许继续创建定时任务。
@@ -143,7 +149,7 @@ npx -y @reconcrap/boss-recommend-mcp@latest prepare-run --instruction-file .\bos
 然后必须用 package-owned scheduler 创建定时任务，不要手写系统 cron：
 
 ```powershell
-npx -y @reconcrap/boss-recommend-mcp@latest schedule-run --schedule-delay-minutes 10 --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --slow-live --port 9222
+npx -y @reconcrap/boss-recommend-mcp@latest schedule-run --schedule-delay-minutes 10 --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --rest-level <low|medium|high> --slow-live --port 9222
 ```
 
 用户查询时：
@@ -188,18 +194,22 @@ npx -y @reconcrap/boss-recommend-mcp@latest schedule-status --schedule-id <sched
 - `featured` 且缺少校准文件：先 `boss-recommend-mcp calibrate`。
 - `latest`：流程同 `recommend`，但使用最新 tab 结构（`data-status=1`）。
 
-## QClaw / Shell-Only Fallback
+## True Shell-Only Fallback (Never Trae-CN)
 
-当 QClaw/OpenClaw 变体只暴露 shell、没有原生 MCP tool list 时，禁止停在“请使用 `run_recommend` / `start_recommend_pipeline_run` 工具”。必须用 shell 继续启动。
+本节只适用于宿主**完全没有**原生 MCP tool list、也无法调用 `boss-recommend/prepare_recommend_pipeline_run` 的 QClaw/OpenClaw 变体。
+
+只要当前会话里出现过 `boss-recommend/prepare_recommend_pipeline_run`、`boss-recommend/run_recommend`、`boss-recommend/start_recommend_pipeline_run` 这类原生 MCP 调用，本节立即失效。Trae-CN 永远不使用本节。
+
+当 QClaw/OpenClaw 变体只暴露 shell、没有原生 MCP tool list 时，才可以用 shell 继续启动。
 
 推荐做法：
 
 1. 将锁定的用户原文写入 instruction 文件，将已确认参数写入 `overrides` JSON；`confirmation` JSON 只需要 `{ "final_confirmed": true }`。
-2. 先用 `prepare-run` 校验完整 payload 已 cron-ready；未返回 `READY + cron_ready=true` 不得创建定时任务或启动 run。
+2. 先用 `prepare-run` 校验完整 payload 已 cron-ready，并显式传 `--rest-level <low|medium|high>`；未返回 `READY + cron_ready=true` 不得创建定时任务或启动 run。
 3. 若用户要“现在启动”，用 detached CLI 启动，让父命令返回启动证据，子进程继续持有 CDP 会话：
 
 ```powershell
-npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --slow-live --port 9222
+npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\boss-recommend-instruction.txt --overrides-file .\boss-recommend-overrides.json --confirmation-file .\boss-recommend-confirmation.json --rest-level <low|medium|high> --slow-live --port 9222
 ```
 
 4. 若用户要“稍后/cron/定时启动”，用 `schedule-run`，不是 `run --detached`。若 `schedule-run` 未返回 `SCHEDULED + schedule_id`，不得告诉用户定时任务已创建。
@@ -208,7 +218,7 @@ npx -y @reconcrap/boss-recommend-mcp@latest run --detached --instruction-file .\
 兼容路径：
 
 - 若 `--detached` 不可用，或返回 `RECOMMEND_CLI_RUN_UNSUPPORTED_CDP_ONLY`，说明 npm/QClaw 仍在使用旧包；先运行 `npx -y @reconcrap/boss-recommend-mcp@latest install --agent qclaw` 并重启 QClaw。
-- 在包更新未生效时，可以使用已验证过的直接 MCP stdio JSON-RPC 方式调用 `run_recommend` / `start_recommend_pipeline_run`；该方式等价于原生 MCP tool 调用，不能改用 recruit/search 路径。
+- 禁止使用 `npx @reconcrap/boss-recommend-mcp --stdio` 或 PowerShell 手写 `tools/call` JSON-RPC；该包的 MCP server 入口是 `start`，普通 MCP 宿主必须使用原生 tool call。
 
 普通 MCP 可用时：
 

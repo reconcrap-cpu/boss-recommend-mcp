@@ -1567,7 +1567,8 @@ export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} 
     immediate_run: {
       recommended_next_tool: "start_recommend_pipeline_run",
       alternate_next_tool: "run_recommend",
-      same_arguments: true
+      same_arguments: true,
+      native_mcp_required: true
     },
     scheduled_run: {
       recommended_next_tool: "schedule_recommend_pipeline_run",
@@ -1575,7 +1576,35 @@ export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} 
       requires_schedule_field: true
     },
     do_not_call_prepare_again: true,
-    do_not_use_cli_fallback_when_mcp_tools_available: true
+    do_not_use_cli_fallback_when_mcp_tools_available: true,
+    do_not_use_terminal_or_shell: true,
+    forbidden_fallbacks: [
+      "run_command",
+      "terminal",
+      "shell",
+      "CLI detached fallback",
+      "manual JSON-RPC over shell",
+      "npx --stdio"
+    ]
+  };
+  const agentGuidance = {
+    host_has_native_mcp: true,
+    native_mcp_required_after_prepare: true,
+    proof: "This prepare_recommend_pipeline_run response was returned by the MCP server, so the host can call MCP tools from this server.",
+    immediate_run: {
+      tool: nextAction.immediate_run.recommended_next_tool,
+      alternate_tool: nextAction.immediate_run.alternate_next_tool,
+      same_arguments: true
+    },
+    scheduled_run: {
+      tool: nextAction.scheduled_run.recommended_next_tool,
+      same_arguments: true
+    },
+    trae_cn: {
+      next_step: "Call boss-recommend/start_recommend_pipeline_run or boss-recommend/run_recommend through the native MCP tool interface.",
+      never_use_terminal_fallback_after_prepare: true
+    },
+    forbidden_when_mcp_tools_are_available: nextAction.forbidden_fallbacks
   };
   return {
     status: "READY",
@@ -1585,7 +1614,8 @@ export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} 
     recommended_next_tool: nextAction.immediate_run.recommended_next_tool,
     alternate_next_tool: nextAction.immediate_run.alternate_next_tool,
     next_action: nextAction,
-    message: "READY only means the payload passed validation; prepare_recommend_pipeline_run did not start a run. To start now, call start_recommend_pipeline_run or run_recommend with the same arguments. Do not call prepare_recommend_pipeline_run again, and do not use CLI fallback when MCP tools are available.",
+    agent_guidance: agentGuidance,
+    message: "READY only means the payload passed validation; prepare_recommend_pipeline_run did not start a run. This response proves the MCP server is available. To start now, call the native MCP tool start_recommend_pipeline_run or run_recommend with the same arguments. Do not call prepare_recommend_pipeline_run again, and do not use terminal, shell, CLI detached fallback, or manual JSON-RPC when MCP tools are available.",
     review: parsed.review,
     post_action: {
       requested: normalized.postAction,

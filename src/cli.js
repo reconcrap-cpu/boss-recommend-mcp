@@ -2716,11 +2716,11 @@ function printHelp() {
   console.log("  boss-recommend-mcp install --mcp-launch global-wrapper  Use ~/.boss-recommend-mcp/bin wrapper so npm global upgrades affect MCP hosts");
   console.log("");
   console.log("Run command:");
-  console.log("  boss-recommend-mcp prepare-run --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
-  console.log("  boss-recommend-mcp schedule-run --schedule-delay-minutes 10 --instruction-file boss-recommend-instruction.txt --overrides-file overrides.json --confirmation-file confirmation.json");
+  console.log("  boss-recommend-mcp prepare-run --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json --rest-level medium");
+  console.log("  boss-recommend-mcp schedule-run --schedule-delay-minutes 10 --instruction-file boss-recommend-instruction.txt --overrides-file overrides.json --confirmation-file confirmation.json --rest-level medium");
   console.log("  boss-recommend-mcp schedule-status --schedule-id <id>");
-  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" --overrides-file overrides.json --confirmation-file confirmation.json");
-  console.log("  boss-recommend-mcp run --detached --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json");
+  console.log("  boss-recommend-mcp run --instruction \"推荐页上筛选211男生，近14天没有，有大模型平台经验\" --overrides-file overrides.json --confirmation-file confirmation.json --rest-level medium");
+  console.log("  boss-recommend-mcp run --detached --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json --rest-level medium");
   console.log("  boss-recommend-mcp list-jobs --slow-live --port 9222");
   console.log("  boss-recommend-mcp chat prepare-run --slow-live --port 9222    # CDP-only preflight; start runs through MCP start_boss_chat_run");
   console.log("  boss-recommend-mcp config set --base-url <url> --api-key <key> --model <model> [--thinking-level off|low|medium|high|current] [--greeting-message <text>] [--openai-organization <id>] [--openai-project <id>]");
