@@ -1139,8 +1139,18 @@ function createToolsSchema() {
       inputSchema: createRunInputSchema()
     },
     {
+      name: TOOL_RUN_RECOMMEND,
+      description: "立即通过原生 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名，适合 Trae/Trae-CN 等代理在 prepare_recommend_pipeline_run 返回 READY 后继续正式运行；必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      inputSchema: createRunInputSchema()
+    },
+    {
+      name: TOOL_START_RUN,
+      description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）；prepare_recommend_pipeline_run 返回 READY 后，如果用户要现在运行就调用本工具或 run_recommend。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      inputSchema: createRunInputSchema()
+    },
+    {
       name: TOOL_SCHEDULE_RUN,
-      description: "创建 package-owned Boss 推荐页定时任务：先校验 READY/cron_ready，再保存完整 payload，并由 detached scheduler 到点直接启动，不再依赖 AI harness 自己拼 shell cron。",
+      description: "只用于用户明确要求稍后/cron/定时启动的 package-owned Boss 推荐页定时任务。若用户要现在运行，必须调用 run_recommend 或 start_recommend_pipeline_run，不要用短延迟 schedule 冒充立即启动。schedule 会先校验 READY/cron_ready，再保存完整 payload，并由 detached scheduler 到点直接启动，不依赖 AI harness 自己拼 shell cron。",
       inputSchema: createScheduleRunInputSchema()
     },
     {
@@ -1154,16 +1164,6 @@ function createToolsSchema() {
         required: ["schedule_id"],
         additionalProperties: false
       }
-    },
-    {
-      name: TOOL_RUN_RECOMMEND,
-      description: "立即通过原生 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名，适合 Trae/Trae-CN 等代理在 prepare_recommend_pipeline_run 返回 READY 后继续正式运行；必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/CLI/manual JSON-RPC 代替。",
-      inputSchema: createRunInputSchema()
-    },
-    {
-      name: TOOL_START_RUN,
-      description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）；prepare_recommend_pipeline_run 返回 READY 后，如果用户要现在运行就调用本工具或 run_recommend。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/CLI/manual JSON-RPC 代替。",
-      inputSchema: createRunInputSchema()
     },
     {
       name: TOOL_GET_RUN,

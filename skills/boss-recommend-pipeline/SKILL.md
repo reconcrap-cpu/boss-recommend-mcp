@@ -21,6 +21,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 如果当前会话里已经成功调用过 `boss-recommend/prepare_recommend_pipeline_run`，说明 Trae-CN 已经具备原生 MCP tool call 能力；下一步必须继续调用 `boss-recommend/start_recommend_pipeline_run` 或 `boss-recommend/run_recommend`。
   - `prepare_recommend_pipeline_run` 返回 `READY` 只代表参数校验通过，不代表已经启动；严禁再次调用 prepare 试图启动。
   - 在 Trae-CN、Trae、Codex、Cursor、Claude Code 等普通 MCP 宿主中，严禁用 `run_command`、终端、PowerShell、`npx ... run --detached`、手写 `tools/call` JSON-RPC 或任何 CLI fallback 启动 recommend run。
+  - 用户要“现在启动”时，严禁用 `schedule_recommend_pipeline_run` 加短延迟冒充立即启动；schedule 只用于用户明确要求稍后/cron/定时。
   - 不要说“prepare 覆盖了 MCP run 调用”。正确说法是：prepare 没有启动，下一步是原生 MCP tool call。
 
 - **确认不可代填（强制）**
@@ -105,7 +106,8 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - READY 响应会带 `prepared_only=true`、`run_started=false`、`recommended_next_tool=start_recommend_pipeline_run`、`alternate_next_tool=run_recommend`、`next_action.do_not_call_prepare_again=true`、`agent_guidance.native_mcp_required_after_prepare=true`；必须照这些字段继续，不得再次调用 prepare。
   - 若返回 `NEED_INPUT` / `NEED_CONFIRMATION` / `FAILED`：继续补齐 `pending_questions` 或修复登录/页面/config；不得先创建 cron。
 - Cron 创建工具：`schedule_recommend_pipeline_run`
-  - 用途：保存已经 READY 的完整 payload，并启动 package-owned detached scheduler；到点后由包内 worker 直接调用 `start_recommend_pipeline_run`。
+  - 用途：只在用户明确要求“稍后/cron/定时启动”时保存已经 READY 的完整 payload，并启动 package-owned detached scheduler；到点后由包内 worker 直接调用 `start_recommend_pipeline_run`。
+  - 禁止：用户要“现在启动”时，不得用短延迟 schedule 作为 `run_recommend` / `start_recommend_pipeline_run` 的替代。
   - 必填：同 `start_recommend_pipeline_run` 的完整 payload，另加 `schedule_delay_minutes` / `schedule_delay_seconds` / `schedule_run_at` 之一。
   - 成功标准：必须返回 `status=SCHEDULED`、`schedule_created=true`、`schedule_id`、`run_at`。只有这个返回后，才可以告诉用户定时任务已创建。
 - Cron 查询工具：`get_recommend_scheduled_run`

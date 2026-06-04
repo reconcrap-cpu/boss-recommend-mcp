@@ -194,17 +194,24 @@ async function testToolListIncludesRecommendTools() {
   assert.equal(names.has(TOOL_PAUSE), true);
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has(TOOL_CANCEL), true);
+  const toolOrder = tools.map((tool) => tool.name);
+  assert.equal(toolOrder.indexOf(TOOL_PREPARE) < toolOrder.indexOf(TOOL_RUN_RECOMMEND), true);
+  assert.equal(toolOrder.indexOf(TOOL_PREPARE) < toolOrder.indexOf(TOOL_START), true);
+  assert.equal(toolOrder.indexOf(TOOL_RUN_RECOMMEND) < toolOrder.indexOf(TOOL_SCHEDULE), true);
+  assert.equal(toolOrder.indexOf(TOOL_START) < toolOrder.indexOf(TOOL_SCHEDULE), true);
   const startTool = tools.find((tool) => tool.name === TOOL_START);
   const runRecommendTool = tools.find((tool) => tool.name === TOOL_RUN_RECOMMEND);
   assert.equal(runRecommendTool.description.includes("start_recommend_pipeline_run"), true);
   assert.equal(runRecommendTool.description.includes("原生 MCP"), true);
   assert.equal(runRecommendTool.description.includes("terminal/shell/run_command"), true);
+  assert.equal(runRecommendTool.description.includes("不要用 schedule_recommend_pipeline_run 冒充立即启动"), true);
   assert.equal(runRecommendTool.description.includes("CLI fallback"), false);
   assert.equal(runRecommendTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
   assert.equal(runRecommendTool.inputSchema.properties.human_behavior.properties.restLevel.enum[1], "medium");
   assert.equal(startTool.description.includes("run_recommend"), true);
   assert.equal(startTool.description.includes("原生 MCP"), true);
   assert.equal(startTool.description.includes("terminal/shell/run_command"), true);
+  assert.equal(startTool.description.includes("不要用 schedule_recommend_pipeline_run 冒充立即启动"), true);
   assert.equal(startTool.description.includes("CLI fallback"), false);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
@@ -218,6 +225,8 @@ async function testToolListIncludesRecommendTools() {
   assert.equal(prepareTool.description.includes("CLI fallback"), false);
   assert.deepEqual(prepareTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
   const scheduleTool = tools.find((tool) => tool.name === TOOL_SCHEDULE);
+  assert.equal(scheduleTool.description.includes("只用于用户明确要求稍后/cron/定时启动"), true);
+  assert.equal(scheduleTool.description.includes("不要用短延迟 schedule 冒充立即启动"), true);
   assert.equal(scheduleTool.inputSchema.properties.schedule_delay_minutes.type, "number");
 }
 
