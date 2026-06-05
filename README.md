@@ -225,8 +225,9 @@ node src/cli.js start
 如果检测到 legacy Boss server entries，installer 会：
 
 - 保留非 Boss MCP server。
-- 默认写入统一 server：`boss-recommend -> npx -y @reconcrap/boss-recommend-mcp@<installed-version> start`
-- 如果传入 `--mcp-launch global-wrapper`，写入升级稳定入口：`boss-recommend -> ~/.boss-recommend-mcp/bin/boss-recommend-mcp-mcp-server`。该 wrapper 会加载 `~/.nvm/nvm.sh` 并执行当前全局 `boss-recommend-mcp start`，适合 macOS 上通过 `npm -g i @reconcrap/boss-recommend-mcp@latest` 持续升级。
+- Trae/Trae-CN 默认写入三个小 toolset server：`boss-recommend`（`BOSS_RECOMMEND_MCP_TOOLSET=recommend`）、`boss-chat`（`chat`）、`boss-recruit`（`recruit`）。这样 recommend/chat/search 的 tool list 不会互相挤占 agent 可见工具预算。
+- 其它宿主默认仍写入兼容统一 server：`boss-recommend -> npx -y @reconcrap/boss-recommend-mcp@<installed-version> start`。
+- 如果传入 `--mcp-launch global-wrapper`，Trae/Trae-CN 同样会写入三个 toolset server，但 command 指向升级稳定 wrapper。该 wrapper 会加载 `~/.nvm/nvm.sh` 并执行当前全局 `boss-recommend-mcp start`，适合 macOS 上通过 `npm -g i @reconcrap/boss-recommend-mcp@latest` 持续升级。
 - 从同一个 `mcp.json` 删除旧 `boss-recruit-mcp`、standalone `boss-chat`、旧本地 Boss repo 路径，避免 agent 继续调用 legacy 包。
 - 在原文件旁生成 `mcp.json.boss-mcp-migration-*.bak`。
 - 同步外部 skills 目录里的 `boss-recommend-pipeline`、`boss-recruit-pipeline`、`boss-chat`。
@@ -263,6 +264,7 @@ BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS="/path/to/skills" boss-recommend-mcp install
 BOSS_RECOMMEND_HOME               # 统一状态目录，默认 ~/.boss-recommend-mcp
 BOSS_CHAT_HOME                    # 覆盖 boss-chat 运行态目录；默认 ~/.boss-recommend-mcp/boss-chat
 BOSS_RECOMMEND_SCREEN_CONFIG      # 显式指定 screening-config.json 路径（最高优先级）
+BOSS_RECOMMEND_MCP_TOOLSET        # 可选收窄 MCP 工具：all|recommend|chat|recruit；Trae/Trae-CN installer 会自动设置
 BOSS_RECOMMEND_MCP_CONFIG_TARGETS   # JSON 数组或系统 path 分隔路径列表，指定额外 mcp.json 目标文件
 BOSS_RECOMMEND_EXTERNAL_SKILL_DIRS  # JSON 数组或系统 path 分隔路径列表，指定额外 skills 根目录
 ```

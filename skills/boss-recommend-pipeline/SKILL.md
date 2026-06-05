@@ -97,6 +97,8 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 ## Tool Usage
 
+Trae/Trae-CN split-server config exposes these under the `boss-recommend` MCP server. 推荐页任务应调用 `boss-recommend/<tool>`；不要切到 `boss-chat` 或 `boss-recruit`。
+
 - 岗位发现工具：`list_recommend_jobs`
   - 用途：当用户需要为 cron / 一次性自动任务提前填写完整参数时，先用它读取推荐页岗位下拉框的全部可用岗位名；默认会复用/自动打开本机 9222 Chrome 并导航到推荐页。
   - 输出：优先把 `job_names` 里的值作为后续 `overrides.job` / `confirmation.job_value`。

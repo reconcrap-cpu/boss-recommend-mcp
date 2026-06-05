@@ -11,6 +11,8 @@ description: "Use when users want Boss search/recruit-page screening via the uni
 
 ## Tool Routing
 
+Trae/Trae-CN split-server config exposes these under the `boss-recruit` MCP server. Search/recruit tasks should call `boss-recruit/<tool>` when the host shows server-qualified tool names.
+
 - 同步启动：`run_recruit_pipeline`
 - 异步启动：`start_recruit_pipeline_run`
 - 查询进度：`get_recruit_pipeline_run`

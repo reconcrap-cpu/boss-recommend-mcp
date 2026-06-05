@@ -59,10 +59,13 @@ const bossLoginUrlPattern = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhip
 const bossLoginTitlePattern = /登录|signin|扫码登录|BOSS直聘登录/i;
 const supportedMcpClients = ["generic", "cursor", "trae", "claudecode", "openclaw", "qclaw"];
 const defaultMcpServerName = "boss-recommend";
+const bossChatMcpServerName = "boss-chat";
+const bossRecruitMcpServerName = "boss-recruit";
 const defaultMcpCommand = "npx";
 const recommendMcpPackageName = "@reconcrap/boss-recommend-mcp";
 const recommendMcpBinaryName = "boss-recommend-mcp";
 const globalMcpWrapperFileName = "boss-recommend-mcp-mcp-server";
+const mcpToolsetEnv = "BOSS_RECOMMEND_MCP_TOOLSET";
 const supportedMcpLaunchModes = ["npx", "global-wrapper"];
 const autoSyncSkipCommands = new Set(["install", "install-skill", "where", "help", "--help", "-h", "list-jobs", "jobs", "recommend-jobs"]);
 const externalMcpTargetsEnv = "BOSS_RECOMMEND_MCP_CONFIG_TARGETS";
@@ -810,6 +813,29 @@ function shouldDefaultRecommendDetachedMcpEnv(options = {}) {
     || agent === "qclaw";
 }
 
+function normalizeMcpToolsetOption(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (!raw || raw === "all") return "";
+  if (raw === "boss-recommend" || raw === "recommend-page") return "recommend";
+  if (raw === "boss-chat" || raw === "chat-only" || raw === "chat-page") return "chat";
+  if (raw === "boss-recruit" || raw === "search" || raw === "search-page" || raw === "recruit-page") return "recruit";
+  if (["recommend", "chat", "recruit"].includes(raw)) return raw;
+  throw new Error(`Unsupported --toolset value: ${raw}. Supported: recommend, chat, recruit, all`);
+}
+
+function getMcpToolsetEnv(options = {}) {
+  const toolset = normalizeMcpToolsetOption(options.toolset || options["toolset"]);
+  return toolset ? { [mcpToolsetEnv]: toolset } : {};
+}
+
+function shouldUseSplitBossMcpServers(options = {}) {
+  if (options["server-name"] || options.serverName || options.toolset || options["toolset"]) return false;
+  if (options.split === true || options["split-tools"] === true || options.splitTools === true) return true;
+  const client = normalizeMcpClientName(options.client);
+  const agent = normalizeAgentName(options.agent);
+  return client === "trae" || agent === "trae" || agent === "trae-cn";
+}
+
 function getDefaultMcpEnv(options = {}) {
   return shouldDefaultRecommendDetachedMcpEnv(options)
     ? { ...detachedRecommendMcpEnv }
@@ -834,6 +860,7 @@ function buildMcpLaunchConfig(options = {}) {
     };
     const mergedEnv = {
       ...getDefaultMcpEnv(options),
+      ...getMcpToolsetEnv(options),
       ...(isPlainObject(env) ? env : {})
     };
     if (Object.keys(mergedEnv).length > 0) {
@@ -855,12 +882,29 @@ function buildMcpLaunchConfig(options = {}) {
   const launchConfig = { command, args: launchArgs };
   const mergedEnv = {
     ...getDefaultMcpEnv(options),
+    ...getMcpToolsetEnv(options),
     ...(isPlainObject(env) ? env : {})
   };
   if (Object.keys(mergedEnv).length > 0) {
     launchConfig.env = mergedEnv;
   }
   return launchConfig;
+}
+
+function buildBossMcpServerEntries(options = {}) {
+  if (shouldUseSplitBossMcpServers(options)) {
+    return {
+      [defaultMcpServerName]: buildMcpLaunchConfig({ ...options, toolset: "recommend" }),
+      [bossChatMcpServerName]: buildMcpLaunchConfig({ ...options, toolset: "chat" }),
+      [bossRecruitMcpServerName]: buildMcpLaunchConfig({ ...options, toolset: "recruit" })
+    };
+  }
+  const serverName = typeof options["server-name"] === "string" && options["server-name"].trim()
+    ? options["server-name"].trim()
+    : defaultMcpServerName;
+  return {
+    [serverName]: buildMcpLaunchConfig(options)
+  };
 }
 
 function mergeExistingMcpEntryEnv(existingEntry, launchConfig) {
@@ -877,23 +921,16 @@ function mergeExistingMcpEntryEnv(existingEntry, launchConfig) {
 }
 
 function buildMcpConfigFileContent(options = {}) {
-  const serverName = typeof options["server-name"] === "string" && options["server-name"].trim()
-    ? options["server-name"].trim()
-    : defaultMcpServerName;
-  const launchConfig = buildMcpLaunchConfig(options);
+  const servers = buildBossMcpServerEntries(options);
   if (normalizeMcpClientName(options.client) === "qclaw") {
     return {
       mcp: {
-        servers: {
-          [serverName]: launchConfig
-        }
+        servers
       }
     };
   }
   return {
-    mcpServers: {
-      [serverName]: launchConfig
-    }
+    mcpServers: servers
   };
 }
 
@@ -1044,17 +1081,20 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
   const useQClawShape = isQClawMcpConfigTarget(filePath, options, current);
   const nextConfig = buildMcpConfigFileContent({ ...options, client: useQClawShape ? "qclaw" : options.client });
   const nextServers = useQClawShape ? nextConfig.mcp?.servers : nextConfig.mcpServers;
-  const serverName = Object.keys(nextServers || {})[0] || defaultMcpServerName;
+  const serverNames = Object.keys(nextServers || {});
+  const nextBossServerNames = new Set(serverNames);
   const existingServers = getMcpServersFromConfig(current, useQClawShape);
-  const existingEntry = existingServers[serverName];
-  const launchConfig = mergeExistingMcpEntryEnv(
-    existingEntry,
-    nextServers?.[serverName] || buildMcpLaunchConfig(options)
-  );
+  const mergedBossServers = {};
+  for (const serverName of serverNames) {
+    mergedBossServers[serverName] = mergeExistingMcpEntryEnv(
+      existingServers[serverName],
+      nextServers?.[serverName] || buildMcpLaunchConfig(options)
+    );
+  }
   const retainedServers = {};
   const migratedLegacyServers = [];
   for (const [name, config] of Object.entries(existingServers)) {
-    if (name === serverName) continue;
+    if (nextBossServerNames.has(name)) continue;
     if (isBossMcpServerEntry(name, config)) {
       migratedLegacyServers.push(name);
       continue;
@@ -1068,7 +1108,7 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
           ...(current?.mcp && typeof current.mcp === "object" && !Array.isArray(current.mcp) ? current.mcp : {}),
           servers: {
             ...retainedServers,
-            [serverName]: launchConfig
+            ...mergedBossServers
           }
         }
       }
@@ -1076,7 +1116,7 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
         ...current,
         mcpServers: {
           ...retainedServers,
-          [serverName]: launchConfig
+          ...mergedBossServers
         }
       };
 
@@ -1089,10 +1129,11 @@ function mergeMcpServerConfigFile(filePath, options = {}) {
     fs.writeFileSync(backupFile, before, "utf8");
   }
   fs.writeFileSync(filePath, JSON.stringify(merged, null, 2), "utf8");
-  const updated = before.trim() !== next.trim() || JSON.stringify(existingEntry || null) !== JSON.stringify(launchConfig);
+  const updated = before.trim() !== next.trim();
   return {
     file: filePath,
-    server: serverName,
+    server: serverNames[0] || defaultMcpServerName,
+    servers: serverNames,
     config_shape: useQClawShape ? "qclaw" : "mcpServers",
     updated,
     migrated_legacy_servers: migratedLegacyServers,
@@ -1111,6 +1152,7 @@ function installExternalMcpConfigs(options = {}) {
       applied.push({
         file: target,
         server: merged.server,
+        servers: merged.servers,
         created: !existed,
         updated: merged.updated,
         migrated_legacy_servers: merged.migrated_legacy_servers,
@@ -2718,6 +2760,7 @@ function printHelp() {
   console.log("  boss-recommend-mcp launch-chrome Launch or reuse Chrome debug instance and open Boss recommend page");
   console.log("  boss-recommend-mcp where        Print installed package, skill, and config paths");
   console.log("  boss-recommend-mcp install --mcp-launch global-wrapper  Use ~/.boss-recommend-mcp/bin wrapper so npm global upgrades affect MCP hosts");
+  console.log("  boss-recommend-mcp start --toolset recommend  Start a narrowed MCP server (all|recommend|chat|recruit)");
   console.log("");
   console.log("Run command:");
   console.log("  boss-recommend-mcp prepare-run --instruction \"...\" --overrides-file overrides.json --confirmation-file confirmation.json --rest-level medium");
@@ -3397,6 +3440,7 @@ export const __testables = {
   buildBossChatCliInput,
   buildDefaultMcpArgs,
   buildMcpLaunchConfig,
+  buildMcpConfigFileContent,
   ensureGlobalMcpWrapper,
   getGlobalMcpWrapperPath,
   collectRuntimeDirectories,

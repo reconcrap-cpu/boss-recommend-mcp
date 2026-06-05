@@ -7,7 +7,9 @@ import { __testables } from "./index.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const {
+  createToolsSchema,
   handleRequest,
+  normalizeMcpToolset,
   resetRecommendMcpStateForTests,
   runDetachedWorkerForTests,
   runScheduledRecommendWorkerForTests,
@@ -29,6 +31,9 @@ const TOOL_LIST_RUNS = "list_recommend_pipeline_runs";
 const TOOL_PAUSE = "pause_recommend_pipeline_run";
 const TOOL_RESUME = "resume_recommend_pipeline_run";
 const TOOL_CANCEL = "cancel_recommend_pipeline_run";
+const TOOL_CHAT_START = "start_boss_chat_run";
+const TOOL_CHAT_LIST_JOBS = "list_boss_chat_jobs";
+const TOOL_RECRUIT_START = "start_recruit_pipeline_run";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -69,6 +74,76 @@ async function waitUntil(predicate, timeoutMs = 5000) {
     await sleep(50);
   }
   throw new Error("Timed out waiting for condition");
+}
+
+async function testMcpToolsetFilteringKeepsRecommendSmallAndFirst() {
+  assert.equal(normalizeMcpToolset("boss-recommend"), "recommend");
+  assert.equal(normalizeMcpToolset("chat-only"), "chat");
+  assert.equal(normalizeMcpToolset("search-page"), "recruit");
+  assert.equal(normalizeMcpToolset("unknown"), "all");
+
+  const recommendTools = createToolsSchema("recommend");
+  const recommendNames = recommendTools.map((tool) => tool.name);
+  assert.ok(JSON.stringify(recommendTools).length < 15000);
+  assert.deepEqual(recommendNames, [
+    TOOL_LIST_JOBS,
+    TOOL_RUN_RECOMMEND,
+    TOOL_START,
+    TOOL_PREPARE,
+    TOOL_SCHEDULE,
+    TOOL_GET_SCHEDULE,
+    TOOL_GET,
+    TOOL_LIST_RUNS,
+    TOOL_CANCEL,
+    TOOL_PAUSE,
+    TOOL_RESUME
+  ]);
+  assert.equal(recommendNames.includes(TOOL_CHAT_START), false);
+  assert.equal(recommendNames.includes(TOOL_RECRUIT_START), false);
+
+  const chatNames = createToolsSchema("chat").map((tool) => tool.name);
+  assert.deepEqual(chatNames, [
+    "boss_chat_health_check",
+    TOOL_CHAT_LIST_JOBS,
+    "prepare_boss_chat_run",
+    TOOL_CHAT_START,
+    "get_boss_chat_run",
+    "pause_boss_chat_run",
+    "resume_boss_chat_run",
+    "cancel_boss_chat_run"
+  ]);
+  assert.equal(chatNames.includes(TOOL_START), false);
+
+  const recruitNames = createToolsSchema("recruit").map((tool) => tool.name);
+  assert.deepEqual(recruitNames, [
+    "run_recruit_pipeline",
+    TOOL_RECRUIT_START,
+    "get_recruit_pipeline_run",
+    "cancel_recruit_pipeline_run",
+    "pause_recruit_pipeline_run",
+    "resume_recruit_pipeline_run"
+  ]);
+  assert.equal(recruitNames.includes(TOOL_START), false);
+
+  const previousToolset = process.env.BOSS_RECOMMEND_MCP_TOOLSET;
+  process.env.BOSS_RECOMMEND_MCP_TOOLSET = "chat";
+  try {
+    const response = await handleRequest({
+      jsonrpc: "2.0",
+      id: 1001,
+      method: "tools/list"
+    }, process.cwd());
+    assert.deepEqual(response.result.tools.map((tool) => tool.name), chatNames);
+    const rejected = await handleRequest(makeToolCall(1002, TOOL_START, readyArgs()), process.cwd());
+    assert.equal(rejected.error.code, -32602);
+    assert.match(rejected.error.message, /not available in the chat boss-recommend-mcp toolset/);
+  } finally {
+    if (previousToolset === undefined) {
+      delete process.env.BOSS_RECOMMEND_MCP_TOOLSET;
+    } else {
+      process.env.BOSS_RECOMMEND_MCP_TOOLSET = previousToolset;
+    }
+  }
 }
 
 function readyArgs(extra = {}) {
@@ -1143,9 +1218,17 @@ async function testRecommendListRunsReturnsCompactLatest() {
       pid: process.pid,
       progress: {
         processed: runId === newerId ? 2 : 1,
+        screened: runId === newerId ? 2 : 1,
+        target_count: 50,
+        card_count: 3,
         passed: 0,
         skipped: 0,
-        greet_count: 0
+        greet_count: 0,
+        last_human_event: "large progress should not appear".repeat(200),
+        human_rest_last: {
+          reason: "nested progress detail should not appear",
+          samples: Array.from({ length: 50 }, (_, index) => ({ index, value: "oversized" }))
+        }
       },
       control: {
         pause_requested: true,
@@ -1168,9 +1251,21 @@ async function testRecommendListRunsReturnsCompactLatest() {
   assert.equal(payload.latest_run.run_id, newerId);
   assert.equal(payload.runs[0].run_id, newerId);
   assert.equal(payload.runs[0].result.output_csv, `C:/tmp/${newerId}.csv`);
+  assert.deepEqual(payload.runs[0].progress, {
+    processed: 2,
+    screened: 2,
+    passed: 0,
+    skipped: 0,
+    target_count: 50,
+    card_count: 3,
+    greet_count: 0
+  });
   assert.equal(Object.prototype.hasOwnProperty.call(payload.runs[0].result, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.runs[0], "resume"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(payload.runs[0], "run_state_path"), false);
   assert.equal(JSON.stringify(payload).includes("large payload should not appear"), false);
+  assert.equal(JSON.stringify(payload).includes("large progress should not appear"), false);
+  assert.ok(JSON.stringify(payload).length < 8000);
   assert.equal(payload.message.includes("PowerShell"), true);
 }
 
@@ -1675,6 +1770,7 @@ async function main() {
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
+    await testMcpToolsetFilteringKeepsRecommendSmallAndFirst();
     await testToolListIncludesRecommendTools();
     resetRecommendMcpStateForTests();
     await testRecommendJobListTool();

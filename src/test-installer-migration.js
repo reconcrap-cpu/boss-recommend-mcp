@@ -85,6 +85,64 @@ function testCreatesCanonicalMcpServerWhenFileMissing() {
   ]);
 }
 
+function testTraeConfigUsesSplitToolsets() {
+  const tempDir = makeTempDir();
+  const mcpPath = path.join(tempDir, "mcp.json");
+  fs.writeFileSync(mcpPath, JSON.stringify({
+    mcpServers: {
+      filesystem: {
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "D:/Projects"]
+      },
+      "boss-recommend": {
+        command: "npx",
+        args: ["-y", "@reconcrap/boss-recommend-mcp@2.1.11", "start"],
+        env: {
+          BOSS_WORKSPACE_ROOT: "C:/Users/example"
+        }
+      },
+      "old-boss-chat": {
+        command: "boss-chat",
+        args: ["start"]
+      }
+    }
+  }, null, 2), "utf8");
+
+  const result = __testables.mergeMcpServerConfigFile(mcpPath, {
+    agent: "trae-cn",
+    packageVersion: "2.1.12",
+    packageRootPath: path.join(tempDir, "node_modules", "@reconcrap", "boss-recommend-mcp")
+  });
+  const updated = readJson(mcpPath);
+  const serverNames = Object.keys(updated.mcpServers).sort();
+
+  assert.deepEqual(serverNames, ["boss-chat", "boss-recommend", "boss-recruit", "filesystem"]);
+  assert.deepEqual(result.servers.sort(), ["boss-chat", "boss-recommend", "boss-recruit"]);
+  assert.deepEqual(result.migrated_legacy_servers, ["old-boss-chat"]);
+  assert.deepEqual(updated.mcpServers["boss-recommend"].args, [
+    "-y",
+    "@reconcrap/boss-recommend-mcp@2.1.12",
+    "start"
+  ]);
+  assert.deepEqual(updated.mcpServers["boss-recommend"].env, {
+    BOSS_WORKSPACE_ROOT: "C:/Users/example",
+    BOSS_RECOMMEND_MCP_TOOLSET: "recommend"
+  });
+  assert.deepEqual(updated.mcpServers["boss-chat"].env, {
+    BOSS_RECOMMEND_MCP_TOOLSET: "chat"
+  });
+  assert.deepEqual(updated.mcpServers["boss-recruit"].env, {
+    BOSS_RECOMMEND_MCP_TOOLSET: "recruit"
+  });
+
+  const template = __testables.buildMcpConfigFileContent({
+    client: "trae",
+    packageVersion: "2.1.12"
+  });
+  assert.deepEqual(Object.keys(template.mcpServers).sort(), ["boss-chat", "boss-recommend", "boss-recruit"]);
+  assert.equal(template.mcpServers["boss-recommend"].env.BOSS_RECOMMEND_MCP_TOOLSET, "recommend");
+}
+
 function testMigratesQClawOpenClawConfigShape() {
   const tempDir = makeTempDir();
   const qclawPath = path.join(tempDir, ".qclaw", "openclaw.json");
@@ -316,6 +374,7 @@ function testDetachedRunCliShellFallback() {
 
 testMigratesLegacyMcpServers();
 testCreatesCanonicalMcpServerWhenFileMissing();
+testTraeConfigUsesSplitToolsets();
 testMigratesQClawOpenClawConfigShape();
 testOpenClawConfigPreservesExistingEnvAndEnablesDetached();
 testGlobalWrapperLaunchConfigSupportsNpmGlobalUpgrades();

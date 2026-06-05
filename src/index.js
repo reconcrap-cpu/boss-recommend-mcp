@@ -125,6 +125,48 @@ const TOOL_PAUSE_RECRUIT_PIPELINE_RUN = "pause_recruit_pipeline_run";
 const TOOL_RESUME_RECRUIT_PIPELINE_RUN = "resume_recruit_pipeline_run";
 
 const SERVER_NAME = "boss-recommend-mcp";
+const MCP_TOOLSET_ENV = "BOSS_RECOMMEND_MCP_TOOLSET";
+const MCP_TOOLSET_ALL = "all";
+const MCP_TOOLSET_RECOMMEND = "recommend";
+const MCP_TOOLSET_CHAT = "chat";
+const MCP_TOOLSET_RECRUIT = "recruit";
+const VALID_MCP_TOOLSETS = new Set([
+  MCP_TOOLSET_ALL,
+  MCP_TOOLSET_RECOMMEND,
+  MCP_TOOLSET_CHAT,
+  MCP_TOOLSET_RECRUIT
+]);
+const RECOMMEND_TOOL_NAMES = new Set([
+  TOOL_LIST_RECOMMEND_JOBS,
+  TOOL_RUN_RECOMMEND,
+  TOOL_START_RUN,
+  TOOL_PREPARE_RUN,
+  TOOL_SCHEDULE_RUN,
+  TOOL_GET_SCHEDULED_RUN,
+  TOOL_GET_RUN,
+  TOOL_LIST_RUNS,
+  TOOL_CANCEL_RUN,
+  TOOL_PAUSE_RUN,
+  TOOL_RESUME_RUN
+]);
+const BOSS_CHAT_TOOL_NAMES = new Set([
+  TOOL_BOSS_CHAT_HEALTH_CHECK,
+  TOOL_BOSS_CHAT_LIST_JOBS,
+  TOOL_BOSS_CHAT_PREPARE_RUN,
+  TOOL_BOSS_CHAT_START_RUN,
+  TOOL_BOSS_CHAT_GET_RUN,
+  TOOL_BOSS_CHAT_PAUSE_RUN,
+  TOOL_BOSS_CHAT_RESUME_RUN,
+  TOOL_BOSS_CHAT_CANCEL_RUN
+]);
+const RECRUIT_TOOL_NAMES = new Set([
+  TOOL_RUN_RECRUIT_PIPELINE,
+  TOOL_START_RECRUIT_PIPELINE_RUN,
+  TOOL_GET_RECRUIT_PIPELINE_RUN,
+  TOOL_CANCEL_RECRUIT_PIPELINE_RUN,
+  TOOL_PAUSE_RECRUIT_PIPELINE_RUN,
+  TOOL_RESUME_RECRUIT_PIPELINE_RUN
+]);
 const FRAMING_UNKNOWN = "unknown";
 const FRAMING_HEADER = "header";
 const FRAMING_LINE = "line";
@@ -454,6 +496,26 @@ function readRawRunState(runId) {
   }
 }
 
+function compactProgressForList(progress = {}) {
+  const compact = {};
+  for (const key of [
+    "processed",
+    "screened",
+    "passed",
+    "skipped",
+    "target_count",
+    "card_count",
+    "detail_opened",
+    "greet_count",
+    "post_action_clicked"
+  ]) {
+    if (Number.isFinite(progress?.[key])) {
+      compact[key] = progress[key];
+    }
+  }
+  return compact;
+}
+
 function getRunSortTime(run = {}, fallbackMs = 0) {
   for (const key of ["updated_at", "heartbeat_at", "completed_at", "started_at", "updatedAt", "completedAt", "startedAt"]) {
     const ms = Date.parse(run?.[key] || "");
@@ -477,7 +539,7 @@ function compactRunForList(run = {}) {
     heartbeat_at: run.heartbeat_at || null,
     completed_at: run.completed_at || run.completedAt || null,
     pid: Number.isInteger(run.pid) && run.pid > 0 ? run.pid : null,
-    progress: run.progress || {},
+    progress: compactProgressForList(run.progress),
     last_message: normalizeText(run.last_message || error?.message || ""),
     control: {
       pause_requested: run.control?.pause_requested === true,
@@ -494,11 +556,10 @@ function compactRunForList(run = {}) {
       report_json: normalizeText(result.report_json || result.result?.report_json || ""),
       checkpoint_path: normalizeText(result.checkpoint_path || result.result?.checkpoint_path || "")
     } : null,
-    resume: {
-      checkpoint_path: normalizeText(run.resume?.checkpoint_path || ""),
-      output_csv: normalizeText(run.resume?.output_csv || ""),
-      worker_stdout_path: normalizeText(run.resume?.worker_stdout_path || ""),
-      worker_stderr_path: normalizeText(run.resume?.worker_stderr_path || "")
+    artifacts: {
+      output_csv: normalizeText(result?.output_csv || result?.result?.output_csv || ""),
+      report_json: normalizeText(result?.report_json || result?.result?.report_json || ""),
+      checkpoint_path: normalizeText(result?.checkpoint_path || result?.result?.checkpoint_path || "")
     }
   };
 }
@@ -1294,8 +1355,154 @@ function createScheduleRunInputSchema() {
   };
 }
 
-function createToolsSchema() {
-  return [
+function createCompactRunInputSchema() {
+  const targetCountSchema = {
+    anyOf: [
+      { type: "integer", minimum: 0 },
+      { type: "string" }
+    ],
+    description: "目标通过人数；扫到底/不限可传 all"
+  };
+  return {
+    type: "object",
+    properties: {
+      instruction: {
+        type: "string",
+        description: "用户原始筛选标准/任务说明；正式启动时逐字复用"
+      },
+      confirmation: {
+        type: "object",
+        properties: {
+          final_confirmed: {
+            type: "boolean",
+            description: "用户完成总确认后传 true"
+          }
+        },
+        additionalProperties: true
+      },
+      overrides: {
+        type: "object",
+        properties: {
+          page_scope: { type: "string", enum: ["recommend", "latest", "featured"] },
+          school_tag: {
+            anyOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } }
+            ]
+          },
+          degree: {
+            anyOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" } }
+            ]
+          },
+          gender: { type: "string" },
+          recent_not_view: { type: "string" },
+          criteria: { type: "string" },
+          target_count: targetCountSchema,
+          post_action: { type: "string", enum: ["greet", "none"] },
+          max_greet_count: targetCountSchema,
+          job: { type: "string" }
+        },
+        additionalProperties: true
+      },
+      human_behavior: {
+        type: "object",
+        properties: {
+          restLevel: { type: "string", enum: ["low", "medium", "high"] },
+          rest_level: { type: "string", enum: ["low", "medium", "high"] }
+        },
+        additionalProperties: true
+      },
+      host: { type: "string" },
+      port: { type: "integer", minimum: 1 },
+      slow_live: { type: "boolean" },
+      delay_ms: { type: "integer", minimum: 0 },
+      detail_limit: { type: "integer", minimum: 0 },
+      execute_post_action: { type: "boolean" },
+      no_filter: { type: "boolean" },
+      dry_run: { type: "boolean" }
+    },
+    required: ["instruction"],
+    additionalProperties: true
+  };
+}
+
+function createCompactScheduleRunInputSchema() {
+  const base = createCompactRunInputSchema();
+  return {
+    ...base,
+    properties: {
+      ...base.properties,
+      schedule_id: {
+        type: "string",
+        description: "可选，自定义定时任务 id；默认自动生成"
+      },
+      schedule_run_at: {
+        type: "string",
+        description: "ISO 时间字符串"
+      },
+      schedule_delay_minutes: {
+        type: "number",
+        minimum: 0
+      },
+      schedule_delay_seconds: {
+        type: "number",
+        minimum: 0
+      }
+    }
+  };
+}
+
+function normalizeMcpToolset(value) {
+  const raw = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (!raw) return MCP_TOOLSET_ALL;
+  if (raw === "boss-recommend" || raw === "recommend-page" || raw === "recommended") return MCP_TOOLSET_RECOMMEND;
+  if (raw === "boss-chat" || raw === "chat-only" || raw === "chat-page") return MCP_TOOLSET_CHAT;
+  if (raw === "boss-recruit" || raw === "search" || raw === "search-page" || raw === "recruit-page") return MCP_TOOLSET_RECRUIT;
+  return VALID_MCP_TOOLSETS.has(raw) ? raw : MCP_TOOLSET_ALL;
+}
+
+function getConfiguredMcpToolset(argv = process.argv, env = process.env) {
+  const args = Array.isArray(argv) ? argv.slice(2) : [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = String(args[index] || "");
+    if (arg === "--toolset" || arg === "--tools") {
+      return normalizeMcpToolset(args[index + 1]);
+    }
+    if (arg.startsWith("--toolset=")) {
+      return normalizeMcpToolset(arg.slice("--toolset=".length));
+    }
+    if (arg.startsWith("--tools=")) {
+      return normalizeMcpToolset(arg.slice("--tools=".length));
+    }
+  }
+  return normalizeMcpToolset(env?.[MCP_TOOLSET_ENV]);
+}
+
+function toolNamesForMcpToolset(toolset) {
+  const normalized = normalizeMcpToolset(toolset);
+  if (normalized === MCP_TOOLSET_RECOMMEND) return RECOMMEND_TOOL_NAMES;
+  if (normalized === MCP_TOOLSET_CHAT) return BOSS_CHAT_TOOL_NAMES;
+  if (normalized === MCP_TOOLSET_RECRUIT) return RECRUIT_TOOL_NAMES;
+  return null;
+}
+
+function filterToolsForMcpToolset(tools, toolset = getConfiguredMcpToolset()) {
+  const names = toolNamesForMcpToolset(toolset);
+  if (!names) return tools;
+  return tools.filter((tool) => names.has(tool.name));
+}
+
+function createToolsSchema(toolset = getConfiguredMcpToolset()) {
+  const normalizedToolset = normalizeMcpToolset(toolset);
+  const runInputSchema = normalizedToolset === MCP_TOOLSET_RECOMMEND
+    ? createCompactRunInputSchema()
+    : createRunInputSchema();
+  const scheduleRunInputSchema = normalizedToolset === MCP_TOOLSET_RECOMMEND
+    ? createCompactScheduleRunInputSchema()
+    : createScheduleRunInputSchema();
+  const tools = [
     {
       name: TOOL_BOSS_CHAT_HEALTH_CHECK,
       description: "Boss 聊天页/chat-only 健康检查。chat-only、未读、全部聊天、求简历等任务必须先走 boss-chat 工具，不要调用 list_recommend_jobs 或 start_recommend_pipeline_run。",
@@ -1402,22 +1609,22 @@ function createToolsSchema() {
     {
       name: TOOL_RUN_RECOMMEND,
       description: "立即通过原生 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名；用户已经确认并要现在启动时，优先调用本工具，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
-      inputSchema: createRunInputSchema()
+      inputSchema: runInputSchema
     },
     {
       name: TOOL_START_RUN,
       description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）。用户已经确认并要现在启动时，优先调用本工具或 run_recommend，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
-      inputSchema: createRunInputSchema()
+      inputSchema: runInputSchema
     },
     {
       name: TOOL_PREPARE_RUN,
       description: "只校验 Boss 推荐页流水线参数是否完整；不会启动筛选任务。主要用于显式预检或稍后/cron/定时启动前校验。若用户要现在运行，READY/cron_ready=true 后必须继续调用本 MCP server 的 run_recommend 或 start_recommend_pipeline_run；prepare 能返回结果就证明原生 MCP 可用，禁止改用 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC，也禁止再次调用 prepare 试图启动。",
-      inputSchema: createRunInputSchema()
+      inputSchema: runInputSchema
     },
     {
       name: TOOL_SCHEDULE_RUN,
       description: "只用于用户明确要求稍后/cron/定时启动的 package-owned Boss 推荐页定时任务。若用户要现在运行，必须调用 run_recommend 或 start_recommend_pipeline_run，不要用短延迟 schedule 冒充立即启动。schedule 会先校验 READY/cron_ready，再保存完整 payload，并由 detached scheduler 到点直接启动，不依赖 AI harness 自己拼 shell cron。",
-      inputSchema: createScheduleRunInputSchema()
+      inputSchema: scheduleRunInputSchema
     },
     {
       name: TOOL_GET_SCHEDULED_RUN,
@@ -1558,6 +1765,7 @@ function createToolsSchema() {
       inputSchema: createRecruitRunIdInputSchema()
     }
   ];
+  return filterToolsForMcpToolset(tools, toolset);
 }
 
 function createToolResultResponse(id, payload, isError = false) {
@@ -2862,6 +3070,15 @@ async function handleRequest(message, workspaceRoot) {
   if (method === "tools/call") {
     const toolName = params?.name;
     const args = params?.arguments || {};
+    const toolset = getConfiguredMcpToolset();
+    const visibleToolNames = new Set(createToolsSchema(toolset).map((tool) => tool.name));
+    if (!visibleToolNames.has(toolName)) {
+      return createJsonRpcError(
+        id,
+        -32602,
+        `Tool ${toolName || ""} is not available in the ${toolset} boss-recommend-mcp toolset. Use the MCP server/toolset that exposes this domain instead of terminal or CLI fallback.`
+      );
+    }
 
     if ([TOOL_RUN_RECOMMEND, TOOL_START_RUN].includes(toolName)) {
       const inputError = validateRunArgs(args);
@@ -3105,6 +3322,9 @@ export function startServer() {
 }
 
 export const __testables = {
+  createToolsSchema,
+  getConfiguredMcpToolset,
+  normalizeMcpToolset,
   handleRequest,
   runDetachedWorkerForTests(options = {}) {
     return runDetachedWorker(options);

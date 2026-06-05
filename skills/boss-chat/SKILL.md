@@ -13,6 +13,8 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 
 ## Tool Routing
 
+Trae/Trae-CN split-server config exposes these under the `boss-chat` MCP server. Chat-only tasks should call `boss-chat/<tool>` when the host shows server-qualified tool names.
+
 - 健康检查：`boss_chat_health_check`
 - 只读获取聊天页岗位列表：`list_boss_chat_jobs`
 - 预备并获取岗位列表：`prepare_boss_chat_run`
