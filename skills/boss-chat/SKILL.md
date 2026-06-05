@@ -14,6 +14,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 ## Tool Routing
 
 - 健康检查：`boss_chat_health_check`
+- 只读获取聊天页岗位列表：`list_boss_chat_jobs`
 - 预备并获取岗位列表：`prepare_boss_chat_run`
 - 启动异步任务：`start_boss_chat_run`
 - 查询进度：`get_boss_chat_run`
@@ -69,6 +70,8 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - 若本机找不到 Chrome，可提示用户设置 `BOSS_MCP_CHROME_PATH` 或 `BOSS_RECOMMEND_CHROME_PATH`；非本机 debug host 不自动启动。
 - `job` / `start_from` / `criteria` 缺一不可；缺参时只补缺口。
 - `target_count` 在 chat-only 启动前也是必填项，不能默认省略。
+- chat-only 岗位列表只能通过 `list_boss_chat_jobs` 或 `prepare_boss_chat_run` 获取；严禁调用 `list_recommend_jobs`，因为它会切到推荐页。
+- chat-only 启动只能调用 `start_boss_chat_run`；严禁调用 `run_recommend` 或 `start_recommend_pipeline_run`。
 - 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
 - 当用户说“全部候选人/所有候选人”时，必须按“扫到底（unlimited）”处理，不要再追问正整数。
 - 参数名必须写 `target_count`（不要写“目标数量”等中文键名）。
@@ -77,7 +80,7 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 - 若工具或提问选项里出现“扫到底（必须传 `target_count=\"all\"`）”之类字样，下一次工具调用时必须直接照抄这个字面量，不要只保留“扫到底”语义。
 - 禁止 agent 自行补全 `job/start_from/criteria` 并直接执行，必须由用户明确给出或确认。
 - chat-only 启动流程必须先进入聊天页并拉取岗位列表，再让用户从列表中选择 `job`。
-- 必须先用空参调用 `prepare_boss_chat_run` 获取 `job_options`；不要用 `start_boss_chat_run` 做预备调用。
+- 必须先用空参调用 `list_boss_chat_jobs` 或 `prepare_boss_chat_run` 获取 `job_options`；不要用 `start_boss_chat_run` 做预备调用。
 - `start_boss_chat_run` 只能用于真正启动，必须一次性传齐 `job` / `start_from` / `target_count` / `criteria`。
 - 若 `start_boss_chat_run` 返回 `NEED_INPUT` 且 `missing_fields` 包含 `target_count`，说明你没有把用户选择写入工具参数；下一次调用必须照 `next_call_example` 原样补上 `"target_count": "all"` 或正整数，不要重复空调用。
 - 默认不自动轮询；只有用户要求查进度时才调用 `get_boss_chat_run`。
@@ -96,6 +99,6 @@ description: "Use when users want Boss chat-page screening/outreach via the bund
 ## Response Style
 
 - 用结构化中文。
-- 首轮建议先调用一次 `prepare_boss_chat_run`（可空参）获取 `job_options` 与 `pending_questions`。
+- 首轮建议先调用一次 `list_boss_chat_jobs`（可空参）或 `prepare_boss_chat_run`（可空参）获取 `job_options` 与 `pending_questions`。
 - 缺参时必须逐项确认：`job`（来自岗位列表）、`start_from`（`unread|all`）、`target_count`、`criteria`、`rest_level`。
 - 若健康检查失败，明确提示共享配置文件 `screening-config.json` 不可用。

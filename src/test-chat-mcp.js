@@ -14,6 +14,7 @@ const {
   setChatMcpWorkflowForTests
 } = __testables;
 
+const TOOL_LIST_CHAT_JOBS = "list_boss_chat_jobs";
 const TOOL_PREPARE = "prepare_boss_chat_run";
 const TOOL_HEALTH = "boss_chat_health_check";
 const TOOL_START = "start_boss_chat_run";
@@ -21,6 +22,8 @@ const TOOL_GET = "get_boss_chat_run";
 const TOOL_PAUSE = "pause_boss_chat_run";
 const TOOL_RESUME = "resume_boss_chat_run";
 const TOOL_CANCEL = "cancel_boss_chat_run";
+const TOOL_LIST_RECOMMEND_JOBS = "list_recommend_jobs";
+const TOOL_START_RECOMMEND = "start_recommend_pipeline_run";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -108,13 +111,22 @@ async function testToolListIncludesChatTools() {
   const tools = response?.result?.tools || [];
   const names = new Set(tools.map((tool) => tool.name));
   assert.equal(names.has(TOOL_HEALTH), true);
+  assert.equal(names.has(TOOL_LIST_CHAT_JOBS), true);
   assert.equal(names.has(TOOL_PREPARE), true);
   assert.equal(names.has(TOOL_START), true);
   assert.equal(names.has(TOOL_GET), true);
   assert.equal(names.has(TOOL_PAUSE), true);
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has(TOOL_CANCEL), true);
+  const toolOrder = tools.map((tool) => tool.name);
+  assert.equal(toolOrder.indexOf(TOOL_LIST_CHAT_JOBS) < toolOrder.indexOf(TOOL_LIST_RECOMMEND_JOBS), true);
+  assert.equal(toolOrder.indexOf(TOOL_PREPARE) < toolOrder.indexOf(TOOL_LIST_RECOMMEND_JOBS), true);
+  assert.equal(toolOrder.indexOf(TOOL_START) < toolOrder.indexOf(TOOL_START_RECOMMEND), true);
+  const listChatJobsTool = tools.find((tool) => tool.name === TOOL_LIST_CHAT_JOBS);
   const startTool = tools.find((tool) => tool.name === TOOL_START);
+  assert.equal(listChatJobsTool.description.includes("prepare_boss_chat_run"), true);
+  assert.equal(listChatJobsTool.description.includes("list_recommend_jobs"), true);
+  assert.equal(startTool.description.includes("start_recommend_pipeline_run"), true);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
 }
@@ -162,6 +174,49 @@ async function testChatPrepareReadsJobOptions() {
   assert.equal(payload.job_options.length, 2);
   assert.equal(payload.pending_questions.find((question) => question.field === "job").options.length, 2);
   assert.equal(payload.method_summary["DOM.getDocument"], 1);
+}
+
+async function testChatJobListAliasReadsJobOptions() {
+  let connectorCalled = false;
+  setChatMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    return {
+      client: { guarded: true },
+      target: {
+        id: "fake-chat-target",
+        url: "https://www.zhipin.com/web/chat/index",
+        type: "page"
+      },
+      methodLog: [
+        { method: "DOM.getDocument", at: new Date().toISOString() }
+      ],
+      navigation: {
+        navigated: false,
+        url: "https://www.zhipin.com/web/chat/index"
+      },
+      health: {
+        status: "healthy"
+      },
+      async close() {}
+    };
+  });
+  setChatMcpJobReaderForTests(async () => ({
+    selector: ".chat-job .ui-dropmenu-list li",
+    source: "chat-job-list",
+    selected_label: "全部职位",
+    job_options: [
+      { index: 1, label: "全部职位", value: "-1", active: true, is_all: true },
+      { index: 2, label: "海外用户增长运营专家（AI产品） _ 上海 25-45K", value: "job-1", active: false, is_all: false }
+    ]
+  }));
+
+  const payload = await callTool(TOOL_LIST_CHAT_JOBS, {}, 22_1);
+  assert.equal(connectorCalled, true);
+  assert.equal(payload.status, "NEED_INPUT");
+  assert.equal(payload.stage, "chat_run_setup");
+  assert.equal(payload.page_url, "https://www.zhipin.com/web/chat/index");
+  assert.equal(payload.job_options.length, 2);
+  assert.equal(payload.message.includes("Boss 聊天页岗位列表"), true);
 }
 
 async function testChatHealthCheckUsesCdpRoute() {
@@ -598,6 +653,8 @@ async function main() {
     await testChatHealthCheckUsesCdpRoute();
     resetChatMcpStateForTests();
     await testChatPrepareReadsJobOptions();
+    resetChatMcpStateForTests();
+    await testChatJobListAliasReadsJobOptions();
     resetChatMcpStateForTests();
     await testChatNeedInputDoesNotConnect();
     resetChatMcpStateForTests();

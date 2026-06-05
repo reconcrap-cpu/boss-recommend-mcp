@@ -79,6 +79,112 @@ function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function collectRecommendRouteText(args = {}) {
+  return normalizeText([
+    args.instruction,
+    args.criteria,
+    args.target_url_includes,
+    args.page_scope,
+    args.confirmation?.page_value,
+    args.confirmation?.job_value,
+    args.overrides?.criteria,
+    args.overrides?.page_scope,
+    args.overrides?.job,
+    args.overrides?.target_url_includes
+  ].filter((value) => value !== undefined && value !== null).join(" "));
+}
+
+function findRouteSignals(text, patterns = []) {
+  const signals = [];
+  for (const { label, pattern } of patterns) {
+    if (pattern.test(text)) signals.push(label);
+  }
+  return signals;
+}
+
+function detectNonRecommendRoute(args = {}) {
+  const text = collectRecommendRouteText(args);
+  if (!text) return null;
+  const chatSignals = findRouteSignals(text, [
+    { label: "chat-only", pattern: /\bchat[-\s]?only\b/i },
+    { label: "boss-chat", pattern: /\bboss[-\s]?chat\b/i },
+    { label: "chat page", pattern: /\bchat\s+page\b/i },
+    { label: "chat/index", pattern: /(?:\/web\/chat\/index|chat\/index)/i },
+    { label: "聊天页", pattern: /聊天页/ },
+    { label: "聊天列表", pattern: /聊天列表/ },
+    { label: "未读", pattern: /未读/ },
+    { label: "全部聊天", pattern: /全部聊天|所有聊天/ },
+    { label: "求简历", pattern: /求简历|索要简历|要简历|在线简历/ }
+  ]);
+  if (chatSignals.length) {
+    return {
+      domain: "chat",
+      signals: chatSignals,
+      text
+    };
+  }
+  const searchSignals = findRouteSignals(text, [
+    { label: "search-only", pattern: /\bsearch[-\s]?only\b/i },
+    { label: "search page", pattern: /\bsearch\s+page\b/i },
+    { label: "recruit pipeline", pattern: /\brecruit\s+pipeline\b/i },
+    { label: "chat/search", pattern: /(?:\/web\/chat\/search|chat\/search)/i },
+    { label: "搜索页", pattern: /搜索页/ },
+    { label: "招聘搜索", pattern: /招聘搜索/ }
+  ]);
+  if (searchSignals.length) {
+    return {
+      domain: "search",
+      signals: searchSignals,
+      text
+    };
+  }
+  return null;
+}
+
+function buildWrongRecommendRouteResponse(route) {
+  if (route?.domain === "chat") {
+    return {
+      status: "FAILED",
+      route_guard: true,
+      error: {
+        code: "WRONG_BOSS_TOOL_FOR_CHAT",
+        message: "This request is explicitly chat-only/chat-page work. Do not use recommend tools. Use boss_chat_health_check, then list_boss_chat_jobs or prepare_boss_chat_run, then start_boss_chat_run.",
+        retryable: false
+      },
+      detected_domain: "chat",
+      detected_signals: route.signals || [],
+      recommended_tool_sequence: [
+        "boss_chat_health_check",
+        "list_boss_chat_jobs",
+        "prepare_boss_chat_run",
+        "start_boss_chat_run"
+      ]
+    };
+  }
+  if (route?.domain === "search") {
+    return {
+      status: "FAILED",
+      route_guard: true,
+      error: {
+        code: "WRONG_BOSS_TOOL_FOR_SEARCH",
+        message: "This request is explicitly search/recruit-page work. Do not use recommend tools. Use run_recruit_pipeline or start_recruit_pipeline_run.",
+        retryable: false
+      },
+      detected_domain: "search",
+      detected_signals: route.signals || [],
+      recommended_tool_sequence: [
+        "run_recruit_pipeline",
+        "start_recruit_pipeline_run"
+      ]
+    };
+  }
+  return null;
+}
+
+function guardRecommendRoute(args = {}) {
+  return buildWrongRecommendRouteResponse(detectNonRecommendRoute(args));
+}
+
 function parsePositiveInteger(raw, fallback) {
   const parsed = Number.parseInt(String(raw || ""), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -856,6 +962,14 @@ async function readRecommendJobOptionsFromSession(session) {
 }
 
 export async function listRecommendJobsTool({ workspaceRoot = "", args = {} } = {}) {
+  const routeGuard = guardRecommendRoute(args);
+  if (routeGuard) {
+    return {
+      ...routeGuard,
+      stage: "recommend_job_list",
+      message: "list_recommend_jobs is recommend-page only. For chat-only job lists, call list_boss_chat_jobs or prepare_boss_chat_run."
+    };
+  }
   const configResolution = resolveBossScreeningConfig(workspaceRoot);
   const host = normalizeText(args.host) || DEFAULT_RECOMMEND_HOST;
   const port = parsePositiveInteger(
@@ -1478,6 +1592,8 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
 }
 
 function prepareRecommendPipelineStart(args = {}, { workspaceRoot = "" } = {}) {
+  const routeGuard = guardRecommendRoute(args);
+  if (routeGuard) return { response: routeGuard };
   const parsed = parseRecommendPipelineRequest(args);
   const gate = evaluateRecommendPipelineGate(parsed, args);
   if (gate) return { response: gate };

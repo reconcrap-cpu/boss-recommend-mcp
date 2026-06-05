@@ -16,7 +16,7 @@ Please run a Boss chat-only task (do not switch to recommend flow).
 
 Execution order:
 1) Call boss_chat_health_check.
-2) Call prepare_boss_chat_run once (empty params allowed) to fetch job_options and missing fields.
+2) Call list_boss_chat_jobs once (empty params allowed), or prepare_boss_chat_run once, to fetch job_options and missing fields.
 3) Ask for these required fields in one shot: job, start_from (unread/all), target_count, criteria, rest_level (low/medium/high).
 4) After user reply, call start_boss_chat_run exactly once to start the run.
 5) If ACCEPTED, reply only with run_id and "task started"; no auto polling.
@@ -24,6 +24,8 @@ Execution order:
 Anti-loop rules:
 - Do not repeat the same sentence across turns.
 - On validation errors, list all missing/invalid fields once.
+- Do not call list_recommend_jobs for chat-only tasks; it is recommend-page only and will switch the browser to /web/chat/recommend.
+- Do not call run_recommend or start_recommend_pipeline_run for chat-only tasks; use start_boss_chat_run.
 - Do not use start_boss_chat_run for preflight. It is only for the final start call and must include job/start_from/target_count/criteria.
 - Do not call start_boss_chat_run repeatedly in one turn.
 - Do not call get_boss_chat_run unless user explicitly asks for progress.

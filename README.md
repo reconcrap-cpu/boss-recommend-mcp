@@ -100,6 +100,7 @@ MCP 工具：
 - `resume_recruit_pipeline_run`
 - `cancel_recruit_pipeline_run`
 - `boss_chat_health_check`
+- `list_boss_chat_jobs`（只读读取聊天页岗位列表；chat-only 获取 `job_options` 的首选别名，不会启动任务）
 - `prepare_boss_chat_run`
 - `start_boss_chat_run`
 - `get_boss_chat_run`
@@ -424,7 +425,7 @@ node src/cli.js chat prepare-run --slow-live --port 9222
 - `baseUrl` / `apiKey` / `model` 不再单独传入，固定复用 recommend 的 `screening-config.json`
 - `greeting_text` 默认优先级：本次显式值 > `screening-config.json.greetingMessage` > 内置默认招呼语（`Hi同学，能麻烦发下简历吗？`）
 - 若缺少 `follow_up.chat` 必填项，pipeline 会返回 `NEED_INPUT`
-- 如需聊天页筛选，请调用 `prepare_boss_chat_run` 获取岗位列表，再调用 `start_boss_chat_run`。
+- 如需聊天页筛选，请调用 `list_boss_chat_jobs` 或 `prepare_boss_chat_run` 获取岗位列表，再调用 `start_boss_chat_run`。chat-only、未读、全部聊天、求简历任务不要调用 `list_recommend_jobs` / `run_recommend` / `start_recommend_pipeline_run`；这些 recommend 工具会对明确的 chat/search 误路由 fail closed。
 - `boss-chat` 状态统一写入 `~/.boss-recommend-mcp/boss-chat`（或 `BOSS_CHAT_HOME` 指定目录），不再依赖工作区 `cwd`
 
 ## Chat-only
@@ -438,6 +439,7 @@ node src/cli.js chat prepare-run --slow-live --port 9222
   - `boss-recommend-mcp chat get-run|pause-run|resume-run|cancel-run`
 - MCP：
   - `boss_chat_health_check`
+  - `list_boss_chat_jobs`
   - `prepare_boss_chat_run`
   - `start_boss_chat_run`
   - `get_boss_chat_run`
@@ -450,14 +452,15 @@ node src/cli.js chat prepare-run --slow-live --port 9222
 
 chat-only 交互建议：
 
-- 先调用一次 `prepare_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
+- 先调用一次 `list_boss_chat_jobs` 或 `prepare_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
 - 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count`、`criteria` 后调用 `start_boss_chat_run` 启动任务。
 - `greeting_text` 可选；未传时使用 `screening-config.json.greetingMessage`，若未配置则使用默认招呼语（`Hi同学，能麻烦发下简历吗？`）。
 - `target_count` 支持正整数、`all`、`-1`；若用户给出 `全部候选人` / `所有候选人`，会自动按不限（扫到底）处理。
 
 Trae-CN / 长对话防循环建议：
 
-- 固定流程：`boss_chat_health_check` -> `prepare_boss_chat_run(空参可)` -> 一次性补齐 `job/start_from/target_count/criteria` -> `start_boss_chat_run`。
+- 固定流程：`boss_chat_health_check` -> `list_boss_chat_jobs(空参可)` / `prepare_boss_chat_run(空参可)` -> 一次性补齐 `job/start_from/target_count/criteria` -> `start_boss_chat_run`。
+- chat-only 场景严禁调用 `list_recommend_jobs`、`run_recommend` 或 `start_recommend_pipeline_run`。
 - `start_boss_chat_run` 的工具 schema 已把 `job/start_from/target_count/criteria` 标记为必填；不要用它获取岗位列表。
 - 若 `pending_questions` / UI 选项里出现“扫到底（必须传 `target_count="all"`）”，下一次工具调用请直接照抄 `"target_count": "all"`，不要只保留“扫到底”这层自然语言语义。
 - `start_boss_chat_run` 返回 `ACCEPTED` 后直接结束当前回合，不要自动轮询。

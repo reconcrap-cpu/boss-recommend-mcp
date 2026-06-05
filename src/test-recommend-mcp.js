@@ -346,6 +346,63 @@ async function testRecommendPrepareGateBeforeBrowserConnect() {
   assert.equal(connectorCalled, false);
 }
 
+async function testRecommendToolsRejectChatOnlyMisrouteBeforeBrowserConnect() {
+  let connectorCalled = false;
+  setRecommendMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("chat-only misroutes must not connect to recommend page");
+  });
+  const started = await callTool(TOOL_START, {
+    instruction: "Chat-only 任务"
+  }, 3_1);
+  assert.equal(started.status, "FAILED");
+  assert.equal(started.route_guard, true);
+  assert.equal(started.error.code, "WRONG_BOSS_TOOL_FOR_CHAT");
+  assert.equal(started.detected_domain, "chat");
+  assert.equal(started.recommended_tool_sequence.includes("prepare_boss_chat_run"), true);
+
+  const prepared = await callTool(TOOL_PREPARE, {
+    instruction: "Chat-only 筛选「海外用户增长运营专家（AI产品） _ 上海」岗位的未读候选人"
+  }, 3_2);
+  assert.equal(prepared.status, "FAILED");
+  assert.equal(prepared.cron_ready, false);
+  assert.equal(prepared.error.code, "WRONG_BOSS_TOOL_FOR_CHAT");
+  assert.equal(connectorCalled, false);
+}
+
+async function testRecommendToolsRejectSearchMisrouteBeforeBrowserConnect() {
+  let connectorCalled = false;
+  setRecommendMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("search misroutes must not connect to recommend page");
+  });
+  const payload = await callTool(TOOL_START, {
+    instruction: "请在 Boss 搜索页筛选算法工程师候选人"
+  }, 3_3);
+  assert.equal(payload.status, "FAILED");
+  assert.equal(payload.route_guard, true);
+  assert.equal(payload.error.code, "WRONG_BOSS_TOOL_FOR_SEARCH");
+  assert.equal(payload.detected_domain, "search");
+  assert.equal(payload.recommended_tool_sequence.includes("start_recruit_pipeline_run"), true);
+  assert.equal(connectorCalled, false);
+}
+
+async function testRecommendJobListRejectsExplicitChatTarget() {
+  let connectorCalled = false;
+  setRecommendMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("chat target misroutes must not navigate to recommend page");
+  });
+  const payload = await callTool(TOOL_LIST_JOBS, {
+    target_url_includes: "https://www.zhipin.com/web/chat/index"
+  }, 3_4);
+  assert.equal(payload.status, "FAILED");
+  assert.equal(payload.route_guard, true);
+  assert.equal(payload.stage, "recommend_job_list");
+  assert.equal(payload.error.code, "WRONG_BOSS_TOOL_FOR_CHAT");
+  assert.equal(connectorCalled, false);
+}
+
 async function testRecommendPrepareReadyDoesNotStartRun() {
   let connectorCalled = false;
   setRecommendMcpConnectorForTests(async () => {
@@ -1626,6 +1683,12 @@ async function main() {
     await testRecommendGateBeforeBrowserConnect();
     resetRecommendMcpStateForTests();
     await testRecommendPrepareGateBeforeBrowserConnect();
+    resetRecommendMcpStateForTests();
+    await testRecommendToolsRejectChatOnlyMisrouteBeforeBrowserConnect();
+    resetRecommendMcpStateForTests();
+    await testRecommendToolsRejectSearchMisrouteBeforeBrowserConnect();
+    resetRecommendMcpStateForTests();
+    await testRecommendJobListRejectsExplicitChatTarget();
     resetRecommendMcpStateForTests();
     await testRecommendPrepareReadyDoesNotStartRun();
     resetRecommendMcpStateForTests();

@@ -110,6 +110,7 @@ const TOOL_RUN_FEATURED_CALIBRATION = "run_featured_calibration";
 const TOOL_GET_FEATURED_CALIBRATION_STATUS = "get_featured_calibration_status";
 const TOOL_RUN_RECOMMEND_SELF_HEAL = "run_recommend_self_heal";
 const TOOL_BOSS_CHAT_HEALTH_CHECK = "boss_chat_health_check";
+const TOOL_BOSS_CHAT_LIST_JOBS = "list_boss_chat_jobs";
 const TOOL_BOSS_CHAT_PREPARE_RUN = "prepare_boss_chat_run";
 const TOOL_BOSS_CHAT_START_RUN = "start_boss_chat_run";
 const TOOL_BOSS_CHAT_GET_RUN = "get_boss_chat_run";
@@ -1296,8 +1297,106 @@ function createScheduleRunInputSchema() {
 function createToolsSchema() {
   return [
     {
+      name: TOOL_BOSS_CHAT_HEALTH_CHECK,
+      description: "Boss 聊天页/chat-only 健康检查。chat-only、未读、全部聊天、求简历等任务必须先走 boss-chat 工具，不要调用 list_recommend_jobs 或 start_recommend_pipeline_run。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          host: {
+            type: "string",
+            description: "可选，Chrome 调试 host；默认 127.0.0.1"
+          },
+          port: {
+            type: "integer",
+            minimum: 1,
+            description: "可选，Chrome 调试端口；默认读取 screening-config.json.debugPort 或 9222"
+          },
+          target_url_includes: {
+            type: "string",
+            description: "可选，Chrome target URL 匹配片段；默认 Boss chat 页"
+          },
+          allow_navigate: {
+            type: "boolean",
+            description: "可选，未在 chat 页时允许通过 Page.navigate 切换；默认 true"
+          },
+          slow_live: {
+            type: "boolean",
+            description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
+          }
+        },
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_LIST_JOBS,
+      description: "只读读取 Boss 聊天页岗位列表；这是 chat-only 获取 job_options 的首选别名，等价于 prepare_boss_chat_run 的预备步骤但不会启动任务。聊天页/未读/全部聊天/求简历任务必须用本工具或 prepare_boss_chat_run，严禁用 list_recommend_jobs。",
+      inputSchema: createBossChatStartInputSchema()
+    },
+    {
+      name: TOOL_BOSS_CHAT_PREPARE_RUN,
+      description: "预备一次 boss-chat/chat-only 任务：只导航聊天页并返回岗位列表与待补字段，不会启动任务。用它先获取 job_options；不要用 list_recommend_jobs。",
+      inputSchema: createBossChatStartInputSchema()
+    },
+    {
+      name: TOOL_BOSS_CHAT_START_RUN,
+      description: "异步启动一次 boss-chat/chat-only 任务。必须一次性提供 job、start_from、target_count、criteria；若用户选择扫到底/不限/全部候选人，必须字面传 target_count=\"all\"。严禁改用 start_recommend_pipeline_run。",
+      inputSchema: createBossChatStartInputSchema({ requireFullInput: true })
+    },
+    {
+      name: TOOL_BOSS_CHAT_GET_RUN,
+      description: "查询 boss-chat run_id 的当前状态。chat-only 状态查询用本工具，不要用 get_recommend_pipeline_run。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_PAUSE_RUN,
+      description: "暂停运行中的 boss-chat 任务。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_RESUME_RUN,
+      description: "继续已暂停的 boss-chat 任务。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
+      name: TOOL_BOSS_CHAT_CANCEL_RUN,
+      description: "取消运行中的 boss-chat 任务。",
+      inputSchema: {
+        type: "object",
+        properties: {
+          run_id: { type: "string" },
+          profile: { type: "string" }
+        },
+        required: ["run_id"],
+        additionalProperties: false
+      }
+    },
+    {
       name: TOOL_LIST_RECOMMEND_JOBS,
-      description: "CDP-only 读取 Boss 推荐页岗位下拉框，返回所有可用岗位完整名称，方便 cron/一次性任务提前填写 job 参数。不会启动筛选任务。",
+      description: "CDP-only 读取 Boss 推荐页岗位下拉框，返回所有可用岗位完整名称，方便 recommend/推荐页 cron/一次性任务提前填写 job 参数。不会启动筛选任务。chat-only、未读、全部聊天、求简历任务严禁调用本工具，必须用 list_boss_chat_jobs 或 prepare_boss_chat_run。",
       inputSchema: createListRecommendJobsInputSchema()
     },
     {
@@ -1427,99 +1526,6 @@ function createToolsSchema() {
       name: TOOL_RUN_RECOMMEND_SELF_HEAL,
       description: "手动运维自愈工具：扫描 Boss recommend 相关 selector / network 规则漂移，并在确认后应用高置信度修复。",
       inputSchema: createRunRecommendSelfHealInputSchema()
-    },
-    {
-      name: TOOL_BOSS_CHAT_HEALTH_CHECK,
-      description: "CDP-only 检查 Boss chat 页面、自愈 probes、共享 screening-config.json 与 chat runtime 目录是否可用。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          host: {
-            type: "string",
-            description: "可选，Chrome 调试 host；默认 127.0.0.1"
-          },
-          port: {
-            type: "integer",
-            minimum: 1,
-            description: "可选，Chrome 调试端口；默认读取 screening-config.json.debugPort 或 9222"
-          },
-          target_url_includes: {
-            type: "string",
-            description: "可选，Chrome target URL 匹配片段；默认 Boss chat 页"
-          },
-          allow_navigate: {
-            type: "boolean",
-            description: "可选，未在 chat 页时允许通过 Page.navigate 切换；默认 true"
-          },
-          slow_live: {
-            type: "boolean",
-            description: "可选，VPN/慢页面 live 测试模式，放宽等待时间"
-          }
-        },
-        additionalProperties: false
-      }
-    },
-    {
-      name: TOOL_BOSS_CHAT_PREPARE_RUN,
-      description: "预备一次 boss-chat 任务：只导航聊天页并返回岗位列表与待补字段，不会启动任务。用它先获取 job_options。",
-      inputSchema: createBossChatStartInputSchema()
-    },
-    {
-      name: TOOL_BOSS_CHAT_START_RUN,
-      description: "异步启动一次 boss-chat 任务。必须一次性提供 job、start_from、target_count、criteria；若用户选择扫到底/不限/全部候选人，必须字面传 target_count=\"all\"。",
-      inputSchema: createBossChatStartInputSchema({ requireFullInput: true })
-    },
-    {
-      name: TOOL_BOSS_CHAT_GET_RUN,
-      description: "查询 boss-chat run_id 的当前状态。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          run_id: { type: "string" },
-          profile: { type: "string" }
-        },
-        required: ["run_id"],
-        additionalProperties: false
-      }
-    },
-    {
-      name: TOOL_BOSS_CHAT_PAUSE_RUN,
-      description: "暂停运行中的 boss-chat 任务。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          run_id: { type: "string" },
-          profile: { type: "string" }
-        },
-        required: ["run_id"],
-        additionalProperties: false
-      }
-    },
-    {
-      name: TOOL_BOSS_CHAT_RESUME_RUN,
-      description: "继续已暂停的 boss-chat 任务。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          run_id: { type: "string" },
-          profile: { type: "string" }
-        },
-        required: ["run_id"],
-        additionalProperties: false
-      }
-    },
-    {
-      name: TOOL_BOSS_CHAT_CANCEL_RUN,
-      description: "取消运行中的 boss-chat 任务。",
-      inputSchema: {
-        type: "object",
-        properties: {
-          run_id: { type: "string" },
-          profile: { type: "string" }
-        },
-        required: ["run_id"],
-        additionalProperties: false
-      }
     },
     {
       name: TOOL_RUN_RECRUIT_PIPELINE,
@@ -2885,7 +2891,7 @@ async function handleRequest(message, workspaceRoot) {
       }
     }
 
-    if ([TOOL_BOSS_CHAT_PREPARE_RUN, TOOL_BOSS_CHAT_START_RUN].includes(toolName)) {
+    if ([TOOL_BOSS_CHAT_LIST_JOBS, TOOL_BOSS_CHAT_PREPARE_RUN, TOOL_BOSS_CHAT_START_RUN].includes(toolName)) {
       const inputError = validateBossChatStartArgs(args);
       if (inputError) {
         return createJsonRpcError(id, -32602, inputError);
@@ -2941,6 +2947,8 @@ async function handleRequest(message, workspaceRoot) {
         payload = await handleRunRecommendSelfHealTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_HEALTH_CHECK) {
         payload = await handleBossChatHealthCheckTool(workspaceRoot, args);
+      } else if (toolName === TOOL_BOSS_CHAT_LIST_JOBS) {
+        payload = await handleBossChatPrepareRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_PREPARE_RUN) {
         payload = await handleBossChatPrepareRunTool({ workspaceRoot, args });
       } else if (toolName === TOOL_BOSS_CHAT_START_RUN) {
