@@ -1477,7 +1477,7 @@ export function llmResultToScreening(llmResult, candidate) {
 }
 
 export function isRecoverableLlmScreeningError(error) {
-  return /(?:LLM response missing boolean passed decision|LLM response was not valid JSON)/i
+  return /(?:LLM response missing boolean passed decision|LLM response missing brief summary|LLM response was not valid JSON)/i
     .test(String(error?.message || error || ""));
 }
 
@@ -1504,6 +1504,7 @@ export function createFailedLlmScreeningResult(error) {
 export function buildScreeningLlmMessages({
   candidate,
   criteria,
+  thinkingLevel = "low",
   imageEvidence = null,
   imagePaths = [],
   imageInputs = null,
@@ -1512,6 +1513,8 @@ export function buildScreeningLlmMessages({
 }) {
   const safeCriteria = normalizeText(criteria || "判断候选人是否符合本次招聘筛选标准");
   const safeText = String(candidate?.text?.raw || candidate?.text || "");
+  const normalizedThinkingLevel = normalizeLlmThinkingLevel(thinkingLevel) || "low";
+  const requestSummary = normalizedThinkingLevel === "current";
   const images = Array.isArray(imageInputs)
     ? imageInputs
     : buildScreeningLlmImageInputs({
@@ -1520,6 +1523,11 @@ export function buildScreeningLlmMessages({
       maxImages,
       detail: imageDetail
     });
+  const outputShape = requestSummary
+    ? "4) 只返回 JSON，格式为："
+      + "{\"passed\": true/false, \"summary\": \"少于100个中文词的筛选总结\"}"
+    : "4) 只返回 JSON，格式为："
+      + "{\"passed\": true/false}";
   const prompt =
     `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${safeCriteria}\n\n`
     + `候选人信息:\n${safeText || "候选人的完整简历信息在后续截图中，请按截图顺序阅读。"}\n\n`
@@ -1529,9 +1537,10 @@ export function buildScreeningLlmMessages({
     + "要求：\n"
     + "1) 只能依据候选人信息或截图中真实出现的内容判断。\n"
     + "2) 若证据不足或截图无法确认，必须返回 passed=false。\n"
-    + "3) 不要输出评估原因、证据列表、解释或额外文字。\n"
-    + "4) 只返回 JSON，格式为："
-    + "{\"passed\": true/false}";
+    + (requestSummary
+      ? "3) summary 必须为少于100个中文词的简短筛选总结，可包含核心依据和主要风险；不要输出推理过程。\n"
+      : "3) 不要输出评估原因、证据列表、解释或额外文字。\n")
+    + outputShape;
   const userContent = images.length
     ? [
       { type: "text", text: prompt },
@@ -1546,7 +1555,9 @@ export function buildScreeningLlmMessages({
       role: "system",
       content:
         "你是一位严谨的招聘筛选助手。必须完整阅读输入内容，严禁编造不存在的候选人经历。"
-        + "只能返回严格 JSON，不要输出原因、证据或额外文字。"
+        + (requestSummary
+          ? "只能返回严格 JSON。必须包含 passed 和 summary；summary 用中文，少于100个词，只概括筛选结论、核心依据和主要风险，不要输出推理过程。"
+          : "只能返回严格 JSON，不要输出原因、证据或额外文字。")
     },
     {
       role: "user",
@@ -1608,6 +1619,7 @@ async function callScreeningLlmWithProvider({
     messages: buildScreeningLlmMessages({
       candidate,
       criteria,
+      thinkingLevel,
       imageInputs
     })
   };
@@ -1665,20 +1677,27 @@ async function callScreeningLlmWithProvider({
       if (passed === null) {
         throw new Error(`LLM response missing boolean passed decision: ${content.slice(0, 240)}`);
       }
+      const normalizedThinkingLevel = normalizeLlmThinkingLevel(thinkingLevel) || "low";
+      const summary = normalizeBlockText(parsed?.summary || parsed?.screen_summary || parsed?.brief_summary);
+      if (normalizedThinkingLevel === "current" && !summary) {
+        throw new Error(`LLM response missing brief summary for current thinking level: ${content.slice(0, 240)}`);
+      }
       const evidence = Array.isArray(parsed?.evidence)
         ? parsed.evidence.map(normalizeText).filter(Boolean)
         : [];
-      const decisionCot = firstReasoningText([
-        parsed?.cot,
-        parsed?.decision_cot,
-        parsed?.reasoning,
-        parsed?.chain_of_thought,
-        reasoningContent
-      ].map(normalizeBlockText).filter(Boolean)) || reasoningContent;
+      const decisionCot = normalizedThinkingLevel === "current"
+        ? summary
+        : (firstReasoningText([
+          parsed?.cot,
+          parsed?.decision_cot,
+          parsed?.reasoning,
+          parsed?.chain_of_thought,
+          reasoningContent
+        ].map(normalizeBlockText).filter(Boolean)) || reasoningContent);
       const providerName = normalizeText(config.llmProviderName || config.name || config.label || config.id);
       const providerIndex = Number.isFinite(Number(config.llmProviderIndex)) ? Number(config.llmProviderIndex) : 0;
       const providerCount = Number.isFinite(Number(config.llmProviderCount)) ? Number(config.llmProviderCount) : 1;
-      return {
+      const result = {
         ok: true,
         provider: {
           baseUrl: redactBaseUrl(baseUrl),
@@ -1708,6 +1727,7 @@ async function callScreeningLlmWithProvider({
         provider_attempt_count: attempt,
         screened_at: nowIso()
       };
+      return result;
     } catch (error) {
       lastError = error;
       if (attempt >= maxAttempts || !isRetryableLlmRequestError(error)) {

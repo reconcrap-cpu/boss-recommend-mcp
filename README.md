@@ -367,6 +367,8 @@ config/screening-config.example.json
 - `debugPort`：未显式传 `port` 时，recommend / search / chat CDP-only MCP run 和健康检查默认连接这个 Chrome 调试端口。
 - `outputDir`：recommend / search / chat 完成后的最终 CSV 与 report JSON 会写入这里；run state / checkpoint 仍保留在各自状态目录，方便 pause/resume/cancel。
 - `llmThinkingLevel`：默认 `low`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。
+  - `current`：不显式发送 thinking/reasoning 参数，并要求 LLM 返回 `{"passed": true/false, "summary": "少于100个中文词的筛选总结"}`；CSV 的 `判断依据(CoT)` 写入该 summary。
+  - 其他值：只要求 LLM 返回 `{"passed": true/false}`；若 provider 返回 reasoning / CoT 字段，CSV 的 `判断依据(CoT)` 写入该内容。
 - `humanBehavior`：默认 `{ "enabled": true, "profile": "paced_with_rests", "restLevel": "low" }`。用于 recommend / search / chat 的可靠性实验，支持：
   - `profile: "baseline"`：关闭人类节奏，保持确定性行为。
   - `profile: "paced"`：启用 CDP-only Bezier 鼠标移动、较大按钮的安全 inset 点击点、分块 `Input.insertText`、列表 wheel/settle jitter，以及小的动作前后读秒。

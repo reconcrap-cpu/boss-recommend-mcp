@@ -16,9 +16,7 @@ export const LEGACY_RESULT_HEADER = [
   "简历来源",
   "原始判定通过",
   "最终判定通过",
-  "证据总数",
-  "证据命中数",
-  "证据门控降级",
+  "LLM thinking_level",
   "错误码",
   "错误信息",
   "候选人ID",
@@ -182,12 +180,6 @@ function firstBoolean(...values) {
   return "";
 }
 
-function evidenceCount(llm = {}) {
-  if (Number.isFinite(llm.evidence_count)) return llm.evidence_count;
-  if (Array.isArray(llm.evidence)) return llm.evidence.length;
-  return "";
-}
-
 function actionResultText(row = {}) {
   const action = row.post_action || row.action || {};
   if (action.requested === true && !action.skipped) {
@@ -258,10 +250,10 @@ export function legacyScreenResultRow(row = {}) {
       ? "passed"
       : "skipped";
   const cot = firstText(
-    llm.reasoning_content,
-    llm.raw_reasoning_content,
     llm.decision_cot,
     llm.cot,
+    llm.reasoning_content,
+    llm.raw_reasoning_content,
     llm.raw_model_output,
     llm.raw_content,
     row.decision_cot,
@@ -276,7 +268,6 @@ export function legacyScreenResultRow(row = {}) {
     candidate.source,
     screening.candidate?.source
   );
-  const totalEvidence = evidenceCount(llm);
   return [
     identity.name,
     identity.school,
@@ -290,9 +281,7 @@ export function legacyScreenResultRow(row = {}) {
     cvSource,
     rawPassed,
     finalPassed,
-    totalEvidence,
-    totalEvidence,
-    "",
+    firstText(llm.provider?.thinking_level),
     row.error_code || error.code || error.name || (llm.error ? "LLM_SCREENING_ERROR" : ""),
     row.error_message || error.message || llm.error || "",
     candidate.id || row.candidate_id || "",

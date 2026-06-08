@@ -708,6 +708,154 @@ async function testCallScreeningLlmUsesConfigThinkingAndBudget() {
   }
 }
 
+async function testCallScreeningLlmCurrentRequiresSummaryForCot() {
+  const originalFetch = globalThis.fetch;
+  let payload = null;
+  globalThis.fetch = async (_url, options) => {
+    payload = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  passed: false,
+                  summary: "passed=false；学历证据不足，算法经验与毕业年份仍需核验。"
+                })
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 30 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "current-summary",
+        text: "候选人\n本科\n算法经验"
+      }),
+      criteria: "必须本科且有算法经验",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmThinkingLevel: "current"
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(payload.reasoning_effort, undefined);
+    assert.equal(payload.messages[0].content.includes("summary"), true);
+    assert.equal(payload.messages[1].content.includes("\"summary\""), true);
+    assert.equal(result.passed, false);
+    assert.equal(result.cot, "passed=false；学历证据不足，算法经验与毕业年份仍需核验。");
+    assert.equal(result.reasoning_content, "");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmCurrentRejectsMissingSummary() {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async text() {
+      return JSON.stringify({
+        choices: [
+          {
+            message: { content: "{\"passed\": true}" },
+            finish_reason: "stop"
+          }
+        ],
+        usage: { total_tokens: 20 }
+      });
+    }
+  });
+  try {
+    await assert.rejects(
+      () => callScreeningLlm({
+        candidate: normalizeCandidateProfile({
+          domain: "recommend",
+          source: "fixture",
+          id: "current-missing-summary",
+          text: "候选人\n本科\n算法经验"
+        }),
+        criteria: "必须本科",
+        config: {
+          baseUrl: "https://coding.example.com/v1",
+          apiKey: "test-key",
+          model: "kimi-k2.5",
+          llmThinkingLevel: "current",
+          llmMaxRetries: 0
+        },
+        timeoutMs: 1000
+      }),
+      /missing brief summary/
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmNonCurrentStaysBooleanOnlyAndCapturesProviderCot() {
+  const originalFetch = globalThis.fetch;
+  let payload = null;
+  globalThis.fetch = async (_url, options) => {
+    payload = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: "{\"passed\": true}",
+                reasoning_content: "provider cot"
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 24 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "low-cot",
+        text: "候选人\n本科\n算法经验"
+      }),
+      criteria: "必须本科",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmThinkingLevel: "low"
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(payload.messages[0].content.includes("summary"), false);
+    assert.equal(payload.messages[1].content.includes("\"summary\""), false);
+    assert.equal(payload.reasoning_effort, "low");
+    assert.equal(result.passed, true);
+    assert.equal(result.cot, "provider cot");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 async function testCallScreeningLlmRetriesTransientFailure() {
   const originalFetch = globalThis.fetch;
   let calls = 0;
@@ -852,6 +1000,9 @@ await testCallScreeningLlmDefaultsThinkingLow();
 await testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao();
 await testCallScreeningLlmCollapsesRepeatedReasoningBlock();
 await testCallScreeningLlmUsesConfigThinkingAndBudget();
+await testCallScreeningLlmCurrentRequiresSummaryForCot();
+await testCallScreeningLlmCurrentRejectsMissingSummary();
+await testCallScreeningLlmNonCurrentStaysBooleanOnlyAndCapturesProviderCot();
 await testCallScreeningLlmRetriesTransientFailure();
 await testCallScreeningLlmFallsBackToNextConfiguredModel();
 

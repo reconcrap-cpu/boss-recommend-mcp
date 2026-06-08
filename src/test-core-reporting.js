@@ -67,6 +67,9 @@ writeLegacyScreenCsv(filePath, {
       },
       llm: {
         passed: true,
+        provider: {
+          thinking_level: "low"
+        },
         reason: "这个字段不应写入评估通过详细原因",
         reasoning_content: "完整 CoT / reasoning_content",
         raw_model_output: "{\"passed\":true}"
@@ -94,6 +97,8 @@ assert.equal(csv.includes(LEGACY_RESULT_HEADER.map((header) => `"${header}"`).jo
 assert.equal(csv.includes("完整 CoT / reasoning_content"), true);
 assert.equal(csv.includes("这个字段不应写入评估通过详细原因"), false);
 assert.equal(csv.includes("\"passed\""), true);
+assert.equal(csv.includes("\"LLM thinking_level\""), true);
+assert.equal(csv.includes("\"low\""), true);
 assert.equal(csv.includes("\"network\""), true);
 assert.equal(csv.includes("\"2000\""), true);
 assert.equal(csv.includes("\"123\""), true);
