@@ -12,6 +12,7 @@ const SCREEN_CONFIG_TEMPLATE_DEFAULTS = Object.freeze({
   model: "gpt-4.1-mini"
 });
 const LLM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "auto", "current"]);
+const LLM_SCREENING_STRATEGIES = new Set(["single_pass", "fast_first_verified"]);
 
 export const TARGET_COUNT_CANONICAL_ALL = "all";
 export const TARGET_COUNT_ACCEPTED_EXAMPLES = [TARGET_COUNT_CANONICAL_ALL, -1, 20, "全部候选人"];
@@ -322,6 +323,11 @@ function normalizeLlmThinkingLevel(raw, fallback = "low") {
   return LLM_THINKING_LEVELS.has(normalized) ? normalized : fallback;
 }
 
+function normalizeLlmScreeningStrategy(raw, fallback = "single_pass") {
+  const normalized = normalizeText(raw).toLowerCase();
+  return LLM_SCREENING_STRATEGIES.has(normalized) ? normalized : fallback;
+}
+
 function firstConfiguredValue(...values) {
   for (const value of values) {
     if (value === undefined || value === null) continue;
@@ -351,6 +357,26 @@ function normalizeScreeningLlmModel(config = {}, rawEntry = {}, index = 0) {
     llmThinkingLevel: normalizeLlmThinkingLevel(
       firstConfiguredValue(entry.llmThinkingLevel, entry.thinkingLevel, entry.reasoningEffort, config.llmThinkingLevel, config.thinkingLevel, config.reasoningEffort),
       "low"
+    ),
+    llmScreeningStrategy: normalizeLlmScreeningStrategy(
+      firstConfiguredValue(entry.llmScreeningStrategy, entry.screeningStrategy, entry.screening_strategy, config.llmScreeningStrategy, config.screeningStrategy, config.screening_strategy),
+      "single_pass"
+    ),
+    llmFastThinkingLevel: normalizeLlmThinkingLevel(
+      firstConfiguredValue(entry.llmFastThinkingLevel, entry.fastThinkingLevel, entry.fast_thinking_level, config.llmFastThinkingLevel, config.fastThinkingLevel, config.fast_thinking_level),
+      "current"
+    ),
+    llmVerifyThinkingLevel: normalizeLlmThinkingLevel(
+      firstConfiguredValue(entry.llmVerifyThinkingLevel, entry.verifyThinkingLevel, entry.verify_thinking_level, config.llmVerifyThinkingLevel, config.verifyThinkingLevel, config.verify_thinking_level),
+      "low"
+    ),
+    llmFastMaxTokens: parsePositiveInteger(
+      firstConfiguredValue(entry.llmFastMaxTokens, entry.fastMaxTokens, entry.fast_max_tokens, config.llmFastMaxTokens, config.fastMaxTokens, config.fast_max_tokens),
+      null
+    ),
+    llmVerifyMaxTokens: parsePositiveInteger(
+      firstConfiguredValue(entry.llmVerifyMaxTokens, entry.verifyMaxTokens, entry.verify_max_tokens, config.llmVerifyMaxTokens, config.verifyMaxTokens, config.verify_max_tokens),
+      null
     ),
     llmTimeoutMs: parsePositiveInteger(firstConfiguredValue(entry.llmTimeoutMs, entry.timeoutMs, config.llmTimeoutMs, config.timeoutMs), null),
     llmMaxRetries: parsePositiveInteger(firstConfiguredValue(entry.llmMaxRetries, entry.maxRetries, config.llmMaxRetries, config.maxRetries), null),

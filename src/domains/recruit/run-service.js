@@ -39,7 +39,9 @@ import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import {
   callScreeningLlm,
   compactScreeningLlmResult,
+  createFatalLlmRunError,
   createFailedLlmScreeningResult,
+  isFatalLlmProviderError,
   llmResultToScreening,
   screenCandidate
 } from "../../core/screening/index.js";
@@ -1022,6 +1024,12 @@ export async function runRecruitWorkflow({
             imageDetail: llmImageDetail
           }));
         } catch (error) {
+          if (isFatalLlmProviderError(error)) {
+            throw createFatalLlmRunError(error, {
+              domain: "recruit",
+              candidate: screeningCandidate
+            });
+          }
           llmResult = createFailedLlmScreeningResult(error);
         }
       }

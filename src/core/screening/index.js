@@ -38,6 +38,9 @@ const GENDER_CODE_MAP = {
 };
 
 const LLM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "auto", "current"]);
+const LLM_SCREENING_STRATEGIES = new Set(["single_pass", "fast_first_verified"]);
+const FAST_FIRST_DEFAULT_FAST_MAX_TOKENS = 384;
+const FATAL_LLM_PROVIDER_MAX_RETRIES = 2;
 
 function nowIso() {
   return new Date().toISOString();
@@ -46,6 +49,11 @@ function nowIso() {
 function normalizeLlmThinkingLevel(value) {
   const normalized = normalizeText(value).toLowerCase();
   return LLM_THINKING_LEVELS.has(normalized) ? normalized : "";
+}
+
+function normalizeLlmScreeningStrategy(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return LLM_SCREENING_STRATEGIES.has(normalized) ? normalized : "single_pass";
 }
 
 function normalizeBaseUrl(baseUrl) {
@@ -126,6 +134,65 @@ function compactLlmProviderFailure(error, providerConfig = {}, providerIndex = 0
   };
 }
 
+export function classifyFatalLlmProviderError(error) {
+  if (!error) return null;
+  if (error.llm_fatal_provider_error) {
+    return {
+      code: error.code || "LLM_FATAL_PROVIDER_ERROR",
+      reason: error.llm_fatal_reason || "fatal_provider_error"
+    };
+  }
+  const status = Number(error?.status);
+  const message = String(error?.message || error || "");
+  const providerCode = normalizeText(error?.provider_error_code).toLowerCase();
+  const providerType = normalizeText(error?.provider_error_type).toLowerCase();
+  const searchable = `${providerCode} ${providerType} ${message}`.toLowerCase();
+  if (/(?:budget[_\s-]*exceeded|budget has been exceeded|max budget|spend cap|hard limit|credit limit)/i.test(searchable)) {
+    return { code: "LLM_BUDGET_EXCEEDED", reason: "budget_exceeded" };
+  }
+  if (/(?:insufficient[_\s-]*quota|quota[_\s-]*(?:exceeded|exhausted)|(?:exceeded|exhausted).*quota|out of quota|usage quota|token quota|monthly quota|rate limit quota)/i.test(searchable)) {
+    return { code: "LLM_QUOTA_EXCEEDED", reason: "quota_exceeded" };
+  }
+  if (/(?:insufficient[_\s-]*(?:balance|credit|credits)|no credits|credit balance|billing|payment required|unpaid|account balance)/i.test(searchable)) {
+    return { code: "LLM_BILLING_REQUIRED", reason: "billing_required" };
+  }
+  if (status === 401 || /(?:unauthorized|unauthorised|invalid api key|incorrect api key|authentication failed|invalid authentication|api key invalid|no api key)/i.test(searchable)) {
+    return { code: "LLM_AUTH_FAILED", reason: "auth_failed" };
+  }
+  if (status === 403 || /(?:forbidden|permission denied|access denied|not authorized|not authorised|model access denied)/i.test(searchable)) {
+    return { code: "LLM_PERMISSION_DENIED", reason: "permission_denied" };
+  }
+  return null;
+}
+
+export function isFatalLlmProviderError(error) {
+  return Boolean(classifyFatalLlmProviderError(error));
+}
+
+export function createFatalLlmRunError(error, { domain = "", candidate = null } = {}) {
+  const classification = classifyFatalLlmProviderError(error) || {
+    code: "LLM_FATAL_PROVIDER_ERROR",
+    reason: "fatal_provider_error"
+  };
+  const attempts = Number(error?.llm_attempt_count) || 0;
+  const suffix = attempts ? ` after ${attempts} attempts` : "";
+  const fatal = new Error(`Fatal LLM provider error${suffix}: ${error?.message || String(error || "unknown")}`);
+  fatal.name = "FatalLlmProviderError";
+  fatal.code = classification.code;
+  fatal.llm_fatal_provider_error = true;
+  fatal.llm_fatal_reason = classification.reason;
+  fatal.llm_attempt_count = attempts;
+  fatal.status = Number.isFinite(Number(error?.status)) ? Number(error.status) : null;
+  fatal.provider_error_code = error?.provider_error_code || null;
+  fatal.provider_error_type = error?.provider_error_type || null;
+  fatal.provider_error_message = error?.provider_error_message || null;
+  fatal.domain = domain || null;
+  fatal.candidate_id = candidate?.id || null;
+  fatal.candidate_name = candidate?.identity?.name || null;
+  fatal.cause = error || null;
+  return fatal;
+}
+
 function isVolcengineModel(baseUrl, model) {
   return /volces|volcengine|ark\.cn|doubao|seed/i.test(`${baseUrl || ""} ${model || ""}`);
 }
@@ -168,7 +235,7 @@ function parseFiniteNumber(value, fallback = null) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function resolveLlmOutputTokenBudget(config = {}, thinkingLevel = "") {
+function resolveLlmOutputTokenBudget(config = {}, thinkingLevel = "", options = {}) {
   const explicit = parsePositiveNumber(
     config.llmMaxCompletionTokens
     ?? config.maxCompletionTokens
@@ -177,8 +244,14 @@ function resolveLlmOutputTokenBudget(config = {}, thinkingLevel = "") {
     null
   );
   if (explicit) return Math.max(1, Math.floor(explicit));
+  if (options.requireReviewDecision) return 384;
   const normalizedThinking = normalizeLlmThinkingLevel(thinkingLevel || "low") || "low";
   return normalizedThinking === "off" || normalizedThinking === "minimal" ? 64 : 512;
+}
+
+function parsePositiveInteger(value, fallback = null) {
+  const parsed = parsePositiveNumber(value, fallback);
+  return parsed ? Math.max(1, Math.floor(parsed)) : fallback;
 }
 
 export function normalizeText(input) {
@@ -1451,6 +1524,7 @@ export function compactScreeningLlmResult(llmResult) {
     ok: Boolean(llmResult.ok),
     provider: llmResult.provider || null,
     passed: llmResult.passed,
+    review_required: typeof llmResult.review_required === "boolean" ? llmResult.review_required : null,
     cot: llmResult.cot || llmResult.decision_cot || "",
     reasoning_content: llmResult.reasoning_content || "",
     raw_model_output: llmResult.raw_model_output || "",
@@ -1461,6 +1535,17 @@ export function compactScreeningLlmResult(llmResult) {
     attempt_count: llmResult.attempt_count || 0,
     fallback_count: llmResult.fallback_count || 0,
     llm_model_failures: Array.isArray(llmResult.llm_model_failures) ? llmResult.llm_model_failures : [],
+    screening_strategy: llmResult.screening_strategy || "",
+    fast_thinking_level: llmResult.fast_thinking_level || "",
+    verify_thinking_level: llmResult.verify_thinking_level || "",
+    verified: typeof llmResult.verified === "boolean" ? llmResult.verified : null,
+    verification_reason: llmResult.verification_reason || "",
+    decision_source: llmResult.decision_source || "",
+    fast_result: llmResult.fast_result || null,
+    verify_result: llmResult.verify_result || null,
+    error_code: llmResult.error_code || null,
+    fatal: Boolean(llmResult.fatal),
+    fatal_reason: llmResult.fatal_reason || "",
     error: llmResult.error || null,
     screened_at: llmResult.screened_at || null
   };
@@ -1477,11 +1562,12 @@ export function llmResultToScreening(llmResult, candidate) {
 }
 
 export function isRecoverableLlmScreeningError(error) {
-  return /(?:LLM response missing boolean passed decision|LLM response missing brief summary|LLM response was not valid JSON)/i
+  return /(?:LLM response missing boolean passed decision|LLM response missing brief summary|LLM response missing boolean review_required decision|LLM response was not valid JSON)/i
     .test(String(error?.message || error || ""));
 }
 
 export function createFailedLlmScreeningResult(error) {
+  const fatalClassification = classifyFatalLlmProviderError(error);
   return {
     ok: false,
     passed: false,
@@ -1496,6 +1582,9 @@ export function createFailedLlmScreeningResult(error) {
     attempt_count: Number(error?.llm_attempt_count) || 0,
     fallback_count: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures.length : 0,
     llm_model_failures: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures : [],
+    error_code: fatalClassification?.code || error?.code || null,
+    fatal: Boolean(fatalClassification),
+    fatal_reason: fatalClassification?.reason || "",
     error: error?.message || String(error || "unknown"),
     screened_at: nowIso()
   };
@@ -1505,6 +1594,7 @@ export function buildScreeningLlmMessages({
   candidate,
   criteria,
   thinkingLevel = "low",
+  requireReviewDecision = false,
   imageEvidence = null,
   imagePaths = [],
   imageInputs = null,
@@ -1514,7 +1604,8 @@ export function buildScreeningLlmMessages({
   const safeCriteria = normalizeText(criteria || "判断候选人是否符合本次招聘筛选标准");
   const safeText = String(candidate?.text?.raw || candidate?.text || "");
   const normalizedThinkingLevel = normalizeLlmThinkingLevel(thinkingLevel) || "low";
-  const requestSummary = normalizedThinkingLevel === "current";
+  const requestReviewDecision = Boolean(requireReviewDecision);
+  const requestSummary = requestReviewDecision || normalizedThinkingLevel === "current";
   const images = Array.isArray(imageInputs)
     ? imageInputs
     : buildScreeningLlmImageInputs({
@@ -1523,23 +1614,43 @@ export function buildScreeningLlmMessages({
       maxImages,
       detail: imageDetail
     });
-  const outputShape = requestSummary
-    ? "4) 只返回 JSON，格式为："
-      + "{\"passed\": true/false, \"summary\": \"少于100个中文词的筛选总结\"}"
-    : "4) 只返回 JSON，格式为："
-      + "{\"passed\": true/false}";
+  const outputShape = requestReviewDecision
+    ? "最后只返回 JSON，格式为："
+      + "{\"passed\": true/false, \"summary\": \"少于100个中文词的筛选总结\", \"review_required\": true/false}"
+    : requestSummary
+      ? "7) 只返回 JSON，格式为："
+        + "{\"passed\": true/false, \"summary\": \"少于100个中文词的筛选总结\"}"
+      : "7) 只返回 JSON，格式为："
+        + "{\"passed\": true/false}";
+  const failFastInstructions = [
+    "3) 按筛选标准原文顺序拆解并检查硬性淘汰项；一旦某项可确定不满足，必须立即返回 passed=false，不要继续评估后续条件。",
+    "4) 若筛选标准规定证据不足、业务线无法判断、任期无法判断、学校无法判断等情况不通过，这类缺失证据就是可确定不满足。",
+    "5) 只有当前淘汰项本身存在截图不清、信息冲突、或可能被后续可见简历内容澄清时，才继续阅读以核实该项。"
+  ].join("\n");
+  const fastReviewInstructions = requestReviewDecision
+    ? [
+      "7) review_required 必须是布尔值；当证据缺失、证据冲突、截图/文本不完整或不清晰、结论接近规则边界、或你依赖假设时设为 true；若结论明确且无需更深推理核验，设为 false。",
+      "8) 只有当某个硬性不通过条件有直接、明确、无可见反向证据的简历证据时，才可返回 review_required=false。",
+      "9) 如果简历中存在任何可能满足当前被否定条件的反向证据、边界证据或可计入经历，即使你倾向 passed=false，也必须 review_required=true。",
+      "10) 反向证据包括但不限于：可能合格的学校/学历、可能合格的产品或行业、可能合格的职责或指标、可能合格的海外/语言证据、或需要精确计算的任期/年限证据。",
+      "11) 不要因为候选人其他经历不匹配，就忽略某一段可能匹配的经历；只要任一可见经历可能满足被否定条件，就必须交给复核。",
+      "12) 当 review_required=false 时，summary 必须点明确切的决定性硬性失败，并说明没有可见反向证据或边界证据。"
+    ].join("\n")
+    : "";
   const prompt =
     `请根据以下标准判断候选人是否通过筛选。\n\n筛选标准:\n${safeCriteria}\n\n`
     + `候选人信息:\n${safeText || "候选人的完整简历信息在后续截图中，请按截图顺序阅读。"}\n\n`
     + (images.length
-      ? `候选人简历截图共 ${images.length} 张，按从上到下的滚动顺序排列。若截图是拼接长图，请按图内从上到下顺序完整阅读；不要跳过任何一段简历内容。\n\n`
+      ? `候选人简历截图共 ${images.length} 张，按从上到下的滚动顺序排列。若截图是拼接长图，请按图内从上到下顺序阅读；若已出现明确硬性淘汰项，可停止后续评估。\n\n`
       : "")
     + "要求：\n"
     + "1) 只能依据候选人信息或截图中真实出现的内容判断。\n"
     + "2) 若证据不足或截图无法确认，必须返回 passed=false。\n"
+    + failFastInstructions + "\n"
     + (requestSummary
-      ? "3) summary 必须为少于100个中文词的简短筛选总结，可包含核心依据和主要风险；不要输出推理过程。\n"
-      : "3) 不要输出评估原因、证据列表、解释或额外文字。\n")
+      ? "6) summary 必须为少于100个中文词的简短筛选总结，可包含核心依据和主要风险；不要输出推理过程。\n"
+      : "6) 不要输出评估原因、证据列表、解释或额外文字。\n")
+    + (fastReviewInstructions ? `${fastReviewInstructions}\n` : "")
     + outputShape;
   const userContent = images.length
     ? [
@@ -1554,8 +1665,10 @@ export function buildScreeningLlmMessages({
     {
       role: "system",
       content:
-        "你是一位严谨的招聘筛选助手。必须完整阅读输入内容，严禁编造不存在的候选人经历。"
-        + (requestSummary
+        "你是一位严谨的招聘筛选助手。必须按筛选标准顺序严格阅读和判断，严禁编造不存在的候选人经历；一旦确定命中硬性淘汰项，可立即给出最终不通过结论。"
+        + (requestReviewDecision
+          ? "只能返回严格 JSON。必须包含 passed、summary 和 review_required；summary 用中文，少于100个词，只概括筛选结论、核心依据和主要风险，不要输出推理过程；review_required 只能是 true 或 false。只有在硬性失败直接明确且无可见反向证据时，review_required 才能为 false。"
+          : requestSummary
           ? "只能返回严格 JSON。必须包含 passed 和 summary；summary 用中文，少于100个词，只概括筛选结论、核心依据和主要风险，不要输出推理过程。"
           : "只能返回严格 JSON，不要输出原因、证据或额外文字。")
     },
@@ -1589,6 +1702,7 @@ async function callScreeningLlmWithProvider({
   criteria,
   config = {},
   timeoutMs = 60000,
+  requireReviewDecision = false,
   imageEvidence = null,
   imagePaths = [],
   maxImages = 8,
@@ -1611,7 +1725,7 @@ async function callScreeningLlmWithProvider({
   }
 
   const thinkingLevel = config.llmThinkingLevel || config.thinkingLevel || config.reasoningEffort || "low";
-  const outputTokenBudget = resolveLlmOutputTokenBudget(config, thinkingLevel);
+  const outputTokenBudget = resolveLlmOutputTokenBudget(config, thinkingLevel, { requireReviewDecision });
   const payload = {
     model,
     temperature: parseFiniteNumber(config.temperature, 0.1),
@@ -1620,6 +1734,7 @@ async function callScreeningLlmWithProvider({
       candidate,
       criteria,
       thinkingLevel,
+      requireReviewDecision,
       imageInputs
     })
   };
@@ -1642,7 +1757,10 @@ async function callScreeningLlmWithProvider({
   const maxRetries = normalizeLlmMaxRetries(config.llmMaxRetries ?? config.maxRetries);
   const maxAttempts = maxRetries + 1;
   let lastError = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  let attempt = 0;
+  let fatalProviderAttempts = 0;
+  while (true) {
+    attempt += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     try {
@@ -1663,6 +1781,10 @@ async function callScreeningLlmWithProvider({
       if (!response.ok) {
         const error = new Error(`LLM request failed: ${response.status} ${responseText.slice(0, 400)}`);
         error.status = response.status;
+        const providerError = tryParseJson(responseText)?.error || {};
+        error.provider_error_code = providerError.code || null;
+        error.provider_error_type = providerError.type || null;
+        error.provider_error_message = providerError.message || null;
         throw error;
       }
       const json = tryParseJson(responseText);
@@ -1679,13 +1801,19 @@ async function callScreeningLlmWithProvider({
       }
       const normalizedThinkingLevel = normalizeLlmThinkingLevel(thinkingLevel) || "low";
       const summary = normalizeBlockText(parsed?.summary || parsed?.screen_summary || parsed?.brief_summary);
-      if (normalizedThinkingLevel === "current" && !summary) {
-        throw new Error(`LLM response missing brief summary for current thinking level: ${content.slice(0, 240)}`);
+      if ((normalizedThinkingLevel === "current" || requireReviewDecision) && !summary) {
+        throw new Error(`LLM response missing brief summary for current thinking level or fast-first strategy: ${content.slice(0, 240)}`);
+      }
+      const reviewRequired = requireReviewDecision
+        ? parsePassedDecision(parsed?.review_required ?? parsed?.reviewRequired ?? parsed?.needs_review ?? parsed?.needsReview)
+        : null;
+      if (requireReviewDecision && reviewRequired === null) {
+        throw new Error(`LLM response missing boolean review_required decision: ${content.slice(0, 240)}`);
       }
       const evidence = Array.isArray(parsed?.evidence)
         ? parsed.evidence.map(normalizeText).filter(Boolean)
         : [];
-      const decisionCot = normalizedThinkingLevel === "current"
+      const decisionCot = (normalizedThinkingLevel === "current" || requireReviewDecision)
         ? summary
         : (firstReasoningText([
           parsed?.cot,
@@ -1712,6 +1840,7 @@ async function callScreeningLlmWithProvider({
           max_completion_tokens: payload.max_completion_tokens || null
         },
         passed,
+        review_required: reviewRequired,
         reason: "",
         evidence,
         cot: decisionCot,
@@ -1730,7 +1859,23 @@ async function callScreeningLlmWithProvider({
       return result;
     } catch (error) {
       lastError = error;
-      if (attempt >= maxAttempts || !isRetryableLlmRequestError(error)) {
+      const fatalClassification = classifyFatalLlmProviderError(error);
+      if (fatalClassification) {
+        fatalProviderAttempts += 1;
+        error.code = fatalClassification.code;
+        error.llm_fatal_provider_error = true;
+        error.llm_fatal_reason = fatalClassification.reason;
+        if (fatalProviderAttempts <= FATAL_LLM_PROVIDER_MAX_RETRIES) {
+          await sleepMs(Math.min(2500, 500 * fatalProviderAttempts));
+          continue;
+        }
+        error.image_input_count = imageInputs.length;
+        error.image_inputs = summarizeLlmImageInputs(imageInputs);
+        error.llm_attempt_count = attempt;
+        throw error;
+      }
+      const retryable = isRetryableLlmRequestError(error) || isRecoverableLlmScreeningError(error);
+      if (attempt >= maxAttempts || !retryable) {
         error.image_input_count = imageInputs.length;
         error.image_inputs = summarizeLlmImageInputs(imageInputs);
         error.llm_attempt_count = attempt;
@@ -1748,7 +1893,110 @@ async function callScreeningLlmWithProvider({
   throw lastError;
 }
 
-export async function callScreeningLlm(args = {}) {
+function compactStrategyLlmResult(result) {
+  if (!result) return null;
+  const compact = compactScreeningLlmResult(result);
+  if (compact) {
+    compact.fast_result = null;
+    compact.verify_result = null;
+  }
+  return compact;
+}
+
+function attachFastFirstScreeningMetadata(result, {
+  fastThinkingLevel = "current",
+  verifyThinkingLevel = "low",
+  verified = false,
+  verificationReason = "",
+  decisionSource = "fast",
+  fastResult = null,
+  verifyResult = null
+} = {}) {
+  return {
+    ...result,
+    screening_strategy: "fast_first_verified",
+    fast_thinking_level: fastThinkingLevel,
+    verify_thinking_level: verifyThinkingLevel,
+    verified: Boolean(verified),
+    verification_reason: verificationReason,
+    decision_source: decisionSource,
+    fast_result: compactStrategyLlmResult(fastResult),
+    verify_result: compactStrategyLlmResult(verifyResult)
+  };
+}
+
+function normalizeStrategyThinkingLevel(value, fallback) {
+  return normalizeLlmThinkingLevel(value) || normalizeLlmThinkingLevel(fallback) || fallback;
+}
+
+function resolveStrategyPassMaxTokens(entry = {}, inherited = {}, pass = "fast", fallback = null) {
+  const value = pass === "verify"
+    ? firstConfiguredValue(
+      entry.llmVerifyMaxTokens,
+      entry.verifyMaxTokens,
+      entry.verify_max_tokens,
+      inherited.llmVerifyMaxTokens,
+      inherited.verifyMaxTokens,
+      inherited.verify_max_tokens
+    )
+    : firstConfiguredValue(
+      entry.llmFastMaxTokens,
+      entry.fastMaxTokens,
+      entry.fast_max_tokens,
+      inherited.llmFastMaxTokens,
+      inherited.fastMaxTokens,
+      inherited.fast_max_tokens
+    );
+  return parsePositiveInteger(value, fallback);
+}
+
+function applyForcedOutputTokenBudget(config = {}, outputTokenBudget = null) {
+  const budget = parsePositiveInteger(outputTokenBudget, null);
+  if (!budget) return config;
+  const next = {
+    ...config,
+    llmMaxTokens: budget,
+    maxTokens: budget
+  };
+  delete next.llmMaxCompletionTokens;
+  delete next.maxCompletionTokens;
+  return next;
+}
+
+function withForcedLlmThinkingLevel(config = {}, thinkingLevel = "low", options = {}) {
+  const normalizedThinkingLevel = normalizeStrategyThinkingLevel(thinkingLevel, "low");
+  const forceEntry = (entry) => {
+    const objectEntry = typeof entry === "string" ? { model: entry } : { ...(entry || {}) };
+    const forced = {
+      ...objectEntry,
+      llmThinkingLevel: normalizedThinkingLevel,
+      thinkingLevel: normalizedThinkingLevel,
+      reasoningEffort: normalizedThinkingLevel
+    };
+    const entryBudget = options.pass
+      ? resolveStrategyPassMaxTokens(objectEntry, config, options.pass, options.defaultMaxTokens)
+      : options.outputTokenBudget;
+    return applyForcedOutputTokenBudget(forced, entryBudget);
+  };
+  const baseBudget = options.pass
+    ? resolveStrategyPassMaxTokens(config, {}, options.pass, options.defaultMaxTokens)
+    : options.outputTokenBudget;
+  const next = applyForcedOutputTokenBudget({
+    ...(config || {}),
+    llmThinkingLevel: normalizedThinkingLevel,
+    thinkingLevel: normalizedThinkingLevel,
+    reasoningEffort: normalizedThinkingLevel
+  }, baseBudget);
+  if (Array.isArray(config?.llmModels)) {
+    next.llmModels = config.llmModels.map(forceEntry);
+  }
+  if (Array.isArray(config?.models)) {
+    next.models = config.models.map(forceEntry);
+  }
+  return next;
+}
+
+async function callSinglePassScreeningLlm(args = {}) {
   const providers = normalizeLlmProviderConfigs(args.config || {});
   if (providers.length <= 1) {
     return callScreeningLlmWithProvider({
@@ -1782,6 +2030,7 @@ export async function callScreeningLlm(args = {}) {
         fallback_count: providerFailures.length
       };
     } catch (error) {
+      if (isFatalLlmProviderError(error)) throw error;
       lastError = error;
       providerFailures.push(compactLlmProviderFailure(error, providerConfig, index));
       if (index < providers.length - 1) {
@@ -1801,4 +2050,86 @@ export async function callScreeningLlm(args = {}) {
   finalError.image_input_count = lastError?.image_input_count || 0;
   finalError.image_inputs = lastError?.image_inputs || [];
   throw finalError;
+}
+
+async function callFastFirstVerifiedScreeningLlm(args = {}) {
+  const config = args.config || {};
+  const fastThinkingLevel = normalizeStrategyThinkingLevel(config.llmFastThinkingLevel ?? config.fastThinkingLevel, "current");
+  const verifyThinkingLevel = normalizeStrategyThinkingLevel(config.llmVerifyThinkingLevel ?? config.verifyThinkingLevel, "low");
+  const fastArgs = {
+    ...args,
+    config: withForcedLlmThinkingLevel(config, fastThinkingLevel, {
+      pass: "fast",
+      defaultMaxTokens: FAST_FIRST_DEFAULT_FAST_MAX_TOKENS
+    }),
+    requireReviewDecision: true
+  };
+  let fastResult = null;
+  let verifyReason = "";
+  try {
+    fastResult = await callSinglePassScreeningLlm(fastArgs);
+    if (fastResult.passed === true) {
+      verifyReason = fastResult.review_required === true ? "fast_passed_review_required" : "fast_passed";
+    } else if (fastResult.review_required === true) {
+      verifyReason = "fast_review_required";
+    }
+  } catch (error) {
+    if (isFatalLlmProviderError(error)) throw error;
+    fastResult = createFailedLlmScreeningResult(error);
+    verifyReason = "fast_invalid_response";
+  }
+
+  if (!verifyReason) {
+    return attachFastFirstScreeningMetadata(fastResult, {
+      fastThinkingLevel,
+      verifyThinkingLevel,
+      verified: false,
+      decisionSource: "fast",
+      fastResult
+    });
+  }
+
+  const verifyArgs = {
+    ...args,
+    config: withForcedLlmThinkingLevel(config, verifyThinkingLevel, {
+      pass: "verify"
+    }),
+    requireReviewDecision: false
+  };
+  try {
+    const verifyResult = await callSinglePassScreeningLlm(verifyArgs);
+    return attachFastFirstScreeningMetadata(verifyResult, {
+      fastThinkingLevel,
+      verifyThinkingLevel,
+      verified: true,
+      verificationReason: verifyReason,
+      decisionSource: "verify",
+      fastResult,
+      verifyResult
+    });
+  } catch (error) {
+    if (isFatalLlmProviderError(error)) throw error;
+    const failedVerifyResult = createFailedLlmScreeningResult(error);
+    return attachFastFirstScreeningMetadata(failedVerifyResult, {
+      fastThinkingLevel,
+      verifyThinkingLevel,
+      verified: true,
+      verificationReason: verifyReason,
+      decisionSource: "verify_error",
+      fastResult,
+      verifyResult: failedVerifyResult
+    });
+  }
+}
+
+export async function callScreeningLlm(args = {}) {
+  const strategy = normalizeLlmScreeningStrategy(
+    args.config?.llmScreeningStrategy
+    ?? args.config?.screeningStrategy
+    ?? args.config?.screening_strategy
+  );
+  if (strategy === "fast_first_verified") {
+    return callFastFirstVerifiedScreeningLlm(args);
+  }
+  return callSinglePassScreeningLlm(args);
 }

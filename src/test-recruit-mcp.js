@@ -167,6 +167,11 @@ async function testRecruitDefaultsUseScreeningConfig() {
   assert.equal(observedOptions.llmConfig.baseUrl, "https://api.example.com/v1");
   assert.equal(observedOptions.llmConfig.model, "gpt-4.1-mini");
   assert.equal(observedOptions.llmConfig.llmThinkingLevel, "low");
+  assert.equal(observedOptions.llmConfig.llmScreeningStrategy, "fast_first_verified");
+  assert.equal(observedOptions.llmConfig.llmFastThinkingLevel, "current");
+  assert.equal(observedOptions.llmConfig.llmVerifyThinkingLevel, "medium");
+  assert.equal(observedOptions.llmConfig.llmFastMaxTokens, 320);
+  assert.equal(observedOptions.llmConfig.llmVerifyMaxTokens, 1536);
   assert.equal(observedOptions.llmConfig.llmMaxTokens, 384);
   assert.equal(observedOptions.llmConfig.llmMaxRetries, 2);
   assert.equal(observedOptions.llmConfig.llmTimeoutMs, 70000);
@@ -331,6 +336,11 @@ async function main() {
     debugPort: 9444,
     outputDir,
     llmThinkingLevel: "low",
+    llmScreeningStrategy: "fast_first_verified",
+    llmFastThinkingLevel: "current",
+    llmVerifyThinkingLevel: "medium",
+    llmFastMaxTokens: 320,
+    llmVerifyMaxTokens: 1536,
     llmMaxTokens: 384,
     llmMaxRetries: 2,
     llmTimeoutMs: 70000,

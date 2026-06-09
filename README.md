@@ -354,7 +354,12 @@ config/screening-config.example.json
     }
   ],
   "greetingMessage": "Hi同学，能麻烦发下简历吗？",
+  "llmScreeningStrategy": "single_pass",
   "llmThinkingLevel": "low",
+  "llmFastThinkingLevel": "current",
+  "llmVerifyThinkingLevel": "low",
+  "llmFastMaxTokens": 384,
+  "llmVerifyMaxTokens": null,
   "llmMaxRetries": 1
 }
 ```
@@ -366,9 +371,15 @@ config/screening-config.example.json
 - `greetingMessage`：chat 求简历流程发送的招呼语。兼容 `greetingText` / `greeting_text`；本次 run 显式传入的 `greeting_text` 优先级最高。
 - `debugPort`：未显式传 `port` 时，recommend / search / chat CDP-only MCP run 和健康检查默认连接这个 Chrome 调试端口。
 - `outputDir`：recommend / search / chat 完成后的最终 CSV 与 report JSON 会写入这里；run state / checkpoint 仍保留在各自状态目录，方便 pause/resume/cancel。
-- `llmThinkingLevel`：默认 `low`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。
+- `llmScreeningStrategy`：默认 `single_pass`，保持旧行为并使用 `llmThinkingLevel`。设为 `fast_first_verified` 时，recommend / search / chat 会先用 `llmFastThinkingLevel` 快速判断，再只对快速通过、快速判断要求复核、或快速输出无效/缺字段的候选人用 `llmVerifyThinkingLevel` 复核；明确 `passed=false` 且 `review_required=false` 的快速淘汰不会复核。复核发生时，复核结果作为最终结果。
+- `llmFastThinkingLevel` / `llmVerifyThinkingLevel`：仅在 `llmScreeningStrategy="fast_first_verified"` 时生效；默认分别为 `current` 和 `low`，可设为 `off/minimal/low/medium/high/auto/current`。此策略会忽略 `llmThinkingLevel` 的通过选择。
+- `llmFastMaxTokens` / `llmVerifyMaxTokens`：仅在 `llmScreeningStrategy="fast_first_verified"` 时生效。快速首轮默认最多输出 `384` tokens，即使全局 `llmMaxTokens` 更大，也会使用这个快速轮上限，避免 `current` 模式输出冗长推理；可用 `llmFastMaxTokens` 覆盖。复核轮默认沿用全局 `llmMaxTokens` / `llmMaxCompletionTokens`，也可用 `llmVerifyMaxTokens` 单独覆盖。
+- `fast_first_verified` 的快速轮只有在硬性不通过证据直接、明确、且没有可见反向证据时才应返回 `review_required=false`。如果简历里存在任一可能合格的学校/学历、产品或行业、职责或指标、海外/语言证据、或需要精确计算的任期/年限证据，即使快速轮倾向 `passed=false`，也应返回 `review_required=true` 交给复核轮。
+- LLM provider 返回预算、额度、账单或鉴权类 fatal 错误（例如 `budget_exceeded`、quota exceeded、401/403）时，单次 LLM 调用最多重试 2 次；若仍失败，recommend / search / chat 会直接让本次 run 失败，不再把后续候选人记录为筛选不通过。
+- `llmThinkingLevel`：默认 `low`。可设为 `off/minimal/low/medium/high/auto/current`，用于控制 OpenAI-compatible LLM 的 thinking/reasoning 强度。recommend / search / chat 共用同一套 LLM 筛选提示词：模型会按筛选标准顺序检查硬性淘汰项，若某项已可确定不满足（包括标准要求“证据不足即不通过”的缺失证据），会直接返回不通过；只有当前淘汰项存在截图不清、信息冲突或可能被后续简历内容澄清时才继续核实。
   - `current`：不显式发送 thinking/reasoning 参数，并要求 LLM 返回 `{"passed": true/false, "summary": "少于100个中文词的筛选总结"}`；CSV 的 `判断依据(CoT)` 写入该 summary。
   - 其他值：只要求 LLM 返回 `{"passed": true/false}`；若 provider 返回 reasoning / CoT 字段，CSV 的 `判断依据(CoT)` 写入该内容。
+  - 在 `fast_first_verified` 下，快速首轮始终要求 `{"passed": true/false, "summary": "少于100个中文词的筛选总结", "review_required": true/false}`。若最终来自快速轮，CSV 的 `判断依据(CoT)` 写入快速 summary；若最终来自复核轮，CSV 优先写入复核 CoT/reasoning，复核轮为 `current` 时写入复核 summary。
 - `humanBehavior`：默认 `{ "enabled": true, "profile": "paced_with_rests", "restLevel": "low" }`。用于 recommend / search / chat 的可靠性实验，支持：
   - `profile: "baseline"`：关闭人类节奏，保持确定性行为。
   - `profile: "paced"`：启用 CDP-only Bezier 鼠标移动、较大按钮的安全 inset 点击点、分块 `Input.insertText`、列表 wheel/settle jitter，以及小的动作前后读秒。

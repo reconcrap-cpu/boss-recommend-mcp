@@ -7,12 +7,43 @@ import {
   buildScreeningCandidateFromDetail,
   buildScreeningLlmMessages,
   callScreeningLlm,
+  classifyFatalLlmProviderError,
+  compactScreeningLlmResult,
+  createFatalLlmRunError,
   extractBossProfileFromNetworkBody,
   htmlToText,
+  isFatalLlmProviderError,
   normalizeCandidateFromHtml,
   normalizeCandidateProfile,
   screenCandidate
 } from "./core/screening/index.js";
+
+function getPromptText(messages) {
+  const userContent = messages?.[1]?.content;
+  if (typeof userContent === "string") return userContent;
+  return userContent?.find((item) => item?.type === "text")?.text || "";
+}
+
+function assertPromptHasFailFast(messages) {
+  assert.equal(messages[0].content.includes("必须完整阅读输入内容"), false);
+  assert.equal(messages[0].content.includes("一旦确定命中硬性淘汰项"), true);
+  const promptText = getPromptText(messages);
+  assert.equal(promptText.includes("按筛选标准原文顺序拆解并检查硬性淘汰项"), true);
+  assert.equal(promptText.includes("一旦某项可确定不满足，必须立即返回 passed=false"), true);
+  assert.equal(promptText.includes("这类缺失证据就是可确定不满足"), true);
+  assert.equal(promptText.includes("可能被后续可见简历内容澄清"), true);
+}
+
+function assertPromptHasFastReviewCounterevidenceGuard(messages) {
+  assert.equal(messages[0].content.includes("无可见反向证据"), true);
+  const promptText = getPromptText(messages);
+  assert.equal(promptText.includes("只有当某个硬性不通过条件有直接、明确、无可见反向证据"), true);
+  assert.equal(promptText.includes("存在任何可能满足当前被否定条件的反向证据、边界证据或可计入经历"), true);
+  assert.equal(promptText.includes("可能合格的产品或行业"), true);
+  assert.equal(promptText.includes("可能合格的职责或指标"), true);
+  assert.equal(promptText.includes("不要因为候选人其他经历不匹配，就忽略某一段可能匹配的经历"), true);
+  assert.equal(promptText.includes("summary 必须点明确切的决定性硬性失败"), true);
+}
 
 function testHtmlToText() {
   const text = htmlToText("<div data-geek=\"abc\"><span>张三</span><br><b>本科</b>&nbsp;5年经验</div>");
@@ -431,6 +462,50 @@ function testBuildScreeningLlmMessages() {
   assert.equal(messages[1].content.includes("\"passed\""), true);
   assert.equal(messages[1].content.includes("\"reason\""), false);
   assert.equal(messages[1].content.includes("\"evidence\""), false);
+  assertPromptHasFailFast(messages);
+}
+
+function testBuildScreeningLlmMessagesFailFastForAllThinkingModes() {
+  const candidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "fixture",
+    id: "candidate-fail-fast",
+    text: "赵六\n本科\n用户运营"
+  });
+  for (const thinkingLevel of ["current", "auto", "off", "minimal", "low", "medium", "high"]) {
+    const messages = buildScreeningLlmMessages({
+      candidate,
+      criteria: "必须满足全部硬条件；证据不足一律 passed=false",
+      thinkingLevel
+    });
+    assertPromptHasFailFast(messages);
+    assert.equal(getPromptText(messages).includes("无可见反向证据"), false);
+  }
+}
+
+function testBuildScreeningLlmMessagesFastFirstRequiresReviewOnCounterevidence() {
+  const candidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "fixture",
+    id: "candidate-counterevidence",
+    text: [
+      "候选人：潘新宇式混合经历",
+      "EcoFlow 硬件配套 App 运营",
+      "Boomplay DAU 千万级音乐流媒体产品，负责用户运营、消息推送、A/B test、FCM",
+      "短剧/网文数据产品，负责产品运营和数据分析"
+    ].join("\n")
+  });
+  const messages = buildScreeningLlmMessages({
+    candidate,
+    criteria: "筛选海外 prosumer 软件用户增长负责人。若产品/行业不匹配或用户数量增长责任证据不足，passed=false。",
+    thinkingLevel: "current",
+    requireReviewDecision: true
+  });
+  assertPromptHasFailFast(messages);
+  assertPromptHasFastReviewCounterevidenceGuard(messages);
+  const promptText = getPromptText(messages);
+  assert.equal(promptText.includes("\"review_required\""), true);
+  assert.equal(promptText.includes("Boomplay DAU 千万级音乐流媒体产品"), true);
 }
 
 function testBuildScreeningLlmMessagesWithImages() {
@@ -455,8 +530,10 @@ function testBuildScreeningLlmMessagesWithImages() {
   assert.equal(imageInputs.length, 1);
   assert.equal(messages[1].content[0].type, "text");
   assert.equal(messages[1].content[0].text.includes("简历截图共 1 张"), true);
+  assert.equal(messages[1].content[0].text.includes("明确硬性淘汰项，可停止后续评估"), true);
   assert.equal(messages[1].content[1].type, "image_url");
   assert.equal(messages[1].content[1].image_url.url.startsWith("data:image/png;base64,"), true);
+  assertPromptHasFailFast(messages);
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
@@ -754,12 +831,85 @@ async function testCallScreeningLlmCurrentRequiresSummaryForCot() {
     assert.equal(payload.reasoning_effort, undefined);
     assert.equal(payload.messages[0].content.includes("summary"), true);
     assert.equal(payload.messages[1].content.includes("\"summary\""), true);
+    assertPromptHasFailFast(payload.messages);
     assert.equal(result.passed, false);
     assert.equal(result.cot, "passed=false；学历证据不足，算法经验与毕业年份仍需核验。");
     assert.equal(result.reasoning_content, "");
   } finally {
     globalThis.fetch = originalFetch;
   }
+}
+
+function testCompactScreeningLlmResultPreservesCurrentSummaryCot() {
+  const summary = "passed=false；当前经历命中硬性淘汰项，已停止后续评估。";
+  const result = {
+    ok: true,
+    provider: {
+      model: "kimi-k2.5",
+      thinking_level: "current"
+    },
+    passed: false,
+    cot: summary,
+    decision_cot: summary,
+    reasoning_content: "",
+    raw_model_output: JSON.stringify({ passed: false, summary }),
+    evidence: [],
+    usage: { total_tokens: 31 },
+    finish_reason: "stop",
+    image_input_count: 3,
+    attempt_count: 1,
+    fallback_count: 0,
+    screening_strategy: "fast_first_verified",
+    fast_thinking_level: "current",
+    verify_thinking_level: "low",
+    verified: false,
+    verification_reason: "",
+    decision_source: "fast",
+    fast_result: {
+      ok: true,
+      passed: false,
+      cot: summary,
+      provider: {
+        model: "kimi-k2.5",
+        thinking_level: "current"
+      }
+    },
+    verify_result: null
+  };
+  const compact = compactScreeningLlmResult(result);
+  assert.equal(compact.provider.thinking_level, "current");
+  assert.equal(compact.passed, false);
+  assert.equal(compact.cot, summary);
+  assert.equal(compact.reasoning_content, "");
+  assert.equal(compact.raw_model_output.includes("summary"), true);
+  assert.equal(compact.screening_strategy, "fast_first_verified");
+  assert.equal(compact.fast_thinking_level, "current");
+  assert.equal(compact.verify_thinking_level, "low");
+  assert.equal(compact.verified, false);
+  assert.equal(compact.decision_source, "fast");
+  assert.equal(compact.fast_result.passed, false);
+
+  const chatShapedCompact = {
+    ok: Boolean(result.ok),
+    provider: result.provider || null,
+    passed: result.passed,
+    review_required: typeof result.review_required === "boolean" ? result.review_required : null,
+    cot: result.cot || result.decision_cot || "",
+    reasoning_content: result.reasoning_content || "",
+    raw_model_output: result.raw_model_output || "",
+    screening_strategy: result.screening_strategy || "",
+    fast_thinking_level: result.fast_thinking_level || "",
+    verify_thinking_level: result.verify_thinking_level || "",
+    verified: typeof result.verified === "boolean" ? result.verified : null,
+    verification_reason: result.verification_reason || "",
+    decision_source: result.decision_source || "",
+    fast_result: result.fast_result || null,
+    verify_result: result.verify_result || null
+  };
+  assert.equal(chatShapedCompact.provider.thinking_level, "current");
+  assert.equal(chatShapedCompact.cot, summary);
+  assert.equal(chatShapedCompact.screening_strategy, "fast_first_verified");
+  assert.equal(chatShapedCompact.decision_source, "fast");
 }
 
 async function testCallScreeningLlmCurrentRejectsMissingSummary() {
@@ -848,9 +998,549 @@ async function testCallScreeningLlmNonCurrentStaysBooleanOnlyAndCapturesProvider
     });
     assert.equal(payload.messages[0].content.includes("summary"), false);
     assert.equal(payload.messages[1].content.includes("\"summary\""), false);
+    assertPromptHasFailFast(payload.messages);
     assert.equal(payload.reasoning_effort, "low");
     assert.equal(result.passed, true);
     assert.equal(result.cot, "provider cot");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastFirstClearFailSkipsVerify() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  passed: false,
+                  summary: "passed=false；硬性条件明确不满足，无需复核。",
+                  review_required: false
+                })
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 22 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fast-clear-fail",
+        text: "候选人\n不满足硬性条件"
+      }),
+      criteria: "必须满足硬性条件",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmThinkingLevel: "high",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "low",
+        llmMaxRetries: 0
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].reasoning_effort, undefined);
+    assert.equal(calls[0].max_tokens, 384);
+    assert.equal(calls[0].messages[1].content.includes("\"review_required\""), true);
+    assertPromptHasFastReviewCounterevidenceGuard(calls[0].messages);
+    assert.equal(result.passed, false);
+    assert.equal(result.cot, "passed=false；硬性条件明确不满足，无需复核。");
+    assert.equal(result.review_required, false);
+    assert.equal(result.screening_strategy, "fast_first_verified");
+    assert.equal(result.fast_thinking_level, "current");
+    assert.equal(result.verify_thinking_level, "low");
+    assert.equal(result.verified, false);
+    assert.equal(result.decision_source, "fast");
+    assert.equal(result.verification_reason, "");
+    assert.equal(result.provider.thinking_level, "current");
+    assert.equal(result.fast_result.passed, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastPassVerifiesAndVerifierWins() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload);
+    const isFast = calls.length === 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            isFast
+              ? {
+                message: {
+                  content: JSON.stringify({
+                    passed: true,
+                    summary: "passed=true；快速轮认为满足但需要复核通过项。",
+                    review_required: false
+                  })
+                },
+                finish_reason: "stop"
+              }
+              : {
+                message: {
+                  content: "{\"passed\": false}",
+                  reasoning_content: "verifier cot"
+                },
+                finish_reason: "stop"
+              }
+          ],
+          usage: { total_tokens: isFast ? 20 : 40 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fast-pass-verify",
+        text: "候选人\n边界案例"
+      }),
+      criteria: "必须满足全部条件",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "low",
+        llmMaxTokens: 2048,
+        llmMaxRetries: 0
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].reasoning_effort, undefined);
+    assert.equal(calls[1].reasoning_effort, "low");
+    assert.equal(calls[0].max_tokens, 384);
+    assert.equal(calls[1].max_tokens, 2048);
+    assert.equal(result.passed, false);
+    assert.equal(result.cot, "verifier cot");
+    assert.equal(result.verified, true);
+    assert.equal(result.decision_source, "verify");
+    assert.equal(result.verification_reason, "fast_passed");
+    assert.equal(result.fast_result.passed, true);
+    assert.equal(result.verify_result.passed, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastFirstUsesPassSpecificTokenCaps() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload);
+    const isFast = calls.length === 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            isFast
+              ? {
+                message: {
+                  content: JSON.stringify({
+                    passed: true,
+                    summary: "passed=true；快速轮通过后复核。",
+                    review_required: false
+                  })
+                },
+                finish_reason: "stop"
+              }
+              : {
+                message: {
+                  content: "{\"passed\": true}",
+                  reasoning_content: "verifier cot"
+                },
+                finish_reason: "stop"
+              }
+          ],
+          usage: { total_tokens: isFast ? 20 : 40 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fast-pass-token-caps",
+        text: "候选人\n证据完整"
+      }),
+      criteria: "必须满足全部条件",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "low",
+        llmMaxTokens: 2048,
+        llmMaxCompletionTokens: 4096,
+        llmFastMaxTokens: 256,
+        llmVerifyMaxTokens: 768,
+        llmMaxRetries: 0
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].max_tokens, 256);
+    assert.equal(calls[0].max_completion_tokens, undefined);
+    assert.equal(calls[1].max_tokens, 768);
+    assert.equal(calls[1].max_completion_tokens, undefined);
+    assert.equal(result.provider.max_tokens, 768);
+    assert.equal(result.fast_result.provider.max_tokens, 256);
+    assert.equal(result.verify_result.provider.max_tokens, 768);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastUncertainFailVerifies() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload);
+    const isFast = calls.length === 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            isFast
+              ? {
+                message: {
+                  content: JSON.stringify({
+                    passed: false,
+                    summary: "passed=false；证据边界不清，需要复核。",
+                    review_required: true
+                  })
+                },
+                finish_reason: "stop"
+              }
+              : {
+                message: {
+                  content: "{\"passed\": true}",
+                  reasoning_content: "medium verifier cot"
+                },
+                finish_reason: "stop"
+              }
+          ],
+          usage: { total_tokens: isFast ? 25 : 42 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "chat",
+        source: "fixture",
+        id: "fast-uncertain-fail",
+        text: "候选人\n证据边界案例"
+      }),
+      criteria: "证据不足则不通过，但截图可能有补充信息",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "minimal",
+        llmVerifyThinkingLevel: "medium",
+        llmMaxRetries: 0
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].reasoning_effort, "minimal");
+    assert.equal(calls[1].reasoning_effort, "medium");
+    assert.equal(result.passed, true);
+    assert.equal(result.cot, "medium verifier cot");
+    assert.equal(result.verification_reason, "fast_review_required");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastInvalidOutputRetries() {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: calls === 1
+                  ? "{}"
+                  : JSON.stringify({
+                    passed: false,
+                    summary: "passed=false；重试后得到明确淘汰结论。",
+                    review_required: false
+                  })
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 18 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fast-invalid-retry",
+        text: "候选人\n明确不通过"
+      }),
+      criteria: "必须满足硬性条件",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "low",
+        llmMaxRetries: 1
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.passed, false);
+    assert.equal(result.verified, false);
+    assert.equal(result.attempt_count, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastFirstAllInvalidFailsClosed() {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: { content: "{}" },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: 10 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fast-all-invalid",
+        text: "候选人\n无法判断"
+      }),
+      criteria: "必须满足硬性条件",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "low",
+        llmMaxRetries: 0
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls, 2);
+    assert.equal(result.ok, false);
+    assert.equal(result.passed, false);
+    assert.equal(result.verified, true);
+    assert.equal(result.decision_source, "verify_error");
+    assert.equal(result.verification_reason, "fast_invalid_response");
+    assert.equal(result.error.includes("missing boolean passed decision"), true);
+    assert.equal(result.fast_result.ok, false);
+    assert.equal(result.verify_result.ok, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmVerifierCurrentSummaryIsPreserved() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload);
+    const isFast = calls.length === 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify(isFast
+                  ? {
+                    passed: true,
+                    summary: "passed=true；快速轮通过，进入 current 复核。",
+                    review_required: false
+                  }
+                  : {
+                    passed: true,
+                    summary: "passed=true；复核确认核心证据完整。"
+                  })
+              },
+              finish_reason: "stop"
+            }
+          ],
+          usage: { total_tokens: isFast ? 22 : 28 }
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recruit",
+        source: "fixture",
+        id: "verify-current-summary",
+        text: "候选人\n证据完整"
+      }),
+      criteria: "必须满足全部条件",
+      config: {
+        baseUrl: "https://coding.example.com/v1",
+        apiKey: "test-key",
+        model: "kimi-k2.5",
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "current",
+        llmMaxRetries: 0
+      },
+      timeoutMs: 1000
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].reasoning_effort, undefined);
+    assert.equal(result.passed, true);
+    assert.equal(result.cot, "passed=true；复核确认核心证据完整。");
+    assert.equal(result.verify_result.cot, "passed=true；复核确认核心证据完整。");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastFirstSupportsConfiguredLevelPairs() {
+  const originalFetch = globalThis.fetch;
+  const pairs = [
+    ["minimal", "low"],
+    ["current", "medium"],
+    ["off", "low"]
+  ];
+  try {
+    for (const [fastLevel, verifyLevel] of pairs) {
+      const calls = [];
+      globalThis.fetch = async (_url, options) => {
+        const payload = JSON.parse(options.body);
+        calls.push(payload);
+        const isFast = calls.length === 1;
+        return {
+          ok: true,
+          status: 200,
+          async text() {
+            return JSON.stringify({
+              choices: [
+                isFast
+                  ? {
+                    message: {
+                      content: JSON.stringify({
+                        passed: true,
+                        summary: "passed=true；快速轮通过后复核。",
+                        review_required: false
+                      })
+                    },
+                    finish_reason: "stop"
+                  }
+                  : {
+                    message: {
+                      content: "{\"passed\": true}",
+                      reasoning_content: `${verifyLevel} verifier cot`
+                    },
+                    finish_reason: "stop"
+                  }
+              ],
+              usage: { total_tokens: 20 }
+            });
+          }
+        };
+      };
+      const result = await callScreeningLlm({
+        candidate: normalizeCandidateProfile({
+          domain: "recommend",
+          source: "fixture",
+          id: `level-${fastLevel}-${verifyLevel}`,
+          text: "候选人\n证据完整"
+        }),
+        criteria: "必须满足全部条件",
+        config: {
+          baseUrl: "https://coding.example.com/v1",
+          apiKey: "test-key",
+          model: "kimi-k2.5",
+          llmScreeningStrategy: "fast_first_verified",
+          llmFastThinkingLevel: fastLevel,
+          llmVerifyThinkingLevel: verifyLevel,
+          llmMaxRetries: 0
+        },
+        timeoutMs: 1000
+      });
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0].reasoning_effort, fastLevel === "current" ? undefined : (fastLevel === "off" ? "minimal" : fastLevel));
+      assert.equal(calls[1].reasoning_effort, verifyLevel === "current" ? undefined : (verifyLevel === "off" ? "minimal" : verifyLevel));
+      assert.equal(result.fast_thinking_level, fastLevel);
+      assert.equal(result.verify_thinking_level, verifyLevel);
+      assert.equal(result.verified, true);
+    }
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -980,6 +1670,84 @@ async function testCallScreeningLlmFallsBackToNextConfiguredModel() {
   }
 }
 
+function testFatalLlmProviderErrorClassification() {
+  const budget = new Error("LLM request failed: 400 {\"error\":{\"message\":\"Budget has been exceeded! Current cost: 100.1, Max budget: 100.0\",\"type\":\"budget_exceeded\",\"code\":\"400\"}}");
+  budget.status = 400;
+  assert.deepEqual(classifyFatalLlmProviderError(budget), {
+    code: "LLM_BUDGET_EXCEEDED",
+    reason: "budget_exceeded"
+  });
+  const auth = new Error("LLM request failed: 401 unauthorized");
+  auth.status = 401;
+  assert.deepEqual(classifyFatalLlmProviderError(auth), {
+    code: "LLM_AUTH_FAILED",
+    reason: "auth_failed"
+  });
+  const invalidJson = new Error("LLM response was not valid JSON");
+  assert.equal(classifyFatalLlmProviderError(invalidJson), null);
+  const fatal = createFatalLlmRunError(budget, {
+    domain: "recommend",
+    candidate: { id: "candidate-1", identity: { name: "候选人" } }
+  });
+  assert.equal(isFatalLlmProviderError(fatal), true);
+  assert.equal(fatal.code, "LLM_BUDGET_EXCEEDED");
+  assert.equal(fatal.domain, "recommend");
+  assert.equal(fatal.candidate_id, "candidate-1");
+}
+
+async function testCallScreeningLlmFatalProviderErrorRetriesTwiceThenThrows() {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: false,
+      status: 400,
+      async text() {
+        return JSON.stringify({
+          error: {
+            message: "Budget has been exceeded! Current cost: 100.0004, Max budget: 100.0",
+            type: "budget_exceeded",
+            code: "400"
+          }
+        });
+      }
+    };
+  };
+  try {
+    await assert.rejects(
+      () => callScreeningLlm({
+        candidate: normalizeCandidateProfile({
+          domain: "recommend",
+          source: "fixture",
+          id: "fatal-budget",
+          text: "候选人\n增长负责人"
+        }),
+        criteria: "必须满足硬性条件",
+        config: {
+          baseUrl: "https://coding.example.com/v1",
+          apiKey: "test-key",
+          model: "kimi-k2.5",
+          llmScreeningStrategy: "fast_first_verified",
+          llmFastThinkingLevel: "current",
+          llmVerifyThinkingLevel: "low",
+          llmMaxRetries: 0
+        },
+        timeoutMs: 1000
+      }),
+      (error) => {
+        assert.equal(isFatalLlmProviderError(error), true);
+        assert.equal(error.code, "LLM_BUDGET_EXCEEDED");
+        assert.equal(error.llm_attempt_count, 3);
+        return true;
+      }
+    );
+    assert.equal(calls, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 testHtmlToText();
 testNormalizeFromHtml();
 testNormalizeFromHtmlSkipsSalaryAsName();
@@ -994,6 +1762,8 @@ testBossChatGeekInfoExtraction();
 testBossChatHistoryResumeExtraction();
 testBuildScreeningCandidateFromDetailUsesCleanNetworkText();
 testBuildScreeningLlmMessages();
+testBuildScreeningLlmMessagesFailFastForAllThinkingModes();
+testBuildScreeningLlmMessagesFastFirstRequiresReviewOnCounterevidence();
 testBuildScreeningLlmMessagesWithImages();
 testBuildScreeningLlmImageInputsPrefersComposedFullCvImages();
 await testCallScreeningLlmDefaultsThinkingLow();
@@ -1001,9 +1771,20 @@ await testCallScreeningLlmSendsReasoningEffortForOpenAiCompatibleDoubao();
 await testCallScreeningLlmCollapsesRepeatedReasoningBlock();
 await testCallScreeningLlmUsesConfigThinkingAndBudget();
 await testCallScreeningLlmCurrentRequiresSummaryForCot();
+testCompactScreeningLlmResultPreservesCurrentSummaryCot();
 await testCallScreeningLlmCurrentRejectsMissingSummary();
 await testCallScreeningLlmNonCurrentStaysBooleanOnlyAndCapturesProviderCot();
+await testCallScreeningLlmFastFirstClearFailSkipsVerify();
+await testCallScreeningLlmFastPassVerifiesAndVerifierWins();
+await testCallScreeningLlmFastFirstUsesPassSpecificTokenCaps();
+await testCallScreeningLlmFastUncertainFailVerifies();
+await testCallScreeningLlmFastInvalidOutputRetries();
+await testCallScreeningLlmFastFirstAllInvalidFailsClosed();
+await testCallScreeningLlmVerifierCurrentSummaryIsPreserved();
+await testCallScreeningLlmFastFirstSupportsConfiguredLevelPairs();
 await testCallScreeningLlmRetriesTransientFailure();
 await testCallScreeningLlmFallsBackToNextConfiguredModel();
+testFatalLlmProviderErrorClassification();
+await testCallScreeningLlmFatalProviderErrorRetriesTwiceThenThrows();
 
 console.log("Core screening tests passed");

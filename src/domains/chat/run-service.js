@@ -40,6 +40,8 @@ import {
 } from "../../core/run/timing.js";
 import {
   callScreeningLlm,
+  createFatalLlmRunError,
+  isFatalLlmProviderError,
   normalizeText,
   screenCandidate
 } from "../../core/screening/index.js";
@@ -108,6 +110,7 @@ function compactLlmResult(llmResult) {
     ok: Boolean(llmResult.ok),
     provider: llmResult.provider || null,
     passed: llmResult.passed,
+    review_required: typeof llmResult.review_required === "boolean" ? llmResult.review_required : null,
     cot: llmResult.cot || llmResult.decision_cot || "",
     reasoning_content: llmResult.reasoning_content || "",
     raw_model_output: llmResult.raw_model_output || "",
@@ -118,6 +121,17 @@ function compactLlmResult(llmResult) {
     attempt_count: llmResult.attempt_count || 0,
     fallback_count: llmResult.fallback_count || 0,
     llm_model_failures: Array.isArray(llmResult.llm_model_failures) ? llmResult.llm_model_failures : [],
+    screening_strategy: llmResult.screening_strategy || "",
+    fast_thinking_level: llmResult.fast_thinking_level || "",
+    verify_thinking_level: llmResult.verify_thinking_level || "",
+    verified: typeof llmResult.verified === "boolean" ? llmResult.verified : null,
+    verification_reason: llmResult.verification_reason || "",
+    decision_source: llmResult.decision_source || "",
+    fast_result: llmResult.fast_result || null,
+    verify_result: llmResult.verify_result || null,
+    error_code: llmResult.error_code || null,
+    fatal: Boolean(llmResult.fatal),
+    fatal_reason: llmResult.fatal_reason || "",
     error: llmResult.error || null
   };
 }
@@ -351,6 +365,9 @@ function createFailedLlmResult(error) {
     attempt_count: Number(error?.llm_attempt_count) || 0,
     fallback_count: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures.length : 0,
     llm_model_failures: Array.isArray(error?.llm_model_failures) ? error.llm_model_failures : [],
+    error_code: error?.code || null,
+    fatal: Boolean(isFatalLlmProviderError(error)),
+    fatal_reason: error?.llm_fatal_reason || "",
     error: error?.message || String(error || "unknown"),
     screened_at: new Date().toISOString()
   };
@@ -1511,6 +1528,12 @@ export async function runChatWorkflow({
                       imageDetail: llmImageDetail
                     }));
                   } catch (error) {
+                    if (isFatalLlmProviderError(error)) {
+                      throw createFatalLlmRunError(error, {
+                        domain: "chat",
+                        candidate: detailResult.candidate
+                      });
+                    }
                     llmResult = createFailedLlmResult(error);
                   }
                 }
@@ -1584,6 +1607,12 @@ export async function runChatWorkflow({
                     imageDetail: llmImageDetail
                   }));
                 } catch (error) {
+                  if (isFatalLlmProviderError(error)) {
+                    throw createFatalLlmRunError(error, {
+                      domain: "chat",
+                      candidate: detailResult.candidate
+                    });
+                  }
                   llmResult = createFailedLlmResult(error);
                 }
               }

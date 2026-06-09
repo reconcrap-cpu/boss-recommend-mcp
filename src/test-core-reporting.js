@@ -84,6 +84,36 @@ writeLegacyScreenCsv(filePath, {
         text_model_ms: 800,
         post_action_ms: 50
       }
+    },
+    {
+      index: 1,
+      candidate: {
+        id: "candidate-2",
+        identity: {
+          name: "李四",
+          school: "示例学院",
+          current_company: "示例软件",
+          current_position: "增长运营"
+        }
+      },
+      detail: {
+        llm_screening: {
+          passed: false,
+          provider: {
+            thinking_level: "current"
+          },
+          screening_strategy: "fast_first_verified",
+          decision_source: "fast",
+          verified: false,
+          verification_reason: "",
+          cot: "passed=false；当前模式总结写入CoT列。",
+          raw_model_output: "{\"passed\":false,\"summary\":\"passed=false；当前模式总结写入CoT列。\"}"
+        }
+      },
+      timings: {
+        total_ms: 1200,
+        vision_model_ms: 900
+      }
     }
   ]
 });
@@ -98,7 +128,17 @@ assert.equal(csv.includes("完整 CoT / reasoning_content"), true);
 assert.equal(csv.includes("这个字段不应写入评估通过详细原因"), false);
 assert.equal(csv.includes("\"passed\""), true);
 assert.equal(csv.includes("\"LLM thinking_level\""), true);
+assert.equal(csv.includes("\"LLM screening_strategy\""), true);
+assert.equal(csv.includes("\"LLM decision_source\""), true);
+assert.equal(csv.includes("\"LLM verified\""), true);
+assert.equal(csv.includes("\"LLM verification_reason\""), true);
 assert.equal(csv.includes("\"low\""), true);
+assert.equal(csv.includes("passed=false；当前模式总结写入CoT列。"), true);
+assert.equal(csv.includes("\"current\""), true);
+assert.equal(csv.includes("\"fast_first_verified\""), true);
+assert.equal(csv.includes("\"fast\""), true);
+assert.equal(csv.includes("\"False\""), false);
+assert.equal(csv.includes("\"false\""), true);
 assert.equal(csv.includes("\"network\""), true);
 assert.equal(csv.includes("\"2000\""), true);
 assert.equal(csv.includes("\"123\""), true);

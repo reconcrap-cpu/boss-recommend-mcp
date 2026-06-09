@@ -903,6 +903,11 @@ async function testRecommendLoadsLlmConfigByDefault() {
   assert.equal(observedOptions.llmConfig.baseUrl, "https://api.example.com/v1");
   assert.equal(observedOptions.llmConfig.model, "gpt-4.1-mini");
   assert.equal(observedOptions.llmConfig.llmThinkingLevel, "low");
+  assert.equal(observedOptions.llmConfig.llmScreeningStrategy, "fast_first_verified");
+  assert.equal(observedOptions.llmConfig.llmFastThinkingLevel, "current");
+  assert.equal(observedOptions.llmConfig.llmVerifyThinkingLevel, "medium");
+  assert.equal(observedOptions.llmConfig.llmFastMaxTokens, 320);
+  assert.equal(observedOptions.llmConfig.llmVerifyMaxTokens, 1536);
   assert.equal(observedOptions.llmConfig.llmMaxTokens, 384);
   assert.equal(observedOptions.llmConfig.llmMaxRetries, 2);
   assert.equal(observedOptions.llmConfig.llmTimeoutMs, 70000);
@@ -920,8 +925,14 @@ async function testRecommendLoadsLlmConfigByDefault() {
   assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
   assert.equal(observedOptions.humanBehavior.restLevel, "medium");
   assert.equal(observedOptions.llmConfig.llmModels.length, 2);
+  assert.equal(observedOptions.llmConfig.llmModels[0].llmScreeningStrategy, "fast_first_verified");
+  assert.equal(observedOptions.llmConfig.llmModels[0].llmFastThinkingLevel, "current");
+  assert.equal(observedOptions.llmConfig.llmModels[0].llmVerifyThinkingLevel, "medium");
+  assert.equal(observedOptions.llmConfig.llmModels[0].llmFastMaxTokens, 320);
+  assert.equal(observedOptions.llmConfig.llmModels[0].llmVerifyMaxTokens, 1536);
   assert.equal(observedOptions.llmConfig.llmModels[1].model, "gpt-4.1-nano");
   assert.equal(observedOptions.llmConfig.llmModels[1].apiKey, "sk-backup-key");
+  assert.equal(observedOptions.llmConfig.llmModels[1].llmScreeningStrategy, "fast_first_verified");
 }
 
 async function testRecommendHumanBehaviorArgsOverrideConfig() {
@@ -1754,6 +1765,11 @@ async function main() {
     debugPort: 9333,
     outputDir,
     llmThinkingLevel: "low",
+    llmScreeningStrategy: "fast_first_verified",
+    llmFastThinkingLevel: "current",
+    llmVerifyThinkingLevel: "medium",
+    llmFastMaxTokens: 320,
+    llmVerifyMaxTokens: 1536,
     llmMaxTokens: 384,
     llmMaxRetries: 2,
     llmTimeoutMs: 70000,

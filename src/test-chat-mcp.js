@@ -385,6 +385,11 @@ async function testChatRequestCvLoadsLlmConfig() {
     assert.equal(options.llmConfig.baseUrl, "https://api.example.com/v1");
     assert.equal(options.llmConfig.model, "gpt-4.1-mini");
     assert.equal(options.llmConfig.llmThinkingLevel, "low");
+    assert.equal(options.llmConfig.llmScreeningStrategy, "fast_first_verified");
+    assert.equal(options.llmConfig.llmFastThinkingLevel, "current");
+    assert.equal(options.llmConfig.llmVerifyThinkingLevel, "medium");
+    assert.equal(options.llmConfig.llmFastMaxTokens, 320);
+    assert.equal(options.llmConfig.llmVerifyMaxTokens, 1536);
     assert.equal(options.llmConfig.llmMaxTokens, 384);
     assert.equal(options.llmConfig.llmMaxRetries, 2);
     assert.equal(options.llmConfig.llmTimeoutMs, 70000);
@@ -631,6 +636,11 @@ async function main() {
     outputDir,
     greetingMessage: "配置招呼语",
     llmThinkingLevel: "low",
+    llmScreeningStrategy: "fast_first_verified",
+    llmFastThinkingLevel: "current",
+    llmVerifyThinkingLevel: "medium",
+    llmFastMaxTokens: 320,
+    llmVerifyMaxTokens: 1536,
     llmMaxTokens: 384,
     llmMaxRetries: 2,
     llmTimeoutMs: 70000,

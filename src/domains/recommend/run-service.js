@@ -41,7 +41,9 @@ import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import {
   callScreeningLlm,
   compactScreeningLlmResult,
+  createFatalLlmRunError,
   createFailedLlmScreeningResult,
+  isFatalLlmProviderError,
   llmResultToScreening,
   screenCandidate
 } from "../../core/screening/index.js";
@@ -1343,9 +1345,15 @@ export async function runRecommendWorkflow({
             maxImages: llmImageLimit,
             imageDetail: llmImageDetail
           }));
-        } catch (error) {
-          llmResult = createFailedLlmScreeningResult(error);
-        }
+          } catch (error) {
+            if (isFatalLlmProviderError(error)) {
+              throw createFatalLlmRunError(error, {
+                domain: "recommend",
+                candidate: screeningCandidate
+              });
+            }
+            llmResult = createFailedLlmScreeningResult(error);
+          }
       }
       if (detailResult) detailResult.llm_result = llmResult;
     }
