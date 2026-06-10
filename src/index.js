@@ -1074,7 +1074,7 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       },
       criteria: {
         type: "string",
-        description: "boss-chat 的筛选 criteria"
+        description: "boss-chat 的筛选 criteria；可留空，留空时进入 collect_cv 模式：不触发 LLM 筛选，只向没有在线/附件简历的人选求简历"
       },
       greeting_text: {
         type: "string",
@@ -1133,8 +1133,8 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
       },
       screening_mode: {
         type: "string",
-        enum: ["llm", "deterministic"],
-        description: "筛选引擎；默认 llm。deterministic 仅限 debug_test_mode=true"
+        enum: ["llm", "deterministic", "collect_cv"],
+        description: "筛选引擎；默认 llm。有 criteria 时 deterministic 仅限 debug_test_mode=true；criteria 留空时自动 collect_cv"
       },
       debug_test_mode: {
         type: "boolean",
@@ -1222,11 +1222,17 @@ function createBossChatStartInputSchema({ requireFullInput = false } = {}) {
         start_from: "unread",
         target_count: 20,
         criteria: "请筛选 20 位符合条件的人选"
+      },
+      {
+        job: "530272634",
+        start_from: "all",
+        target_count: "all",
+        criteria: ""
       }
     ]
   };
   if (requireFullInput) {
-    schema.required = ["job", "start_from", "criteria"];
+    schema.required = ["job", "start_from"];
     schema.anyOf = [
       { required: ["target_count"] },
       { required: ["targetCount"] }
@@ -1546,7 +1552,7 @@ function createToolsSchema(toolset = getConfiguredMcpToolset()) {
     },
     {
       name: TOOL_BOSS_CHAT_START_RUN,
-      description: "异步启动一次 boss-chat/chat-only 任务。必须一次性提供 job、start_from、target_count、criteria；若用户选择扫到底/不限/全部候选人，必须字面传 target_count=\"all\"。严禁改用 start_recommend_pipeline_run。",
+      description: "异步启动一次 boss-chat/chat-only 任务。必须一次性提供 job、start_from、target_count；criteria 可留空，留空时自动收集缺失简历而不触发 LLM 筛选。若用户选择扫到底/不限/全部候选人，必须字面传 target_count=\"all\"。严禁改用 start_recommend_pipeline_run。",
       inputSchema: createBossChatStartInputSchema({ requireFullInput: true })
     },
     {
@@ -1603,17 +1609,17 @@ function createToolsSchema(toolset = getConfiguredMcpToolset()) {
     },
     {
       name: TOOL_LIST_RECOMMEND_JOBS,
-      description: "CDP-only 读取 Boss 推荐页岗位下拉框，返回所有可用岗位完整名称，方便 recommend/推荐页 cron/一次性任务提前填写 job 参数。不会启动筛选任务。chat-only、未读、全部聊天、求简历任务严禁调用本工具，必须用 list_boss_chat_jobs 或 prepare_boss_chat_run。",
+      description: "CDP-only 读取 Boss 推荐页岗位下拉框，返回所有可用岗位完整名称，方便 recommend/推荐页 cron/一次性任务提前填写 job 参数。不会启动筛选任务。chat-only、未读、全部聊天、求简历任务严禁调用本工具，必须用 list_boss_chat_jobs 或 prepare_boss_chat_run。搜索页/search/recruit、/web/chat/search 任务也严禁调用本工具，必须用 boss-recruit/run_recruit_pipeline 或 boss-recruit/start_recruit_pipeline_run。",
       inputSchema: createListRecommendJobsInputSchema()
     },
     {
       name: TOOL_RUN_RECOMMEND,
-      description: "立即通过原生 MCP 启动 Boss 推荐页筛选。它是 start_recommend_pipeline_run 的短别名；用户已经确认并要现在启动时，优先调用本工具，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      description: "立即通过原生 MCP 启动 Boss 推荐页筛选。仅用于 boss-recommend/推荐页，不用于搜索页。搜索页/search/recruit、/web/chat/search 任务必须调用 boss-recruit/run_recruit_pipeline 或 boss-recruit/start_recruit_pipeline_run。它是 start_recommend_pipeline_run 的短别名；用户已经确认并要现在启动时，优先调用本工具，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
       inputSchema: runInputSchema
     },
     {
       name: TOOL_START_RUN,
-      description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）。用户已经确认并要现在启动时，优先调用本工具或 run_recommend，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
+      description: "立即通过原生 MCP 异步启动 Boss 推荐页流水线（含同步门禁预检）。仅用于 boss-recommend/推荐页，不用于搜索页。搜索页/search/recruit、/web/chat/search 任务必须调用 boss-recruit/start_recruit_pipeline_run 或 boss-recruit/run_recruit_pipeline。用户已经确认并要现在启动时，优先调用本工具或 run_recommend，不需要先调用 prepare_recommend_pipeline_run。必须作为 MCP tool call 调用，禁止通过 terminal/shell/run_command/PowerShell/CLI/manual JSON-RPC 代替，也不要用 schedule_recommend_pipeline_run 冒充立即启动。",
       inputSchema: runInputSchema
     },
     {
@@ -1736,12 +1742,12 @@ function createToolsSchema(toolset = getConfiguredMcpToolset()) {
     },
     {
       name: TOOL_RUN_RECRUIT_PIPELINE,
-      description: "兼容 Boss recruit 入口：默认 async；sync 模式会等待终态。所有浏览器动作走共享 CDP-only recruit service。",
+      description: "Boss 搜索页/search/recruit 专用入口；Trae-CN split-server 下应调用 boss-recruit/run_recruit_pipeline。默认 async，sync 模式会等待终态。必须提供搜索页岗位 job（关键词输入框旁边的岗位选择）和 keyword/search intent；不要改用 boss-recommend/run_recommend 或 boss-recommend/start_recommend_pipeline_run。所有浏览器动作走共享 CDP-only recruit service。",
       inputSchema: createRecruitPipelineInputSchema()
     },
     {
       name: TOOL_START_RECRUIT_PIPELINE_RUN,
-      description: "异步启动 Boss recruit 流水线；先完成参数/criteria/default 确认门禁，再连接 Chrome search 页执行。",
+      description: "异步启动 Boss 搜索页/search/recruit 流水线；Trae-CN split-server 下应调用 boss-recruit/start_recruit_pipeline_run。必须提供搜索页岗位 job（关键词输入框旁边的岗位选择）和 keyword/search intent；先完成参数/criteria/default 确认门禁，再连接 Chrome search 页执行。不要改用 boss-recommend/start_recommend_pipeline_run。",
       inputSchema: createRecruitPipelineInputSchema()
     },
     {
@@ -1811,8 +1817,8 @@ function validateBossChatStartArgs(args) {
     }
   }
   if (Object.prototype.hasOwnProperty.call(args, "criteria")) {
-    if (typeof args.criteria !== "string" || !normalizeText(args.criteria)) {
-      return "criteria must be a non-empty string when provided";
+    if (typeof args.criteria !== "string") {
+      return "criteria must be a string when provided";
     }
   }
   if (

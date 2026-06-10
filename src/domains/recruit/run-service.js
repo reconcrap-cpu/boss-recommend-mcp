@@ -54,6 +54,10 @@ import {
   waitForRecruitDetailNetworkEvents
 } from "./detail.js";
 import {
+  clickRecruitActionControl,
+  waitForRecruitDetailActionControls
+} from "./actions.js";
+import {
   readRecruitCardCandidate,
   waitForRecruitCardNodeIds
 } from "./cards.js";
@@ -70,6 +74,7 @@ import {
   RECRUIT_CARD_SELECTOR,
   RECRUIT_LIST_CONTAINER_SELECTORS
 } from "./constants.js";
+import { GREET_CREDITS_EXHAUSTED_CODE } from "../../core/greet-quota/index.js";
 
 function compactScreening(screening) {
   return {
@@ -118,6 +123,164 @@ function normalizeScreeningMode(value) {
 
 function createMissingLlmConfigResult() {
   return createFailedLlmScreeningResult(new Error("LLM screening config is required for production search runs"));
+}
+
+function normalizeRecruitPostAction(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["", "none", "skip", "no", "不执行", "无", "什么也不做"].includes(normalized)) return "none";
+  if (["greet", "chat", "打招呼", "直接沟通", "沟通"].includes(normalized)) return "greet";
+  return "none";
+}
+
+function resolveRecruitPostAction({
+  postAction = "none",
+  greetCount = 0,
+  maxGreetCount = null
+} = {}) {
+  const requested = normalizeRecruitPostAction(postAction);
+  const currentGreetCount = Number.isInteger(greetCount) && greetCount >= 0 ? greetCount : 0;
+  const limit = Number.isInteger(maxGreetCount) && maxGreetCount > 0 ? maxGreetCount : null;
+  if (requested === "greet" && limit !== null && currentGreetCount >= limit) {
+    return {
+      requested,
+      effective: "none",
+      reason: "greet_limit_reached",
+      greet_count: currentGreetCount,
+      max_greet_count: limit
+    };
+  }
+  return {
+    requested,
+    effective: requested,
+    reason: "requested_action",
+    greet_count: currentGreetCount,
+    max_greet_count: limit
+  };
+}
+
+function compactActionDiscovery(discovery) {
+  if (!discovery) return null;
+  return {
+    ok: Boolean(discovery.ok),
+    elapsed_ms: discovery.elapsed_ms,
+    summary: discovery.summary || null
+  };
+}
+
+async function runRecruitPostAction({
+  client,
+  rootNodeIds = [],
+  screening,
+  actionDiscovery,
+  postAction = "none",
+  greetCount = 0,
+  maxGreetCount = null,
+  executePostAction = true,
+  afterClickDelayMs = 900
+} = {}) {
+  const plan = resolveRecruitPostAction({
+    postAction,
+    greetCount,
+    maxGreetCount
+  });
+  const result = {
+    requested: postAction,
+    execute_post_action: Boolean(executePostAction),
+    plan,
+    eligible: Boolean(screening?.passed),
+    action_attempted: false,
+    action_clicked: false,
+    counted_as_greet: false,
+    reason: ""
+  };
+
+  if (!screening?.passed) {
+    result.reason = "screening_not_passed";
+    return result;
+  }
+  if (plan.effective === "none") {
+    result.reason = plan.reason === "greet_limit_reached" ? "greet_limit_reached" : "post_action_none";
+    return result;
+  }
+
+  const summary = actionDiscovery?.summary || {};
+  const control = summary.greet?.control || summary.greet;
+  if (!control?.found && !control?.node_id) {
+    result.reason = `${plan.effective}_control_not_found`;
+    return result;
+  }
+  result.control = control;
+
+  if (plan.effective === "greet" && control.continue_chat) {
+    result.reason = "already_connected_continue_chat";
+    result.already_connected = true;
+    return result;
+  }
+  if (plan.effective === "greet" && control.greet_quota?.exhausted) {
+    result.reason = "greet_credits_exhausted";
+    result.out_of_greet_credits = true;
+    result.stop_run = true;
+    return result;
+  }
+  if (plan.effective === "greet" && control.available === false) {
+    result.reason = "greet_control_not_available";
+    return result;
+  }
+  if (control.disabled) {
+    result.reason = `${plan.effective}_control_disabled`;
+    return result;
+  }
+  if (!executePostAction) {
+    result.reason = "dry_run_post_action";
+    result.would_click = true;
+    return result;
+  }
+
+  result.action_attempted = true;
+  result.control_before = control;
+  let clickResult;
+  try {
+    clickResult = await clickRecruitActionControl(client, {
+      ...control,
+      kind: plan.effective
+    });
+  } catch (error) {
+    if (error?.code === GREET_CREDITS_EXHAUSTED_CODE) {
+      result.reason = "greet_credits_exhausted";
+      result.out_of_greet_credits = true;
+      result.stop_run = true;
+      result.greet_quota = error.greet_quota || control.greet_quota || null;
+      return result;
+    }
+    throw error;
+  }
+  result.click_result = clickResult;
+  result.action_clicked = true;
+  result.counted_as_greet = plan.effective === "greet";
+  result.reason = "clicked";
+  if (afterClickDelayMs > 0) await sleep(afterClickDelayMs);
+  try {
+    const afterDiscovery = await waitForRecruitDetailActionControls(client, {
+      rootNodeIds,
+      timeoutMs: 2500,
+      intervalMs: 300,
+      requireAny: false
+    });
+    const afterControl = afterDiscovery?.summary?.greet?.control || afterDiscovery?.summary?.greet || null;
+    result.action_discovery_after = compactActionDiscovery(afterDiscovery);
+    result.control_after = afterControl;
+    if (plan.effective === "greet") {
+      result.verified_after_click = Boolean(
+        afterControl?.continue_chat
+        || String(afterControl?.label || "").includes("继续沟通")
+      );
+    }
+  } catch (error) {
+    result.verify_error = {
+      message: error?.message || String(error)
+    };
+  }
+  return result;
 }
 
 function normalizeSearchParams(searchParams = {}) {
@@ -328,13 +491,17 @@ function createRecoverableDetailFailureScreening(candidate, error) {
   };
 }
 
-export function countRecruitResultStatuses(results = []) {
+export function countRecruitResultStatuses(results = [], {
+  greetCount = 0
+} = {}) {
   return {
     processed: results.length,
     screened: results.length,
     detail_opened: results.filter((item) => item.detail).length,
     passed: results.filter((item) => item.screening?.passed).length,
     llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
+    greet_count: greetCount,
+    post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
     image_capture_failed: results.filter((item) => item.detail?.image_evidence?.ok === false).length,
     detail_open_failed: results.filter((item) => (
       item.error?.code === "DETAIL_STALE_NODE"
@@ -380,7 +547,13 @@ export async function runRecruitWorkflow({
   llmImageDetail = "high",
   imageOutputDir = "",
   humanRestEnabled = false,
-  humanBehavior = null
+  humanBehavior = null,
+  postAction = "none",
+  maxGreetCount = null,
+  executePostAction = true,
+  actionTimeoutMs = 8000,
+  actionIntervalMs = 400,
+  actionAfterClickDelayMs = 900
 } = {}, runControl) {
   if (!client) throw new Error("runRecruitWorkflow requires a guarded CDP client");
   const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
@@ -402,6 +575,8 @@ export async function runRecruitWorkflow({
   });
   const normalizedSearchParams = normalizeSearchParams(searchParams);
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+  const normalizedPostAction = normalizeRecruitPostAction(postAction);
+  const postActionEnabled = normalizedPostAction !== "none";
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const limit = Math.max(1, Number(maxCandidates) || 1);
   const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
@@ -427,6 +602,7 @@ export async function runRecruitWorkflow({
   }
   const results = [];
   const refreshAttempts = [];
+  let greetCount = 0;
   let refreshRounds = 0;
   let contextRecoveryAttempts = 0;
   const candidateRecoveryCounts = new Map();
@@ -470,7 +646,7 @@ export async function runRecruitWorkflow({
   }
 
   function updateRecruitProgress(extra = {}) {
-    const counts = countRecruitResultStatuses(results);
+    const counts = countRecruitResultStatuses(results, { greetCount });
     const listSnapshot = compactInfiniteListState(listState);
     const humanRestState = humanRestController.getState();
     runControl.updateProgress({
@@ -510,7 +686,7 @@ export async function runRecruitWorkflow({
         key: candidateKey,
         card_node_id: cardNodeId,
         detail_step: detailStep || null,
-        counters: countRecruitResultStatuses(results),
+        counters: countRecruitResultStatuses(results, { greetCount }),
         error: compactError(error, "RECRUIT_IN_PROGRESS_ERROR")
       },
       candidate_list: compactInfiniteListState(listState)
@@ -566,7 +742,7 @@ export async function runRecruitWorkflow({
         reason,
         trigger_error: compactError(error, "RECRUIT_CONTEXT_RECOVERY_TRIGGER"),
         refresh: compactRefresh,
-        counters: countRecruitResultStatuses(results)
+        counters: countRecruitResultStatuses(results, { greetCount })
       },
       candidate_list: compactInfiniteListState(listState)
     });
@@ -596,7 +772,7 @@ export async function runRecruitWorkflow({
       metadata: {
         card_count: cardNodeIds.length,
         forced_recent_viewed: forceRecentViewed,
-        counters: countRecruitResultStatuses(results)
+        counters: countRecruitResultStatuses(results, { greetCount })
       }
     });
     listEndReason = "";
@@ -782,6 +958,7 @@ export async function runRecruitWorkflow({
 
     let screeningCandidate = cardCandidate;
     let detailResult = null;
+    let detailActionRootNodeIds = [];
     let recoverableDetailError = null;
     let detailStep = "not_started";
     if (index < detailCountLimit) {
@@ -815,6 +992,7 @@ export async function runRecruitWorkflow({
         networkRecorder.clear();
         await maybeHumanActionCooldown("before_detail_open", timings);
         const openedDetail = await openRecruitCardDetail(client, cardNodeId);
+        detailActionRootNodeIds = (openedDetail.detail_state?.roots || []).map((root) => root.nodeId).filter(Boolean);
         addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
         addTiming(timings, "detail_open_ms", openedDetail.timings?.detail_open_ms);
         const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
@@ -957,7 +1135,7 @@ export async function runRecruitWorkflow({
           capture_target_wait: captureTargetWait
         };
         screeningCandidate = detailResult.candidate;
-        if (closeDetail) {
+        if (closeDetail && !postActionEnabled) {
           detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecruitDetail(client));
           await maybeHumanActionCooldown("after_detail_close", timings);
           if (!detailResult.close_result?.closed) {
@@ -1045,6 +1223,70 @@ export async function runRecruitWorkflow({
       : useLlmScreening
         ? llmResultToScreening(llmResult, screeningCandidate)
         : screenCandidate(screeningCandidate, { criteria });
+    let actionDiscovery = null;
+    let postActionResult = null;
+    let closeFailureError = null;
+    let closeRecoveryFailure = null;
+    if (postActionEnabled && detailResult) {
+      const postActionStarted = Date.now();
+      await runControl.waitIfPaused();
+      runControl.throwIfCanceled();
+      runControl.setPhase("recruit:post-action");
+      await maybeHumanActionCooldown("before_post_action", timings);
+      actionDiscovery = await waitForRecruitDetailActionControls(client, {
+        rootNodeIds: detailActionRootNodeIds,
+        timeoutMs: actionTimeoutMs,
+        intervalMs: actionIntervalMs,
+        requireAny: true
+      });
+      postActionResult = await runRecruitPostAction({
+        client,
+        rootNodeIds: detailActionRootNodeIds,
+        screening,
+        actionDiscovery,
+        postAction: normalizedPostAction,
+        greetCount,
+        maxGreetCount: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
+        executePostAction,
+        afterClickDelayMs: actionAfterClickDelayMs
+      });
+      if (postActionResult.counted_as_greet && postActionResult.action_clicked) {
+        greetCount += 1;
+      }
+      addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
+    }
+    if (postActionEnabled && detailResult && closeDetail) {
+      detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecruitDetail(client));
+      await maybeHumanActionCooldown("after_detail_close", timings);
+      if (!detailResult.close_result?.closed) {
+        closeFailureError = createRecruitCloseFailureError(detailResult.close_result);
+        try {
+          const recovery = await recoverAndReapplyRecruitContext("detail_close_failed", closeFailureError, {
+            forceRecentViewed: true
+          });
+          detailResult.cv_acquisition = {
+            ...(detailResult.cv_acquisition || {}),
+            close_recovery: {
+              ok: Boolean(recovery.ok),
+              method: recovery.method || "",
+              forced_recent_viewed: Boolean(recovery.forced_recent_viewed),
+              card_count: recovery.card_count || 0
+            }
+          };
+        } catch (error) {
+          closeRecoveryFailure = error;
+          detailResult.cv_acquisition = {
+            ...(detailResult.cv_acquisition || {}),
+            close_recovery: {
+              ok: false,
+              reason: "context_recovery_failed",
+              error: error?.message || String(error),
+              forced_recent_viewed: true
+            }
+          };
+        }
+      }
+    }
     timings.total_ms = Date.now() - candidateStarted;
     const compactResult = {
       index,
@@ -1054,8 +1296,12 @@ export async function runRecruitWorkflow({
       detail: compactDetail(detailResult),
       llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
       screening: compactScreening(screening),
+      action_discovery: compactActionDiscovery(actionDiscovery),
+      post_action: postActionResult,
       error: recoverableDetailError
         ? compactRecoverableDetailError(recoverableDetailError)
+        : closeRecoveryFailure
+        ? compactError(closeFailureError, "DETAIL_CLOSE_FAILED")
         : detailResult?.image_evidence?.ok === false
         ? compactError({
           code: detailResult.image_evidence.error_code,
@@ -1123,6 +1369,10 @@ export async function runRecruitWorkflow({
       addTiming(compactResult.timings, "sleep_ms", Date.now() - sleepStarted);
       compactResult.timings.total_ms = Date.now() - candidateStarted;
     }
+    if (postActionResult?.stop_run) {
+      listEndReason = postActionResult.reason || "post_action_stop";
+      break;
+    }
   }
 
   runControl.setPhase("recruit:done");
@@ -1143,7 +1393,7 @@ export async function runRecruitWorkflow({
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
     context_recoveries: contextRecoveryAttempts,
-    ...countRecruitResultStatuses(results),
+    ...countRecruitResultStatuses(results, { greetCount }),
     results
   };
 }
@@ -1189,11 +1439,18 @@ export function createRecruitRunService({
     imageOutputDir = "",
     humanRestEnabled = false,
     humanBehavior = null,
+    postAction = "none",
+    maxGreetCount = null,
+    executePostAction = true,
+    actionTimeoutMs = 8000,
+    actionIntervalMs = 400,
+    actionAfterClickDelayMs = 900,
     name = "recruit-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecruitRun requires a guarded CDP client");
     const normalizedSearchParams = normalizeSearchParams(searchParams);
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+    const normalizedPostAction = normalizeRecruitPostAction(postAction);
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
     const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
@@ -1235,7 +1492,13 @@ export function createRecruitRunService({
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_behavior: effectiveHumanBehavior,
         human_rest_level: effectiveHumanBehavior.restLevel,
-        human_rest_enabled: effectiveHumanRestEnabled
+        human_rest_enabled: effectiveHumanRestEnabled,
+        post_action: normalizedPostAction,
+        max_greet_count: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
+        execute_post_action: Boolean(executePostAction),
+        action_timeout_ms: actionTimeoutMs,
+        action_interval_ms: actionIntervalMs,
+        action_after_click_delay_ms: actionAfterClickDelayMs
       },
       progress: {
         card_count: 0,
@@ -1255,6 +1518,8 @@ export function createRecruitRunService({
         human_rest_enabled: effectiveHumanRestEnabled,
         human_rest_count: 0,
         human_rest_ms: 0,
+        greet_count: 0,
+        post_action_clicked: 0,
         last_human_event: null
       },
       checkpoint: {},
@@ -1289,7 +1554,13 @@ export function createRecruitRunService({
         llmImageDetail,
         imageOutputDir,
         humanRestEnabled: effectiveHumanRestEnabled,
-        humanBehavior: effectiveHumanBehavior
+        humanBehavior: effectiveHumanBehavior,
+        postAction: normalizedPostAction,
+        maxGreetCount,
+        executePostAction,
+        actionTimeoutMs,
+        actionIntervalMs,
+        actionAfterClickDelayMs
       }, runControl)
     });
   }

@@ -52,6 +52,7 @@ import {
 } from "./page-guard.js";
 
 export const CHAT_UNSAFE_ONLINE_RESUME_LINK_CODE = "CHAT_UNSAFE_ONLINE_RESUME_LINK";
+export const CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE = "CHAT_ONLINE_RESUME_MODAL_NOT_OPEN";
 
 const CHAT_CONVERSATION_CONTROL_SCOPE_SELECTORS = Object.freeze([
   ".conversation-main",
@@ -131,6 +132,11 @@ export function makeUnsafeChatOnlineResumeLinkError(target = {}, buttonHTML = ""
 export function isUnsafeChatOnlineResumeLinkError(error) {
   return error?.code === CHAT_UNSAFE_ONLINE_RESUME_LINK_CODE
     || /CHAT_UNSAFE_ONLINE_RESUME_LINK/i.test(String(error?.message || error || ""));
+}
+
+export function isChatOnlineResumeModalOpenFailureError(error) {
+  return error?.code === CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE
+    || /Chat online resume modal did not open/i.test(String(error?.message || error || ""));
 }
 
 export function createChatProfileNetworkRecorder(client) {
@@ -258,6 +264,19 @@ async function hydrateActiveChatCandidate(client, activeCandidate = null) {
     candidate_id: chatCandidateIdFromAttributes(attributes) || null,
     label: normalizeDetailText(htmlToText(outerHTML)),
     outer_html_length: outerHTML.length
+  };
+}
+
+export async function readChatActiveCandidateState(client) {
+  const rootState = await getChatRoots(client);
+  const activeCandidate = await queryFirstAcrossChatRoots(
+    client,
+    rootState.roots,
+    CHAT_ACTIVE_CANDIDATE_SELECTORS
+  );
+  return {
+    roots: rootState.roots,
+    active_candidate: await hydrateActiveChatCandidate(client, activeCandidate)
   };
 }
 
@@ -983,6 +1002,8 @@ export async function openChatOnlineResume(client, {
   }
 
   const error = new Error("Chat online resume modal did not open");
+  error.code = CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE;
+  error.retryable = true;
   error.attempts = attempts;
   throw error;
 }
@@ -1175,7 +1196,8 @@ export async function sendChatMessage(client, expectedText = "", {
 
 export async function clickChatAskResume(client, {
   timeoutMs = 8000,
-  settleMs = 700
+  settleMs = 700,
+  skipWhenAttachmentResumeAvailable = true
 } = {}) {
   const started = Date.now();
   let lastState = null;
@@ -1183,7 +1205,7 @@ export async function clickChatAskResume(client, {
   while (Date.now() - started <= timeoutMs) {
     const state = await readChatConversationReadyState(client);
     lastState = state;
-    if (state.attachment_resume_enabled) {
+    if (skipWhenAttachmentResumeAvailable && state.attachment_resume_enabled) {
       return {
         ok: true,
         already_requested: true,
@@ -1372,15 +1394,24 @@ export async function requestChatResumeForPassedCandidate(client, {
   greetingText = "Hi同学，能麻烦发下简历吗？",
   maxAttempts = 3,
   askResumeTimeoutMs = 8000,
-  dryRun = false
+  dryRun = false,
+  skipWhenAttachmentResumeAvailable = true
 } = {}) {
   const effectiveGreetingText = normalizeDetailText(greetingText) || "Hi同学，能麻烦发下简历吗？";
   const initialState = await readChatConversationReadyState(client);
-  if (initialState.attachment_resume_enabled) {
+  if (skipWhenAttachmentResumeAvailable && initialState.attachment_resume_enabled) {
     return {
       requested: false,
       skipped: true,
       reason: "attachment_resume_already_available",
+      initial_state: initialState
+    };
+  }
+  if (initialState.already_requested_resume) {
+    return {
+      requested: false,
+      skipped: true,
+      reason: "resume_request_already_pending",
       initial_state: initialState
     };
   }
@@ -1418,7 +1449,8 @@ export async function requestChatResumeForPassedCandidate(client, {
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const before = await getChatResumeRequestMessageState(client);
     const askResult = await clickChatAskResume(client, {
-      timeoutMs: askResumeTimeoutMs
+      timeoutMs: askResumeTimeoutMs,
+      skipWhenAttachmentResumeAvailable
     });
     let confirmResult = {
       confirmed: false,

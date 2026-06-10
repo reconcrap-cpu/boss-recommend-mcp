@@ -697,11 +697,25 @@ export function createRecruitPipelineInputSchema() {
       },
       confirmation: {
         type: "object",
+        description: "搜索页确认状态。新流程建议在用户看过总览后传 final_confirmed=true；逐字段 *_confirmed 为兼容旧调用保留。",
         properties: {
+          final_confirmed: {
+            type: "boolean",
+            description: "用户已确认包含岗位、关键词、城市、学历/院校、是否过滤已看、criteria、目标人数、动作和 restLevel 的总览。"
+          },
+          job_confirmed: { type: "boolean" },
+          job_value: { type: "string" },
           keyword_confirmed: { type: "boolean" },
           keyword_value: { type: "string" },
           search_params_confirmed: { type: "boolean" },
           criteria_confirmed: { type: "boolean" },
+          criteria_value: { type: "string" },
+          post_action_confirmed: { type: "boolean" },
+          post_action_value: {
+            type: "string",
+            enum: ["greet", "none"]
+          },
+          max_greet_count_value: { type: "integer", minimum: 1 },
           use_default_for_missing: { type: "boolean" }
         },
         additionalProperties: false
@@ -709,18 +723,188 @@ export function createRecruitPipelineInputSchema() {
       overrides: {
         type: "object",
         properties: {
+          job: { type: "string" },
+          job_title: { type: "string" },
+          selected_job: { type: "string" },
           city: { type: "string" },
-          degree: { type: "string" },
+          degree: {
+            anyOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" }, minItems: 1 }
+            ]
+          },
+          degrees: {
+            anyOf: [
+              { type: "string" },
+              { type: "array", items: { type: "string" }, minItems: 1 }
+            ]
+          },
           filter_recent_viewed: { type: "boolean" },
+          recent_not_view: {
+            anyOf: [
+              { type: "boolean" },
+              { type: "string" }
+            ]
+          },
           schools: {
             anyOf: [
               { type: "array", items: { type: "string" } },
               { type: "string" }
             ]
           },
+          school_tag: {
+            anyOf: [
+              { type: "array", items: { type: "string" } },
+              { type: "string" }
+            ]
+          },
+          school_tags: {
+            anyOf: [
+              { type: "array", items: { type: "string" } },
+              { type: "string" }
+            ]
+          },
+          experience: {
+            anyOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  mode: { type: "string" },
+                  label: { type: "string" },
+                  option: { type: "string" },
+                  start: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  end: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  min: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  max: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  from: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  to: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  start_value: { type: "integer" },
+                  end_value: { type: "integer" }
+                },
+                additionalProperties: false
+              }
+            ]
+          },
+          experiences: {
+            anyOf: [
+              { type: "array", items: { type: "string" } },
+              { type: "string" }
+            ]
+          },
+          experience_range: {
+            anyOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  mode: { type: "string" },
+                  label: { type: "string" },
+                  option: { type: "string" },
+                  start: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  end: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  min: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  max: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  from: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  to: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  start_value: { type: "integer" },
+                  end_value: { type: "integer" }
+                },
+                additionalProperties: false
+              }
+            ]
+          },
+          experience_start: {
+            anyOf: [
+              { type: "string" },
+              { type: "integer" }
+            ]
+          },
+          experience_end: {
+            anyOf: [
+              { type: "string" },
+              { type: "integer" }
+            ]
+          },
+          gender: { type: "string" },
+          age: {
+            anyOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  mode: { type: "string" },
+                  label: { type: "string" },
+                  option: { type: "string" },
+                  min: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  max: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  start: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  end: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  from: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  to: { anyOf: [{ type: "string" }, { type: "integer" }] }
+                },
+                additionalProperties: false
+              }
+            ]
+          },
+          ages: {
+            anyOf: [
+              { type: "array", items: { type: "string" } },
+              { type: "string" }
+            ]
+          },
+          age_range: {
+            anyOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  mode: { type: "string" },
+                  label: { type: "string" },
+                  option: { type: "string" },
+                  min: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  max: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  start: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  end: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  from: { anyOf: [{ type: "string" }, { type: "integer" }] },
+                  to: { anyOf: [{ type: "string" }, { type: "integer" }] }
+                },
+                additionalProperties: false
+              }
+            ]
+          },
+          age_min: {
+            anyOf: [
+              { type: "string" },
+              { type: "integer" }
+            ]
+          },
+          age_max: {
+            anyOf: [
+              { type: "string" },
+              { type: "integer" }
+            ]
+          },
+          min_age: {
+            anyOf: [
+              { type: "string" },
+              { type: "integer" }
+            ]
+          },
+          max_age: {
+            anyOf: [
+              { type: "string" },
+              { type: "integer" }
+            ]
+          },
           keyword: { type: "string" },
           target_count: { type: "integer", minimum: 1 },
-          criteria: { type: "string" }
+          criteria: { type: "string" },
+          post_action: {
+            type: "string",
+            enum: ["greet", "none"]
+          },
+          max_greet_count: { type: "integer", minimum: 1 }
         },
         additionalProperties: false
       },
@@ -805,6 +989,29 @@ export function createRecruitPipelineInputSchema() {
         type: "integer",
         minimum: 0,
         description: "候选人之间的延迟；live pause/resume 测试可增大它"
+      },
+      execute_post_action: {
+        type: "boolean",
+        description: "可选，是否实际执行通过后的 search 后置动作 greet；默认 true"
+      },
+      dry_run_post_action: {
+        type: "boolean",
+        description: "可选，只验证 search 打招呼动作发现/配额/可点击路径，不实际点击"
+      },
+      action_timeout_ms: {
+        type: "integer",
+        minimum: 1000,
+        description: "可选，等待详情页 greet 控件出现的超时时间"
+      },
+      action_interval_ms: {
+        type: "integer",
+        minimum: 100,
+        description: "可选，轮询详情页 greet 控件的间隔"
+      },
+      action_after_click_delay_ms: {
+        type: "integer",
+        minimum: 0,
+        description: "可选，点击 greet 后等待页面状态稳定的时间"
       }
     },
     required: ["instruction"],
@@ -1183,6 +1390,9 @@ function getRunOptions(args, parsed, session, configResolution = null) {
   const targetCount = parsePositiveInteger(args.max_candidates, parsed.screenParams.target_count || 10);
   const screeningMode = normalizeScreeningModeArg(args);
   const humanBehavior = resolveHumanBehaviorForRun(args, configResolution?.config || {});
+  const executePostAction = args.dry_run_post_action === true
+    ? false
+    : args.execute_post_action !== false;
   return {
     client: session.client,
     targetUrl: RECRUIT_TARGET_URL,
@@ -1215,6 +1425,14 @@ function getRunOptions(args, parsed, session, configResolution = null) {
     imageOutputDir: resolveBossConfiguredOutputDir("", getRecruitRunsDir()),
     humanRestEnabled: humanBehavior.restEnabled,
     humanBehavior,
+    postAction: parsed.screenParams?.post_action || "none",
+    maxGreetCount: Number.isInteger(parsed.screenParams?.max_greet_count)
+      ? parsed.screenParams.max_greet_count
+      : null,
+    executePostAction,
+    actionTimeoutMs: parsePositiveInteger(args.action_timeout_ms, slowLive ? 12000 : 8000),
+    actionIntervalMs: parsePositiveInteger(args.action_interval_ms, 400),
+    actionAfterClickDelayMs: parseNonNegativeInteger(args.action_after_click_delay_ms, 900),
     name: "mcp-recruit-pipeline-run"
   };
 }
@@ -1364,7 +1582,14 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "", 
     run: persistedStarted,
     poll_after_sec: DEFAULT_RECRUIT_POLL_AFTER_SEC,
     review: parsed.review,
-    message: "Recruit pipeline run started through shared CDP-only recruit service."
+    message: parsed.screenParams?.post_action === "greet"
+      ? `Recruit pipeline run started through shared CDP-only recruit service with post_action=greet${args.dry_run_post_action === true ? " in dry-run mode" : ""}.`
+      : "Recruit pipeline run started through shared CDP-only recruit service.",
+    post_action: {
+      requested: parsed.screenParams?.post_action || "none",
+      execute_post_action: args.dry_run_post_action === true ? false : args.execute_post_action !== false,
+      max_greet_count: Number.isInteger(parsed.screenParams?.max_greet_count) ? parsed.screenParams.max_greet_count : null
+    }
   };
 }
 

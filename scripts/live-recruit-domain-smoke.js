@@ -42,6 +42,8 @@ import {
   getRecruitRoots,
   openRecruitCardDetail,
   applyRecruitSearchParams,
+  normalizeRecruitAgeFilter,
+  normalizeRecruitGenderFilter,
   parseRecruitInstruction,
   readRecruitCardCandidate,
   RECRUIT_TARGET_URL,
@@ -136,6 +138,33 @@ function parseArgs(argv) {
       ];
     }
     if (arg === "--schools") result.overrides.schools = argv[++index];
+    if (arg === "--experience") result.overrides.experience = argv[++index];
+    if (arg === "--experience-start") {
+      result.overrides.experience = {
+        ...(result.overrides.experience && typeof result.overrides.experience === "object" ? result.overrides.experience : {}),
+        start: argv[++index]
+      };
+    }
+    if (arg === "--experience-end") {
+      result.overrides.experience = {
+        ...(result.overrides.experience && typeof result.overrides.experience === "object" ? result.overrides.experience : {}),
+        end: argv[++index]
+      };
+    }
+    if (arg === "--gender") result.overrides.gender = argv[++index];
+    if (arg === "--age") result.overrides.age = argv[++index];
+    if (arg === "--age-min") {
+      result.overrides.age = {
+        ...(result.overrides.age && typeof result.overrides.age === "object" ? result.overrides.age : {}),
+        min: argv[++index]
+      };
+    }
+    if (arg === "--age-max") {
+      result.overrides.age = {
+        ...(result.overrides.age && typeof result.overrides.age === "object" ? result.overrides.age : {}),
+        max: argv[++index]
+      };
+    }
     if (arg === "--filter-recent-viewed") {
       const parsed = parseBoolean(argv[++index]);
       if (parsed !== null) result.overrides.filter_recent_viewed = parsed;
@@ -201,6 +230,9 @@ function validateSearchApplication(parsedInstruction, searchApplication) {
     : [String(searchParams.degree || "").trim()].filter(Boolean);
   const schools = Array.isArray(searchParams.schools) ? searchParams.schools.filter(Boolean) : [];
   const city = String(searchParams.city || "").trim();
+  const experience = searchParams.experience || null;
+  const gender = normalizeRecruitGenderFilter(searchParams.gender);
+  const age = normalizeRecruitAgeFilter(searchParams.age);
 
   if (keyword) {
     const result = stepResult(searchApplication, "keyword");
@@ -226,6 +258,32 @@ function validateSearchApplication(parsedInstruction, searchApplication) {
     const ok = result?.applied === true;
     checks.push({ field: "city", ok, result });
     if (!ok) failures.push("city");
+  }
+  if (experience) {
+    const result = stepResult(searchApplication, "experience");
+    const ok = result?.applied === true
+      && (
+        !experience.mode
+        || result.mode === experience.mode
+      );
+    checks.push({ field: "experience", ok, result });
+    if (!ok) failures.push("experience");
+  }
+  if (gender) {
+    const result = stepResult(searchApplication, "gender");
+    const ok = result?.applied === true && result.selected_label === gender.label;
+    checks.push({ field: "gender", ok, result });
+    if (!ok) failures.push("gender");
+  }
+  if (age) {
+    const result = stepResult(searchApplication, "age");
+    const ok = result?.applied === true
+      && (
+        !age.mode
+        || result.mode === age.mode
+      );
+    checks.push({ field: "age", ok, result });
+    if (!ok) failures.push("age");
   }
   if (typeof searchParams.filter_recent_viewed === "boolean") {
     const result = stepResult(searchApplication, "recent_viewed");

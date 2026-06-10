@@ -55,15 +55,17 @@ function readyArgs(extra = {}) {
   return {
     instruction: "搜索关键词算法工程师，目标筛选3位",
     confirmation: {
-      keyword_confirmed: true,
-      search_params_confirmed: true,
-      criteria_confirmed: true,
-      use_default_for_missing: true
+      final_confirmed: true
     },
     overrides: {
+      job: "海外用户增长运营专家（AI产品）",
       keyword: "算法工程师",
       filter_recent_viewed: false,
-      target_count: 3
+      target_count: 3,
+      criteria: "候选人需有算法工程师相关经历"
+    },
+    human_behavior: {
+      restLevel: "medium"
     },
     reset_search: false,
     ...extra
@@ -112,6 +114,18 @@ async function testToolListIncludesRecruitTools() {
   assert.equal(names.has(TOOL_RESUME), true);
   assert.equal(names.has("cancel_recruit_pipeline_run"), true);
   const startTool = tools.find((tool) => tool.name === TOOL_START);
+  assert.equal(startTool.inputSchema.properties.confirmation.properties.final_confirmed.type, "boolean");
+  assert.equal(startTool.inputSchema.properties.confirmation.properties.job_value.type, "string");
+  assert.equal(startTool.inputSchema.properties.confirmation.properties.criteria_value.type, "string");
+  assert.equal(startTool.inputSchema.properties.overrides.properties.job.type, "string");
+  assert.ok(startTool.inputSchema.properties.overrides.properties.degrees);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.school_tag);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.experience);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.experience_range);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.gender);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.age);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.age_range);
+  assert.deepEqual(startTool.inputSchema.properties.overrides.properties.post_action.enum, ["greet", "none"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
   const runTool = tools.find((tool) => tool.name === TOOL_RUN);
@@ -129,6 +143,109 @@ async function testRecruitGateBeforeBrowserConnect() {
   }, 2);
   assert.equal(payload.status, "NEED_INPUT");
   assert.equal(connectorCalled, false);
+}
+
+async function testRecruitRequiresExplicitCriteria() {
+  let connectorCalled = false;
+  setRecruitMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("should not connect before criteria gate");
+  });
+  const payload = await callTool(TOOL_RUN, {
+    instruction: [
+      "岗位 (job): 海外用户增长运营专家（AI产品） _ 上海",
+      "关键词 (keyword): 用户运营，增长运营，国际化",
+      "城市 (city): 上海",
+      "学历 (degree): 本科及以上",
+      "学校类型 (school_tag): 不限",
+      "只看未查看 (recent_not_view): 不限",
+      "目标筛选人数 (target_count): 20"
+    ].join("\n"),
+    confirmation: {
+      final_confirmed: true
+    },
+    human_behavior: {
+      restLevel: "medium"
+    }
+  }, 23);
+  assert.equal(payload.status, "NEED_INPUT");
+  assert.equal(connectorCalled, false);
+  assert.equal(payload.missing_fields.includes("criteria"), true);
+  assert.equal(payload.screen_params.criteria, null);
+  assert.equal(payload.review.criteria_source, "missing");
+  assert.equal(payload.pending_questions.some((question) => question.field === "criteria"), true);
+}
+
+async function testRecruitFullUpfrontArgsFinalConfirmStarts() {
+  let observedOptions = null;
+  installFakeConnector();
+  setRecruitMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recruit:test-full-upfront");
+    runControl.updateProgress({ processed: 1, screened: 1, passed: 0 });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+  const instruction = [
+    "岗位 (job): 海外用户增长运营专家（AI产品） _ 上海",
+    "关键词 (keyword): 用户运营，增长运营，国际化",
+    "城市 (city): 上海",
+    "学历 (degree): 本科及以上",
+    "学校类型 (school_tag): 不限",
+    "经验 (experience): 5-10年",
+    "性别 (gender): 女",
+    "年龄 (age): 25-35",
+    "只看未查看 (recent_not_view): 不限",
+    "目标筛选人数 (target_count): 20",
+    "休息强度 (rest_level): medium",
+    "筛选条件：筛选海外用户增长运营负责人。只依据简历真实可见信息判断；证据不足、业务线无法判断、任期无法判断、学校无法判断时，一律 passed=false。只有同时满足以下全部硬条件才 passed=true：",
+    "",
+    "1. 学历：若简历只有中国大陆学历，则至少来自强双非 / 顶尖双非、双一流、211、985等院校；若简历出现海外或香港、澳门学历，则passed=true。",
+    "2. 经验年限和稳定性：累计至少 3 年软件产品的增长、用户增长、用户运营、产品运营、内容运营、平台运营、海外市场运营、国际化运营或海外运营经验。",
+    "3. 产品/行业匹配：硬件、消费电子、IoT、智能设备、机器人、汽车、能源设备等公司不通过。",
+    "4. 海外适配能力：满足二选一即可：A 简历可见面向海外用户、海外市场或海外渠道的增长/运营经验；B 若没有海外经验，则必须有强英语能力证据。"
+  ].join("\n");
+  const payload = await callTool(TOOL_RUN, {
+    instruction,
+    confirmation: {
+      final_confirmed: true
+    },
+    human_behavior: {
+      restLevel: "medium"
+    },
+    execution_mode: "sync"
+  }, 24);
+  assert.equal(payload.status, "COMPLETED");
+  assert.equal(observedOptions.searchParams.job, "海外用户增长运营专家（AI产品） _ 上海");
+  assert.equal(observedOptions.searchParams.keyword, "用户运营，增长运营，国际化");
+  assert.equal(observedOptions.searchParams.city, "上海");
+  assert.equal(observedOptions.searchParams.degree, "本科");
+  assert.deepEqual(observedOptions.searchParams.schools, []);
+  assert.deepEqual(observedOptions.searchParams.experience, {
+    mode: "option",
+    label: "5-10年",
+    unlimited: false
+  });
+  assert.deepEqual(observedOptions.searchParams.gender, {
+    label: "女",
+    unlimited: false
+  });
+  assert.deepEqual(observedOptions.searchParams.age, {
+    mode: "custom",
+    min: 25,
+    max: 35,
+    label: "25-35"
+  });
+  assert.equal(observedOptions.searchParams.filter_recent_viewed, false);
+  assert.equal(observedOptions.maxCandidates, 20);
+  assert.match(observedOptions.criteria, /只有同时满足以下全部硬条件/);
+  assert.match(observedOptions.criteria, /产品\/行业匹配/);
 }
 
 async function testRecruitDefaultsUseScreeningConfig() {
@@ -183,10 +300,48 @@ async function testRecruitDefaultsUseScreeningConfig() {
   assert.equal(observedOptions.llmConfig.topP, 0.2);
   assert.equal(observedOptions.llmConfig.outputDir, process.env.TEST_BOSS_OUTPUT_DIR);
   assert.equal(observedOptions.llmConfig.humanRestEnabled, true);
+  assert.equal(observedOptions.searchParams.job, "海外用户增长运营专家（AI产品）");
+  assert.deepEqual(observedOptions.searchParams.schools, []);
+  assert.equal(observedOptions.postAction, "none");
   assert.equal(observedOptions.humanRestEnabled, true);
   assert.equal(observedOptions.humanBehavior.profile, "paced_with_rests");
   assert.equal(observedOptions.humanBehavior.listScrollJitter, true);
   assert.equal(observedOptions.humanBehavior.restLevel, "medium");
+}
+
+async function testRecruitPostActionArgsPassThrough() {
+  let observedOptions = null;
+  installFakeConnector();
+  setRecruitMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recruit:test-post-action");
+    runControl.updateProgress({ processed: 1, screened: 1, passed: 1, greet_count: 1 });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      passed: 1,
+      greet_count: 1,
+      post_action_clicked: 1,
+      results: []
+    };
+  });
+  const args = readyArgs({
+    execution_mode: "sync",
+    debug_test_mode: true,
+    dry_run_post_action: true
+  });
+  args.confirmation.post_action_confirmed = true;
+  args.confirmation.post_action_value = "greet";
+  args.overrides.post_action = "greet";
+  args.overrides.max_greet_count = 2;
+  const payload = await callTool(TOOL_RUN, args, 22);
+  assert.equal(payload.status, "COMPLETED");
+  assert.equal(observedOptions.postAction, "greet");
+  assert.equal(observedOptions.maxGreetCount, 2);
+  assert.equal(observedOptions.executePostAction, false);
+  assert.equal(observedOptions.actionTimeoutMs, 8000);
 }
 
 async function testRecruitHumanBehaviorArgsOverrideConfig() {
@@ -360,9 +515,15 @@ async function main() {
     await testToolListIncludesRecruitTools();
     await testRecruitGateBeforeBrowserConnect();
     resetRecruitMcpStateForTests();
+    await testRecruitRequiresExplicitCriteria();
+    resetRecruitMcpStateForTests();
+    await testRecruitFullUpfrontArgsFinalConfirmStarts();
+    resetRecruitMcpStateForTests();
     await testRecruitDefaultsUseScreeningConfig();
     resetRecruitMcpStateForTests();
     await testRecruitHumanBehaviorArgsOverrideConfig();
+    resetRecruitMcpStateForTests();
+    await testRecruitPostActionArgsPassThrough();
     resetRecruitMcpStateForTests();
     await testRecruitSyncRun();
     resetRecruitMcpStateForTests();

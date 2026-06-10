@@ -434,7 +434,7 @@ async function testRecommendToolsRejectChatOnlyMisrouteBeforeBrowserConnect() {
   assert.equal(started.route_guard, true);
   assert.equal(started.error.code, "WRONG_BOSS_TOOL_FOR_CHAT");
   assert.equal(started.detected_domain, "chat");
-  assert.equal(started.recommended_tool_sequence.includes("prepare_boss_chat_run"), true);
+  assert.equal(started.recommended_tool_sequence.includes("boss-chat/prepare_boss_chat_run"), true);
 
   const prepared = await callTool(TOOL_PREPARE, {
     instruction: "Chat-only 筛选「海外用户增长运营专家（AI产品） _ 上海」岗位的未读候选人"
@@ -458,7 +458,73 @@ async function testRecommendToolsRejectSearchMisrouteBeforeBrowserConnect() {
   assert.equal(payload.route_guard, true);
   assert.equal(payload.error.code, "WRONG_BOSS_TOOL_FOR_SEARCH");
   assert.equal(payload.detected_domain, "search");
-  assert.equal(payload.recommended_tool_sequence.includes("start_recruit_pipeline_run"), true);
+  assert.equal(payload.recommended_server, "boss-recruit");
+  assert.equal(payload.recommended_tool_sequence.includes("boss-recruit/start_recruit_pipeline_run"), true);
+  assert.equal(connectorCalled, false);
+
+  const confirmationScopePayload = await callTool(TOOL_START, {
+    instruction: "现在启动筛选任务",
+    confirmation: {
+      final_confirmed: true,
+      page_value: "search",
+      job_value: "海外用户增长运营专家（AI产品） _ 上海"
+    },
+    overrides: {
+      criteria: "x",
+      target_count: 1,
+      post_action: "greet"
+    },
+    human_behavior: {
+      restLevel: "medium"
+    }
+  }, 3_31);
+  assert.equal(confirmationScopePayload.status, "FAILED");
+  assert.equal(confirmationScopePayload.error.code, "WRONG_BOSS_TOOL_FOR_SEARCH");
+  assert.equal(confirmationScopePayload.detected_signals.includes("confirmation.page_value:search"), true);
+
+  const topLevelScopePayload = await callTool(TOOL_START, {
+    instruction: "现在启动筛选任务",
+    page_scope: "search",
+    confirmation: {
+      final_confirmed: true,
+      job_value: "海外用户增长运营专家（AI产品） _ 上海"
+    },
+    overrides: {
+      criteria: "x",
+      target_count: 1,
+      post_action: "greet"
+    },
+    human_behavior: {
+      restLevel: "medium"
+    }
+  }, 3_32);
+  assert.equal(topLevelScopePayload.status, "FAILED");
+  assert.equal(topLevelScopePayload.error.code, "WRONG_BOSS_TOOL_FOR_SEARCH");
+  assert.equal(topLevelScopePayload.detected_signals.includes("page_scope:search"), true);
+  assert.equal(connectorCalled, false);
+
+  const recruitArgPayload = await callTool(TOOL_START, {
+    instruction: "岗位：海外用户增长运营专家（AI产品）_ 上海；关键词：用户运营，增长运营，国际化；城市：上海；学历：本科及以上",
+    confirmation: {
+      final_confirmed: true,
+      job_value: "海外用户增长运营专家（AI产品） _ 上海"
+    },
+    overrides: {
+      keyword: "用户运营，增长运营，国际化",
+      city: "上海",
+      school_tag: "不限",
+      criteria: "x",
+      target_count: 20,
+      post_action: "greet"
+    },
+    human_behavior: {
+      restLevel: "medium"
+    }
+  }, 3_33);
+  assert.equal(recruitArgPayload.status, "FAILED");
+  assert.equal(recruitArgPayload.error.code, "WRONG_BOSS_TOOL_FOR_SEARCH");
+  assert.equal(recruitArgPayload.detected_signals.includes("overrides.keyword:recruit_arg"), true);
+  assert.equal(recruitArgPayload.detected_signals.includes("overrides.city:recruit_arg"), true);
   assert.equal(connectorCalled, false);
 }
 

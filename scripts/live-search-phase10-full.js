@@ -7,7 +7,9 @@ import {
   assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
+  createHumanRestController,
   enableDomains,
+  normalizeHumanBehaviorOptions,
   sleep
 } from "../src/core/browser/index.js";
 import { captureScrolledNodeScreenshots } from "../src/core/capture/index.js";
@@ -107,6 +109,10 @@ function parseArgs(argv) {
     city: "杭州",
     degrees: ["硕士"],
     schools: ["985", "211", "QS100"],
+    schoolsExplicit: false,
+    experience: null,
+    gender: null,
+    age: null,
     keyword: "算法",
     filterRecentViewed: true,
     criteria: DEFAULT_CRITERIA,
@@ -116,6 +122,7 @@ function parseArgs(argv) {
     maxGreetCount: null,
     initialGreetCount: 0,
     executePostAction: false,
+    restLevel: "low",
     allowNavigate: true,
     resetSearch: true,
     detailTimeoutMs: 30000,
@@ -141,6 +148,8 @@ function parseArgs(argv) {
     searchTimeoutMs: 90000,
     cityOptionTimeoutMs: 30000,
     llmTimeoutMs: 120000,
+    llmMaxRetries: null,
+    llmAttempts: 2,
     delayMs: 800,
     slowLive: false
   };
@@ -160,8 +169,33 @@ function parseArgs(argv) {
     if (arg === "--city") result.city = argv[++index];
     if (arg === "--degree") result.degrees = parseList(argv[++index]);
     if (arg === "--degrees") result.degrees = parseList(argv[++index]);
-    if (arg === "--school") result.schools.push(normalizeSchoolLabel(argv[++index]));
-    if (arg === "--schools") result.schools = parseSchools(argv[++index]);
+    if (arg === "--school") {
+      result.schoolsExplicit = true;
+      result.schools.push(normalizeSchoolLabel(argv[++index]));
+    }
+    if (arg === "--schools") {
+      result.schoolsExplicit = true;
+      result.schools = parseSchools(argv[++index]);
+    }
+    if (arg === "--no-schools") {
+      result.schoolsExplicit = true;
+      result.schools = [];
+    }
+    if (arg === "--experience") result.experience = argv[++index];
+    if (arg === "--gender") result.gender = argv[++index];
+    if (arg === "--age") result.age = argv[++index];
+    if (arg === "--age-min") {
+      result.age = {
+        ...(result.age && typeof result.age === "object" ? result.age : {}),
+        min: argv[++index]
+      };
+    }
+    if (arg === "--age-max") {
+      result.age = {
+        ...(result.age && typeof result.age === "object" ? result.age : {}),
+        max: argv[++index]
+      };
+    }
     if (arg === "--keyword") result.keyword = argv[++index];
     if (arg === "--filter-recent-viewed") {
       const parsed = parseBoolean(argv[++index]);
@@ -175,6 +209,7 @@ function parseArgs(argv) {
     if (arg === "--initial-greet-count") result.initialGreetCount = Math.max(0, Number(argv[++index]) || 0);
     if (arg === "--execute-post-action") result.executePostAction = true;
     if (arg === "--dry-run-post-action") result.executePostAction = false;
+    if (arg === "--rest-level") result.restLevel = argv[++index];
     if (arg === "--no-navigate") result.allowNavigate = false;
     if (arg === "--no-reset-search") result.resetSearch = false;
     if (arg === "--detail-timeout-ms") result.detailTimeoutMs = parsePositiveInt(argv[++index], result.detailTimeoutMs);
@@ -210,6 +245,8 @@ function parseArgs(argv) {
       result.cityOptionTimeoutMs = parsePositiveInt(argv[++index], result.cityOptionTimeoutMs);
     }
     if (arg === "--llm-timeout-ms") result.llmTimeoutMs = parsePositiveInt(argv[++index], result.llmTimeoutMs);
+    if (arg === "--llm-max-retries") result.llmMaxRetries = Math.max(0, Number(argv[++index]) || 0);
+    if (arg === "--llm-attempts") result.llmAttempts = parsePositiveInt(argv[++index], result.llmAttempts);
     if (arg === "--delay-ms") result.delayMs = Math.max(0, Number(argv[++index]) || 0);
     if (arg === "--slow-live") {
       result.slowLive = true;
@@ -225,12 +262,17 @@ function parseArgs(argv) {
   }
 
   result.degrees = parseList(result.degrees).length ? parseList(result.degrees) : ["硕士"];
-  result.schools = parseSchools(result.schools).length ? parseSchools(result.schools) : ["985", "211", "QS100"];
+  const parsedSchools = parseSchools(result.schools);
+  result.schools = result.schoolsExplicit
+    ? parsedSchools
+    : parsedSchools.length
+      ? parsedSchools
+      : ["985", "211", "QS100"];
   return result;
 }
 
 function searchParamsFromOptions(options) {
-  return {
+  const params = {
     job: options.job || null,
     city: options.city,
     degrees: options.degrees,
@@ -239,6 +281,10 @@ function searchParamsFromOptions(options) {
     keyword: options.keyword,
     filter_recent_viewed: options.filterRecentViewed
   };
+  if (options.experience) params.experience = options.experience;
+  if (options.gender) params.gender = options.gender;
+  if (options.age) params.age = options.age;
+  return params;
 }
 
 function methodSummary(methodLog) {
@@ -314,6 +360,24 @@ function validateSearchApplication(searchParams, searchApplication) {
     const ok = result?.applied === true && (result.selected || []).length >= searchParams.schools.length;
     checks.push({ field: "schools", ok, result });
     if (!ok) failures.push("schools");
+  }
+  if (searchParams.experience) {
+    const result = stepResult(searchApplication, "experience");
+    const ok = result?.applied === true;
+    checks.push({ field: "experience", ok, result });
+    if (!ok) failures.push("experience");
+  }
+  if (searchParams.gender) {
+    const result = stepResult(searchApplication, "gender");
+    const ok = result?.applied === true;
+    checks.push({ field: "gender", ok, result });
+    if (!ok) failures.push("gender");
+  }
+  if (searchParams.age) {
+    const result = stepResult(searchApplication, "age");
+    const ok = result?.applied === true;
+    checks.push({ field: "age", ok, result });
+    if (!ok) failures.push("age");
   }
   if (searchParams.keyword) {
     const result = stepResult(searchApplication, "keyword");
@@ -797,6 +861,17 @@ async function run() {
   const startedAt = Date.now();
   let session;
   const searchParams = searchParamsFromOptions(options);
+  const humanBehavior = normalizeHumanBehaviorOptions({
+    enabled: options.executePostAction && options.postAction === "greet",
+    profile: "paced_with_rests",
+    restLevel: options.restLevel
+  });
+  const humanRestController = createHumanRestController({
+    enabled: humanBehavior.restEnabled,
+    shortRestEnabled: humanBehavior.shortRest,
+    batchRestEnabled: humanBehavior.batchRest,
+    restLevel: humanBehavior.restLevel
+  });
   const result = {
     status: "UNKNOWN",
     generated_at: new Date().toISOString(),
@@ -814,6 +889,8 @@ async function run() {
       max_greet_count: options.maxGreetCount,
       initial_greet_count: options.initialGreetCount,
       execute_post_action: options.executePostAction,
+      human_behavior: humanBehavior,
+      rest_level: humanBehavior.restLevel,
       criteria: options.criteria
     }
   };
@@ -823,11 +900,23 @@ async function run() {
       throw new Error("Boss search mutating post-action requires an explicit --job value from the user; select the job next to the keyword input before greeting candidates.");
     }
     const llmConfig = readJsonFile(options.configPath);
+    const effectiveLlmConfig = {
+      ...llmConfig,
+      llmTimeoutMs: options.llmTimeoutMs,
+      timeoutMs: options.llmTimeoutMs
+    };
+    if (Number.isInteger(options.llmMaxRetries) && options.llmMaxRetries >= 0) {
+      effectiveLlmConfig.llmMaxRetries = options.llmMaxRetries;
+      effectiveLlmConfig.maxRetries = options.llmMaxRetries;
+    }
     result.llm_config = {
       path: path.resolve(options.configPath),
-      baseUrl: safeHost(llmConfig.baseUrl),
-      model: llmConfig.model || null,
-      has_api_key: Boolean(llmConfig.apiKey)
+      baseUrl: safeHost(effectiveLlmConfig.baseUrl),
+      model: effectiveLlmConfig.model || null,
+      has_api_key: Boolean(effectiveLlmConfig.apiKey),
+      timeout_ms: effectiveLlmConfig.llmTimeoutMs,
+      max_retries: effectiveLlmConfig.llmMaxRetries ?? effectiveLlmConfig.maxRetries ?? null,
+      wrapper_attempts: options.llmAttempts
     };
 
     session = await connectToRecruitSession(options);
@@ -893,10 +982,21 @@ async function run() {
     let refreshRounds = 0;
     let listEndReason = "";
     let stopRunReason = "";
+    const targetCountGoal = Math.max(1, Number(options.targetCount) || 1);
+    const maxScreenedGoal = Math.max(1, Number(options.maxScreened) || 1);
+    const targetAchievementMode = options.executePostAction && options.postAction === "greet"
+      ? "greet_clicked"
+      : "llm_passed";
+    const countPassedResults = () => results.filter((item) => item.llm?.passed).length;
+    const targetMet = () => (
+      targetAchievementMode === "greet_clicked"
+        ? newGreetCount >= targetCountGoal
+        : countPassedResults() >= targetCountGoal
+    );
 
     while (
-      results.length < Math.max(1, Number(options.maxScreened) || 1)
-      && newGreetCount < Math.max(1, Number(options.targetCount) || 1)
+      results.length < maxScreenedGoal
+      && !targetMet()
       && (
         !Number.isInteger(options.maxGreetCount)
         || options.maxGreetCount <= 0
@@ -1034,12 +1134,12 @@ async function run() {
         const llm = await callScreeningLlmWithRetry({
           candidate: detailResult.candidate,
           criteria: options.criteria,
-          config: llmConfig,
+          config: effectiveLlmConfig,
           timeoutMs: options.llmTimeoutMs,
           imageEvidence: detailResult.image_evidence,
           maxImages: options.maxImagePages,
-          imageDetail: llmConfig.llmImageDetail || "high",
-          attempts: 2
+          imageDetail: effectiveLlmConfig.llmImageDetail || "high",
+          attempts: options.llmAttempts
         });
         candidateResult.timings.text_model_ms = Date.now() - llmStartedAt;
         candidateResult.llm = compactLlmResult(llm);
@@ -1121,6 +1221,18 @@ async function run() {
         candidateResult.timings.close_detail_ms = Date.now() - closeStartedAt;
       }
 
+      const restStartedAt = Date.now();
+      const humanRest = await humanRestController.takeBreakIfNeeded({ sleepFn: sleep });
+      candidateResult.human_rest = humanRest;
+      if (humanRest.rested) {
+        candidateResult.timings.human_rest_ms = Date.now() - restStartedAt;
+        progress("human_rest", {
+          index,
+          rest_level: humanRest.rest_level,
+          pause_ms: humanRest.pause_ms || candidateResult.timings.human_rest_ms,
+          events: humanRest.events || []
+        });
+      }
       candidateResult.timings.total_ms = Date.now() - candidateStartedAt;
       results.push(candidateResult);
       markInfiniteListCandidateProcessed(listState, candidateKey, {
@@ -1168,11 +1280,17 @@ async function run() {
       new_greet_count: newGreetCount,
       initial_greet_count: Math.max(0, Number(options.initialGreetCount) || 0),
       target_count: targetCount,
+      target_achievement_mode: targetAchievementMode,
+      target_met: targetAchievementMode === "greet_clicked"
+        ? newGreetCount >= targetCount
+        : passedCount >= targetCount,
       required_greet_count: requiredGreetCount,
       max_greet_count: maxGreetCount,
       list_end_reason: listEndReason || null,
       stop_run_reason: stopRunReason || null,
       greet_credit_exhausted: stopRunReason === "greet_credits_exhausted",
+      human_behavior,
+      human_rest: humanRestController.getState(),
       refresh_rounds: refreshRounds,
       refresh_attempts: refreshAttempts.length,
       candidate_list: compactInfiniteListState(listState),

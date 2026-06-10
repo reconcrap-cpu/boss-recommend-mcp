@@ -127,6 +127,9 @@ async function testToolListIncludesChatTools() {
   assert.equal(listChatJobsTool.description.includes("prepare_boss_chat_run"), true);
   assert.equal(listChatJobsTool.description.includes("list_recommend_jobs"), true);
   assert.equal(startTool.description.includes("start_recommend_pipeline_run"), true);
+  assert.deepEqual(startTool.inputSchema.required, ["job", "start_from"]);
+  assert.deepEqual(startTool.inputSchema.properties.screening_mode.enum, ["llm", "deterministic", "collect_cv"]);
+  assert.equal(startTool.inputSchema.properties.criteria.description.includes("collect_cv"), true);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
 }
@@ -169,7 +172,9 @@ async function testChatPrepareReadsJobOptions() {
   const payload = await callTool(TOOL_PREPARE, {}, 22);
   assert.equal(connectorCalled, true);
   assert.equal(payload.status, "NEED_INPUT");
-  assert.deepEqual(payload.missing_fields, ["job", "start_from", "target_count", "criteria"]);
+  assert.deepEqual(payload.missing_fields, ["job", "start_from", "target_count"]);
+  assert.equal(payload.criteria_optional, true);
+  assert.equal(payload.empty_criteria_mode, "collect_cv");
   assert.equal(payload.runtime_evaluate_used, false);
   assert.equal(payload.job_options.length, 2);
   assert.equal(payload.pending_questions.find((question) => question.field === "job").options.length, 2);
@@ -264,11 +269,66 @@ async function testChatNeedInputDoesNotConnect() {
     start_from: "all"
   }, 21);
   assert.equal(payload.status, "NEED_INPUT");
-  assert.deepEqual(payload.missing_fields, ["job", "target_count", "criteria"]);
+  assert.deepEqual(payload.missing_fields, ["job", "target_count"]);
+  assert.equal(payload.criteria_optional, true);
+  assert.equal(payload.empty_criteria_mode, "collect_cv");
   assert.equal(payload.runtime_evaluate_used, undefined);
   assert.equal(payload.job_options.length, 0);
   assert.equal(payload.pending_questions.some((question) => question.field === "target_count"), true);
   assert.equal(connectorCalled, false);
+}
+
+async function testChatBlankCriteriaStartsCvCollectionWithoutLlmConfig() {
+  installFakeConnector();
+  const previousConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+  process.env.BOSS_RECOMMEND_SCREEN_CONFIG = path.join(process.env.BOSS_CHAT_HOME, "missing-screening-config.json");
+  setChatMcpWorkflowForTests(async (options, runControl) => {
+    assert.equal(options.criteria, "");
+    assert.equal(options.screeningMode, "collect_cv");
+    assert.equal(options.requestResumeForPassed, true);
+    assert.equal(options.detailLimit, 100000);
+    assert.equal(options.llmConfig, null);
+    runControl.setPhase("chat:test");
+    runControl.updateProgress({
+      processed: 1,
+      screened: 1,
+      passed: 1,
+      requested: 1,
+      target_count: options.targetPassCount
+    });
+    return {
+      domain: "chat",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      llm_screened: 0,
+      passed: 1,
+      requested: 1,
+      results: []
+    };
+  });
+  try {
+    const started = await callTool(TOOL_START, {
+      job: "算法工程师",
+      start_from: "all",
+      target_count: "all",
+      criteria: "",
+      delay_ms: 0
+    }, 24);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.run.context.criteria_present, false);
+    assert.equal(started.run.context.screening_mode, "collect_cv");
+    assert.equal(started.run.context.cv_collection_mode, true);
+    assert.equal(started.run.context.llm_configured, false);
+    const completed = await waitForChatRun(started.run_id, (run) => run?.status === "completed");
+    assert.equal(completed.result.requested_count, 1);
+  } finally {
+    if (previousConfig === undefined) {
+      delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
+    } else {
+      process.env.BOSS_RECOMMEND_SCREEN_CONFIG = previousConfig;
+    }
+  }
 }
 
 async function testChatAsyncPauseResumeCancel() {
@@ -667,6 +727,8 @@ async function main() {
     await testChatJobListAliasReadsJobOptions();
     resetChatMcpStateForTests();
     await testChatNeedInputDoesNotConnect();
+    resetChatMcpStateForTests();
+    await testChatBlankCriteriaStartsCvCollectionWithoutLlmConfig();
     resetChatMcpStateForTests();
     await testChatAsyncPauseResumeCancel();
     resetChatMcpStateForTests();

@@ -17,24 +17,63 @@ const SEARCH_SCHOOL_MAP = {
 
 const KNOWN_SCHOOL_LABELS = new Set(Object.values(SEARCH_SCHOOL_MAP));
 const DEFAULT_PARAM_VALUES = {
+  job: null,
   city: null,
   degree: "不限",
   schools: [],
-  keyword: "算法工程师",
-  target_count: 10
+  experience: null,
+  gender: null,
+  age: null,
+  keyword: null,
+  target_count: null,
+  criteria: null
 };
 const DEFAULT_PARAM_LABELS = {
+  job: "搜索页岗位未指定",
   city: "不限城市",
   degree: "不限",
   schools: "不限院校标签",
-  keyword: "算法工程师",
-  target_count: 10
+  experience: "经验要求未指定",
+  gender: "性别未指定",
+  age: "年龄要求未指定",
+  keyword: "搜索关键词未指定",
+  target_count: "目标通过人数未指定",
+  criteria: "筛选 criteria 未指定"
 };
 const DEGREE_VALUES = new Set(["不限", "本科", "本科及以上", "硕士及以上", "博士"]);
-const CITY_STOP_PATTERN = /(?:筛选|搜索|查找|找|做过|从事过|有过|相关|的人选|的人|并且|且|学历|学校|目标|必须|优先|，|。|；|;|,)/;
+const CITY_STOP_PATTERN = /(?:筛选|搜索|查找|找|做过|从事过|有过|相关|的人选|的人|并且|且|学历|学校|经验|性别|年龄|目标|必须|优先|，|。|；|;|,)/;
+const POST_ACTIONS = new Set(["none", "greet"]);
+const CRITERIA_MARKER_PATTERN = /(?:筛选条件|筛选标准|筛选要求|筛选规则|硬性条件|硬条件|criteria)\s*[：:]/i;
+const CRITERIA_TRAILING_FIELD_PATTERN = /\n\s*(?:岗位|职位|关键词|城市|地点|工作地|学历|学校类型|院校标签|经验|经验要求|工作经验|工作年限|性别|年龄|年龄要求|年龄范围|只看未查看|目标筛选人数|目标人数|休息强度|后置动作|post_action|rest_level)\s*[：:]/i;
 
 function normalizeText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeCriteriaBlock(input) {
+  const lines = String(input || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.join("\n").trim() || null;
+}
+
+function escapeRegExp(input) {
+  return String(input).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractFieldLineValue(rawText, labels = []) {
+  const lines = String(rawText || "").replace(/\r\n/g, "\n").split("\n");
+  const labelPattern = labels.map(escapeRegExp).join("|");
+  if (!labelPattern) return null;
+  const pattern = new RegExp(`^\\s*(?:${labelPattern})(?:\\s*\\([^)]*\\))?\\s*[：:]\\s*(.+?)\\s*$`, "i");
+  for (const line of lines) {
+    const match = line.match(pattern);
+    const value = match?.[1]?.trim();
+    if (value) return value;
+  }
+  return null;
 }
 
 function uniqueList(items) {
@@ -45,6 +84,7 @@ function normalizeSchoolLabel(value) {
   if (typeof value !== "string") return null;
   const raw = value.trim();
   if (!raw) return null;
+  if (/^(?:不限|不限制|无限制|全部|所有|无|none|all)$/i.test(raw)) return null;
   if (KNOWN_SCHOOL_LABELS.has(raw)) return raw;
 
   const compact = raw.toLowerCase().replace(/\s+/g, "");
@@ -123,6 +163,15 @@ function extractRecentViewedFilter(text) {
   return null;
 }
 
+function normalizeRecentViewedOverride(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["true", "yes", "1", "需要过滤", "过滤", "近14天没有", "not_viewed"].includes(normalized)) return true;
+  if (["false", "no", "0", "不过滤", "不限", "none"].includes(normalized)) return false;
+  return null;
+}
+
 function normalizeStringOverride(value) {
   if (typeof value !== "string") return null;
   const normalized = value.trim();
@@ -130,15 +179,77 @@ function normalizeStringOverride(value) {
 }
 
 function normalizeSchoolsOverride(value) {
-  if (Array.isArray(value)) return uniqueList(value.map(normalizeSchoolLabel));
-  if (typeof value === "string") return uniqueList(value.split(/[，,]/).map(normalizeSchoolLabel));
+  if (Array.isArray(value)) {
+    return uniqueList(value.flatMap((item) => normalizeSchoolsOverride(item) || []));
+  }
+  if (typeof value === "string") return uniqueList(value.split(/[，,、|/]/).map(normalizeSchoolLabel));
   return null;
+}
+
+function extractSchoolFilterExplicit(rawText) {
+  const value = extractFieldLineValue(rawText, [
+    "学校",
+    "院校",
+    "学校类型",
+    "院校标签",
+    "学校标签",
+    "school",
+    "school_tag",
+    "school_tags",
+    "schools"
+  ]);
+  if (value === null) return { explicit: false, schools: null };
+  return { explicit: true, schools: normalizeSchoolsOverride(value) || [] };
+}
+
+function extractRecentViewedExplicit(rawText) {
+  const value = extractFieldLineValue(rawText, ["只看未查看", "过滤已看", "recent_not_view", "filter_recent_viewed"]);
+  return value === null ? null : normalizeRecentViewedOverride(value);
 }
 
 function normalizeDegreesOverride(value) {
   if (Array.isArray(value)) return uniqueList(value.map(normalizeText));
   if (typeof value === "string") return uniqueList(value.split(/[，,、|/]/).map(normalizeText));
   return null;
+}
+
+function normalizeExperienceOverride(value) {
+  if (typeof value === "string") return normalizeText(value) || null;
+  if (Array.isArray(value)) {
+    const normalized = value.map(normalizeText).filter(Boolean);
+    return normalized.length ? normalized[0] : null;
+  }
+  if (value && typeof value === "object") return value;
+  return null;
+}
+
+function normalizeGenericSearchFilterOverride(value) {
+  if (typeof value === "string" || typeof value === "number") return normalizeText(value) || null;
+  if (Array.isArray(value)) {
+    const normalized = value.map(normalizeText).filter(Boolean);
+    return normalized.length ? normalized[0] : null;
+  }
+  if (value && typeof value === "object") return value;
+  return null;
+}
+
+function normalizeDegreeFieldValue(value) {
+  const normalized = normalizeText(value);
+  if (!normalized) return null;
+  if (/^(?:不限|不限制|无限制|全部|所有|无|none|all)$/i.test(normalized)) return "不限";
+  return extractDegree(normalized) || normalized;
+}
+
+function normalizePostAction(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (["", "none", "skip", "no", "不执行", "无", "什么也不做"].includes(normalized)) return "none";
+  if (["greet", "chat", "打招呼", "直接沟通", "沟通"].includes(normalized)) return "greet";
+  return POST_ACTIONS.has(normalized) ? normalized : "";
+}
+
+function parsePositiveInteger(value) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 function extractKeywordExplicit(text) {
@@ -169,6 +280,19 @@ function extractKeywordAuto(text) {
   return null;
 }
 
+function extractJobExplicit(text) {
+  const patterns = [
+    /(?:搜索页)?(?:岗位|职位)(?:名称)?(?:为|是|:|：)?\s*([^\n，。；;]+)/i,
+    /job(?:\s*title)?(?:\s*[:：=]\s*|\s+is\s+)([^\n，。；;]+)/i
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    const job = match?.[1]?.trim();
+    if (job) return job;
+  }
+  return null;
+}
+
 function extractTargetCount(text) {
   const patterns = [
     /至少筛选\s*(\d+)\s*位?/i,
@@ -186,50 +310,30 @@ function extractTargetCount(text) {
   return null;
 }
 
-function sanitizeClause(clause) {
-  return clause
-    .replace(/^使用boss-recruit-pipeline skills/i, "")
-    .replace(/^帮我(?:在boss上)?(?:找|筛选)/i, "")
-    .replace(/^请(?:在boss上)?(?:帮我)?(?:找|筛选)/i, "")
-    .replace(/^在boss上(?:帮我)?(?:找|筛选)/i, "")
-    .replace(/的人选$/, "")
-    .replace(/的人$/, "")
-    .trim();
+function extractPostAction(text) {
+  if (/(?:什么也不做|不(?:打招呼|沟通)|只筛选|不执行)/.test(text)) return "none";
+  if (/(?:直接沟通|打招呼|立即沟通|greet|post_action\s*[:：=]\s*greet)/i.test(text)) return "greet";
+  return "";
 }
 
-function isCountPlanningClause(clause) {
-  return /(?:目标(?:筛选)?(?:人数|数量)?|至少筛选|筛选\s*\d+\s*位|输出\s*\d+\s*(?:位|个|个人选|个候选人)?|最终输出\s*\d+\s*(?:位|个|个人选|个候选人)?|处理\s*\d+\s*(?:位|人)|(?:浏览|拉取|抓取).*(?:至少\s*)?\d+\s*(?:位|个|个人选|个候选人)?|最匹配.*\d+\s*(?:位|个|个人选|个候选人)?)/i.test(clause);
+function extractTargetCountExplicit(rawText) {
+  const value = extractFieldLineValue(rawText, ["目标筛选人数", "目标人数", "目标通过人数", "target_count", "max_candidates"]);
+  return parsePositiveInteger(value);
 }
 
-function buildScreenCriteria(text, searchParams) {
-  const clauses = text
-    .split(/[，,。；;\n]/)
-    .map((clause) => sanitizeClause(clause))
-    .filter(Boolean);
+function extractPostActionExplicit(rawText) {
+  const value = extractFieldLineValue(rawText, ["后置动作", "通过后执行动作", "post_action"]);
+  return normalizePostAction(value);
+}
 
-  const normalized = clauses
-    .filter((clause) => {
-      if (/搜索关键词|关键词|keyword/i.test(clause)) return false;
-      if (/地点|城市/.test(clause)) return false;
-      if (/近?14天(?:内)?查看(?:过)?|过滤近14天查看/.test(clause)) return false;
-      if (isCountPlanningClause(clause)) return false;
-      return true;
-    })
-    .map((clause) => clause.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-
-  if (searchParams?.keyword) {
-    const keywordClause = `候选人需有${searchParams.keyword}相关经历`;
-    const alreadyCovered = normalized.some((clause) =>
-      clause.toLowerCase().includes(String(searchParams.keyword).toLowerCase())
-    );
-    if (!alreadyCovered) normalized.unshift(keywordClause);
-  }
-
-  if (!normalized.length) {
-    return searchParams?.keyword ? `候选人需有${searchParams.keyword}相关经历` : text;
-  }
-  return uniqueList(normalized).join("；");
+function extractExplicitCriteria(rawText) {
+  const normalized = String(rawText || "").replace(/\r\n/g, "\n");
+  const match = normalized.match(CRITERIA_MARKER_PATTERN);
+  if (!match) return null;
+  let criteria = normalized.slice(match.index + match[0].length).trim();
+  const trailingFieldIndex = criteria.search(CRITERIA_TRAILING_FIELD_PATTERN);
+  if (trailingFieldIndex > 0) criteria = criteria.slice(0, trailingFieldIndex).trim();
+  return normalizeCriteriaBlock(criteria);
 }
 
 function resolveKeyword(parsed, confirmation) {
@@ -249,6 +353,45 @@ function resolveKeyword(parsed, confirmation) {
     return { keyword: null, needsConfirmation: true, proposedKeyword: auto };
   }
   return { keyword: null, needsConfirmation: false, proposedKeyword: null };
+}
+
+function resolveJob(parsed, confirmation) {
+  if (parsed.job_override) return parsed.job_override;
+  const confirmed = confirmation?.job_confirmed === true;
+  const value = typeof confirmation?.job_value === "string" ? confirmation.job_value.trim() : "";
+  if (confirmed && value) return value;
+  return parsed.job_explicit || null;
+}
+
+function resolvePostAction(parsed, confirmation) {
+  const confirmed = confirmation?.post_action_confirmed === true;
+  const confirmationValue = normalizePostAction(confirmation?.post_action_value);
+  return parsed.post_action_override
+    || (confirmed && confirmationValue ? confirmationValue : "")
+    || parsed.post_action_explicit
+    || "none";
+}
+
+function resolveMaxGreetCount(parsed, confirmation) {
+  return parsePositiveInteger(confirmation?.max_greet_count_value)
+    || parsePositiveInteger(parsed.max_greet_count_override)
+    || null;
+}
+
+function collectMissingFields(searchParams, screenParams, parsed = {}) {
+  const missing = [];
+  if (!searchParams.job) missing.push("job");
+  if (!searchParams.city && !parsed.city_explicit) missing.push("city");
+  if (!searchParams.degree && !searchParams.degrees?.length && !parsed.degree_explicit) missing.push("degree");
+  if (!searchParams.schools?.length && !parsed.schools_explicit) missing.push("schools");
+  if (!searchParams.keyword) missing.push("keyword");
+  if (!screenParams.criteria) missing.push("criteria");
+  if (!screenParams.target_count) missing.push("target_count");
+  return missing;
+}
+
+function collectUnresolvedMissingFields(missingFields, appliedDefaults) {
+  return missingFields.filter((field) => !Object.prototype.hasOwnProperty.call(appliedDefaults, field));
 }
 
 function collectSuspiciousFields(searchParams, screenParams) {
@@ -284,9 +427,27 @@ function collectSuspiciousFields(searchParams, screenParams) {
   return suspicious;
 }
 
+function buildMissingFieldQuestions(missingFields = [], defaultPreview = {}) {
+  const questions = {
+    job: "请填写搜索页岗位名称（关键词输入框旁边的岗位选择）。",
+    city: "请填写城市；如不限城市，请明确回复不限。",
+    degree: "请填写学历筛选；如不限学历，请明确回复不限。",
+    schools: "请填写院校标签；如不限院校标签，请明确回复不限。",
+    keyword: "请填写搜索关键词。",
+    criteria: "请填写本次筛选 criteria（完整自然语言硬条件）。",
+    target_count: "请填写本次目标通过人数。"
+  };
+  return missingFields.map((field) => ({
+    field,
+    question: questions[field] || `请填写 ${field}。`,
+    value: Object.prototype.hasOwnProperty.call(defaultPreview, field) ? defaultPreview[field] : null
+  }));
+}
+
 function buildDefaultPreview(missingFields, { skipKeywordDefault = false } = {}) {
   return missingFields.reduce((acc, field) => {
     if (field === "keyword" && skipKeywordDefault) return acc;
+    if (!["city", "degree", "schools"].includes(field)) return acc;
     acc[field] = DEFAULT_PARAM_LABELS[field];
     return acc;
   }, {});
@@ -311,14 +472,6 @@ function applyDefaults(searchParams, screenParams, missingFields, useDefaultForM
     nextSearchParams.schools = DEFAULT_PARAM_VALUES.schools.slice();
     appliedDefaults.schools = DEFAULT_PARAM_LABELS.schools;
   }
-  if (missingFields.includes("keyword") && !skipKeywordDefault) {
-    nextSearchParams.keyword = DEFAULT_PARAM_VALUES.keyword;
-    appliedDefaults.keyword = DEFAULT_PARAM_LABELS.keyword;
-  }
-  if (missingFields.includes("target_count")) {
-    nextScreenParams.target_count = DEFAULT_PARAM_VALUES.target_count;
-    appliedDefaults.target_count = DEFAULT_PARAM_LABELS.target_count;
-  }
   return {
     searchParams: nextSearchParams,
     screenParams: nextScreenParams,
@@ -327,58 +480,173 @@ function applyDefaults(searchParams, screenParams, missingFields, useDefaultForM
 }
 
 export function parseRecruitInstruction({ instruction, confirmation, overrides } = {}) {
-  const text = normalizeText(instruction);
+  const rawInstruction = String(instruction || "");
+  const text = normalizeText(rawInstruction);
+  const finalConfirmed = confirmation?.final_confirmed === true;
+  const explicitSchools = extractSchoolFilterExplicit(rawInstruction);
+  const explicitRecentViewed = extractRecentViewedExplicit(rawInstruction);
+  const explicitKeyword = extractFieldLineValue(rawInstruction, ["搜索关键词", "关键词", "keyword"]);
+  const explicitJob = extractFieldLineValue(rawInstruction, ["岗位", "职位", "job"]);
+  const explicitCity = extractFieldLineValue(rawInstruction, ["城市", "地点", "工作地", "base"]);
+  const explicitDegree = extractFieldLineValue(rawInstruction, ["学历", "degree"]);
+  const explicitExperience = extractFieldLineValue(rawInstruction, ["经验", "经验要求", "工作经验", "工作年限", "experience"]);
+  const explicitGender = extractFieldLineValue(rawInstruction, ["性别", "gender"]);
+  const explicitAge = extractFieldLineValue(rawInstruction, ["年龄", "年龄要求", "年龄范围", "age"]);
+  const explicitTargetCount = extractTargetCountExplicit(rawInstruction);
+  const explicitPostAction = extractPostActionExplicit(rawInstruction);
   const parsed = {
-    city: extractCity(text),
-    degree: extractDegree(text),
-    schools: extractSchools(text),
-    filter_recent_viewed: extractRecentViewedFilter(text),
-    keyword_explicit: extractKeywordExplicit(text),
+    job_explicit: explicitJob || extractJobExplicit(text),
+    city: sanitizeCityCandidate(explicitCity) || extractCity(text),
+    city_explicit: explicitCity !== null,
+    degree: normalizeDegreeFieldValue(explicitDegree) || extractDegree(text),
+    degree_explicit: explicitDegree !== null,
+    experience: normalizeExperienceOverride(explicitExperience),
+    experience_explicit: explicitExperience !== null,
+    gender: normalizeGenericSearchFilterOverride(explicitGender),
+    gender_explicit: explicitGender !== null,
+    age: normalizeGenericSearchFilterOverride(explicitAge),
+    age_explicit: explicitAge !== null,
+    schools: explicitSchools.explicit ? explicitSchools.schools : extractSchools(text),
+    schools_explicit: explicitSchools.explicit,
+    filter_recent_viewed: explicitRecentViewed !== null ? explicitRecentViewed : extractRecentViewedFilter(text),
+    keyword_explicit: explicitKeyword || extractKeywordExplicit(text),
     keyword_auto: extractKeywordAuto(text),
-    target_count: extractTargetCount(text)
+    target_count: explicitTargetCount || extractTargetCount(text),
+    post_action_explicit: explicitPostAction || extractPostAction(text),
+    criteria_explicit: extractExplicitCriteria(rawInstruction)
   };
 
   if (overrides) {
     const overrideCity = sanitizeCityCandidate(normalizeStringOverride(overrides.city));
     const overrideDegree = normalizeStringOverride(overrides.degree);
-    const overrideDegrees = normalizeDegreesOverride(overrides.degrees);
-    const overrideSchools = normalizeSchoolsOverride(overrides.schools);
+    const overrideDegrees = normalizeDegreesOverride(overrides.degrees || (Array.isArray(overrides.degree) ? overrides.degree : null));
+    const hasOverrideSchools = Object.prototype.hasOwnProperty.call(overrides, "schools")
+      || Object.prototype.hasOwnProperty.call(overrides, "school_tag")
+      || Object.prototype.hasOwnProperty.call(overrides, "school_tags");
+    const overrideSchools = normalizeSchoolsOverride(
+      Object.prototype.hasOwnProperty.call(overrides, "schools")
+        ? overrides.schools
+        : Object.prototype.hasOwnProperty.call(overrides, "school_tag")
+          ? overrides.school_tag
+          : overrides.school_tags
+    );
     const overrideKeyword = normalizeStringOverride(overrides.keyword);
-    const overrideRecentViewed = typeof overrides.filter_recent_viewed === "boolean"
-      ? overrides.filter_recent_viewed
-      : null;
+    const overrideJob = normalizeStringOverride(overrides.job || overrides.job_title || overrides.selected_job);
+    const overrideCriteria = normalizeStringOverride(overrides.criteria);
+    const hasOverrideExperience = Object.prototype.hasOwnProperty.call(overrides, "experience")
+      || Object.prototype.hasOwnProperty.call(overrides, "experiences")
+      || Object.prototype.hasOwnProperty.call(overrides, "experience_range")
+      || Object.prototype.hasOwnProperty.call(overrides, "experience_start")
+      || Object.prototype.hasOwnProperty.call(overrides, "experience_end");
+    const overrideExperience = Object.prototype.hasOwnProperty.call(overrides, "experience")
+      ? normalizeExperienceOverride(overrides.experience)
+      : Object.prototype.hasOwnProperty.call(overrides, "experiences")
+        ? normalizeExperienceOverride(overrides.experiences)
+        : Object.prototype.hasOwnProperty.call(overrides, "experience_range")
+          ? normalizeExperienceOverride(overrides.experience_range)
+          : hasOverrideExperience
+            ? {
+              start: overrides.experience_start,
+              end: overrides.experience_end
+            }
+            : null;
+    const hasOverrideGender = Object.prototype.hasOwnProperty.call(overrides, "gender");
+    const overrideGender = hasOverrideGender ? normalizeGenericSearchFilterOverride(overrides.gender) : null;
+    const hasOverrideAge = Object.prototype.hasOwnProperty.call(overrides, "age")
+      || Object.prototype.hasOwnProperty.call(overrides, "ages")
+      || Object.prototype.hasOwnProperty.call(overrides, "age_range")
+      || Object.prototype.hasOwnProperty.call(overrides, "age_min")
+      || Object.prototype.hasOwnProperty.call(overrides, "age_max")
+      || Object.prototype.hasOwnProperty.call(overrides, "min_age")
+      || Object.prototype.hasOwnProperty.call(overrides, "max_age");
+    const overrideAge = Object.prototype.hasOwnProperty.call(overrides, "age")
+      ? normalizeGenericSearchFilterOverride(overrides.age)
+      : Object.prototype.hasOwnProperty.call(overrides, "ages")
+        ? normalizeGenericSearchFilterOverride(overrides.ages)
+        : Object.prototype.hasOwnProperty.call(overrides, "age_range")
+          ? normalizeGenericSearchFilterOverride(overrides.age_range)
+          : hasOverrideAge
+            ? {
+              min: overrides.age_min ?? overrides.min_age,
+              max: overrides.age_max ?? overrides.max_age
+            }
+            : null;
+    const overrideRecentViewed = normalizeRecentViewedOverride(
+      Object.prototype.hasOwnProperty.call(overrides, "filter_recent_viewed")
+        ? overrides.filter_recent_viewed
+        : overrides.recent_not_view
+    );
+    const overridePostAction = normalizePostAction(overrides.post_action);
     if (overrideCity) parsed.city = overrideCity;
     if (overrideDegree) parsed.degree = overrideDegree;
     if (overrideDegrees?.length) parsed.degrees = overrideDegrees;
-    if (overrideSchools?.length) parsed.schools = overrideSchools;
+    if (Object.prototype.hasOwnProperty.call(overrides, "city")) parsed.city_explicit = true;
+    if (Object.prototype.hasOwnProperty.call(overrides, "degree") || Object.prototype.hasOwnProperty.call(overrides, "degrees")) {
+      parsed.degree_explicit = true;
+    }
+    if (hasOverrideSchools && Array.isArray(overrideSchools)) {
+      parsed.schools = overrideSchools;
+      parsed.schools_explicit = true;
+    }
+    if (hasOverrideExperience) {
+      parsed.experience = overrideExperience;
+      parsed.experience_explicit = true;
+    }
+    if (hasOverrideGender) {
+      parsed.gender = overrideGender;
+      parsed.gender_explicit = true;
+    }
+    if (hasOverrideAge) {
+      parsed.age = overrideAge;
+      parsed.age_explicit = true;
+    }
     if (overrideKeyword) parsed.keyword_override = overrideKeyword;
+    if (overrideJob) parsed.job_override = overrideJob;
+    if (overrideCriteria) parsed.criteria_override = overrideCriteria;
     if (overrideRecentViewed !== null) parsed.filter_recent_viewed = overrideRecentViewed;
+    if (overridePostAction) parsed.post_action_override = overridePostAction;
+    if (Number.isFinite(overrides.max_greet_count) && overrides.max_greet_count > 0) {
+      parsed.max_greet_count_override = Number.parseInt(String(overrides.max_greet_count), 10);
+    }
     if (Number.isFinite(overrides.target_count) && overrides.target_count > 0) {
       parsed.target_count = Number.parseInt(String(overrides.target_count), 10);
     }
   }
 
   const keywordResolution = resolveKeyword(parsed, confirmation);
+  const job = resolveJob(parsed, confirmation);
+  const postAction = resolvePostAction(parsed, confirmation);
+  const maxGreetCount = resolveMaxGreetCount(parsed, confirmation);
+  const confirmationCriteria = normalizeStringOverride(confirmation?.criteria_value);
   const baseSearchParams = {
+    job,
     city: parsed.city,
     degree: parsed.degree,
     degrees: parsed.degrees,
     schools: parsed.schools,
+    experience: parsed.experience,
+    gender: parsed.gender,
+    age: parsed.age,
     filter_recent_viewed: parsed.filter_recent_viewed,
     keyword: keywordResolution.keyword
   };
+  const criteria = parsed.criteria_override || confirmationCriteria || parsed.criteria_explicit || null;
+  const criteriaSource = parsed.criteria_override
+    ? "override"
+    : confirmationCriteria
+      ? "confirmation"
+      : parsed.criteria_explicit
+        ? "instruction_block"
+        : "missing";
   const baseScreenParams = {
-    criteria: buildScreenCriteria(text, baseSearchParams),
-    target_count: parsed.target_count
+    criteria,
+    target_count: parsed.target_count,
+    post_action: postAction,
+    max_greet_count: maxGreetCount
   };
-  const missingBeforeDefaults = [];
-  if (!baseSearchParams.city) missingBeforeDefaults.push("city");
-  if (!baseSearchParams.degree) missingBeforeDefaults.push("degree");
-  if (!baseSearchParams.schools?.length) missingBeforeDefaults.push("schools");
-  if (!baseSearchParams.keyword) missingBeforeDefaults.push("keyword");
-  if (!baseScreenParams.target_count) missingBeforeDefaults.push("target_count");
+  const missingBeforeDefaults = collectMissingFields(baseSearchParams, baseScreenParams, parsed);
 
-  const useDefaultForMissing = confirmation?.use_default_for_missing === true;
+  const useDefaultForMissing = finalConfirmed || confirmation?.use_default_for_missing === true;
   const skipKeywordDefault = keywordResolution.needsConfirmation;
   const defaultPreview = buildDefaultPreview(missingBeforeDefaults, { skipKeywordDefault });
   const { searchParams, screenParams, appliedDefaults } = applyDefaults(
@@ -388,10 +656,12 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     useDefaultForMissing,
     { skipKeywordDefault }
   );
+  const missingAfterDefaults = collectUnresolvedMissingFields(missingBeforeDefaults, appliedDefaults);
   const suspicious_fields = collectSuspiciousFields(searchParams, screenParams);
-  const needs_recent_viewed_filter_confirmation = searchParams.filter_recent_viewed === null;
-  const needs_criteria_confirmation = confirmation?.criteria_confirmed !== true;
+  const needs_recent_viewed_filter_confirmation = !finalConfirmed && searchParams.filter_recent_viewed === null;
+  const needs_criteria_confirmation = Boolean(screenParams.criteria) && !finalConfirmed && confirmation?.criteria_confirmed !== true;
   const pending_questions = [
+    ...buildMissingFieldQuestions(missingAfterDefaults, defaultPreview),
     ...(needs_recent_viewed_filter_confirmation
       ? [{
         field: "filter_recent_viewed",
@@ -415,25 +685,28 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     extracted_screen_params: baseScreenParams,
     current_search_params: searchParams,
     current_screen_params: screenParams,
-    missing_fields: missingBeforeDefaults,
-    has_unresolved_missing_fields: missingBeforeDefaults.length > 0 && !useDefaultForMissing,
+    missing_fields: missingAfterDefaults,
+    missing_fields_before_defaults: missingBeforeDefaults,
+    has_unresolved_missing_fields: missingAfterDefaults.length > 0,
     suspicious_fields,
     pending_questions,
     default_preview: defaultPreview,
-    applied_defaults: appliedDefaults
+    applied_defaults: appliedDefaults,
+    criteria_source: criteriaSource,
+    final_confirmed: finalConfirmed
   };
 
   return {
     parsed,
     searchParams,
     screenParams,
-    missing_fields: missingBeforeDefaults,
-    has_unresolved_missing_fields: missingBeforeDefaults.length > 0 && !useDefaultForMissing,
+    missing_fields: missingAfterDefaults,
+    has_unresolved_missing_fields: missingAfterDefaults.length > 0,
     suspicious_fields,
     needs_keyword_confirmation: keywordResolution.needsConfirmation,
     needs_recent_viewed_filter_confirmation,
     needs_criteria_confirmation,
-    needs_search_params_confirmation: confirmation?.search_params_confirmed !== true,
+    needs_search_params_confirmation: !finalConfirmed && confirmation?.search_params_confirmed !== true,
     proposed_keyword: keywordResolution.proposedKeyword,
     pending_questions,
     default_preview: defaultPreview,
@@ -447,5 +720,8 @@ export const recruitInstructionParserSemantics = Object.freeze({
   imported_at: "2026-04-30",
   default_param_values: DEFAULT_PARAM_VALUES,
   school_labels: SEARCH_SCHOOL_MAP,
-  degree_values: Array.from(DEGREE_VALUES)
+  degree_values: Array.from(DEGREE_VALUES),
+  experience_values: ["不限", "在校/应届", "25年毕业", "26年毕业", "26年后毕业", "1-3年", "3-5年", "5-10年", "自定义"],
+  gender_values: ["不限", "男", "女"],
+  age_values: ["不限", "20-25", "25-30", "30-35", "35-40", "40-50", "50以上", "自定义"]
 });

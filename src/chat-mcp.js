@@ -69,8 +69,7 @@ const DETACHED_WORKER_POLL_MS = 1000;
 const CHAT_REQUIRED_FIELDS = Object.freeze([
   "job",
   "start_from",
-  "target_count",
-  "criteria"
+  "target_count"
 ]);
 
 const TERMINAL_STATUSES = new Set([
@@ -1102,7 +1101,6 @@ function getMissingChatStartFields(args = {}, normalized = normalizeChatStartInp
   if (!normalized.job) missing.push("job");
   if (!["unread", "all"].includes(normalized.startFrom)) missing.push("start_from");
   if (!normalized.target.provided || normalized.target.parseError) missing.push("target_count");
-  if (!normalized.criteria) missing.push("criteria");
   return missing;
 }
 
@@ -1168,13 +1166,6 @@ function buildPendingChatQuestions({ args, missingFields, normalized, jobOptions
         parse_error: normalized.target.parseError || null
       };
     }
-    if (field === "criteria") {
-      return {
-        field,
-        question: "请提供自然语言筛选 criteria。",
-        value: normalized.criteria || null
-      };
-    }
     return {
       field,
       question: `请提供 ${field}。`,
@@ -1189,12 +1180,14 @@ async function buildNeedInputResponse({ args, missingFields, normalized }) {
     status: "NEED_INPUT",
     required_fields: CHAT_REQUIRED_FIELDS.slice(),
     missing_fields: missingFields,
+    criteria_optional: true,
+    empty_criteria_mode: "collect_cv",
     ...diagnostics,
     pending_questions: buildPendingChatQuestions({ args, missingFields, normalized }),
     job_options: [],
     error: {
       code: "MISSING_REQUIRED_FIELDS",
-      message: "缺少必要字段。请补齐 job、start_from、target_count、criteria 后再启动 Boss chat CDP-only run。",
+      message: "缺少必要字段。请补齐 job、start_from、target_count 后再启动 Boss chat CDP-only run。criteria 可留空；留空时会进入收集简历模式。",
       retryable: true
     }
   };
@@ -1232,7 +1225,8 @@ function isDebugTestMode(args = {}) {
   return args.debug_test_mode === true || args.allow_debug_test_mode === true;
 }
 
-function normalizeScreeningModeArg(args = {}) {
+function normalizeScreeningModeArg(args = {}, normalized = normalizeChatStartInput(args)) {
+  if (!normalized.criteria) return "collect_cv";
   const raw = normalizeText(args.screening_mode || args.screeningMode || "");
   if (args.use_llm === false) return "deterministic";
   return ["deterministic", "local", "local_scorer"].includes(raw.toLowerCase())
@@ -1248,8 +1242,8 @@ function collectChatDebugTestOptions(args = {}) {
   return reasons;
 }
 
-function shouldUseChatLlm(args = {}) {
-  return normalizeScreeningModeArg(args) !== "deterministic";
+function shouldUseChatLlm(args = {}, normalized = normalizeChatStartInput(args)) {
+  return normalizeScreeningModeArg(args, normalized) === "llm";
 }
 
 function getRunOptions(args, normalized, session, { workspaceRoot = "", configResolution = null } = {}) {
@@ -1260,7 +1254,8 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
     isAllTarget ? CHAT_ALL_MAX_CANDIDATES : CHAT_ALL_MAX_CANDIDATES
   );
   const shouldRequestResume = shouldRequestChatResume(args);
-  const useLlm = shouldUseChatLlm(args);
+  const screeningMode = normalizeScreeningModeArg(args, normalized);
+  const useLlm = shouldUseChatLlm(args, normalized);
   const resolvedConfig = configResolution || (useLlm ? resolveBossScreeningConfig(workspaceRoot) : { ok: false });
   const humanBehavior = resolveHumanBehaviorForRun(args, resolvedConfig?.config || {});
   return {
@@ -1302,7 +1297,7 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
     llmImageDetail: normalizeText(
       args.llm_image_detail || resolvedConfig.config?.llmImageDetail || resolvedConfig.config?.imageDetail
     ) || "low",
-    screeningMode: normalizeScreeningModeArg(args),
+    screeningMode,
     listMaxScrolls: parsePositiveInteger(args.list_max_scrolls, 200),
     listStableSignatureLimit: parsePositiveInteger(args.list_stable_signature_limit, 2),
     listWheelDeltaY: parsePositiveInteger(args.list_wheel_delta_y, 850),
@@ -1373,7 +1368,7 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "", runId =
   }
 
   const shouldRequestResume = shouldRequestChatResume(args);
-  const useLlm = shouldUseChatLlm(args);
+  const useLlm = shouldUseChatLlm(args, normalized);
   const debugTestOptions = collectChatDebugTestOptions(args);
   if (debugTestOptions.length && !isDebugTestMode(args)) {
     return {
@@ -1540,6 +1535,8 @@ export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } =
       page_url: session.navigation?.url || session.target?.url || CHAT_TARGET_URL,
       required_fields: CHAT_REQUIRED_FIELDS.slice(),
       missing_fields: missingFields,
+      criteria_optional: true,
+      empty_criteria_mode: "collect_cv",
       job_options: jobOptions,
       selected_job: selectedJob,
       selected_job_label: jobs?.selected_label || selectedJob?.label || "",
@@ -1554,8 +1551,8 @@ export async function prepareBossChatRunTool({ workspaceRoot = "", args = {} } =
       ...diagnostics,
       ...(nextCallExample ? { next_call_example: nextCallExample } : {}),
       message: missingFields.length
-        ? "已通过 CDP-only 读取 Boss 聊天页岗位列表，请补齐 job / start_from / target_count / criteria。"
-        : "Boss chat CDP-only preflight is ready. Use start_boss_chat_run to start screening.",
+        ? "已通过 CDP-only 读取 Boss 聊天页岗位列表，请补齐 job / start_from / target_count。criteria 可留空；留空会进入收集简历模式。"
+        : "Boss chat CDP-only preflight is ready. Use start_boss_chat_run to start screening or collect CVs.",
       runtime_evaluate_used: false,
       method_summary: methodSummary(session.methodLog || []),
       method_log: session.methodLog || [],
@@ -1723,7 +1720,7 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
     });
   }
 
-  const useLlm = shouldUseChatLlm(args);
+  const useLlm = shouldUseChatLlm(args, normalized);
   const debugTestOptions = collectChatDebugTestOptions(args);
   if (debugTestOptions.length && !isDebugTestMode(args)) {
     return {

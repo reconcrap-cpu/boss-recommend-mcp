@@ -102,7 +102,71 @@ function findRouteSignals(text, patterns = []) {
   return signals;
 }
 
+function detectExplicitNonRecommendScope(args = {}) {
+  const fields = [
+    ["page_scope", args.page_scope],
+    ["confirmation.page_value", args.confirmation?.page_value],
+    ["overrides.page_scope", args.overrides?.page_scope],
+    ["target_url_includes", args.target_url_includes],
+    ["overrides.target_url_includes", args.overrides?.target_url_includes]
+  ];
+  for (const [field, value] of fields) {
+    const normalized = normalizeText(value).toLowerCase();
+    if (!normalized) continue;
+    if (/\/web\/chat\/index|chat\/index/.test(normalized) || ["chat", "chat-page", "boss-chat"].includes(normalized)) {
+      return {
+        domain: "chat",
+        signals: [`${field}:chat`],
+        text: normalized
+      };
+    }
+    if (/\/web\/chat\/search|chat\/search/.test(normalized) || ["search", "search-page", "recruit", "recruit-page", "boss-recruit"].includes(normalized)) {
+      return {
+        domain: "search",
+        signals: [`${field}:search`],
+        text: normalized
+      };
+    }
+  }
+  return null;
+}
+
+function detectRecruitShapedRecommendArgs(args = {}) {
+  const checks = [
+    ["keyword", args.keyword],
+    ["search_keyword", args.search_keyword],
+    ["city", args.city],
+    ["confirmation.keyword_value", args.confirmation?.keyword_value],
+    ["confirmation.keyword_confirmed", args.confirmation?.keyword_confirmed],
+    ["confirmation.search_params_confirmed", args.confirmation?.search_params_confirmed],
+    ["overrides.keyword", args.overrides?.keyword],
+    ["overrides.search_keyword", args.overrides?.search_keyword],
+    ["overrides.city", args.overrides?.city],
+    ["overrides.filter_recent_viewed", args.overrides?.filter_recent_viewed],
+    ["overrides.schools", args.overrides?.schools],
+    ["overrides.school_tags", args.overrides?.school_tags]
+  ];
+  const signals = [];
+  for (const [field, value] of checks) {
+    if (value === undefined || value === null) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    if (typeof value === "string" && !normalizeText(value)) continue;
+    signals.push(field);
+  }
+  if (!signals.length) return null;
+  return {
+    domain: "search",
+    signals: signals.map((field) => `${field}:recruit_arg`),
+    text: signals.join(" ")
+  };
+}
+
 function detectNonRecommendRoute(args = {}) {
+  const explicitRoute = detectExplicitNonRecommendScope(args);
+  if (explicitRoute) return explicitRoute;
+  const recruitArgRoute = detectRecruitShapedRecommendArgs(args);
+  if (recruitArgRoute) return recruitArgRoute;
+
   const text = collectRecommendRouteText(args);
   if (!text) return null;
   const chatSignals = findRouteSignals(text, [
@@ -126,6 +190,7 @@ function detectNonRecommendRoute(args = {}) {
   const searchSignals = findRouteSignals(text, [
     { label: "search-only", pattern: /\bsearch[-\s]?only\b/i },
     { label: "search page", pattern: /\bsearch\s+page\b/i },
+    { label: "search keyword", pattern: /搜索关键词|关键词|keyword/i },
     { label: "recruit pipeline", pattern: /\brecruit\s+pipeline\b/i },
     { label: "chat/search", pattern: /(?:\/web\/chat\/search|chat\/search)/i },
     { label: "搜索页", pattern: /搜索页/ },
@@ -148,16 +213,18 @@ function buildWrongRecommendRouteResponse(route) {
       route_guard: true,
       error: {
         code: "WRONG_BOSS_TOOL_FOR_CHAT",
-        message: "This request is explicitly chat-only/chat-page work. Do not use recommend tools. Use boss_chat_health_check, then list_boss_chat_jobs or prepare_boss_chat_run, then start_boss_chat_run.",
+        message: "This request is explicitly chat-only/chat-page work. In Trae-CN split toolsets, call boss-chat/boss_chat_health_check, then boss-chat/list_boss_chat_jobs or boss-chat/prepare_boss_chat_run, then boss-chat/start_boss_chat_run. Do not call boss-recommend tools.",
         retryable: false
       },
       detected_domain: "chat",
       detected_signals: route.signals || [],
+      wrong_server: "boss-recommend",
+      recommended_server: "boss-chat",
       recommended_tool_sequence: [
-        "boss_chat_health_check",
-        "list_boss_chat_jobs",
-        "prepare_boss_chat_run",
-        "start_boss_chat_run"
+        "boss-chat/boss_chat_health_check",
+        "boss-chat/list_boss_chat_jobs",
+        "boss-chat/prepare_boss_chat_run",
+        "boss-chat/start_boss_chat_run"
       ]
     };
   }
@@ -167,14 +234,16 @@ function buildWrongRecommendRouteResponse(route) {
       route_guard: true,
       error: {
         code: "WRONG_BOSS_TOOL_FOR_SEARCH",
-        message: "This request is explicitly search/recruit-page work. Do not use recommend tools. Use run_recruit_pipeline or start_recruit_pipeline_run.",
+        message: "This request is explicitly search/recruit-page work. In Trae-CN split toolsets, call boss-recruit/run_recruit_pipeline or boss-recruit/start_recruit_pipeline_run. Do not call boss-recommend/run_recommend or boss-recommend/start_recommend_pipeline_run.",
         retryable: false
       },
       detected_domain: "search",
       detected_signals: route.signals || [],
+      wrong_server: "boss-recommend",
+      recommended_server: "boss-recruit",
       recommended_tool_sequence: [
-        "run_recruit_pipeline",
-        "start_recruit_pipeline_run"
+        "boss-recruit/run_recruit_pipeline",
+        "boss-recruit/start_recruit_pipeline_run"
       ]
     };
   }

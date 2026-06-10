@@ -75,6 +75,12 @@ export const RECRUIT_SEARCH_SELECTORS = Object.freeze({
     'button[ka*="search"]',
     '[class*="search"][class*="btn"]'
   ],
+  jobTitleTrigger: [
+    ".search-job-list-C .ui-dropmenu",
+    ".search-job-list-C .ui-dropmenu-label",
+    ".search-job-list-C .search-current-job",
+    ".search-job-list-C"
+  ],
   jobTitleOption: [
     '.search-job-list-C li[ka="search_select_job"]',
     ".search-job-list-C li",
@@ -103,6 +109,65 @@ export const RECRUIT_SEARCH_SELECTORS = Object.freeze({
     "label.checkbox.high_search_checkbox",
     "label.checkbox",
     '[ka="search_change_view_resume"]'
+  ],
+  experienceOption: [
+    ".experience-select .exp-item",
+    ".experience-select li",
+    ".exp-list-ui .exp-item",
+    '[class*="experience"] [class*="exp-item"]'
+  ],
+  experienceCustom: [
+    ".experience-select .custom",
+    ".experience-select .custom-wrap",
+    ".experience-select-custom-slider",
+    '[class*="experience"] [class*="custom"]'
+  ],
+  experienceCustomSlider: [
+    ".experience-select .experience-select-custom-slider .ui-slider-wrap",
+    ".experience-select .ui-slider-wrap",
+    ".experience-select-custom-slider .ui-slider-wrap"
+  ],
+  experienceCustomSliderHandle: [
+    ".experience-select .experience-select-custom-slider .ui-slider-button-wrap",
+    ".experience-select .ui-slider-button-wrap",
+    ".experience-select-custom-slider .ui-slider-button-wrap"
+  ],
+  experienceCustomHiddenInput: [
+    ".experience-select .experience-select-custom-slider input[type='hidden']",
+    ".experience-select input[type='hidden']",
+    ".experience-select-custom-slider input[type='hidden']"
+  ],
+  ageOption: [
+    ".age-select .age-item",
+    ".age-list-ui .age-item",
+    '[class*="age"] [class*="age-item"]'
+  ],
+  ageCustom: [
+    ".age-select .custom",
+    ".age-select .age-custom",
+    '[class*="age"] [class*="custom"]'
+  ],
+  ageCustomDropdown: [
+    ".age-select .age-custom .dropdown-wrap.select"
+  ],
+  ageCustomOption: [
+    ".age-select .age-custom li",
+    ".age-select .age-custom .dropdown-menu li"
+  ],
+  ageCustomInput: [
+    ".age-select .age-custom input"
+  ],
+  genderDropdown: [
+    ".gender-select"
+  ],
+  genderOption: [
+    ".gender-select.dropdown-menu-open li",
+    ".gender-select .dropdown-menu li"
+  ],
+  cityTrigger: [
+    ".city-wrap .city",
+    ".city-wrap",
+    ".search-wrap .city-wrap"
   ],
   cityInput: [
     ".city-wrap .search-city-kw input",

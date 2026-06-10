@@ -176,7 +176,7 @@ boss-recommend-mcp schedule-status --schedule-id <schedule_id>
 - 不会对每位候选人重复确认
 - 推荐页详情处理完成后，会强制关闭详情页并确认已关闭
 - 简历提取优先使用 Network 响应；没有可解析 Network CV 时，回退到完整滚动截图序列再交给多模态模型判断
-- recommend / search / chat 正式运行默认全部使用 `screening-config.json` 配置的 LLM 筛选；deterministic/local scorer 只保留给明确测试场景，必须显式传 `debug_test_mode=true` 且 `screening_mode=deterministic` 或 `use_llm=false`。
+- recommend / search / 带 `criteria` 的 chat 正式运行默认全部使用 `screening-config.json` 配置的 LLM 筛选；chat 的 `criteria` 留空时进入收集简历模式，不需要 LLM 配置。deterministic/local scorer 只保留给明确测试场景，必须显式传 `debug_test_mode=true` 且 `screening_mode=deterministic` 或 `use_llm=false`。
 - `detail_limit=0`、`no_filter`、`filter_enabled=false`、后置动作 dry-run、chat 求简历 dry-run 等调试路径不会在正式 live run 默认启用；需要测试时必须显式传 `debug_test_mode=true`。
 - 提供显式运维自愈工具：只在手动调用 `run_recommend_self_heal` 时运行，不会接入正常 run / doctor / preflight 自动链路
 - 运行前会自动做依赖体检（Node.js、Python、Pillow、`chrome-remote-interface`、`ws`），缺失时会在 `doctor` 与流水线失败诊断中明确提示
@@ -433,7 +433,7 @@ node src/cli.js chat prepare-run --slow-live --port 9222
 
 说明：
 
-- `criteria` / `start_from` / `target_count` 为必填
+- `start_from` / `target_count` 为必填；`criteria` 可选，留空时 chat run 进入收集简历模式：不触发 LLM 筛选，针对没有在线/附件简历的人选发送求简历消息并点击求简历按钮
 - `greeting_text` 可选（兼容 `greetingText`）
 - `profile` 可选，默认 `default`
 - `job` 与 `port` 继承 recommend run 已选岗位和调试端口
@@ -468,15 +468,15 @@ node src/cli.js chat prepare-run --slow-live --port 9222
 chat-only 交互建议：
 
 - 先调用一次 `list_boss_chat_jobs` 或 `prepare_boss_chat_run`（可不带参数），服务会先导航到 `https://www.zhipin.com/web/chat/index` 并返回 `NEED_INPUT`，其中包含岗位 `job_options` 与待补字段。
-- 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count`、`criteria` 后调用 `start_boss_chat_run` 启动任务。
+- 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count` 后调用 `start_boss_chat_run` 启动任务；若要筛选再求简历，提供 `criteria`，若只想收集缺失简历则留空。
 - `greeting_text` 可选；未传时使用 `screening-config.json.greetingMessage`，若未配置则使用默认招呼语（`Hi同学，能麻烦发下简历吗？`）。
 - `target_count` 支持正整数、`all`、`-1`；若用户给出 `全部候选人` / `所有候选人`，会自动按不限（扫到底）处理。
 
 Trae-CN / 长对话防循环建议：
 
-- 固定流程：`boss_chat_health_check` -> `list_boss_chat_jobs(空参可)` / `prepare_boss_chat_run(空参可)` -> 一次性补齐 `job/start_from/target_count/criteria` -> `start_boss_chat_run`。
+- 固定流程：`boss_chat_health_check` -> `list_boss_chat_jobs(空参可)` / `prepare_boss_chat_run(空参可)` -> 一次性补齐 `job/start_from/target_count`，筛选任务再带 `criteria` -> `start_boss_chat_run`。
 - chat-only 场景严禁调用 `list_recommend_jobs`、`run_recommend` 或 `start_recommend_pipeline_run`。
-- `start_boss_chat_run` 的工具 schema 已把 `job/start_from/target_count/criteria` 标记为必填；不要用它获取岗位列表。
+- `start_boss_chat_run` 的工具 schema 已把 `job/start_from/target_count` 标记为必填；`criteria` 留空会进入收集简历模式。不要用它获取岗位列表。
 - 若 `pending_questions` / UI 选项里出现“扫到底（必须传 `target_count="all"`）”，下一次工具调用请直接照抄 `"target_count": "all"`，不要只保留“扫到底”这层自然语言语义。
 - `start_boss_chat_run` 返回 `ACCEPTED` 后直接结束当前回合，不要自动轮询。
 - 缺参或校验失败时，一次性列出全部缺失/错误项，避免重复同一句提示触发宿主“陷入循环”保护。

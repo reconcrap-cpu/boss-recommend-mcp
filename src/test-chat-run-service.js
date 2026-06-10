@@ -1,19 +1,27 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   RUN_STATUS_CANCELED,
+  RUN_STATUS_FAILED,
   RUN_STATUS_PAUSED
 } from "./core/run/index.js";
 import {
   captureNodeIdFromResumeState,
   chatDetailSkipReasonFromReadyState,
   countChatResultStatuses,
+  createCvCollectionScreening,
   createChatRunService,
   isChatCandidateSelectionMismatchError,
+  isChatOnlineResumeModalOpenFailureError,
   isChatResumeModalCloseFailureError,
   makeChatCandidateSelectionMismatchError,
   makeChatResumeModalOpenBeforeCandidateClickError,
+  CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE,
   resolveChatDomFallbackWait,
+  shouldOpenOnlineResumeForChatDetail,
   summarizeChatFullCvEvidence
 } from "./domains/chat/index.js";
 
@@ -135,6 +143,170 @@ function testChatPreDetailAttachmentResumeSkipReason() {
   assert.equal(mismatch.selection_ready_state.active_candidate_id, "active-2");
   assert.equal(isChatCandidateSelectionMismatchError(mismatch), true);
   assert.equal(isChatCandidateSelectionMismatchError(new Error("different")), false);
+
+  const modalError = new Error("Chat online resume modal did not open");
+  modalError.code = CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE;
+  assert.equal(isChatOnlineResumeModalOpenFailureError(modalError), true);
+  assert.equal(isChatOnlineResumeModalOpenFailureError(new Error("different")), false);
+}
+
+function testCollectCvModeDoesNotOpenOnlineResumeDetail() {
+  assert.equal(shouldOpenOnlineResumeForChatDetail(), true);
+  assert.equal(shouldOpenOnlineResumeForChatDetail({
+    collectCvOnly: true
+  }), false);
+  assert.equal(shouldOpenOnlineResumeForChatDetail({
+    collectCvOnly: false,
+    detailResult: {
+      cv_acquisition: {
+        skipped: true,
+        source: "online_cv_already_available"
+      }
+    }
+  }), false);
+}
+
+function testCollectCvMissingOnlineResumeRequestsCv() {
+  const candidate = {
+    identity: {
+      name: "missing-online-cv"
+    }
+  };
+  const requestable = createCvCollectionScreening(candidate, {
+    detailUnavailableReason: "collect_cv_missing_online_resume",
+    preActionState: {
+      has_online_resume: false,
+      attachment_resume_enabled: false,
+      ask_resume: {
+        node_id: 1,
+        disabled: false
+      }
+    }
+  });
+  assert.equal(requestable.status, "pass");
+  assert.equal(requestable.passed, true);
+  assert.deepEqual(requestable.reasons, ["collect_cv:collect_cv_missing_online_resume"]);
+
+  const noButton = createCvCollectionScreening(candidate, {
+    detailUnavailableReason: "online_resume_button_unavailable",
+    preActionState: {
+      has_online_resume: false,
+      attachment_resume_enabled: false,
+      ask_resume: {
+        node_id: 1,
+        disabled: false
+      }
+    }
+  });
+  assert.equal(noButton.status, "pass");
+  assert.equal(noButton.passed, true);
+  assert.deepEqual(noButton.reasons, ["collect_cv:online_resume_button_unavailable"]);
+
+  const requestableDespiteOnlineProbe = createCvCollectionScreening(candidate, {
+    detailUnavailableReason: "online_cv_already_available",
+    preActionState: {
+      has_online_resume: true,
+      attachment_resume_enabled: false,
+      ask_resume: {
+        node_id: 1,
+        disabled: false
+      }
+    }
+  });
+  assert.equal(requestableDespiteOnlineProbe.status, "pass");
+  assert.equal(requestableDespiteOnlineProbe.passed, true);
+  assert.deepEqual(requestableDespiteOnlineProbe.reasons, ["collect_cv:online_cv_already_available"]);
+
+  const attachmentAvailable = createCvCollectionScreening(candidate, {
+    detailUnavailableReason: "attachment_resume_already_available",
+    preActionState: {
+      has_online_resume: false,
+      attachment_resume_enabled: true,
+      ask_resume: {
+        node_id: 1,
+        disabled: false
+      }
+    }
+  });
+  assert.equal(attachmentAvailable.status, "skip");
+  assert.equal(attachmentAvailable.passed, false);
+  assert.deepEqual(attachmentAvailable.reasons, ["attachment_resume_already_available"]);
+
+  const alreadyRequested = createCvCollectionScreening(candidate, {
+    detailUnavailableReason: "collect_cv_missing_online_resume",
+    preActionState: {
+      has_online_resume: false,
+      attachment_resume_enabled: false,
+      already_requested_resume: true,
+      ask_resume: {
+        node_id: 1,
+        disabled: false
+      }
+    }
+  });
+  assert.equal(alreadyRequested.status, "skip");
+  assert.equal(alreadyRequested.passed, false);
+  assert.deepEqual(alreadyRequested.reasons, ["resume_request_already_pending"]);
+
+  const hasOnlineNoRequestControl = createCvCollectionScreening(candidate, {
+    detailUnavailableReason: "collect_cv_request_candidate",
+    preActionState: {
+      has_online_resume: true,
+      attachment_resume_enabled: false,
+      ask_resume: {
+        node_id: 1,
+        disabled: true
+      }
+    }
+  });
+  assert.equal(hasOnlineNoRequestControl.status, "pass");
+  assert.equal(hasOnlineNoRequestControl.passed, true);
+  assert.deepEqual(hasOnlineNoRequestControl.reasons, ["collect_cv:collect_cv_request_candidate"]);
+}
+
+async function testFinalFailureScreenshotArtifact() {
+  const imageOutputDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-final-failure-"));
+  let captured = false;
+  const client = {
+    Page: {
+      async getFrameTree() {
+        return {
+          frameTree: {
+            frame: {
+              url: "https://www.zhipin.com/web/chat/index"
+            }
+          }
+        };
+      },
+      async captureScreenshot() {
+        captured = true;
+        return {
+          data: Buffer.from("x").toString("base64")
+        };
+      }
+    }
+  };
+  const service = createChatRunService({
+    idPrefix: "test_chat_failure",
+    workflow: async () => {
+      throw new Error("synthetic final failure");
+    }
+  });
+  const started = service.startChatRun({
+    client,
+    criteria: "算法",
+    maxCandidates: 1,
+    imageOutputDir
+  });
+  const final = await service.waitForChatRun(started.runId);
+  assert.equal(final.status, RUN_STATUS_FAILED);
+  assert.equal(captured, true);
+  assert.equal(final.checkpoint.final_failure_artifact.kind, "chat_final_failure_page");
+  assert.equal(final.checkpoint.final_failure_artifact.page_state.is_chat_shell, true);
+  const filePath = final.checkpoint.final_failure_artifact.screenshot.file_path;
+  assert.match(filePath, /chat-final-failure-candidate-001\.jpg$/);
+  assert.equal(fs.existsSync(filePath), true);
+  fs.rmSync(imageOutputDir, { recursive: true, force: true });
 }
 
 function testChatResultCountersPreserveCommittedRows() {
@@ -367,8 +539,11 @@ function testChatFullCvEvidenceGate() {
 testChatFullCvEvidenceGate();
 testChatResumeCaptureTarget();
 testChatPreDetailAttachmentResumeSkipReason();
+testCollectCvModeDoesNotOpenOnlineResumeDetail();
+testCollectCvMissingOnlineResumeRequestsCv();
 testChatResultCountersPreserveCommittedRows();
 testChatDomFallbackWaitPlan();
 await testLifecycleDelegation();
+await testFinalFailureScreenshotArtifact();
 
 console.log("chat run service tests passed");
