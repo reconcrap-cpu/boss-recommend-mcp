@@ -12,7 +12,8 @@ import {
   configureHumanInteraction,
   createHumanRestController,
   humanDelay,
-  normalizeHumanBehaviorOptions
+  normalizeHumanBehaviorOptions,
+  sleep
 } from "../../core/browser/index.js";
 import {
   compactCvAcquisitionState,
@@ -74,7 +75,10 @@ import {
   RECRUIT_CARD_SELECTOR,
   RECRUIT_LIST_CONTAINER_SELECTORS
 } from "./constants.js";
-import { GREET_CREDITS_EXHAUSTED_CODE } from "../../core/greet-quota/index.js";
+import {
+  describeGreetQuotaAfterSpend,
+  GREET_CREDITS_EXHAUSTED_CODE
+} from "../../core/greet-quota/index.js";
 
 function compactScreening(screening) {
   return {
@@ -176,7 +180,8 @@ async function runRecruitPostAction({
   greetCount = 0,
   maxGreetCount = null,
   executePostAction = true,
-  afterClickDelayMs = 900
+  afterClickDelayMs = 900,
+  lastGreetQuotaAfterSpend = null
 } = {}) {
   const plan = resolveRecruitPostAction({
     postAction,
@@ -206,6 +211,13 @@ async function runRecruitPostAction({
   const summary = actionDiscovery?.summary || {};
   const control = summary.greet?.control || summary.greet;
   if (!control?.found && !control?.node_id) {
+    if (plan.effective === "greet" && lastGreetQuotaAfterSpend?.exhausted_after_spend) {
+      result.reason = "greet_credits_exhausted";
+      result.out_of_greet_credits = true;
+      result.stop_run = true;
+      result.greet_quota_after_last_click = lastGreetQuotaAfterSpend;
+      return result;
+    }
     result.reason = `${plan.effective}_control_not_found`;
     return result;
   }
@@ -256,6 +268,9 @@ async function runRecruitPostAction({
   }
   result.click_result = clickResult;
   result.action_clicked = true;
+  result.greet_quota_after_click = describeGreetQuotaAfterSpend(
+    clickResult.greet_quota?.found ? clickResult.greet_quota : control.greet_quota || control.label || ""
+  );
   result.counted_as_greet = plan.effective === "greet";
   result.reason = "clicked";
   if (afterClickDelayMs > 0) await sleep(afterClickDelayMs);
@@ -578,6 +593,8 @@ export async function runRecruitWorkflow({
   const normalizedPostAction = normalizeRecruitPostAction(postAction);
   const postActionEnabled = normalizedPostAction !== "none";
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
+  const searchExchangeResumeFilterRequested = normalizedSearchParams.skip_recent_colleague_contacted !== false;
+  let searchExchangeResumeFilterApplied = false;
   const limit = Math.max(1, Number(maxCandidates) || 1);
   const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
   const networkRecorder = detailCountLimit > 0
@@ -603,6 +620,7 @@ export async function runRecruitWorkflow({
   const results = [];
   const refreshAttempts = [];
   let greetCount = 0;
+  let lastGreetQuotaAfterSpend = null;
   let refreshRounds = 0;
   let contextRecoveryAttempts = 0;
   const candidateRecoveryCounts = new Map();
@@ -668,6 +686,8 @@ export async function runRecruitWorkflow({
       human_rest_enabled: effectiveHumanRestEnabled,
       human_rest_count: humanRestState.rest_count,
       human_rest_ms: humanRestState.total_rest_ms,
+      search_exchange_resume_filter_requested: searchExchangeResumeFilterRequested ? 1 : 0,
+      search_exchange_resume_filter_applied: searchExchangeResumeFilterApplied ? 1 : 0,
       last_human_event: lastHumanEvent,
       ...extra
     });
@@ -812,6 +832,12 @@ export async function runRecruitWorkflow({
       resetTimeoutMs,
       cityOptionTimeoutMs
     });
+    const exchangeResumeStep = searchResult.steps.find((step) => step.step === "exchange_resume");
+    searchExchangeResumeFilterApplied = Boolean(
+      searchExchangeResumeFilterRequested
+      && exchangeResumeStep?.result?.applied
+      && exchangeResumeStep?.result?.requested === true
+    );
     runControl.checkpoint({
       search: {
         search_params: searchResult.search_params,
@@ -1248,10 +1274,14 @@ export async function runRecruitWorkflow({
         greetCount,
         maxGreetCount: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
         executePostAction,
-        afterClickDelayMs: actionAfterClickDelayMs
+        afterClickDelayMs: actionAfterClickDelayMs,
+        lastGreetQuotaAfterSpend
       });
       if (postActionResult.counted_as_greet && postActionResult.action_clicked) {
         greetCount += 1;
+      }
+      if (postActionResult.greet_quota_after_click?.found) {
+        lastGreetQuotaAfterSpend = postActionResult.greet_quota_after_click;
       }
       addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
     }
@@ -1390,6 +1420,9 @@ export async function runRecruitWorkflow({
     human_rest: humanRestController.getState(),
     last_human_event: lastHumanEvent,
     list_end_reason: listEndReason || null,
+    search_exchange_resume_filter_requested: searchExchangeResumeFilterRequested ? 1 : 0,
+    search_exchange_resume_filter_applied: searchExchangeResumeFilterApplied ? 1 : 0,
+    last_greet_quota_after_spend: lastGreetQuotaAfterSpend,
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
     context_recoveries: contextRecoveryAttempts,
@@ -1451,6 +1484,7 @@ export function createRecruitRunService({
     const normalizedSearchParams = normalizeSearchParams(searchParams);
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
     const normalizedPostAction = normalizeRecruitPostAction(postAction);
+    const searchExchangeResumeFilterRequested = normalizedSearchParams.skip_recent_colleague_contacted !== false;
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
     const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
@@ -1493,6 +1527,8 @@ export function createRecruitRunService({
         human_behavior: effectiveHumanBehavior,
         human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
+        search_exchange_resume_filter_requested: searchExchangeResumeFilterRequested ? 1 : 0,
+        search_exchange_resume_filter_applied: 0,
         post_action: normalizedPostAction,
         max_greet_count: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
         execute_post_action: Boolean(executePostAction),
@@ -1520,6 +1556,8 @@ export function createRecruitRunService({
         human_rest_ms: 0,
         greet_count: 0,
         post_action_clicked: 0,
+        search_exchange_resume_filter_requested: searchExchangeResumeFilterRequested ? 1 : 0,
+        search_exchange_resume_filter_applied: 0,
         last_human_event: null
       },
       checkpoint: {},

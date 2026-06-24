@@ -662,17 +662,16 @@ async function testRecommendPreparePreservesCriteriaVerbatim() {
   assert.equal(prepared.review.extracted_screen_params.criteria, criteria);
 }
 
-async function testRecommendFullySpecifiedPayloadNeedsOnlyFinalReview() {
+async function testRecommendFullySpecifiedPayloadAsksSkipRecentColleagueContacted() {
   const payload = await callTool(TOOL_PREPARE, singleReviewArgs({
     confirmation: {}
   }), 151);
   assert.equal(payload.status, "NEED_CONFIRMATION");
-  assert.deepEqual(payload.required_confirmations, ["final_review"]);
-  assert.deepEqual(payload.pending_questions.map((item) => item.field), ["final_review"]);
-  assert.equal(payload.pending_questions[0].value.job, "AI算法实习生 _ 杭州");
-  assert.equal(payload.pending_questions[0].value.human_behavior.restLevel, "high");
-  assert.equal(payload.pending_questions[0].value.screen_params.post_action, "greet");
-  assert.equal(payload.pending_questions[0].value.screen_params.max_greet_count, 200);
+  assert.deepEqual(payload.required_confirmations, ["skip_recent_colleague_contacted"]);
+  assert.deepEqual(payload.pending_questions.map((item) => item.field), ["skip_recent_colleague_contacted"]);
+  assert.equal(payload.pending_questions[0].value, true);
+  assert.equal(payload.pending_questions[0].options[0].value, true);
+  assert.equal(payload.pending_questions[0].options[1].value, false);
 }
 
 async function testRecommendGreetWithoutMaxGreetCountIsReady() {
@@ -1876,7 +1875,7 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendPreparePreservesCriteriaVerbatim();
     resetRecommendMcpStateForTests();
-    await testRecommendFullySpecifiedPayloadNeedsOnlyFinalReview();
+    await testRecommendFullySpecifiedPayloadAsksSkipRecentColleagueContacted();
     resetRecommendMcpStateForTests();
     await testRecommendGreetWithoutMaxGreetCountIsReady();
     resetRecommendMcpStateForTests();

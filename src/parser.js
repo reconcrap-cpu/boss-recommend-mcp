@@ -302,6 +302,16 @@ function normalizeRecentNotView(value) {
   return RECENT_NOT_VIEW_OPTIONS.includes(normalized) ? normalized : null;
 }
 
+function normalizeBooleanOverride(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["true", "yes", "y", "1", "on", "enable", "enabled", "需要", "是", "开启"].includes(normalized)) return true;
+  if (["false", "no", "n", "0", "off", "disable", "disabled", "不需要", "否", "关闭"].includes(normalized)) return false;
+  return null;
+}
+
 function normalizePostAction(value) {
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
@@ -658,6 +668,16 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     || ""
   );
   const pageScopeResolution = resolvePageScope({ instruction: text, confirmation, overrides, finalConfirmed });
+  const hasSkipRecentColleagueOverride = Object.prototype.hasOwnProperty.call(
+    overrides || {},
+    "skip_recent_colleague_contacted"
+  );
+  const confirmationSkipRecentColleagueContacted = normalizeBooleanOverride(
+    confirmation?.skip_recent_colleague_contacted_value
+  );
+  const skipRecentColleagueContacted = hasSkipRecentColleagueOverride
+    ? normalizeBooleanOverride(overrides?.skip_recent_colleague_contacted) ?? true
+    : confirmationSkipRecentColleagueContacted ?? true;
 
   const inferredSchoolTag = detectedSchoolTags.length > 0
     ? sortSchoolTagSelections(detectedSchoolTags)
@@ -680,7 +700,9 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     criteria: criteriaResolution.raw || criteriaResolution.normalized || null,
     target_count: null,
     post_action: null,
-    max_greet_count: null
+    max_greet_count: null,
+    skip_recent_colleague_contacted: skipRecentColleagueContacted,
+    colleague_contact_window_days: 14
   };
   const targetCountResolution = resolveTargetCount({ instruction: text, confirmation, overrides, finalConfirmed });
   screenParams.target_count = targetCountResolution.target_count;
@@ -722,6 +744,12 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const needs_post_action_confirmation = postActionResolution.needs_post_action_confirmation;
   const needs_max_greet_count_confirmation = maxGreetCountResolution.needs_max_greet_count_confirmation;
   const needs_page_confirmation = pageScopeResolution.needs_page_confirmation;
+  const needs_skip_recent_colleague_contacted_confirmation = (
+    !finalConfirmed
+    && !hasSkipRecentColleagueOverride
+    && confirmationSkipRecentColleagueContacted === null
+    && confirmation?.skip_recent_colleague_contacted_confirmed !== true
+  );
   const pending_questions = [];
 
   if (needs_page_confirmation) {
@@ -829,6 +857,18 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     });
   }
 
+  if (needs_skip_recent_colleague_contacted_confirmation) {
+    pending_questions.push({
+      field: "skip_recent_colleague_contacted",
+      question: "是否跳过最近已被同事联系过的人选？推荐页会检查近14天同事沟通记录。",
+      value: true,
+      options: [
+        { label: "跳过（推荐）", value: true },
+        { label: "不跳过", value: false }
+      ]
+    });
+  }
+
   return {
     searchParams,
     screenParams,
@@ -844,6 +884,7 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
     needs_post_action_confirmation,
     needs_max_greet_count_confirmation,
     needs_page_confirmation,
+    needs_skip_recent_colleague_contacted_confirmation,
     criteria_normalized: criteriaResolution.normalized,
     proposed_target_count: targetCountResolution.proposed_target_count,
     proposed_post_action: postActionResolution.proposed_post_action,
@@ -860,7 +901,9 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
         criteria_normalized: criteriaResolution.normalized,
         target_count: targetCountResolution.proposed_target_count,
         post_action: postActionResolution.proposed_post_action,
-        max_greet_count: maxGreetCountResolution.proposed_max_greet_count
+        max_greet_count: maxGreetCountResolution.proposed_max_greet_count,
+        skip_recent_colleague_contacted: screenParams.skip_recent_colleague_contacted,
+        colleague_contact_window_days: screenParams.colleague_contact_window_days
       },
       current_page_scope: pageScopeResolution.page_scope,
       current_search_params: searchParams,

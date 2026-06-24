@@ -35,7 +35,10 @@ import {
   callScreeningLlm,
   normalizeText
 } from "../src/core/screening/index.js";
-import { parseGreetQuota } from "../src/core/greet-quota/index.js";
+import {
+  describeGreetQuotaAfterSpend,
+  parseGreetQuota
+} from "../src/core/greet-quota/index.js";
 import {
   buildLegacyScreenInputRows,
   cloneReportInput,
@@ -752,7 +755,8 @@ async function runPostAction({
   options,
   greetCount,
   llm,
-  actionDiscovery
+  actionDiscovery,
+  lastGreetQuotaAfterSpend = null
 }) {
   const result = {
     requested: options.postAction,
@@ -780,6 +784,13 @@ async function runPostAction({
   const greet = actionDiscovery?.summary?.greet || {};
   result.control = compactActionControl(greet.control);
   if (!greet.found) {
+    if (lastGreetQuotaAfterSpend?.exhausted_after_spend) {
+      result.reason = "greet_credits_exhausted";
+      result.out_of_greet_credits = true;
+      result.stop_run = true;
+      result.greet_quota_after_last_click = lastGreetQuotaAfterSpend;
+      return result;
+    }
     result.reason = "greet_control_not_found";
     return result;
   }
@@ -811,6 +822,7 @@ async function runPostAction({
   const clickResult = await clickRecruitActionControl(client, greet.control);
   result.click_result = clickResult;
   result.action_clicked = true;
+  result.greet_quota_after_click = describeGreetQuotaAfterSpend(greetQuota.found ? greetQuota : greet.control?.label || "");
   await sleep(1800);
   const afterDiscovery = await waitForRecruitDetailActionControls(client, {
     rootNodeIds: [greet.control.node_id],
@@ -979,6 +991,7 @@ async function run() {
     const refreshAttempts = [];
     let greetCount = Math.max(0, Number(options.initialGreetCount) || 0);
     let newGreetCount = 0;
+    let lastGreetQuotaAfterSpend = null;
     let refreshRounds = 0;
     let listEndReason = "";
     let stopRunReason = "";
@@ -1177,7 +1190,8 @@ async function run() {
           options,
           greetCount,
           llm,
-          actionDiscovery
+          actionDiscovery,
+          lastGreetQuotaAfterSpend
         });
         candidateResult.timings.post_action_ms = Date.now() - actionStartedAt;
         candidateResult.post_action = actionResult;
@@ -1190,6 +1204,9 @@ async function run() {
         if (actionResult.counted_as_greet && actionResult.action_clicked) {
           greetCount += 1;
           newGreetCount += 1;
+        }
+        if (actionResult.greet_quota_after_click?.found) {
+          lastGreetQuotaAfterSpend = actionResult.greet_quota_after_click;
         }
       } catch (error) {
         const recoverable = isRecoverableCandidateError(error);
@@ -1235,6 +1252,20 @@ async function run() {
       }
       candidateResult.timings.total_ms = Date.now() - candidateStartedAt;
       results.push(candidateResult);
+      result.status = "RUNNING";
+      result.results = results;
+      result.partial_summary = {
+        processed: results.length,
+        llm_passed: results.filter((item) => item.llm?.passed).length,
+        new_greet_count: newGreetCount,
+        target_count: targetCountGoal,
+        max_screened: maxScreenedGoal,
+        target_achievement_mode: targetAchievementMode,
+        last_greet_quota_after_spend: lastGreetQuotaAfterSpend,
+        human_rest: humanRestController.getState(),
+        elapsed_ms: Date.now() - startedAt
+      };
+      result.saved_report_path = writeJsonFile(options.saveReport, result);
       markInfiniteListCandidateProcessed(listState, candidateKey, {
         status: candidateResult.error ? "error" : "processed",
         metadata: {
@@ -1286,6 +1317,7 @@ async function run() {
         : passedCount >= targetCount,
       required_greet_count: requiredGreetCount,
       max_greet_count: maxGreetCount,
+      last_greet_quota_after_spend: lastGreetQuotaAfterSpend,
       list_end_reason: listEndReason || null,
       stop_run_reason: stopRunReason || null,
       greet_credit_exhausted: stopRunReason === "greet_credits_exhausted",

@@ -52,3 +52,20 @@ export function assertGreetQuotaAvailable(source = "") {
   }
   return quota;
 }
+
+export function describeGreetQuotaAfterSpend(source = "") {
+  const quota = normalizeGreetQuotaSource(source);
+  if (!quota.found || quota.numerator === null || quota.denominator === null) {
+    return {
+      ...quota,
+      remaining_after_spend: null,
+      exhausted_after_spend: false
+    };
+  }
+  const remaining = quota.denominator - quota.numerator;
+  return {
+    ...quota,
+    remaining_after_spend: remaining,
+    exhausted_after_spend: remaining < quota.numerator
+  };
+}

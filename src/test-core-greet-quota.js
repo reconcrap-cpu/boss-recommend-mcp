@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import {
   assertGreetQuotaAvailable,
+  describeGreetQuotaAfterSpend,
   GREET_CREDITS_EXHAUSTED_CODE,
   parseGreetQuota
 } from "./core/greet-quota/index.js";
@@ -34,7 +35,29 @@ function testQuotaGuard() {
   );
 }
 
+function testQuotaAfterSpend() {
+  assert.deepEqual(describeGreetQuotaAfterSpend("立即沟通(30/69)"), {
+    found: true,
+    text: "立即沟通(30/69)",
+    numerator: 30,
+    denominator: 69,
+    exhausted: false,
+    remaining_after_spend: 39,
+    exhausted_after_spend: false
+  });
+  assert.deepEqual(describeGreetQuotaAfterSpend("立即沟通(30/39)"), {
+    found: true,
+    text: "立即沟通(30/39)",
+    numerator: 30,
+    denominator: 39,
+    exhausted: false,
+    remaining_after_spend: 9,
+    exhausted_after_spend: true
+  });
+}
+
 testQuotaParsing();
 testQuotaGuard();
+testQuotaAfterSpend();
 
 console.log("core greet quota tests passed");

@@ -72,6 +72,7 @@ import {
   normalizeRecommendPageScope,
   selectRecommendPageScope
 } from "./scopes.js";
+import { inspectRecentColleagueContact } from "./colleague-contact.js";
 import {
   RECOMMEND_BOTTOM_MARKER_SELECTORS,
   RECOMMEND_CARD_SELECTOR,
@@ -232,6 +233,7 @@ function compactDetail(detailResult) {
     network_body_count: detailResult.network_bodies?.filter((item) => item.body).length || 0,
     parsed_network_profile_count: detailResult.parsed_network_profiles?.filter((item) => item.ok).length || 0,
     cv_acquisition: detailResult.cv_acquisition || null,
+    colleague_contact: detailResult.colleague_contact || null,
     image_evidence: summarizeImageEvidence(detailResult.image_evidence),
     llm_screening: compactScreeningLlmResult(detailResult.llm_result),
     close_result: detailResult.close_result
@@ -435,6 +437,7 @@ export function countRecommendResultStatuses(results = [], {
     screened: results.length,
     detail_opened: results.filter((item) => item.detail).length,
     passed: results.filter((item) => item.screening?.passed).length,
+    skipped: results.filter((item) => item.screening?.passed === false).length,
     llm_screened: results.filter((item) => item.detail?.llm_screening || item.llm_screening).length,
     greet_count: greetCount,
     post_action_clicked: results.filter((item) => item.post_action?.action_clicked).length,
@@ -449,6 +452,14 @@ export function countRecommendResultStatuses(results = [], {
       || item.error?.code === "IMAGE_CAPTURE_STALE_NODE"
       || item.error?.code === "IMAGE_CAPTURE_TIMEOUT"
       || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT"
+    )).length,
+    colleague_contact_checked: results.filter((item) => item.detail?.colleague_contact?.checked).length,
+    recent_colleague_contact_skipped: results.filter((item) => (
+      item.screening?.status === "skip"
+      && item.screening?.reasons?.includes("skipped_recent_colleague_contact")
+    )).length,
+    colleague_contact_panel_missing: results.filter((item) => (
+      item.detail?.colleague_contact?.reason === "panel_missing"
     )).length
   };
 }
@@ -627,6 +638,19 @@ function createRecoverableDetailFailureScreening(candidate, error) {
   };
 }
 
+function createRecentColleagueContactSkipScreening(candidate, colleagueContact) {
+  const matched = colleagueContact?.matched_row || null;
+  return {
+    status: "skip",
+    passed: false,
+    score: 0,
+    reasons: ["skipped_recent_colleague_contact"],
+    reason: matched?.text || "Candidate has recent colleague contact history",
+    matched_colleague_contact: matched,
+    candidate
+  };
+}
+
 export async function runRecommendWorkflow({
   client,
   targetUrl = "",
@@ -665,7 +689,9 @@ export async function runRecommendWorkflow({
   llmImageDetail = "high",
   imageOutputDir = "",
   humanRestEnabled = false,
-  humanBehavior = null
+  humanBehavior = null,
+  skipRecentColleagueContacted = true,
+  colleagueContactWindowDays = 14
 } = {}, runControl) {
   if (!client) throw new Error("runRecommendWorkflow requires a guarded CDP client");
   const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
@@ -692,6 +718,9 @@ export async function runRecommendWorkflow({
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const postActionEnabled = normalizedPostAction !== "none";
+  const shouldSkipRecentColleagueContacted = skipRecentColleagueContacted !== false;
+  const normalizedColleagueContactWindowDays = Math.max(1, Number(colleagueContactWindowDays) || 14);
+  const colleagueContactReferenceDate = new Date();
   const targetPassCount = Math.max(1, Number(maxCandidates) || 1);
   const detailCountLimit = detailLimit == null ? Number.POSITIVE_INFINITY : Math.max(0, Number(detailLimit) || 0);
   const effectiveDetailLimit = postActionEnabled ? Number.POSITIVE_INFINITY : detailCountLimit;
@@ -785,6 +814,8 @@ export async function runRecommendWorkflow({
       human_behavior_profile: effectiveHumanBehavior.profile,
       human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
+      skip_recent_colleague_contacted: shouldSkipRecentColleagueContacted,
+      colleague_contact_window_days: normalizedColleagueContactWindowDays,
       human_rest_count: humanRestState.rest_count,
       human_rest_ms: humanRestState.total_rest_ms,
       last_human_event: lastHumanEvent,
@@ -1111,6 +1142,8 @@ export async function runRecommendWorkflow({
     let screeningCandidate = cardCandidate;
     let detailResult = null;
     let recoverableDetailError = null;
+    let colleagueContact = null;
+    let skipRecentColleagueContact = false;
     let detailStep = "not_started";
     if (index < effectiveDetailLimit) {
       try {
@@ -1156,7 +1189,47 @@ export async function runRecommendWorkflow({
         cardNodeId = openedDetail.card_node_id || cardNodeId;
         cardCandidate = openedDetail.card_candidate || cardCandidate;
         screeningCandidate = cardCandidate;
-        const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
+        if (shouldSkipRecentColleagueContacted) {
+          detailStep = "check_colleague_contact";
+          try {
+            colleagueContact = await measureTiming(timings, "colleague_contact_check_ms", () => inspectRecentColleagueContact(
+              client,
+              openedDetail.detail_state,
+              {
+                referenceDate: colleagueContactReferenceDate,
+                windowDays: normalizedColleagueContactWindowDays
+              }
+            ));
+            if (colleagueContact?.recent) {
+              skipRecentColleagueContact = true;
+              detailResult = {
+                candidate: screeningCandidate,
+                detail: {
+                  popup_text: "",
+                  resume_text: ""
+                },
+                colleague_contact: colleagueContact,
+                cv_acquisition: {
+                  source: "skipped_recent_colleague_contact",
+                  skipped: true,
+                  reason: "skipped_recent_colleague_contact"
+                }
+              };
+              detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
+              await maybeHumanActionCooldown("after_detail_close", timings);
+            }
+          } catch (error) {
+            colleagueContact = {
+              checked: false,
+              recent: false,
+              reason: "inspection_failed",
+              error: error?.message || String(error),
+              window_days: normalizedColleagueContactWindowDays
+            };
+          }
+        }
+        if (!skipRecentColleagueContact) {
+          const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
         detailStep = "wait_network";
         const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
           waitForRecommendDetailNetworkEvents,
@@ -1183,6 +1256,7 @@ export async function runRecommendWorkflow({
           networkParseIntervalMs: 250
         });
         addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
+        if (colleagueContact) detailResult.colleague_contact = colleagueContact;
 
         const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
         let source = "network";
@@ -1298,6 +1372,7 @@ export async function runRecommendWorkflow({
           capture_target_wait: captureTargetWait
         };
         screeningCandidate = detailResult.candidate;
+        }
       } catch (error) {
         if (!isRecoverableRecommendDetailError(error)) throw error;
         const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
@@ -1327,7 +1402,7 @@ export async function runRecommendWorkflow({
     runControl.setPhase("recommend:screening");
     let llmResult = null;
     if (useLlmScreening) {
-      if (recoverableDetailError || detailResult?.image_evidence?.ok === false) {
+      if (skipRecentColleagueContact || recoverableDetailError || detailResult?.image_evidence?.ok === false) {
         llmResult = null;
       } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
@@ -1357,7 +1432,9 @@ export async function runRecommendWorkflow({
       }
       if (detailResult) detailResult.llm_result = llmResult;
     }
-    const screening = recoverableDetailError
+    const screening = skipRecentColleagueContact
+      ? createRecentColleagueContactSkipScreening(screeningCandidate, colleagueContact)
+      : recoverableDetailError
       ? createRecoverableDetailFailureScreening(screeningCandidate, recoverableDetailError)
       : detailResult?.image_evidence?.ok === false
       ? createImageCaptureFailureScreening(screeningCandidate, {
@@ -1371,7 +1448,7 @@ export async function runRecommendWorkflow({
     let postActionResult = null;
     let closeFailureError = null;
     let closeRecoveryFailure = null;
-    if (postActionEnabled && detailResult) {
+    if (postActionEnabled && detailResult && !skipRecentColleagueContact) {
       const postActionStarted = Date.now();
       await runControl.waitIfPaused();
       runControl.throwIfCanceled();
@@ -1397,7 +1474,7 @@ export async function runRecommendWorkflow({
       }
       addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
     }
-    if (detailResult && closeDetail) {
+    if (detailResult && closeDetail && !detailResult.close_result?.closed) {
       detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
       await maybeHumanActionCooldown("after_detail_close", timings);
       if (!detailResult.close_result?.closed) {
@@ -1597,6 +1674,8 @@ export function createRecommendRunService({
     imageOutputDir = "",
     humanRestEnabled = false,
     humanBehavior = null,
+    skipRecentColleagueContacted = true,
+    colleagueContactWindowDays = 14,
     name = "recommend-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecommendRun requires a guarded CDP client");
@@ -1605,6 +1684,8 @@ export function createRecommendRunService({
     const requestedPageScope = normalizeRecommendPageScope(pageScope) || "recommend";
     const normalizedFallbackPageScope = normalizeRecommendPageScope(fallbackPageScope) || "recommend";
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
+    const shouldSkipRecentColleagueContacted = skipRecentColleagueContacted !== false;
+    const normalizedColleagueContactWindowDays = Math.max(1, Number(colleagueContactWindowDays) || 14);
     const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
       legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
     });
@@ -1649,6 +1730,8 @@ export function createRecommendRunService({
         llm_image_limit: llmImageLimit,
         llm_image_detail: llmImageDetail,
         image_output_dir: imageOutputDir || "",
+        skip_recent_colleague_contacted: shouldSkipRecentColleagueContacted,
+        colleague_contact_window_days: normalizedColleagueContactWindowDays,
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_behavior: effectiveHumanBehavior,
@@ -1664,11 +1747,15 @@ export function createRecommendRunService({
         detail_opened: 0,
         llm_screened: 0,
         passed: 0,
+        skipped: 0,
         greet_count: 0,
         post_action_clicked: 0,
         image_capture_failed: 0,
         detail_open_failed: 0,
         transient_recovered: 0,
+        colleague_contact_checked: 0,
+        recent_colleague_contact_skipped: 0,
+        colleague_contact_panel_missing: 0,
         context_recoveries: 0,
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
@@ -1717,7 +1804,9 @@ export function createRecommendRunService({
         llmImageDetail,
         imageOutputDir,
         humanRestEnabled: effectiveHumanRestEnabled,
-        humanBehavior: effectiveHumanBehavior
+        humanBehavior: effectiveHumanBehavior,
+        skipRecentColleagueContacted: shouldSkipRecentColleagueContacted,
+        colleagueContactWindowDays: normalizedColleagueContactWindowDays
       }, runControl)
     });
   }

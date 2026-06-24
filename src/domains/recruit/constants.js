@@ -110,6 +110,10 @@ export const RECRUIT_SEARCH_SELECTORS = Object.freeze({
     "label.checkbox",
     '[ka="search_change_view_resume"]'
   ],
+  exchangeResumeLabel: [
+    'label.checkbox.high_search_checkbox[ka="search_change_exchange_resume"]',
+    '[ka="search_change_exchange_resume"]'
+  ],
   experienceOption: [
     ".experience-select .exp-item",
     ".experience-select li",

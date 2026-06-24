@@ -391,6 +391,35 @@ config/screening-config.example.json
   - recommend / search / chat 图片简历 fallback 与主列表滚动都会在启用 `listScrollJitter` 时使用 coverage-safe scroll jitter：每次 wheel delta 在安全范围内变化，并保留截图重叠、重复检测、bottom-marker / stop-boundary 逻辑，实际 delta 和 settle 时间会写入 artifact metadata。
   - chat/recommend/search run 也兼容显式参数 `safe_pacing`、`batch_rest_enabled` 与 `human_behavior.restLevel`：run 参数优先于配置文件。AI harness/skill 启动每次 run 前必须让用户明确选择 `low/medium/high`，再把选择写入 `human_behavior.restLevel`。
 
+### 离线筛选延迟 benchmark
+
+可以用已保存的 recommend run JSON 和截图证据离线评估筛选策略，不打开 Boss、不重新点击候选人，也不改变 `简历来源`。benchmark 会读取每个 saved run 自己的 `result.screen_params.criteria`，缺失时再回退到 run context / instruction，避免用同一套 criteria 误测不同岗位。
+
+```bash
+npm run benchmark:screening -- --dry-run
+npm run benchmark:screening -- --max-candidates 20
+```
+
+默认会自动选择 `~/.boss-recommend-mcp/runs` 下最近 4 个仍有 `detail.image_evidence.llm_file_paths` 的 recommend run，并把输出写到 `.live-artifacts/screening-benchmark/<timestamp>/`。真实 LLM replay 会复用当前 `screening-config.json`；如需指定配置或 run：
+
+```bash
+npm run benchmark:screening -- --config C:/Users/yaolin/.boss-recommend-mcp/screening-config.json --run mcp_recommend_mq92ltt5_3x9liodw
+```
+
+内置策略：
+
+- `oracle_full_image_high`：完整图片筛选，`llmThinkingLevel=high`，作为 pass/fail 质量基准。
+- `baseline_full_image_reasoning`：完整图片筛选，`llmThinkingLevel=low`，用于衡量当前低思考 baseline。
+- `extract_then_reason`：先从图片抽取结构化简历事实，再用文本 reasoning 对每位候选人做最终判断；抽取/判断异常会升级到完整图片筛选。
+- `extract_hard_gate_then_reason`：抽取后先做 cheap hard-fail gate；只有明确违反硬条件/排除项时直接 `passed=false`，否则继续文本 reasoning。
+- `batch_extract_then_reason`：批量抽取多个候选人的结构化事实，再逐个文本 reasoning。
+- `batch_extract_hard_gate_then_reason`：批量抽取后逐个执行 hard-fail gate，明显不合适的候选人不再进入后续 reasoning。
+- `pipeline_simulation`：基于 saved timings 估算浏览器采集和 LLM 重叠后的理论下界；只用于判断是否值得后续改 workflow。
+
+为避免把“输出解释”本身的耗时算进策略，benchmark-native 的抽取/判断提示词不会要求模型输出筛选理由、summary 或 CoT；hard-fail gate 只要求 `{"hard_fail": true/false, "continue_reasoning": true/false, "uncertain": true/false}`，判断阶段只要求 `{"passed": true/false, "uncertain": true/false}`。
+
+输出文件包括 `benchmark-summary.json`、`benchmark-results.json`、`benchmark-results.csv`、`benchmark-disagreements.csv` 和 `benchmark-manifest.json`。所有非 oracle 策略都会和 `oracle_full_image_high` 对比 false negative / false positive / pass-rate drift，并用 `saved_non_llm_ms + benchmark_llm_ms` 计算 projected total time；hard-gate 策略会额外报告 `gate_ms` 和 `early_exit_count`；默认 eligibility 目标是平均 `<30000ms` 且 false negative 为 0。
+
 ## 常用命令
 
 npm 包安装后可直接使用可执行命令 `boss-recommend-mcp`。以下示例展示源码模式（`node src/cli.js`）：

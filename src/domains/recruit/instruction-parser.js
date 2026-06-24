@@ -172,6 +172,16 @@ function normalizeRecentViewedOverride(value) {
   return null;
 }
 
+function normalizeBooleanOverride(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = normalizeText(value).toLowerCase();
+  if (!normalized) return null;
+  if (["true", "yes", "y", "1", "on", "enable", "enabled", "需要", "是", "开启"].includes(normalized)) return true;
+  if (["false", "no", "n", "0", "off", "disable", "disabled", "不需要", "否", "关闭"].includes(normalized)) return false;
+  return null;
+}
+
 function normalizeStringOverride(value) {
   if (typeof value !== "string") return null;
   const normalized = value.trim();
@@ -483,6 +493,13 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
   const rawInstruction = String(instruction || "");
   const text = normalizeText(rawInstruction);
   const finalConfirmed = confirmation?.final_confirmed === true;
+  const hasSkipRecentColleagueOverride = Object.prototype.hasOwnProperty.call(
+    overrides || {},
+    "skip_recent_colleague_contacted"
+  );
+  const confirmationSkipRecentColleagueContacted = normalizeBooleanOverride(
+    confirmation?.skip_recent_colleague_contacted_value
+  );
   const explicitSchools = extractSchoolFilterExplicit(rawInstruction);
   const explicitRecentViewed = extractRecentViewedExplicit(rawInstruction);
   const explicitKeyword = extractFieldLineValue(rawInstruction, ["搜索关键词", "关键词", "keyword"]);
@@ -509,6 +526,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     schools: explicitSchools.explicit ? explicitSchools.schools : extractSchools(text),
     schools_explicit: explicitSchools.explicit,
     filter_recent_viewed: explicitRecentViewed !== null ? explicitRecentViewed : extractRecentViewedFilter(text),
+    skip_recent_colleague_contacted: confirmationSkipRecentColleagueContacted ?? true,
     keyword_explicit: explicitKeyword || extractKeywordExplicit(text),
     keyword_auto: extractKeywordAuto(text),
     target_count: explicitTargetCount || extractTargetCount(text),
@@ -576,6 +594,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
         ? overrides.filter_recent_viewed
         : overrides.recent_not_view
     );
+    const overrideSkipRecentColleagueContacted = normalizeBooleanOverride(overrides.skip_recent_colleague_contacted);
     const overridePostAction = normalizePostAction(overrides.post_action);
     if (overrideCity) parsed.city = overrideCity;
     if (overrideDegree) parsed.degree = overrideDegree;
@@ -604,6 +623,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     if (overrideJob) parsed.job_override = overrideJob;
     if (overrideCriteria) parsed.criteria_override = overrideCriteria;
     if (overrideRecentViewed !== null) parsed.filter_recent_viewed = overrideRecentViewed;
+    if (overrideSkipRecentColleagueContacted !== null) parsed.skip_recent_colleague_contacted = overrideSkipRecentColleagueContacted;
     if (overridePostAction) parsed.post_action_override = overridePostAction;
     if (Number.isFinite(overrides.max_greet_count) && overrides.max_greet_count > 0) {
       parsed.max_greet_count_override = Number.parseInt(String(overrides.max_greet_count), 10);
@@ -628,6 +648,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     gender: parsed.gender,
     age: parsed.age,
     filter_recent_viewed: parsed.filter_recent_viewed,
+    skip_recent_colleague_contacted: parsed.skip_recent_colleague_contacted !== false,
     keyword: keywordResolution.keyword
   };
   const criteria = parsed.criteria_override || confirmationCriteria || parsed.criteria_explicit || null;
@@ -642,7 +663,9 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     criteria,
     target_count: parsed.target_count,
     post_action: postAction,
-    max_greet_count: maxGreetCount
+    max_greet_count: maxGreetCount,
+    skip_recent_colleague_contacted: parsed.skip_recent_colleague_contacted !== false,
+    search_exchange_resume_filter_days: 30
   };
   const missingBeforeDefaults = collectMissingFields(baseSearchParams, baseScreenParams, parsed);
 
@@ -659,6 +682,12 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
   const missingAfterDefaults = collectUnresolvedMissingFields(missingBeforeDefaults, appliedDefaults);
   const suspicious_fields = collectSuspiciousFields(searchParams, screenParams);
   const needs_recent_viewed_filter_confirmation = !finalConfirmed && searchParams.filter_recent_viewed === null;
+  const needs_skip_recent_colleague_contacted_confirmation = (
+    !finalConfirmed
+    && !hasSkipRecentColleagueOverride
+    && confirmationSkipRecentColleagueContacted === null
+    && confirmation?.skip_recent_colleague_contacted_confirmed !== true
+  );
   const needs_criteria_confirmation = Boolean(screenParams.criteria) && !finalConfirmed && confirmation?.criteria_confirmed !== true;
   const pending_questions = [
     ...buildMissingFieldQuestions(missingAfterDefaults, defaultPreview),
@@ -669,6 +698,17 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
         options: [
           { label: "需要过滤", value: true },
           { label: "不过滤", value: false }
+        ]
+      }]
+      : []),
+    ...(needs_skip_recent_colleague_contacted_confirmation
+      ? [{
+        field: "skip_recent_colleague_contacted",
+        question: "是否跳过近期已被同事触达的人选？搜索页会开启 Boss 的“近30天未和同事交换简历”过滤。",
+        value: true,
+        options: [
+          { label: "跳过（推荐）", value: true },
+          { label: "不跳过", value: false }
         ]
       }]
       : []),
@@ -705,6 +745,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     suspicious_fields,
     needs_keyword_confirmation: keywordResolution.needsConfirmation,
     needs_recent_viewed_filter_confirmation,
+    needs_skip_recent_colleague_contacted_confirmation,
     needs_criteria_confirmation,
     needs_search_params_confirmation: !finalConfirmed && confirmation?.search_params_confirmed !== true,
     proposed_keyword: keywordResolution.proposedKeyword,

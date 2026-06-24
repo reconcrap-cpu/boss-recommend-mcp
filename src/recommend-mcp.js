@@ -1384,6 +1384,7 @@ function buildRequiredConfirmations(parsed, args = {}) {
   if (parsed.needs_criteria_confirmation) required.push("criteria");
   if (parsed.needs_target_count_confirmation) required.push("target_count");
   if (parsed.needs_post_action_confirmation) required.push("post_action");
+  if (parsed.needs_skip_recent_colleague_contacted_confirmation) required.push("skip_recent_colleague_contacted");
   if ((parsed.suspicious_fields || []).length) required.push("suspicious_fields");
 
   const confirmation = args.confirmation || {};
@@ -1596,6 +1597,8 @@ function normalizeRecommendStartInput(args = {}, parsed, configResolution = null
     maxGreetCount: Number.isInteger(parsed.screenParams?.max_greet_count)
       ? parsed.screenParams.max_greet_count
       : null,
+    skipRecentColleagueContacted: parsed.screenParams?.skip_recent_colleague_contacted !== false,
+    colleagueContactWindowDays: 14,
     screeningMode: normalizeScreeningModeArg(args)
   };
 }
@@ -1655,6 +1658,8 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
     imageOutputDir: resolveBossConfiguredOutputDir("", getRunsDir()),
     humanRestEnabled: humanBehavior.restEnabled,
     humanBehavior,
+    skipRecentColleagueContacted: normalized.skipRecentColleagueContacted,
+    colleagueContactWindowDays: normalized.colleagueContactWindowDays,
     name: "mcp-recommend-pipeline-run",
     parsed
   };

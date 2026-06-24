@@ -6,5 +6,6 @@ export * from "./detail.js";
 export * from "./actions.js";
 export * from "./jobs.js";
 export * from "./scopes.js";
+export * from "./colleague-contact.js";
 export * from "./refresh.js";
 export * from "./run-service.js";

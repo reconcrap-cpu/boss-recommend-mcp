@@ -28,6 +28,7 @@ import {
   normalizeFilterOptionLabel,
   normalizeRecommendPageScope,
   openRecommendJobDropdown,
+  parseColleagueContactDate,
   parseRecommendCardFieldsFromHtml,
   readRecommendAvatarPreviewState,
   readRecommendDetailHtml,
@@ -37,6 +38,8 @@ import {
   selectRecommendJob,
   selectRecommendJobWithRootRefresh,
   selectRecommendPageScope,
+  inspectRecentColleagueContact,
+  isDateWithinWindow,
   waitForRecommendDetail,
   verifyRecommendJobSelection
 } from "./domains/recommend/index.js";
@@ -153,6 +156,120 @@ function testNetworkPatterns() {
   assert.equal(matchesRecommendDetailNetwork("https://www.zhipin.com/wapi/zpjob/view/geek/info?id=1"), true);
   assert.equal(matchesRecommendDetailNetwork("https://www.zhipin.com/web/frame/c-resume/foo"), true);
   assert.equal(matchesRecommendDetailNetwork("https://example.com/assets/app.js"), false);
+}
+
+function testColleagueContactDateParsing() {
+  const referenceDate = new Date(2026, 5, 24);
+  const explicit = parseColleagueContactDate("费正丽 2026-06-18 10:03 向Ta发起沟通", { referenceDate });
+  const yesterday = parseColleagueContactDate("昨天 同事发起沟通", { referenceDate });
+  const threeDaysAgo = parseColleagueContactDate("3天前 同事交换简历", { referenceDate });
+  assert.deepEqual([explicit.getFullYear(), explicit.getMonth(), explicit.getDate()], [2026, 5, 18]);
+  assert.deepEqual([yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate()], [2026, 5, 23]);
+  assert.deepEqual([threeDaysAgo.getFullYear(), threeDaysAgo.getMonth(), threeDaysAgo.getDate()], [2026, 5, 21]);
+  assert.equal(isDateWithinWindow(new Date(2026, 5, 10), { referenceDate, windowDays: 14 }), true);
+  assert.equal(isDateWithinWindow(new Date(2026, 5, 9), { referenceDate, windowDays: 14 }), false);
+}
+
+function createColleagueContactClient() {
+  let selectedTab = "my";
+  let lastBoxNode = null;
+  const clicks = [];
+  const rowText = "费正丽 向Ta发起沟通 2026-06-18 10:03 3D图形算法实习生";
+  function htmlForNode(nodeId) {
+    if (nodeId === 10) return '<div class="colleague-collaboration"><div class="tab-hd"><span class="selected">我的沟通进度</span><span>同事沟通进度</span></div></div>';
+    if (nodeId === 21) return `<span class="${selectedTab === "my" ? "selected" : ""}">我的沟通进度</span>`;
+    if (nodeId === 22) return `<span class="${selectedTab === "colleague" ? "selected" : ""}">同事沟通进度</span>`;
+    if (nodeId === 31) return `<div class="content">${rowText}</div>`;
+    if (nodeId === 99) return '<div class="resume-item-detail"></div>';
+    return "<div></div>";
+  }
+  return {
+    get state() {
+      return { selectedTab, clicks };
+    },
+    client: {
+      DOM: {
+        async querySelectorAll({ nodeId, selector }) {
+          if (nodeId === 1 && selector === ".colleague-collaboration") return { nodeIds: [10] };
+          if (nodeId === 1 && selector === ".colleague-collaboration .tab-hd") return { nodeIds: [11] };
+          if (nodeId === 1 && selector === ".resume-item-detail") return { nodeIds: [99] };
+          if (nodeId === 1 && selector === ".colleague-collaboration .record-item.mate-log-item .content") {
+            return { nodeIds: selectedTab === "colleague" ? [31] : [] };
+          }
+          if (nodeId === 10 && selector === ".tab-hd .selected") {
+            return { nodeIds: [selectedTab === "my" ? 21 : 22] };
+          }
+          if (nodeId === 10 && selector === ".tab-hd span, .tab-hd div, .tab-hd *") {
+            return { nodeIds: [21, 22] };
+          }
+          return { nodeIds: [] };
+        },
+        async getOuterHTML({ nodeId }) {
+          return { outerHTML: htmlForNode(nodeId) };
+        },
+        async scrollIntoViewIfNeeded() {
+          return {};
+        },
+        async getBoxModel({ nodeId }) {
+          lastBoxNode = nodeId;
+          return {
+            model: {
+              border: [100, 100, 200, 100, 200, 140, 100, 140]
+            }
+          };
+        }
+      },
+      Input: {
+        async dispatchMouseEvent(event) {
+          if (event.type === "mouseReleased" && lastBoxNode === 22) {
+            selectedTab = "colleague";
+            clicks.push("colleague-tab");
+          }
+        }
+      }
+    }
+  };
+}
+
+async function testColleagueContactInspectorSelectsColleagueTab() {
+  const fixture = createColleagueContactClient();
+  const result = await inspectRecentColleagueContact(fixture.client, {
+    roots: [{ name: "top", nodeId: 1 }]
+  }, {
+    referenceDate: new Date(2026, 5, 24),
+    windowDays: 14,
+    scroll: false
+  });
+  assert.equal(result.panel_found, true);
+  assert.equal(result.tab_changed, true);
+  assert.deepEqual(fixture.state.clicks, ["colleague-tab"]);
+  assert.equal(result.recent, true);
+  assert.equal(result.matched_row.parsed_date, "2026-06-18");
+}
+
+async function testColleagueContactInspectorWaitsForLatePanel() {
+  const fixture = createColleagueContactClient();
+  let sectionQueries = 0;
+  const originalQuerySelectorAll = fixture.client.DOM.querySelectorAll;
+  fixture.client.DOM.querySelectorAll = async (params) => {
+    if (params.nodeId === 1 && params.selector === ".colleague-collaboration") {
+      sectionQueries += 1;
+      if (sectionQueries === 1) return { nodeIds: [] };
+    }
+    return originalQuerySelectorAll(params);
+  };
+  const result = await inspectRecentColleagueContact(fixture.client, {
+    roots: [{ name: "top", nodeId: 1 }]
+  }, {
+    referenceDate: new Date(2026, 5, 24),
+    windowDays: 14,
+    scroll: false,
+    sectionWaitMs: 50,
+    sectionPollMs: 1
+  });
+  assert.equal(sectionQueries >= 2, true);
+  assert.equal(result.panel_found, true);
+  assert.equal(result.recent, true);
 }
 
 function createAccountRightsPanelClient() {
@@ -1232,6 +1349,9 @@ testRecoverableImageCaptureEvidencePreservesPartialPages();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
 testNetworkPatterns();
+testColleagueContactDateParsing();
+await testColleagueContactInspectorSelectsColleagueTab();
+await testColleagueContactInspectorWaitsForLatePanel();
 await testRecommendAccountRightsPanelUsesSharedSafeClose();
 testRecommendCardDetailClickPointAvoidsAvatar();
 await testRecommendAvatarPreviewIsNotDetailAndCanClose();

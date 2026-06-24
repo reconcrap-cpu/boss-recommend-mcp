@@ -699,7 +699,8 @@ export function normalizeRecruitSearchParams(searchParams = {}) {
     keyword: normalizeText(searchParams.keyword) || DEFAULT_RECRUIT_KEYWORD,
     filter_recent_viewed: typeof searchParams.filter_recent_viewed === "boolean"
       ? searchParams.filter_recent_viewed
-      : null
+      : null,
+    skip_recent_colleague_contacted: searchParams.skip_recent_colleague_contacted !== false
   };
   const job = normalizeText(searchParams.job || searchParams.job_title || searchParams.selected_job);
   if (job) normalized.job = job;
@@ -720,6 +721,7 @@ export function buildRecruitSearchApplicationStepNames(searchParams = {}) {
   if (normalized.gender) steps.push("gender");
   if (normalized.age) steps.push("age");
   if (typeof normalized.filter_recent_viewed === "boolean") steps.push("recent_viewed");
+  if (typeof normalized.skip_recent_colleague_contacted === "boolean") steps.push("exchange_resume");
   // Keyword is the final filter before executing the search.
   steps.push("keyword", "search");
   return steps;
@@ -739,7 +741,8 @@ export function hasRecruitSearchParams(searchParams = {}) {
     keyword: normalizeText(searchParams.keyword),
     filter_recent_viewed: typeof searchParams.filter_recent_viewed === "boolean"
       ? searchParams.filter_recent_viewed
-      : null
+      : null,
+    skip_recent_colleague_contacted: searchParams.skip_recent_colleague_contacted !== false
   };
   return Boolean(
     job
@@ -751,6 +754,7 @@ export function hasRecruitSearchParams(searchParams = {}) {
     || age
     || normalized.keyword
     || typeof normalized.filter_recent_viewed === "boolean"
+    || typeof normalized.skip_recent_colleague_contacted === "boolean"
   );
 }
 
@@ -2365,19 +2369,23 @@ export async function setRecruitAge(client, frameNodeId, age) {
   };
 }
 
-export async function setRecruitRecentViewedFilter(client, frameNodeId, enabled) {
+async function setRecruitCheckboxFilter(client, frameNodeId, enabled, {
+  selectors,
+  label,
+  errorLabel
+} = {}) {
   if (typeof enabled !== "boolean") {
     return { applied: false, reason: "not_requested" };
   }
   const { candidate, candidates } = await findTextCandidate(
     client,
     frameNodeId,
-    RECRUIT_SEARCH_SELECTORS.recentViewedLabel,
-    "过滤近14天查看",
+    selectors,
+    label,
     { match: "contains" }
   );
   if (!candidate) {
-    throw new Error("Recruit recent-viewed filter was not found");
+    throw new Error(`${errorLabel || "Recruit checkbox filter"} was not found`);
   }
 
   let box = null;
@@ -2404,6 +2412,22 @@ export async function setRecruitRecentViewedFilter(client, frameNodeId, enabled)
       selector: item.selector
     }))
   };
+}
+
+export async function setRecruitRecentViewedFilter(client, frameNodeId, enabled) {
+  return setRecruitCheckboxFilter(client, frameNodeId, enabled, {
+    selectors: RECRUIT_SEARCH_SELECTORS.recentViewedLabel,
+    label: "过滤近14天查看",
+    errorLabel: "Recruit recent-viewed filter"
+  });
+}
+
+export async function setRecruitExchangeResumeFilter(client, frameNodeId, enabled) {
+  return setRecruitCheckboxFilter(client, frameNodeId, enabled, {
+    selectors: RECRUIT_SEARCH_SELECTORS.exchangeResumeLabel,
+    label: "近30天未和同事交换简历",
+    errorLabel: "Recruit exchange-resume filter"
+  });
 }
 
 async function openRecruitCityPicker(client, frameNodeId, {
@@ -3002,6 +3026,16 @@ export async function applyRecruitSearchParams(client, {
           client,
           recentFilterRoots.iframe.documentNodeId,
           normalizedSearchParams.filter_recent_viewed
+        )
+      });
+    } else if (stepName === "exchange_resume") {
+      const exchangeFilterRoots = await getRecruitRoots(client);
+      steps.push({
+        step: "exchange_resume",
+        result: await setRecruitExchangeResumeFilter(
+          client,
+          exchangeFilterRoots.iframe.documentNodeId,
+          normalizedSearchParams.skip_recent_colleague_contacted
         )
       });
     }

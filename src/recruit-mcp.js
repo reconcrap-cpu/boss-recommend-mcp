@@ -710,6 +710,8 @@ export function createRecruitPipelineInputSchema() {
           search_params_confirmed: { type: "boolean" },
           criteria_confirmed: { type: "boolean" },
           criteria_value: { type: "string" },
+          skip_recent_colleague_contacted_confirmed: { type: "boolean" },
+          skip_recent_colleague_contacted_value: { type: "boolean" },
           post_action_confirmed: { type: "boolean" },
           post_action_value: {
             type: "string",
@@ -740,6 +742,10 @@ export function createRecruitPipelineInputSchema() {
             ]
           },
           filter_recent_viewed: { type: "boolean" },
+          skip_recent_colleague_contacted: {
+            type: "boolean",
+            description: "默认 true。搜索页使用 Boss 的“近30天未和同事交换简历”过滤；false 会确保该过滤取消。"
+          },
           recent_not_view: {
             anyOf: [
               { type: "boolean" },
@@ -1043,6 +1049,7 @@ function buildRequiredConfirmations(parsedResult) {
   if (parsedResult.needs_search_params_confirmation) confirmations.push("search_params");
   if (parsedResult.needs_keyword_confirmation) confirmations.push("keyword");
   if (parsedResult.needs_recent_viewed_filter_confirmation) confirmations.push("filter_recent_viewed");
+  if (parsedResult.needs_skip_recent_colleague_contacted_confirmation) confirmations.push("skip_recent_colleague_contacted");
   if (parsedResult.needs_criteria_confirmation) confirmations.push("criteria");
   if (parsedResult.has_unresolved_missing_fields) confirmations.push("missing_fields_or_defaults");
   if ((parsedResult.suspicious_fields || []).length) confirmations.push("suspicious_fields");
@@ -1110,6 +1117,7 @@ function evaluateRecruitPipelineGate(parsed) {
   if (
     parsed.needs_keyword_confirmation
     || parsed.needs_recent_viewed_filter_confirmation
+    || parsed.needs_skip_recent_colleague_contacted_confirmation
     || parsed.needs_criteria_confirmation
     || parsed.needs_search_params_confirmation
     || (parsed.suspicious_fields || []).length > 0

@@ -50,6 +50,7 @@ const SEARCH_PARAM_ORDER = [
   "schools",
   "keyword",
   "filter_recent_viewed",
+  "skip_recent_colleague_contacted",
   "job",
   "start_from",
   "target_count",
@@ -60,7 +61,10 @@ const SCREEN_PARAM_ORDER = [
   "criteria",
   "target_count",
   "post_action",
-  "max_greet_count"
+  "max_greet_count",
+  "skip_recent_colleague_contacted",
+  "colleague_contact_window_days",
+  "search_exchange_resume_filter_days"
 ];
 
 function normalizeText(value) {

@@ -176,6 +176,29 @@ async function testRecruitRequiresExplicitCriteria() {
   assert.equal(payload.pending_questions.some((question) => question.field === "criteria"), true);
 }
 
+async function testRecruitAsksSkipRecentColleagueContactedBeforeRun() {
+  let connectorCalled = false;
+  setRecruitMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("should not connect before skip-contact gate");
+  });
+  const payload = await callTool(TOOL_RUN, {
+    ...readyArgs(),
+    confirmation: {
+      search_params_confirmed: true,
+      criteria_confirmed: true,
+      use_default_for_missing: true
+    }
+  }, 25);
+  assert.equal(payload.status, "NEED_CONFIRMATION");
+  assert.equal(connectorCalled, false);
+  assert.deepEqual(payload.required_confirmations, ["skip_recent_colleague_contacted"]);
+  assert.deepEqual(payload.pending_questions.map((question) => question.field), ["skip_recent_colleague_contacted"]);
+  assert.equal(payload.pending_questions[0].value, true);
+  assert.equal(payload.pending_questions[0].options[0].value, true);
+  assert.equal(payload.pending_questions[0].options[1].value, false);
+}
+
 async function testRecruitFullUpfrontArgsFinalConfirmStarts() {
   let observedOptions = null;
   installFakeConnector();
@@ -516,6 +539,8 @@ async function main() {
     await testRecruitGateBeforeBrowserConnect();
     resetRecruitMcpStateForTests();
     await testRecruitRequiresExplicitCriteria();
+    resetRecruitMcpStateForTests();
+    await testRecruitAsksSkipRecentColleagueContactedBeforeRun();
     resetRecruitMcpStateForTests();
     await testRecruitFullUpfrontArgsFinalConfirmStarts();
     resetRecruitMcpStateForTests();

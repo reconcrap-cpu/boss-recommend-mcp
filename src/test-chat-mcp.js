@@ -404,6 +404,92 @@ async function testChatAsyncPauseResumeCancel() {
   assert.equal(connector.closeCount >= 1, true);
 }
 
+async function testChatDiskControlRequestsSurviveActiveSnapshotRefresh() {
+  installFakeConnector();
+  setChatMcpWorkflowForTests(async (options, runControl) => {
+    for (let index = 0; index < 20; index += 1) {
+      await runControl.waitIfPaused();
+      runControl.throwIfCanceled();
+      runControl.setPhase("chat:detached-control-test");
+      runControl.updateProgress({
+        card_count: 20,
+        target_count: options.maxCandidates,
+        processed: index + 1,
+        screened: index + 1,
+        passed: index + 1
+      });
+      await runControl.sleep(80);
+    }
+    return {
+      domain: "chat",
+      processed: 20,
+      screened: 20,
+      detail_opened: 0,
+      llm_screened: 0,
+      passed: 20,
+      results: []
+    };
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 80 }), 30);
+  assert.equal(started.status, "ACCEPTED");
+  const running = await waitForChatRun(started.run_id, (run) => run?.progress?.processed >= 1);
+  const statePath = running.artifacts.run_state_path;
+
+  const patchDiskControl = (patch) => {
+    const persisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    persisted.control = {
+      ...(persisted.control || {}),
+      ...patch
+    };
+    fs.writeFileSync(statePath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+  };
+
+  patchDiskControl({
+    pause_requested: true,
+    pause_requested_at: "2026-01-01T00:00:00.000Z",
+    pause_requested_by: "pause_boss_chat_run",
+    cancel_requested: false
+  });
+  const pauseRefresh = await callTool(TOOL_GET, { run_id: started.run_id }, 31);
+  assert.equal(pauseRefresh.run.control.pause_requested, true);
+  assert.equal(pauseRefresh.run.control.pause_requested_by, "pause_boss_chat_run");
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).control.pause_requested, true);
+
+  await callTool(TOOL_PAUSE, { run_id: started.run_id }, 32);
+  const paused = await waitForChatRun(started.run_id, (run) => run?.status === "paused");
+  assert.equal(paused.control.pause_requested, true);
+
+  patchDiskControl({
+    pause_requested: false,
+    pause_requested_at: null,
+    pause_requested_by: null,
+    cancel_requested: false
+  });
+  const resumeRefresh = await callTool(TOOL_GET, { run_id: started.run_id }, 33);
+  assert.equal(resumeRefresh.run.status, "paused");
+  assert.equal(resumeRefresh.run.control.pause_requested, false);
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).control.pause_requested, false);
+
+  await callTool(TOOL_RESUME, { run_id: started.run_id }, 34);
+  await waitForChatRun(started.run_id, (run) => run?.status === "running");
+
+  patchDiskControl({
+    pause_requested: true,
+    pause_requested_at: "2026-01-01T00:01:00.000Z",
+    pause_requested_by: "cancel_boss_chat_run",
+    cancel_requested: true
+  });
+  const cancelRefresh = await callTool(TOOL_GET, { run_id: started.run_id }, 35);
+  assert.equal(cancelRefresh.run.control.cancel_requested, true);
+  assert.equal(cancelRefresh.run.control.pause_requested_by, "cancel_boss_chat_run");
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).control.cancel_requested, true);
+
+  await callTool(TOOL_CANCEL, { run_id: started.run_id }, 36);
+  const canceled = await waitForChatRun(started.run_id, (run) => run?.status === "canceled");
+  assert.equal(canceled.result.completion_reason, "canceled_by_user");
+}
+
 async function testChatAllTargetCountContext() {
   installFakeConnector();
   setChatMcpWorkflowForTests(async (options, runControl) => {
@@ -731,6 +817,8 @@ async function main() {
     await testChatBlankCriteriaStartsCvCollectionWithoutLlmConfig();
     resetChatMcpStateForTests();
     await testChatAsyncPauseResumeCancel();
+    resetChatMcpStateForTests();
+    await testChatDiskControlRequestsSurviveActiveSnapshotRefresh();
     resetChatMcpStateForTests();
     await testChatAllTargetCountContext();
     resetChatMcpStateForTests();

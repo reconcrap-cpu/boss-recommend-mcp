@@ -29,6 +29,7 @@ import {
   setRecruitAge,
   setRecruitCity,
   setRecruitExperience,
+  setRecruitExchangeResumeFilter,
   setRecruitGender,
   setRecruitJobTitle,
   setRecruitKeyword,
@@ -192,7 +193,8 @@ function testSearchParamHelpers() {
     degrees: ["硕士"],
     schools: ["985院校", "QS 100"],
     keyword: "算法工程师",
-    filter_recent_viewed: true
+    filter_recent_viewed: true,
+    skip_recent_colleague_contacted: true
   });
 
   assert.deepEqual(normalizeRecruitSearchParams({
@@ -286,7 +288,7 @@ function testSearchParamHelpers() {
     age: { min: 25, max: 35 },
     keyword: "用户运营",
     filter_recent_viewed: true
-  }), ["job_title", "city", "degree", "schools", "experience", "gender", "age", "recent_viewed", "keyword", "search"]);
+  }), ["job_title", "city", "degree", "schools", "experience", "gender", "age", "recent_viewed", "exchange_resume", "keyword", "search"]);
   const noJobSteps = buildRecruitSearchApplicationStepNames({
     city: "上海",
     keyword: "用户运营"
@@ -294,6 +296,88 @@ function testSearchParamHelpers() {
   assert.equal(noJobSteps[0], "city");
   assert.equal(noJobSteps[noJobSteps.length - 2], "keyword");
   assert.equal(noJobSteps[noJobSteps.length - 1], "search");
+}
+
+function testExchangeResumeFilterStepNames() {
+  assert.deepEqual(buildRecruitSearchApplicationStepNames({
+    keyword: "三维重建",
+    skip_recent_colleague_contacted: true
+  }).slice(-3), ["exchange_resume", "keyword", "search"]);
+  assert.equal(normalizeRecruitSearchParams({
+    keyword: "三维重建",
+    skip_recent_colleague_contacted: false
+  }).skip_recent_colleague_contacted, false);
+}
+
+function createExchangeResumeFilterClient({ allowClick = false } = {}) {
+  const clicks = [];
+  const fixture = {
+    get clicks() {
+      return clicks;
+    },
+    client: null
+  };
+  fixture.client = {
+    DOM: {
+      async querySelectorAll({ nodeId, selector }) {
+        assert.equal(nodeId, 1);
+        if (selector === 'label.checkbox.high_search_checkbox[ka="search_change_exchange_resume"]') {
+          return { nodeIds: [44] };
+        }
+        return { nodeIds: [] };
+      },
+      async getAttributes({ nodeId }) {
+        assert.equal(nodeId, 44);
+        return {
+          attributes: ["class", "checkbox high_search_checkbox checked", "ka", "search_change_exchange_resume"]
+        };
+      },
+      async getOuterHTML({ nodeId }) {
+        assert.equal(nodeId, 44);
+        return {
+          outerHTML: '<label class="checkbox high_search_checkbox checked" ka="search_change_exchange_resume"><span class="checkbox-text">近30天未和同事交换简历</span></label>'
+        };
+      },
+      async scrollIntoViewIfNeeded() {
+        if (!allowClick) throw new Error("already checked exchange-resume filter should not be clicked");
+        return {};
+      },
+      async getBoxModel({ nodeId }) {
+        assert.equal(nodeId, 44);
+        return {
+          model: {
+            border: [10, 10, 110, 10, 110, 50, 10, 50]
+          }
+        };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") clicks.push(event);
+        return {};
+      }
+    }
+  };
+  return fixture;
+}
+
+async function testExchangeResumeFilterActiveDetection() {
+  const fixture = createExchangeResumeFilterClient();
+  const result = await setRecruitExchangeResumeFilter(fixture.client, 1, true);
+  assert.equal(result.applied, true);
+  assert.equal(result.requested, true);
+  assert.equal(result.was_active, true);
+  assert.equal(result.changed, false);
+  assert.equal(result.selected_label, "近30天未和同事交换简历");
+  assert.equal(fixture.clicks.length, 0);
+
+  const clearFixture = createExchangeResumeFilterClient({ allowClick: true });
+  const cleared = await setRecruitExchangeResumeFilter(clearFixture.client, 1, false);
+  assert.equal(cleared.applied, true);
+  assert.equal(cleared.requested, false);
+  assert.equal(cleared.was_active, true);
+  assert.equal(cleared.changed, true);
+  assert.equal(clearFixture.clicks.length, 1);
 }
 
 async function testCardCandidateReader() {
@@ -1232,6 +1316,8 @@ testParserImportSemantics();
 testNetworkPatterns();
 await testRecruitAccountRightsPanelUsesSharedSafeClose();
 testSearchParamHelpers();
+testExchangeResumeFilterStepNames();
+await testExchangeResumeFilterActiveDetection();
 await testCardCandidateReader();
 await testRunServiceLifecycle();
 await testRecruitGreetQuotaClickGuard();

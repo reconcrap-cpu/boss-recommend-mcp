@@ -804,6 +804,8 @@ function createRunInputSchema() {
             type: "string",
             enum: ["不限", "近14天没有"]
           },
+          skip_recent_colleague_contacted_confirmed: { type: "boolean" },
+          skip_recent_colleague_contacted_value: { type: "boolean" },
           criteria_confirmed: { type: "boolean" },
           target_count_confirmed: { type: "boolean" },
           target_count_value: {
@@ -877,6 +879,10 @@ function createRunInputSchema() {
           recent_not_view: {
             type: "string",
             enum: ["不限", "近14天没有"]
+          },
+          skip_recent_colleague_contacted: {
+            type: "boolean",
+            description: "默认 true。推荐页跳过近14天同事沟通过的人选；搜索页使用近30天未和同事交换简历过滤。"
           },
           criteria: { type: "string" },
           job: { type: "string" },
@@ -1382,7 +1388,9 @@ function createCompactRunInputSchema() {
           final_confirmed: {
             type: "boolean",
             description: "用户完成总确认后传 true"
-          }
+          },
+          skip_recent_colleague_contacted_confirmed: { type: "boolean" },
+          skip_recent_colleague_contacted_value: { type: "boolean" }
         },
         additionalProperties: true
       },
@@ -1404,6 +1412,7 @@ function createCompactRunInputSchema() {
           },
           gender: { type: "string" },
           recent_not_view: { type: "string" },
+          skip_recent_colleague_contacted: { type: "boolean" },
           criteria: { type: "string" },
           target_count: targetCountSchema,
           post_action: { type: "string", enum: ["greet", "none"] },

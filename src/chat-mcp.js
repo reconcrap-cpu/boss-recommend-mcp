@@ -815,6 +815,46 @@ function normalizeRunSnapshot(snapshot) {
   };
 }
 
+function plainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function mergePersistedChatControlRequest(normalized, existing) {
+  const control = {
+    ...(normalized?.control || {})
+  };
+  if (!normalized) return control;
+  const existingControl = plainRecord(existing?.control);
+  if (TERMINAL_STATUSES.has(normalized.state)) return control;
+  if (existingControl.cancel_requested === true) {
+    return {
+      ...control,
+      pause_requested: true,
+      pause_requested_at: existingControl.pause_requested_at || control.pause_requested_at || new Date().toISOString(),
+      pause_requested_by: existingControl.pause_requested_by || control.pause_requested_by || "cancel_boss_chat_run",
+      cancel_requested: true
+    };
+  }
+  if (existingControl.pause_requested === true && normalized.state !== RUN_STATUS_PAUSED) {
+    return {
+      ...control,
+      pause_requested: true,
+      pause_requested_at: existingControl.pause_requested_at || control.pause_requested_at || new Date().toISOString(),
+      pause_requested_by: existingControl.pause_requested_by || control.pause_requested_by || "pause_boss_chat_run"
+    };
+  }
+  if (existingControl.pause_requested === false && normalized.state === RUN_STATUS_PAUSED) {
+    return {
+      ...control,
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    };
+  }
+  return control;
+}
+
 function persistChatRunSnapshot(snapshot, {
   persistActiveCheckpoint = false
 } = {}) {
@@ -822,6 +862,8 @@ function persistChatRunSnapshot(snapshot, {
   if (!normalized?.run_id) return normalized;
   const artifacts = getChatRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const existing = readJsonFile(artifacts.run_state_path);
+  normalized.control = mergePersistedChatControlRequest(normalized, existing);
   if (persistActiveCheckpoint) {
     persistChatCheckpointSnapshot(normalized);
   }
