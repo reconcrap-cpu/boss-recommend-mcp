@@ -5,6 +5,7 @@ import {
   getNodeBox,
   getOuterHTML,
   querySelectorAll,
+  scrollNodeIntoView,
   sleep
 } from "../../core/browser/index.js";
 import {
@@ -433,7 +434,21 @@ export async function waitForRecommendDetailActionControls(client, {
 export async function clickRecommendActionControl(client, control, {
   allowDisabled = false
 } = {}) {
-  if (!control?.center) {
+  let clickCenter = control?.center || null;
+  let clickRect = control?.rect || null;
+  if (control?.node_id) {
+    try {
+      await scrollNodeIntoView(client, control.node_id);
+      await sleep(150);
+      const box = await getNodeBox(client, control.node_id);
+      clickCenter = box.center;
+      clickRect = box.rect;
+    } catch {
+      // Fall back to the discovered center below; callers still get a clear
+      // error if no usable click point exists.
+    }
+  }
+  if (!clickCenter) {
     throw new Error("Action control has no clickable center");
   }
   const greetQuota = control.kind === "greet"
@@ -442,7 +457,7 @@ export async function clickRecommendActionControl(client, control, {
   if (control.disabled && !allowDisabled) {
     throw new Error(`Action control is disabled: ${control.kind}`);
   }
-  await clickPoint(client, control.center.x, control.center.y);
+  await clickPoint(client, clickCenter.x, clickCenter.y);
   return {
     clicked: true,
     kind: control.kind,
@@ -451,6 +466,7 @@ export async function clickRecommendActionControl(client, control, {
     selector: control.selector,
     root: control.root,
     node_id: control.node_id,
-    center: control.center
+    center: clickCenter,
+    rect: clickRect
   };
 }

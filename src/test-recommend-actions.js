@@ -64,6 +64,50 @@ async function testGreetQuotaClickGuard() {
   );
 }
 
+async function testActionClickScrollsNodeIntoViewBeforeClick() {
+  const events = [];
+  const client = {
+    DOM: {
+      async scrollIntoViewIfNeeded({ nodeId }) {
+        events.push({ type: "scroll", nodeId });
+        return {};
+      },
+      async getBoxModel({ nodeId }) {
+        events.push({ type: "box", nodeId });
+        return {
+          model: {
+            border: [100, 100, 200, 100, 200, 140, 100, 140]
+          }
+        };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        events.push({ type: "mouse", event });
+        return {};
+      }
+    }
+  };
+  const result = await clickRecommendActionControl(client, {
+    kind: "greet",
+    label: "打招呼",
+    center: { x: 1199.5, y: -578.5 },
+    node_id: 22,
+    disabled: false
+  });
+  assert.deepEqual(events.slice(0, 2), [
+    { type: "scroll", nodeId: 22 },
+    { type: "box", nodeId: 22 }
+  ]);
+  assert.deepEqual(result.center, { x: 150, y: 120 });
+  assert.equal(events.some((item) => (
+    item.type === "mouse"
+    && item.event.type === "mousePressed"
+    && item.event.x === 150
+    && item.event.y === 120
+  )), true);
+}
+
 function testPostActionResolution() {
   assert.equal(normalizeRecommendPostAction("收藏"), "");
   assert.equal(normalizeRecommendPostAction("favorite"), "");
@@ -119,6 +163,7 @@ function testSummary() {
 testFavoriteClassification();
 testGreetClassification();
 await testGreetQuotaClickGuard();
+await testActionClickScrollsNodeIntoViewBeforeClick();
 testPostActionResolution();
 testSummary();
 
