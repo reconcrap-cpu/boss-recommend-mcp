@@ -37,10 +37,11 @@ If the visible tool surface only offers `boss-recommend/*` for a search/recruit 
 - 若用户提供城市、学历、学校、关键词、过滤已看、人选目标数、筛选条件等参数，必须逐项传入或确认。
 - 搜索页和推荐页一样支持多选筛选条件；不要把多选降级成单选。
 - 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
-- 启动前展示一次包含岗位、关键词、城市、学历、学校标签、是否过滤已看、criteria、目标人数、后置动作和休息强度的总确认；用户确认后，`confirmation` 只需要 `{ "final_confirmed": true }`。
+- 启动前展示一次包含岗位、关键词、城市、学历、学校标签、是否过滤已看、是否过滤近期同事触达、criteria、目标人数、后置动作和休息强度的总确认；用户确认后，`confirmation` 只需要 `{ "final_confirmed": true }`。
 - 不要让工具重写用户的 `criteria`。用户给出 `筛选条件` / `筛选标准` / `硬条件` 时，逐字写入 `overrides.criteria`；不要传系统简化版。
 - 用户说学校类型“不限”时，在 `overrides.school_tag` 显式传 `"不限"` 或在 `overrides.schools` 传 `[]`；不要因为 criteria 里出现 `985/211/双一流` 就把它们当作搜索页学校过滤器。
 - 用户说只看未查看“不限”时，在 `overrides.recent_not_view` 显式传 `"不限"` 或在 `overrides.filter_recent_viewed` 传 `false`。
+- “只看未查看/过滤已看”只控制 Boss 的“过滤近14天查看”筛选；“是否过滤近期同事触达”是单独输入，写入 `overrides.filter_recent_colleague_contacted` 或兼容字段 `overrides.skip_recent_colleague_contacted`。用户说近期同事触达“不限/不过滤”时传 `false`；用户说过滤近期同事触达/跳过同事已联系时传 `true`。
 
 ## Required Inputs
 
@@ -56,6 +57,7 @@ If the visible tool surface only offers `boss-recommend/*` for a search/recruit 
 - `degree`
 - `school_tag`
 - `recent_not_view`
+- `filter_recent_colleague_contacted`
 - `port`
 
 ## Confirmation Flow

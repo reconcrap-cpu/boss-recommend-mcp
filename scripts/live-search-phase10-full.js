@@ -69,7 +69,7 @@ const DEFAULT_CRITERIA = "必须有ccf-a论文或会议成果，本科学历必�
 function parseBoolean(raw) {
   const normalized = String(raw || "").trim().toLowerCase();
   if (["true", "1", "yes", "y", "on", "是", "要", "需要", "过滤"].includes(normalized)) return true;
-  if (["false", "0", "no", "n", "off", "否", "不要", "不需要", "不过滤"].includes(normalized)) return false;
+  if (["false", "0", "no", "n", "off", "否", "不要", "不需要", "不过滤", "不限"].includes(normalized)) return false;
   return null;
 }
 
@@ -118,6 +118,7 @@ function parseArgs(argv) {
     age: null,
     keyword: "算法",
     filterRecentViewed: true,
+    filterRecentColleagueContacted: null,
     criteria: DEFAULT_CRITERIA,
     targetCount: 3,
     maxScreened: 20,
@@ -204,6 +205,10 @@ function parseArgs(argv) {
       const parsed = parseBoolean(argv[++index]);
       if (parsed !== null) result.filterRecentViewed = parsed;
     }
+    if (arg === "--filter-recent-colleague-contacted" || arg === "--skip-recent-colleague-contacted") {
+      const parsed = parseBoolean(argv[++index]);
+      if (parsed !== null) result.filterRecentColleagueContacted = parsed;
+    }
     if (arg === "--criteria") result.criteria = argv[++index];
     if (arg === "--target-count") result.targetCount = parsePositiveInt(argv[++index], result.targetCount);
     if (arg === "--max-screened") result.maxScreened = parsePositiveInt(argv[++index], result.maxScreened);
@@ -284,6 +289,9 @@ function searchParamsFromOptions(options) {
     keyword: options.keyword,
     filter_recent_viewed: options.filterRecentViewed
   };
+  if (typeof options.filterRecentColleagueContacted === "boolean") {
+    params.skip_recent_colleague_contacted = options.filterRecentColleagueContacted;
+  }
   if (options.experience) params.experience = options.experience;
   if (options.gender) params.gender = options.gender;
   if (options.age) params.age = options.age;
@@ -394,6 +402,12 @@ function validateSearchApplication(searchParams, searchApplication) {
     checks.push({ field: "filter_recent_viewed", ok, result });
     if (!ok) failures.push("filter_recent_viewed");
   }
+  if (typeof searchParams.skip_recent_colleague_contacted === "boolean") {
+    const result = stepResult(searchApplication, "exchange_resume");
+    const ok = result?.applied === true && result.requested === searchParams.skip_recent_colleague_contacted;
+    checks.push({ field: "filter_recent_colleague_contacted", ok, result });
+    if (!ok) failures.push("filter_recent_colleague_contacted");
+  }
 
   if (failures.length) {
     throw new Error(`Recruit search application did not apply requested fields: ${failures.join(", ")}`);
@@ -422,6 +436,8 @@ function compactDetail(detailResult) {
   return {
     popup_text_length: detailResult.detail?.popup_text?.length || 0,
     resume_text_length: detailResult.detail?.resume_text?.length || 0,
+    card_box: detailResult.card_box || null,
+    open_attempts: detailResult.open_attempts || [],
     network_body_count: detailResult.network_bodies?.filter((item) => item.body).length || 0,
     parsed_network_profile_count: detailResult.parsed_network_profiles?.filter((item) => item.ok).length || 0,
     cv_acquisition: detailResult.cv_acquisition || null,
@@ -620,6 +636,8 @@ async function acquireCandidateDetail({
     targetUrl,
     closeDetail: false
   });
+  detailResult.card_box = openedDetail.card_box || null;
+  detailResult.open_attempts = openedDetail.open_attempts || [];
 
   const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
   let source = "network";
@@ -1321,7 +1339,7 @@ async function run() {
       list_end_reason: listEndReason || null,
       stop_run_reason: stopRunReason || null,
       greet_credit_exhausted: stopRunReason === "greet_credits_exhausted",
-      human_behavior,
+      human_behavior: humanBehavior,
       human_rest: humanRestController.getState(),
       refresh_rounds: refreshRounds,
       refresh_attempts: refreshAttempts.length,
@@ -1375,7 +1393,12 @@ async function run() {
     result.status = "FAIL";
     result.error = {
       name: error?.name || "Error",
-      message: error?.message || String(error)
+      message: error?.message || String(error),
+      stack: error?.stack || "",
+      cdp_method: error?.cdp_method || "",
+      node_id: error?.node_id || null,
+      discovered_dropdowns: error?.discovered_dropdowns || null,
+      age_custom_attempts: error?.age_custom_attempts || null
     };
     if (session?.methodLog) {
       result.method_summary = methodSummary(session.methodLog);

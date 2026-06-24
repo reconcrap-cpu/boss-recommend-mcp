@@ -1971,7 +1971,18 @@ export async function getOuterHTML(client, nodeId) {
 }
 
 export async function getNodeBox(client, nodeId) {
-  const result = await client.DOM.getBoxModel({ nodeId });
+  let result;
+  try {
+    result = await client.DOM.getBoxModel({ nodeId });
+  } catch (error) {
+    const wrapped = new Error(error?.message || String(error));
+    wrapped.name = error?.name || "Error";
+    wrapped.node_id = nodeId;
+    wrapped.cdp_method = "DOM.getBoxModel";
+    wrapped.original_stack = error?.stack || "";
+    wrapped.stack = `${new Error(`getNodeBox failed for nodeId=${nodeId}`).stack || wrapped.stack}\nCaused by: ${error?.stack || error}`;
+    throw wrapped;
+  }
   const model = result.model;
   const quad = model.border?.length ? model.border : model.content;
   const xs = [quad[0], quad[2], quad[4], quad[6]];
@@ -2171,7 +2182,17 @@ export async function clickPoint(client, x, y, {
 }
 
 export async function scrollNodeIntoView(client, nodeId) {
-  await client.DOM.scrollIntoViewIfNeeded({ nodeId });
+  try {
+    await client.DOM.scrollIntoViewIfNeeded({ nodeId });
+  } catch (error) {
+    const wrapped = new Error(error?.message || String(error));
+    wrapped.name = error?.name || "Error";
+    wrapped.node_id = nodeId;
+    wrapped.cdp_method = "DOM.scrollIntoViewIfNeeded";
+    wrapped.original_stack = error?.stack || "";
+    wrapped.stack = `${new Error(`scrollNodeIntoView failed for nodeId=${nodeId}`).stack || wrapped.stack}\nCaused by: ${error?.stack || error}`;
+    throw wrapped;
+  }
 }
 
 export async function clickNodeCenter(client, nodeId, {

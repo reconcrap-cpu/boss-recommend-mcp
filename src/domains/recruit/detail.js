@@ -7,6 +7,7 @@ import {
   getOuterHTML,
   pressKey,
   querySelectorAll,
+  scrollNodeIntoView,
   sleep
 } from "../../core/browser/index.js";
 import {
@@ -26,6 +27,111 @@ import {
 import {
   getRecruitRoots
 } from "./roots.js";
+
+function compactBox(box = null) {
+  if (!box) return null;
+  return {
+    center: box.center || null,
+    rect: box.rect || null
+  };
+}
+
+async function getViewportRect(client) {
+  if (typeof client?.Page?.getLayoutMetrics !== "function") return null;
+  try {
+    const metrics = await client.Page.getLayoutMetrics();
+    const viewport = metrics?.cssVisualViewport || metrics?.visualViewport || metrics?.layoutViewport || {};
+    const width = Number(viewport.clientWidth || viewport.width || metrics?.layoutViewport?.clientWidth || 0);
+    const height = Number(viewport.clientHeight || viewport.height || metrics?.layoutViewport?.clientHeight || 0);
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+    return {
+      x: 0,
+      y: 0,
+      width,
+      height
+    };
+  } catch {
+    return null;
+  }
+}
+
+function boxCenterIsInViewport(box, viewport, { marginPx = 16 } = {}) {
+  if (!box?.center || !viewport) return null;
+  const margin = Math.max(0, Number(marginPx) || 0);
+  return (
+    box.center.x >= viewport.x + margin
+    && box.center.x <= viewport.x + viewport.width - margin
+    && box.center.y >= viewport.y + margin
+    && box.center.y <= viewport.y + viewport.height - margin
+  );
+}
+
+function scrollDeltaForBox(box, viewport) {
+  if (!box?.center || !viewport) return 0;
+  const targetY = viewport.y + viewport.height * 0.48;
+  const delta = box.center.y - targetY;
+  if (Math.abs(delta) < 80) return 0;
+  return Math.max(-900, Math.min(900, delta));
+}
+
+export async function ensureRecruitCardInViewport(client, cardNodeId, {
+  maxScrollAttempts = 4,
+  marginPx = 16,
+  settleMs = 220
+} = {}) {
+  const attempts = [];
+  await scrollNodeIntoView(client, cardNodeId);
+  if (settleMs > 0) await sleep(settleMs);
+
+  let finalBox = null;
+  for (let attempt = 0; attempt <= maxScrollAttempts; attempt += 1) {
+    const box = await getNodeBox(client, cardNodeId);
+    finalBox = box;
+    const viewport = await getViewportRect(client);
+    const inViewport = boxCenterIsInViewport(box, viewport, { marginPx });
+    const entry = {
+      attempt,
+      in_viewport: inViewport,
+      viewport,
+      box: compactBox(box)
+    };
+    attempts.push(entry);
+    if (inViewport === true || inViewport === null) {
+      return {
+        ok: inViewport !== false,
+        verified: inViewport === true,
+        box,
+        attempts
+      };
+    }
+    if (attempt >= maxScrollAttempts) break;
+
+    const deltaY = scrollDeltaForBox(box, viewport);
+    if (!deltaY) break;
+    const wheelPoint = {
+      x: viewport.x + viewport.width * 0.5,
+      y: viewport.y + viewport.height * 0.5
+    };
+    await client.Input.dispatchMouseEvent({
+      type: "mouseWheel",
+      x: wheelPoint.x,
+      y: wheelPoint.y,
+      deltaX: 0,
+      deltaY
+    });
+    entry.scroll = {
+      method: "mouseWheel",
+      delta_y: deltaY,
+      point: wheelPoint
+    };
+    if (settleMs > 0) await sleep(settleMs);
+  }
+
+  const error = new Error("Recruit candidate card is not inside the visible viewport before click");
+  error.card_viewport_attempts = attempts;
+  error.card_node_id = cardNodeId;
+  throw error;
+}
 
 export function matchesRecruitDetailNetwork(url) {
   return RECRUIT_DETAIL_NETWORK_PATTERNS.some((pattern) => pattern.test(String(url || "")));
@@ -256,13 +362,19 @@ export async function openRecruitCardDetail(client, cardNodeId, {
   const openedStarted = Date.now();
   const attempts = [];
   const clickStarted = Date.now();
+  const viewportGuard = await ensureRecruitCardInViewport(client, cardNodeId);
   const cardBox = await clickNodeCenter(client, cardNodeId, {
-    scrollIntoView: true
+    scrollIntoView: false
   });
   let candidateClickMs = Date.now() - clickStarted;
   attempts.push({
     mode: "card-center",
-    center: cardBox.center
+    center: cardBox.center,
+    viewport_guard: {
+      ok: viewportGuard.ok,
+      verified: viewportGuard.verified,
+      attempts: viewportGuard.attempts
+    }
   });
   const detailStarted = Date.now();
   let detailState = await waitForRecruitDetail(client, { timeoutMs });

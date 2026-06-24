@@ -44,7 +44,8 @@ const DEGREE_VALUES = new Set(["不限", "本科", "本科及以上", "硕士及
 const CITY_STOP_PATTERN = /(?:筛选|搜索|查找|找|做过|从事过|有过|相关|的人选|的人|并且|且|学历|学校|经验|性别|年龄|目标|必须|优先|，|。|；|;|,)/;
 const POST_ACTIONS = new Set(["none", "greet"]);
 const CRITERIA_MARKER_PATTERN = /(?:筛选条件|筛选标准|筛选要求|筛选规则|硬性条件|硬条件|criteria)\s*[：:]/i;
-const CRITERIA_TRAILING_FIELD_PATTERN = /\n\s*(?:岗位|职位|关键词|城市|地点|工作地|学历|学校类型|院校标签|经验|经验要求|工作经验|工作年限|性别|年龄|年龄要求|年龄范围|只看未查看|目标筛选人数|目标人数|休息强度|后置动作|post_action|rest_level)\s*[：:]/i;
+const CRITERIA_TRAILING_FIELD_PATTERN = /\n\s*(?:岗位|职位|关键词|城市|地点|工作地|学历|学校类型|院校标签|经验|经验要求|工作经验|工作年限|性别|年龄|年龄要求|年龄范围|只看未查看|过滤已看|同事近期触达|近期同事触达|同事触达|同事联系|同事沟通|同事交换简历|目标筛选人数|目标人数|休息强度|后置动作|post_action|rest_level|filter_recent_colleague_contacted|recent_colleague_contacted|skip_recent_colleague_contacted)\s*[：:]/i;
+const INLINE_FIELD_BOUNDARY_PATTERN = /[；;]\s*(?:岗位|职位|关键词|城市|地点|工作地|学历|学校|学校类型|院校标签|经验|经验要求|工作经验|工作年限|性别|年龄|年龄要求|年龄范围|只看未查看|过滤已看|同事近期触达|近期同事触达|同事触达|同事联系|同事沟通|同事交换简历|目标筛选人数|目标人数|休息强度|后置动作|post_action|rest_level|filter_recent_colleague_contacted|recent_colleague_contacted|skip_recent_colleague_contacted)\s*(?:\([^)]*\))?\s*[：:]/i;
 
 function normalizeText(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
@@ -64,13 +65,15 @@ function escapeRegExp(input) {
 }
 
 function extractFieldLineValue(rawText, labels = []) {
-  const lines = String(rawText || "").replace(/\r\n/g, "\n").split("\n");
+  const lines = String(rawText || "").replace(/\r\n/g, "\n").split(/\n|[；;]/);
   const labelPattern = labels.map(escapeRegExp).join("|");
   if (!labelPattern) return null;
   const pattern = new RegExp(`^\\s*(?:${labelPattern})(?:\\s*\\([^)]*\\))?\\s*[：:]\\s*(.+?)\\s*$`, "i");
   for (const line of lines) {
     const match = line.match(pattern);
-    const value = match?.[1]?.trim();
+    let value = match?.[1]?.trim();
+    const inlineBoundaryIndex = value ? value.search(INLINE_FIELD_BOUNDARY_PATTERN) : -1;
+    if (inlineBoundaryIndex >= 0) value = value.slice(0, inlineBoundaryIndex).trim();
     if (value) return value;
   }
   return null;
@@ -172,6 +175,56 @@ function normalizeRecentViewedOverride(value) {
   return null;
 }
 
+function normalizeColleagueContactedFilterOverride(value) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  const normalized = normalizeText(value).toLowerCase();
+  const compact = normalized.replace(/\s+/g, "");
+  if (!compact) return null;
+  if ([
+    "true",
+    "yes",
+    "y",
+    "1",
+    "on",
+    "enable",
+    "enabled",
+    "需要",
+    "是",
+    "开启",
+    "过滤",
+    "需要过滤",
+    "跳过",
+    "排除",
+    "剔除",
+    "近30天未和同事交换简历",
+    "未和同事交换简历",
+    "只看未和同事交换简历"
+  ].includes(compact)) return true;
+  if ([
+    "false",
+    "no",
+    "n",
+    "0",
+    "off",
+    "disable",
+    "disabled",
+    "不需要",
+    "否",
+    "关闭",
+    "不限",
+    "不过滤",
+    "不跳过",
+    "不排除",
+    "保留",
+    "none",
+    "all"
+  ].includes(compact)) return false;
+  if (/(?:不|别|无需|不用|不要).{0,6}(?:过滤|排除|跳过|剔除).{0,8}(?:同事|交换简历|触达|联系|沟通)/i.test(normalized)) return false;
+  if (/(?:过滤|排除|跳过|剔除).{0,8}(?:同事|交换简历|触达|联系|沟通)/i.test(normalized)) return true;
+  return normalizeBooleanOverride(value);
+}
+
 function normalizeBooleanOverride(value) {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
@@ -215,6 +268,29 @@ function extractSchoolFilterExplicit(rawText) {
 function extractRecentViewedExplicit(rawText) {
   const value = extractFieldLineValue(rawText, ["只看未查看", "过滤已看", "recent_not_view", "filter_recent_viewed"]);
   return value === null ? null : normalizeRecentViewedOverride(value);
+}
+
+function extractColleagueContactedFilterExplicit(rawText) {
+  const value = extractFieldLineValue(rawText, [
+    "同事近期触达",
+    "近期同事触达",
+    "同事触达",
+    "同事近期联系",
+    "近期同事联系",
+    "同事联系",
+    "同事近期沟通",
+    "近期同事沟通",
+    "同事沟通",
+    "同事交换简历",
+    "近期同事交换简历",
+    "近30天未和同事交换简历",
+    "filter_recent_colleague_contacted",
+    "recent_colleague_contacted",
+    "colleague_contacted_filter",
+    "colleague_contacted",
+    "skip_recent_colleague_contacted"
+  ]);
+  return value === null ? null : normalizeColleagueContactedFilterOverride(value);
 }
 
 function normalizeDegreesOverride(value) {
@@ -493,15 +569,21 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
   const rawInstruction = String(instruction || "");
   const text = normalizeText(rawInstruction);
   const finalConfirmed = confirmation?.final_confirmed === true;
-  const hasSkipRecentColleagueOverride = Object.prototype.hasOwnProperty.call(
-    overrides || {},
-    "skip_recent_colleague_contacted"
-  );
-  const confirmationSkipRecentColleagueContacted = normalizeBooleanOverride(
-    confirmation?.skip_recent_colleague_contacted_value
+  const hasSkipRecentColleagueOverride = [
+    "skip_recent_colleague_contacted",
+    "filter_recent_colleague_contacted",
+    "recent_colleague_contacted",
+    "colleague_contacted_filter",
+    "colleague_contacted"
+  ].some((key) => Object.prototype.hasOwnProperty.call(overrides || {}, key));
+  const confirmationSkipRecentColleagueContacted = normalizeColleagueContactedFilterOverride(
+    Object.prototype.hasOwnProperty.call(confirmation || {}, "filter_recent_colleague_contacted_value")
+      ? confirmation.filter_recent_colleague_contacted_value
+      : confirmation?.skip_recent_colleague_contacted_value
   );
   const explicitSchools = extractSchoolFilterExplicit(rawInstruction);
   const explicitRecentViewed = extractRecentViewedExplicit(rawInstruction);
+  const explicitColleagueContactedFilter = extractColleagueContactedFilterExplicit(rawInstruction);
   const explicitKeyword = extractFieldLineValue(rawInstruction, ["搜索关键词", "关键词", "keyword"]);
   const explicitJob = extractFieldLineValue(rawInstruction, ["岗位", "职位", "job"]);
   const explicitCity = extractFieldLineValue(rawInstruction, ["城市", "地点", "工作地", "base"]);
@@ -526,7 +608,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     schools: explicitSchools.explicit ? explicitSchools.schools : extractSchools(text),
     schools_explicit: explicitSchools.explicit,
     filter_recent_viewed: explicitRecentViewed !== null ? explicitRecentViewed : extractRecentViewedFilter(text),
-    skip_recent_colleague_contacted: confirmationSkipRecentColleagueContacted ?? true,
+    skip_recent_colleague_contacted: explicitColleagueContactedFilter ?? confirmationSkipRecentColleagueContacted,
     keyword_explicit: explicitKeyword || extractKeywordExplicit(text),
     keyword_auto: extractKeywordAuto(text),
     target_count: explicitTargetCount || extractTargetCount(text),
@@ -594,7 +676,17 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
         ? overrides.filter_recent_viewed
         : overrides.recent_not_view
     );
-    const overrideSkipRecentColleagueContacted = normalizeBooleanOverride(overrides.skip_recent_colleague_contacted);
+    const overrideSkipRecentColleagueContacted = normalizeColleagueContactedFilterOverride(
+      Object.prototype.hasOwnProperty.call(overrides, "skip_recent_colleague_contacted")
+        ? overrides.skip_recent_colleague_contacted
+        : Object.prototype.hasOwnProperty.call(overrides, "filter_recent_colleague_contacted")
+          ? overrides.filter_recent_colleague_contacted
+          : Object.prototype.hasOwnProperty.call(overrides, "recent_colleague_contacted")
+            ? overrides.recent_colleague_contacted
+            : Object.prototype.hasOwnProperty.call(overrides, "colleague_contacted_filter")
+              ? overrides.colleague_contacted_filter
+              : overrides.colleague_contacted
+    );
     const overridePostAction = normalizePostAction(overrides.post_action);
     if (overrideCity) parsed.city = overrideCity;
     if (overrideDegree) parsed.degree = overrideDegree;
@@ -638,6 +730,11 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
   const postAction = resolvePostAction(parsed, confirmation);
   const maxGreetCount = resolveMaxGreetCount(parsed, confirmation);
   const confirmationCriteria = normalizeStringOverride(confirmation?.criteria_value);
+  const skipRecentColleagueContacted = typeof parsed.skip_recent_colleague_contacted === "boolean"
+    ? parsed.skip_recent_colleague_contacted
+    : finalConfirmed
+      ? false
+      : null;
   const baseSearchParams = {
     job,
     city: parsed.city,
@@ -648,7 +745,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     gender: parsed.gender,
     age: parsed.age,
     filter_recent_viewed: parsed.filter_recent_viewed,
-    skip_recent_colleague_contacted: parsed.skip_recent_colleague_contacted !== false,
+    skip_recent_colleague_contacted: skipRecentColleagueContacted,
     keyword: keywordResolution.keyword
   };
   const criteria = parsed.criteria_override || confirmationCriteria || parsed.criteria_explicit || null;
@@ -664,7 +761,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     target_count: parsed.target_count,
     post_action: postAction,
     max_greet_count: maxGreetCount,
-    skip_recent_colleague_contacted: parsed.skip_recent_colleague_contacted !== false,
+    skip_recent_colleague_contacted: skipRecentColleagueContacted === true,
     search_exchange_resume_filter_days: 30
   };
   const missingBeforeDefaults = collectMissingFields(baseSearchParams, baseScreenParams, parsed);
@@ -687,6 +784,7 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
     && !hasSkipRecentColleagueOverride
     && confirmationSkipRecentColleagueContacted === null
     && confirmation?.skip_recent_colleague_contacted_confirmed !== true
+    && confirmation?.filter_recent_colleague_contacted_confirmed !== true
   );
   const needs_criteria_confirmation = Boolean(screenParams.criteria) && !finalConfirmed && confirmation?.criteria_confirmed !== true;
   const pending_questions = [
@@ -703,12 +801,12 @@ export function parseRecruitInstruction({ instruction, confirmation, overrides }
       : []),
     ...(needs_skip_recent_colleague_contacted_confirmation
       ? [{
-        field: "skip_recent_colleague_contacted",
-        question: "是否跳过近期已被同事触达的人选？搜索页会开启 Boss 的“近30天未和同事交换简历”过滤。",
+        field: "filter_recent_colleague_contacted",
+        question: "是否过滤近期已被同事触达的人选？开启后搜索页会勾选 Boss 的“近30天未和同事交换简历”。",
         value: true,
         options: [
-          { label: "跳过（推荐）", value: true },
-          { label: "不跳过", value: false }
+          { label: "过滤", value: true },
+          { label: "不过滤", value: false }
         ]
       }]
       : []),

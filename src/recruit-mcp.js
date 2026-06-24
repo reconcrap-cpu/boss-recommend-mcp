@@ -712,6 +712,11 @@ export function createRecruitPipelineInputSchema() {
           criteria_value: { type: "string" },
           skip_recent_colleague_contacted_confirmed: { type: "boolean" },
           skip_recent_colleague_contacted_value: { type: "boolean" },
+          filter_recent_colleague_contacted_confirmed: { type: "boolean" },
+          filter_recent_colleague_contacted_value: {
+            type: "boolean",
+            description: "是否过滤近期已被同事触达的人选；true 会开启搜索页“近30天未和同事交换简历”。"
+          },
           post_action_confirmed: { type: "boolean" },
           post_action_value: {
             type: "string",
@@ -744,7 +749,18 @@ export function createRecruitPipelineInputSchema() {
           filter_recent_viewed: { type: "boolean" },
           skip_recent_colleague_contacted: {
             type: "boolean",
-            description: "默认 true。搜索页使用 Boss 的“近30天未和同事交换简历”过滤；false 会确保该过滤取消。"
+            description: "显式 true 时开启 Boss 的“近30天未和同事交换简历”过滤；false 会确保该过滤取消；未提供时不默认开启。"
+          },
+          filter_recent_colleague_contacted: {
+            type: "boolean",
+            description: "是否过滤近期已被同事触达的人选；true 会开启搜索页“近30天未和同事交换简历”；false 会确保该过滤取消。"
+          },
+          recent_colleague_contacted: {
+            anyOf: [
+              { type: "boolean" },
+              { type: "string" }
+            ],
+            description: "同事近期触达筛选别名；可填 不限/不过滤/过滤。"
           },
           recent_not_view: {
             anyOf: [
@@ -1049,7 +1065,7 @@ function buildRequiredConfirmations(parsedResult) {
   if (parsedResult.needs_search_params_confirmation) confirmations.push("search_params");
   if (parsedResult.needs_keyword_confirmation) confirmations.push("keyword");
   if (parsedResult.needs_recent_viewed_filter_confirmation) confirmations.push("filter_recent_viewed");
-  if (parsedResult.needs_skip_recent_colleague_contacted_confirmation) confirmations.push("skip_recent_colleague_contacted");
+  if (parsedResult.needs_skip_recent_colleague_contacted_confirmation) confirmations.push("filter_recent_colleague_contacted");
   if (parsedResult.needs_criteria_confirmation) confirmations.push("criteria");
   if (parsedResult.has_unresolved_missing_fields) confirmations.push("missing_fields_or_defaults");
   if ((parsedResult.suspicious_fields || []).length) confirmations.push("suspicious_fields");

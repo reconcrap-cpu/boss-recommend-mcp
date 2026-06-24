@@ -56,7 +56,7 @@ import {
 function parseBoolean(raw) {
   const normalized = String(raw || "").trim().toLowerCase();
   if (["true", "1", "yes", "y", "on", "是", "要", "需要", "过滤"].includes(normalized)) return true;
-  if (["false", "0", "no", "n", "off", "否", "不要", "不需要", "不过滤"].includes(normalized)) return false;
+  if (["false", "0", "no", "n", "off", "否", "不要", "不需要", "不过滤", "不限"].includes(normalized)) return false;
   return null;
 }
 
@@ -168,6 +168,10 @@ function parseArgs(argv) {
     if (arg === "--filter-recent-viewed") {
       const parsed = parseBoolean(argv[++index]);
       if (parsed !== null) result.overrides.filter_recent_viewed = parsed;
+    }
+    if (arg === "--filter-recent-colleague-contacted" || arg === "--skip-recent-colleague-contacted") {
+      const parsed = parseBoolean(argv[++index]);
+      if (parsed !== null) result.overrides.filter_recent_colleague_contacted = parsed;
     }
     if (arg === "--slow-live") {
       result.resetTimeoutMs = 300000;
@@ -290,6 +294,12 @@ function validateSearchApplication(parsedInstruction, searchApplication) {
     const ok = result?.applied === true && result.requested === searchParams.filter_recent_viewed;
     checks.push({ field: "filter_recent_viewed", ok, result });
     if (!ok) failures.push("filter_recent_viewed");
+  }
+  if (typeof searchParams.skip_recent_colleague_contacted === "boolean") {
+    const result = stepResult(searchApplication, "exchange_resume");
+    const ok = result?.applied === true && result.requested === searchParams.skip_recent_colleague_contacted;
+    checks.push({ field: "filter_recent_colleague_contacted", ok, result });
+    if (!ok) failures.push("filter_recent_colleague_contacted");
   }
 
   if (failures.length) {

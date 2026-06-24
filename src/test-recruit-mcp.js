@@ -125,6 +125,9 @@ async function testToolListIncludesRecruitTools() {
   assert.ok(startTool.inputSchema.properties.overrides.properties.gender);
   assert.ok(startTool.inputSchema.properties.overrides.properties.age);
   assert.ok(startTool.inputSchema.properties.overrides.properties.age_range);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.filter_recent_colleague_contacted);
+  assert.ok(startTool.inputSchema.properties.overrides.properties.recent_colleague_contacted);
+  assert.ok(startTool.inputSchema.properties.confirmation.properties.filter_recent_colleague_contacted_value);
   assert.deepEqual(startTool.inputSchema.properties.overrides.properties.post_action.enum, ["greet", "none"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.restLevel.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
@@ -192,8 +195,8 @@ async function testRecruitAsksSkipRecentColleagueContactedBeforeRun() {
   }, 25);
   assert.equal(payload.status, "NEED_CONFIRMATION");
   assert.equal(connectorCalled, false);
-  assert.deepEqual(payload.required_confirmations, ["skip_recent_colleague_contacted"]);
-  assert.deepEqual(payload.pending_questions.map((question) => question.field), ["skip_recent_colleague_contacted"]);
+  assert.deepEqual(payload.required_confirmations, ["filter_recent_colleague_contacted"]);
+  assert.deepEqual(payload.pending_questions.map((question) => question.field), ["filter_recent_colleague_contacted"]);
   assert.equal(payload.pending_questions[0].value, true);
   assert.equal(payload.pending_questions[0].options[0].value, true);
   assert.equal(payload.pending_questions[0].options[1].value, false);
@@ -266,9 +269,40 @@ async function testRecruitFullUpfrontArgsFinalConfirmStarts() {
     label: "25-35"
   });
   assert.equal(observedOptions.searchParams.filter_recent_viewed, false);
+  assert.equal(observedOptions.searchParams.skip_recent_colleague_contacted, false);
   assert.equal(observedOptions.maxCandidates, 20);
   assert.match(observedOptions.criteria, /只有同时满足以下全部硬条件/);
   assert.match(observedOptions.criteria, /产品\/行业匹配/);
+}
+
+async function testRecruitColleagueContactFilterAliasPassThrough() {
+  let observedOptions = null;
+  installFakeConnector();
+  setRecruitMcpWorkflowForTests(async (options, runControl) => {
+    observedOptions = options;
+    runControl.setPhase("recruit:test-colleague-contact-filter");
+    runControl.updateProgress({ processed: 1, screened: 1, passed: 0 });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 0,
+      results: []
+    };
+  });
+  const baseArgs = readyArgs();
+  const payload = await callTool(TOOL_RUN, {
+    ...baseArgs,
+    overrides: {
+      ...baseArgs.overrides,
+      filter_recent_colleague_contacted: true
+    },
+    execution_mode: "sync"
+  }, 26);
+  assert.equal(payload.status, "COMPLETED");
+  assert.equal(observedOptions.searchParams.filter_recent_viewed, false);
+  assert.equal(observedOptions.searchParams.skip_recent_colleague_contacted, true);
 }
 
 async function testRecruitDefaultsUseScreeningConfig() {
@@ -543,6 +577,8 @@ async function main() {
     await testRecruitAsksSkipRecentColleagueContactedBeforeRun();
     resetRecruitMcpStateForTests();
     await testRecruitFullUpfrontArgsFinalConfirmStarts();
+    resetRecruitMcpStateForTests();
+    await testRecruitColleagueContactFilterAliasPassThrough();
     resetRecruitMcpStateForTests();
     await testRecruitDefaultsUseScreeningConfig();
     resetRecruitMcpStateForTests();

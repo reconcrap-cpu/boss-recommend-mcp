@@ -14,6 +14,7 @@ import {
   chooseRecruitTextCandidate,
   clickRecruitActionControl,
   findRecruitBlockingPanel,
+  ensureRecruitCardInViewport,
   isRecoverableRecruitDetailError,
   isRecruitNationalCity,
   matchesRecruitDetailNetwork,
@@ -194,7 +195,7 @@ function testSearchParamHelpers() {
     schools: ["985院校", "QS 100"],
     keyword: "算法工程师",
     filter_recent_viewed: true,
-    skip_recent_colleague_contacted: true
+    skip_recent_colleague_contacted: null
   });
 
   assert.deepEqual(normalizeRecruitSearchParams({
@@ -288,7 +289,7 @@ function testSearchParamHelpers() {
     age: { min: 25, max: 35 },
     keyword: "用户运营",
     filter_recent_viewed: true
-  }), ["job_title", "city", "degree", "schools", "experience", "gender", "age", "recent_viewed", "exchange_resume", "keyword", "search"]);
+  }), ["job_title", "city", "degree", "schools", "experience", "gender", "age", "recent_viewed", "keyword", "search"]);
   const noJobSteps = buildRecruitSearchApplicationStepNames({
     city: "上海",
     keyword: "用户运营"
@@ -303,10 +304,64 @@ function testExchangeResumeFilterStepNames() {
     keyword: "三维重建",
     skip_recent_colleague_contacted: true
   }).slice(-3), ["exchange_resume", "keyword", "search"]);
+  assert.deepEqual(buildRecruitSearchApplicationStepNames({
+    keyword: "三维重建"
+  }).slice(-2), ["keyword", "search"]);
   assert.equal(normalizeRecruitSearchParams({
     keyword: "三维重建",
     skip_recent_colleague_contacted: false
   }).skip_recent_colleague_contacted, false);
+
+  const explicitColleagueFilter = parseRecruitInstruction({
+    instruction: [
+      "岗位：海外用户增长运营专家（AI产品） _ 上海",
+      "关键词：用户运营",
+      "城市：上海",
+      "学历：本科及以上",
+      "学校类型：不限",
+      "只看未查看：不限",
+      "同事近期触达：过滤",
+      "目标筛选人数：3",
+      "筛选条件：候选人需要有用户运营经验。"
+    ].join("\n"),
+    confirmation: {
+      final_confirmed: true
+    }
+  });
+  assert.equal(explicitColleagueFilter.searchParams.filter_recent_viewed, false);
+  assert.equal(explicitColleagueFilter.searchParams.skip_recent_colleague_contacted, true);
+
+  const explicitNoColleagueFilter = parseRecruitInstruction({
+    instruction: [
+      "岗位：海外用户增长运营专家（AI产品） _ 上海",
+      "关键词：用户运营",
+      "城市：上海",
+      "学历：本科及以上",
+      "学校类型：不限",
+      "只看未查看：不限",
+      "近期同事触达：不限",
+      "目标筛选人数：3",
+      "筛选条件：候选人需要有用户运营经验。"
+    ].join("\n"),
+    confirmation: {
+      final_confirmed: true
+    }
+  });
+  assert.equal(explicitNoColleagueFilter.searchParams.filter_recent_viewed, false);
+  assert.equal(explicitNoColleagueFilter.searchParams.skip_recent_colleague_contacted, false);
+
+  const semicolonPackedFields = parseRecruitInstruction({
+    instruction: "岗位：海外用户增长运营专家（AI产品） _ 上海；城市：上海；学历：本科及以上；学校：985、211；关键词：用户运营，增长运营；同事近期触达：不限；目标筛选人数：3；筛选条件：候选人需要有用户运营经验。",
+    confirmation: {
+      final_confirmed: true
+    }
+  });
+  assert.equal(semicolonPackedFields.searchParams.job, "海外用户增长运营专家（AI产品） _ 上海");
+  assert.equal(semicolonPackedFields.searchParams.city, "上海");
+  assert.equal(semicolonPackedFields.searchParams.degree, "本科及以上");
+  assert.deepEqual(semicolonPackedFields.searchParams.schools, ["985院校", "211院校"]);
+  assert.equal(semicolonPackedFields.searchParams.keyword, "用户运营，增长运营");
+  assert.equal(semicolonPackedFields.searchParams.skip_recent_colleague_contacted, false);
 }
 
 function createExchangeResumeFilterClient({ allowClick = false } = {}) {
@@ -460,6 +515,54 @@ function boxModelForRect(rect) {
       border: [x, y, x + width, y, x + width, y + height, x, y + height]
     }
   };
+}
+
+async function testRecruitCardViewportGuardScrollsCardIntoView() {
+  let cardY = 920;
+  const wheelEvents = [];
+  const scrollIntoViewCalls = [];
+  const client = {
+    Page: {
+      async getLayoutMetrics() {
+        return {
+          cssVisualViewport: {
+            clientWidth: 1000,
+            clientHeight: 600
+          }
+        };
+      }
+    },
+    DOM: {
+      async scrollIntoViewIfNeeded({ nodeId }) {
+        scrollIntoViewCalls.push(nodeId);
+        return {};
+      },
+      async getBoxModel({ nodeId }) {
+        assert.equal(nodeId, 42);
+        return boxModelForRect({ x: 120, y: cardY, width: 520, height: 140 });
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(params) {
+        if (params.type === "mouseWheel") {
+          wheelEvents.push(params);
+          cardY -= params.deltaY;
+        }
+        return {};
+      }
+    }
+  };
+
+  const result = await ensureRecruitCardInViewport(client, 42, {
+    settleMs: 0,
+    maxScrollAttempts: 4
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.verified, true);
+  assert.equal(scrollIntoViewCalls[0], 42);
+  assert.equal(wheelEvents.length > 0, true);
+  assert.equal(result.attempts[0].in_viewport, false);
+  assert.equal(result.attempts.at(-1).in_viewport, true);
 }
 
 function createRecruitJobDropdownClient() {
@@ -1003,7 +1106,11 @@ async function testRecruitGenderSelectionUsesVisibleDropdown() {
   assert.equal(alreadyUnlimited.state.selectedLabel, "不限");
 }
 
-function createRecruitAgeFilterClient({ unlimitedValue = "0" } = {}) {
+function createRecruitAgeFilterClient({
+  unlimitedValue = "0",
+  includeHiddenDropdowns = false,
+  hideVisibleDropdownWrappers = false
+} = {}) {
   const optionLabels = {
     300: "不限",
     301: "20-25",
@@ -1060,7 +1167,12 @@ function createRecruitAgeFilterClient({ unlimitedValue = "0" } = {}) {
           const selector = params.selector || "";
           if (selector.includes("age-item")) return { nodeIds: optionIds };
           if (selector.includes(".age-select .custom") || selector.includes("[class*=\"age\"] [class*=\"custom\"]")) return { nodeIds: [310] };
-          if (selector.includes("age-custom .dropdown-wrap")) return { nodeIds: customVisible ? [320, 321] : [] };
+          if (selector.includes("age-custom .dropdown-wrap")) {
+            return { nodeIds: customVisible ? [
+              ...(includeHiddenDropdowns ? [318, 319] : []),
+              ...(hideVisibleDropdownWrappers ? [] : [320, 321])
+            ] : [] };
+          }
           if (selector.includes("age-custom input")) return { nodeIds: customVisible ? [330, 331, 332, 333] : [] };
           if (selector.includes("age-custom li")) return { nodeIds: openDropdownIndex === null ? [] : ageOptionNodeIds };
           return { nodeIds: [] };
@@ -1161,6 +1273,31 @@ async function testRecruitAgeSelectionSupportsOptionsAndCustomRange() {
   assert.equal(custom.state.maxValue, "35");
   assert.equal(customResult.verification.verified, true);
   assert.deepEqual(customResult.verification.actual, [25, 35]);
+
+  const customWithHiddenDropdowns = createRecruitAgeFilterClient({ includeHiddenDropdowns: true });
+  const hiddenDropdownResult = await setRecruitAge(customWithHiddenDropdowns.client, 1, { min: 25, max: 35 });
+  assert.equal(hiddenDropdownResult.applied, true);
+  assert.equal(hiddenDropdownResult.mode, "custom");
+  assert.equal(customWithHiddenDropdowns.state.minValue, "25");
+  assert.equal(customWithHiddenDropdowns.state.maxValue, "35");
+  assert.deepEqual(
+    hiddenDropdownResult.selected.map((item) => item.dropdown_node_id),
+    [320, 321]
+  );
+
+  const customWithInputTriggers = createRecruitAgeFilterClient({
+    includeHiddenDropdowns: true,
+    hideVisibleDropdownWrappers: true
+  });
+  const inputTriggerResult = await setRecruitAge(customWithInputTriggers.client, 1, { min: 25, max: 35 });
+  assert.equal(inputTriggerResult.applied, true);
+  assert.equal(inputTriggerResult.mode, "custom");
+  assert.equal(customWithInputTriggers.state.minValue, "25");
+  assert.equal(customWithInputTriggers.state.maxValue, "35");
+  assert.deepEqual(
+    inputTriggerResult.selected.map((item) => item.dropdown_node_id),
+    [330, 332]
+  );
 
   const strictUpper = createRecruitAgeFilterClient({ unlimitedValue: "-1" });
   const strictUpperResult = await setRecruitAge(strictUpper.client, 1, "低于40");
@@ -1319,6 +1456,7 @@ testSearchParamHelpers();
 testExchangeResumeFilterStepNames();
 await testExchangeResumeFilterActiveDetection();
 await testCardCandidateReader();
+await testRecruitCardViewportGuardScrollsCardIntoView();
 await testRunServiceLifecycle();
 await testRecruitGreetQuotaClickGuard();
 await testRecruitJobSelectionOpensVisibleDropdown();

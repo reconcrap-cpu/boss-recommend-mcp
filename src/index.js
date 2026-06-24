@@ -882,7 +882,7 @@ function createRunInputSchema() {
           },
           skip_recent_colleague_contacted: {
             type: "boolean",
-            description: "默认 true。推荐页跳过近14天同事沟通过的人选；搜索页使用近30天未和同事交换简历过滤。"
+            description: "推荐页默认 true，用于跳过近14天同事沟通过的人选。搜索页请使用 recruit 工具的 filter_recent_colleague_contacted。"
           },
           criteria: { type: "string" },
           job: { type: "string" },
@@ -1390,7 +1390,12 @@ function createCompactRunInputSchema() {
             description: "用户完成总确认后传 true"
           },
           skip_recent_colleague_contacted_confirmed: { type: "boolean" },
-          skip_recent_colleague_contacted_value: { type: "boolean" }
+          skip_recent_colleague_contacted_value: { type: "boolean" },
+          filter_recent_colleague_contacted_confirmed: { type: "boolean" },
+          filter_recent_colleague_contacted_value: {
+            type: "boolean",
+            description: "是否过滤近期已被同事触达的人选；true 会开启搜索页“近30天未和同事交换简历”。"
+          }
         },
         additionalProperties: true
       },
@@ -1413,6 +1418,17 @@ function createCompactRunInputSchema() {
           gender: { type: "string" },
           recent_not_view: { type: "string" },
           skip_recent_colleague_contacted: { type: "boolean" },
+          filter_recent_colleague_contacted: {
+            type: "boolean",
+            description: "是否过滤近期已被同事触达的人选；true 会开启搜索页“近30天未和同事交换简历”；false 会确保该过滤取消。"
+          },
+          recent_colleague_contacted: {
+            anyOf: [
+              { type: "boolean" },
+              { type: "string" }
+            ],
+            description: "同事近期触达筛选别名；可填 不限/不过滤/过滤。"
+          },
           criteria: { type: "string" },
           target_count: targetCountSchema,
           post_action: { type: "string", enum: ["greet", "none"] },

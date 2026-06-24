@@ -691,6 +691,9 @@ export function normalizeRecruitSearchParams(searchParams = {}) {
   const experience = normalizeRecruitExperienceFilter(pickRecruitExperienceSource(searchParams));
   const gender = normalizeRecruitGenderFilter(searchParams.gender);
   const age = normalizeRecruitAgeFilter(pickRecruitAgeSource(searchParams));
+  const skipRecentColleagueContacted = typeof searchParams.skip_recent_colleague_contacted === "boolean"
+    ? searchParams.skip_recent_colleague_contacted
+    : null;
   const normalized = {
     city: normalizeText(searchParams.city) || null,
     degree: degrees[0] || "不限",
@@ -700,7 +703,7 @@ export function normalizeRecruitSearchParams(searchParams = {}) {
     filter_recent_viewed: typeof searchParams.filter_recent_viewed === "boolean"
       ? searchParams.filter_recent_viewed
       : null,
-    skip_recent_colleague_contacted: searchParams.skip_recent_colleague_contacted !== false
+    skip_recent_colleague_contacted: skipRecentColleagueContacted
   };
   const job = normalizeText(searchParams.job || searchParams.job_title || searchParams.selected_job);
   if (job) normalized.job = job;
@@ -733,6 +736,9 @@ export function hasRecruitSearchParams(searchParams = {}) {
   const experience = normalizeRecruitExperienceFilter(pickRecruitExperienceSource(searchParams));
   const gender = normalizeRecruitGenderFilter(searchParams.gender);
   const age = normalizeRecruitAgeFilter(pickRecruitAgeSource(searchParams));
+  const skipRecentColleagueContacted = typeof searchParams.skip_recent_colleague_contacted === "boolean"
+    ? searchParams.skip_recent_colleague_contacted
+    : null;
   const normalized = {
     city: normalizeText(searchParams.city) || null,
     degree: degrees[0] || "不限",
@@ -742,7 +748,7 @@ export function hasRecruitSearchParams(searchParams = {}) {
     filter_recent_viewed: typeof searchParams.filter_recent_viewed === "boolean"
       ? searchParams.filter_recent_viewed
       : null,
-    skip_recent_colleague_contacted: searchParams.skip_recent_colleague_contacted !== false
+    skip_recent_colleague_contacted: skipRecentColleagueContacted
   };
   return Boolean(
     job
@@ -2239,20 +2245,180 @@ function parseRecruitAgeCustomHiddenValue(value) {
   return parseAgeNumber(text, null);
 }
 
+async function listRecruitAgeCustomTriggerState(client, frameNodeId) {
+  const triggerSources = [
+    {
+      source: "dropdown",
+      node_ids: uniqueNodeIds(await querySelectorAll(
+        client,
+        frameNodeId,
+        RECRUIT_SEARCH_SELECTORS.ageCustomDropdown.join(", ")
+      ))
+    },
+    {
+      source: "input",
+      node_ids: uniqueNodeIds(await querySelectorAll(
+        client,
+        frameNodeId,
+        RECRUIT_SEARCH_SELECTORS.ageCustomInput.join(", ")
+      ))
+    }
+  ];
+  const discovered = [];
+  const seenTriggers = new Set();
+  for (const { source, node_ids: nodeIds } of triggerSources) {
+    for (const nodeId of nodeIds) {
+      if (seenTriggers.has(nodeId)) continue;
+      seenTriggers.add(nodeId);
+      const attributes = await getAttributesMap(client, nodeId).catch(() => ({}));
+      if (source === "input" && attributes.type === "hidden") {
+        discovered.push({
+          node_id: nodeId,
+          source,
+          visible: false,
+          reason: "hidden_input"
+        });
+        continue;
+      }
+      let box = null;
+      try {
+        box = await getNodeBox(client, nodeId);
+      } catch (error) {
+        discovered.push({
+          node_id: nodeId,
+          source,
+          visible: false,
+          error: error?.message || String(error)
+        });
+        continue;
+      }
+      discovered.push({
+        node_id: nodeId,
+        source,
+        visible: isVisibleBox(box),
+        center: box.center,
+        rect: box.rect
+      });
+    }
+  }
+  const sortTriggers = (items) => items
+    .slice()
+    .sort((left, right) => left.rect.x - right.rect.x || left.rect.y - right.rect.y);
+  const visible_dropdowns = sortTriggers(discovered.filter((item) => item.visible && item.source === "dropdown"));
+  const visible_inputs = sortTriggers(discovered.filter((item) => item.visible && item.source === "input"));
+  return {
+    discovered,
+    visible_dropdowns,
+    visible_inputs,
+    preferred: visible_dropdowns.length >= 2 ? visible_dropdowns : visible_inputs
+  };
+}
+
+async function waitForRecruitAgeCustomTriggerState(client, frameNodeId, {
+  timeoutMs = 1800,
+  intervalMs = 150
+} = {}) {
+  const started = Date.now();
+  let state = null;
+  while (Date.now() - started <= timeoutMs) {
+    state = await listRecruitAgeCustomTriggerState(client, frameNodeId);
+    if ((state.preferred || []).length >= 2) {
+      return {
+        ok: true,
+        elapsed_ms: Date.now() - started,
+        ...state
+      };
+    }
+    await sleep(intervalMs);
+  }
+  return {
+    ok: false,
+    elapsed_ms: Date.now() - started,
+    ...(state || { discovered: [], visible_dropdowns: [], visible_inputs: [], preferred: [] })
+  };
+}
+
+async function openRecruitAgeCustomControls(client, frameNodeId) {
+  const alreadyOpen = await waitForRecruitAgeCustomTriggerState(client, frameNodeId, {
+    timeoutMs: 200,
+    intervalMs: 100
+  });
+  if (alreadyOpen.ok) {
+    return {
+      opened: true,
+      already_open: true,
+      trigger_state: alreadyOpen
+    };
+  }
+
+  const attempts = [];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const candidates = await listTextCandidates(client, frameNodeId, RECRUIT_SEARCH_SELECTORS.ageCustom, {
+      includeBox: true
+    });
+    const visibleCandidates = candidates.filter((item) => item.visible);
+    const labelCandidate = chooseRecruitTextCandidate(visibleCandidates, {
+      label: "自定义",
+      match: "exact"
+    });
+    const customClick = labelCandidate
+      ? {
+        clicked: true,
+        selector: labelCandidate.selector,
+        node_id: labelCandidate.node_id,
+        box: await clickNodeCenter(client, labelCandidate.node_id, {
+          ...DETERMINISTIC_CLICK_OPTIONS,
+          scrollIntoView: true
+        })
+      }
+      : await clickFirstNodeBySelectors(
+        client,
+        frameNodeId,
+        RECRUIT_SEARCH_SELECTORS.ageCustom,
+        { optional: false, scrollIntoView: true }
+      );
+    await sleep(500);
+    const triggerState = await waitForRecruitAgeCustomTriggerState(client, frameNodeId);
+    attempts.push({
+      attempt,
+      click: customClick,
+      matched_label: labelCandidate ? compactRecruitTextCandidate(labelCandidate) : null,
+      candidates: visibleCandidates.map(compactRecruitTextCandidate).slice(0, 10),
+      trigger_state: triggerState
+    });
+    if (triggerState.ok) {
+      return {
+        opened: true,
+        already_open: false,
+        attempts,
+        trigger_state: triggerState
+      };
+    }
+  }
+
+  const error = new Error("Recruit age custom controls did not open after clicking 自定义");
+  error.age_custom_attempts = attempts;
+  error.discovered_dropdowns = attempts[attempts.length - 1]?.trigger_state?.discovered || [];
+  throw error;
+}
+
 async function selectRecruitAgeCustomDropdownValue(client, frameNodeId, {
   dropdownIndex,
   value
 }) {
-  const dropdownNodeIds = uniqueNodeIds(await querySelectorAll(
-    client,
-    frameNodeId,
-    RECRUIT_SEARCH_SELECTORS.ageCustomDropdown.join(", ")
-  ));
-  const dropdownNodeId = dropdownNodeIds[dropdownIndex];
-  if (!dropdownNodeId) {
-    throw new Error(`Recruit age custom dropdown was not found: index=${dropdownIndex}`);
+  const triggerState = await listRecruitAgeCustomTriggerState(client, frameNodeId);
+  const visibleDropdownWrappers = triggerState.visible_dropdowns || [];
+  const visibleInputTriggers = triggerState.visible_inputs || [];
+  const visibleDropdowns = visibleDropdownWrappers.length > dropdownIndex
+    ? visibleDropdownWrappers
+    : visibleInputTriggers;
+  const dropdown = visibleDropdowns[dropdownIndex];
+  if (!dropdown?.node_id) {
+    const error = new Error(`Recruit age custom dropdown was not found: index=${dropdownIndex}`);
+    error.discovered_dropdowns = triggerState.discovered;
+    throw error;
   }
-  const openBox = await clickNodeCenter(client, dropdownNodeId, {
+  const openBox = await clickNodeCenter(client, dropdown.node_id, {
     ...DETERMINISTIC_CLICK_OPTIONS,
     scrollIntoView: true
   });
@@ -2261,7 +2427,8 @@ async function selectRecruitAgeCustomDropdownValue(client, frameNodeId, {
   const options = await listTextCandidates(client, frameNodeId, RECRUIT_SEARCH_SELECTORS.ageCustomOption, {
     includeBox: true
   });
-  const option = chooseRecruitTextCandidate(options, { label, match: "exact" });
+  const visibleOptions = options.filter((item) => item.visible);
+  const option = chooseRecruitTextCandidate(visibleOptions, { label, match: "exact" });
   if (!option) {
     throw new Error(`Recruit age custom option was not found: ${label}`);
   }
@@ -2274,10 +2441,11 @@ async function selectRecruitAgeCustomDropdownValue(client, frameNodeId, {
     dropdown_index: dropdownIndex,
     requested_value: value,
     selected_label: option.text,
-    dropdown_node_id: dropdownNodeId,
+    dropdown_node_id: dropdown.node_id,
     option_node_id: option.node_id,
     open_box: openBox,
     box,
+    discovered_dropdowns: triggerState.discovered,
     discovered_options: summarizeTextCandidates(options, 40)
   };
 }
@@ -2320,12 +2488,7 @@ export async function setRecruitAge(client, frameNodeId, age) {
     };
   }
 
-  const customClick = await clickFirstNodeBySelectors(
-    client,
-    frameNodeId,
-    RECRUIT_SEARCH_SELECTORS.ageCustom,
-    { optional: false, scrollIntoView: true }
-  );
+  const customOpen = await openRecruitAgeCustomControls(client, frameNodeId);
   const before = await readRecruitAgeCustomState(client, frameNodeId);
   const fixedBefore = await readRecruitAgeFixedOptionState(client, frameNodeId);
   const selected = [];
@@ -2354,7 +2517,7 @@ export async function setRecruitAge(client, frameNodeId, age) {
       min: filter.min,
       max: filter.max
     },
-    custom_click: customClick,
+    custom_open: customOpen,
     before,
     after,
     fixed_options_before: fixedBefore,

@@ -109,6 +109,8 @@ function compactDetail(detailResult) {
   return {
     popup_text_length: detailResult.detail?.popup_text?.length || 0,
     resume_text_length: detailResult.detail?.resume_text?.length || 0,
+    card_box: detailResult.card_box || null,
+    open_attempts: detailResult.open_attempts || [],
     network_body_count: detailResult.network_bodies?.filter((item) => item.body).length || 0,
     parsed_network_profile_count: detailResult.parsed_network_profiles?.filter((item) => item.ok).length || 0,
     cv_acquisition: detailResult.cv_acquisition || null,
@@ -593,7 +595,7 @@ export async function runRecruitWorkflow({
   const normalizedPostAction = normalizeRecruitPostAction(postAction);
   const postActionEnabled = normalizedPostAction !== "none";
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
-  const searchExchangeResumeFilterRequested = normalizedSearchParams.skip_recent_colleague_contacted !== false;
+  const searchExchangeResumeFilterRequested = normalizedSearchParams.skip_recent_colleague_contacted === true;
   let searchExchangeResumeFilterApplied = false;
   const limit = Math.max(1, Number(maxCandidates) || 1);
   const detailCountLimit = detailLimit == null ? limit : Math.max(0, Number(detailLimit) || 0);
@@ -1047,6 +1049,8 @@ export async function runRecruitWorkflow({
           networkParseRetryMs: waitPlan.mode_before === "image" ? 500 : 2200,
           networkParseIntervalMs: 250
         });
+        detailResult.card_box = openedDetail.card_box || null;
+        detailResult.open_attempts = openedDetail.open_attempts || [];
         addTiming(timings, "late_network_retry_ms", detailResult.network_parse_retry_elapsed_ms);
         const parsedNetworkProfileCount = countParsedNetworkProfiles(detailResult);
         let source = "network";
@@ -1484,7 +1488,7 @@ export function createRecruitRunService({
     const normalizedSearchParams = normalizeSearchParams(searchParams);
     const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
     const normalizedPostAction = normalizeRecruitPostAction(postAction);
-    const searchExchangeResumeFilterRequested = normalizedSearchParams.skip_recent_colleague_contacted !== false;
+    const searchExchangeResumeFilterRequested = normalizedSearchParams.skip_recent_colleague_contacted === true;
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? candidateLimit : Math.max(0, Number(detailLimit) || 0);
     const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
