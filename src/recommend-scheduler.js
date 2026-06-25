@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { getStateHome } from "./run-state.js";
 import {
+  compactRecommendRunForStatus,
   getRecommendPipelineRunTool,
   prepareRecommendPipelineRunTool,
   startRecommendPipelineRunTool
@@ -140,6 +141,19 @@ function writeSchedule(scheduleId, patch) {
     schedule_id: scheduleId,
     updated_at: nowIso()
   });
+}
+
+function compactScheduleForStatus(schedule) {
+  if (!schedule || typeof schedule !== "object" || Array.isArray(schedule)) return schedule || null;
+  const compact = clonePlain(schedule, schedule);
+  if (compact.run) compact.run = compactRecommendRunForStatus(compact.run);
+  if (compact.launch_payload?.run) {
+    compact.launch_payload = {
+      ...compact.launch_payload,
+      run: compactRecommendRunForStatus(compact.launch_payload.run)
+    };
+  }
+  return compact;
 }
 
 function isProcessAlive(pid) {
@@ -355,7 +369,7 @@ export function getRecommendScheduledRunTool({ args = {} } = {}) {
   return {
     status: "OK",
     schedule_id: scheduleId,
-    schedule: next
+    schedule: compactScheduleForStatus(next)
   };
 }
 

@@ -190,6 +190,27 @@ function readyArgs(extra = {}) {
   };
 }
 
+function makeLargeRecommendResults(count = 20, marker = "large status payload should not appear") {
+  return Array.from({ length: count }, (_, index) => ({
+    candidate: {
+      identity: {
+        name: `候选人${index}`,
+        marker,
+        oversized_text: `${marker} ${index} `.repeat(80)
+      }
+    },
+    detail: {
+      llm_screening: true,
+      evidence: `${marker} detail ${index} `.repeat(80)
+    },
+    screening: {
+      passed: index % 2 === 0,
+      status: index % 2 === 0 ? "pass" : "fail",
+      reasons: [marker]
+    }
+  }));
+}
+
 function singleReviewArgs(extra = {}) {
   return {
     instruction: "推荐页运行",
@@ -864,22 +885,39 @@ async function testRecommendScheduleWorkerStartsSavedPayload() {
   }));
   installFakeConnector();
   let observedOptions = null;
+  const marker = "scheduled status oversized result marker";
+  const results = makeLargeRecommendResults(25, marker);
   setRecommendMcpWorkflowForTests(async (options, runControl) => {
     observedOptions = options;
     runControl.setPhase("recommend:scheduled-worker");
     runControl.updateProgress({
       target_count: options.maxCandidates,
-      processed: 1,
-      screened: 1,
+      processed: results.length,
+      screened: results.length,
+      detail_opened: results.length,
       passed: 0
+    });
+    runControl.checkpoint({
+      results,
+      checkpoint_marker: marker
     });
     return {
       domain: "recommend",
-      processed: 1,
-      screened: 1,
-      detail_opened: 1,
+      processed: results.length,
+      screened: results.length,
+      detail_opened: results.length,
       passed: 0,
-      results: []
+      candidate_list: {
+        card_count: results.length,
+        cards: results
+      },
+      viewport_health: {
+        stats: {
+          total: results.length
+        },
+        events: results
+      },
+      results
     };
   });
   try {
@@ -902,10 +940,92 @@ async function testRecommendScheduleWorkerStartsSavedPayload() {
     assert.equal(status.schedule.state, "completed");
     assert.ok(status.schedule.run_id);
     assert.equal(status.schedule.run.state, "completed");
+    assert.equal(status.schedule.run.result.results_count, results.length);
+    assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.run.result, "results"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.run.summary, "results"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.run.checkpoint, "results"), false);
+    const serialized = JSON.stringify(status);
+    assert.equal(serialized.includes(marker), false);
+    assert.ok(serialized.length < 30000);
     assert.equal(observedOptions.humanBehavior.restLevel, "medium");
   } finally {
     setRecommendSchedulerSpawnForTests(null);
   }
+}
+
+async function testRecommendScheduleStatusCompactsPersistedInlineRun() {
+  const scheduleId = "mcp_recommend_schedule_compact_status_test";
+  const runId = "mcp_recommend_schedule_compact_run_test";
+  const marker = "persisted schedule oversized marker";
+  const results = makeLargeRecommendResults(30, marker);
+  const schedulesDir = path.join(process.env.BOSS_RECOMMEND_HOME, "schedules");
+  fs.mkdirSync(schedulesDir, { recursive: true });
+  fs.writeFileSync(path.join(schedulesDir, `${scheduleId}.json`), `${JSON.stringify({
+    schedule_id: scheduleId,
+    state: "completed",
+    status: "completed",
+    run_id: runId,
+    run: {
+      run_id: runId,
+      state: "completed",
+      status: "completed",
+      progress: {
+        processed: results.length,
+        screened: results.length,
+        passed: 0
+      },
+      result: {
+        status: "COMPLETED",
+        completion_reason: "completed",
+        output_csv: "C:/tmp/schedule.csv",
+        report_json: "C:/tmp/schedule.report.json",
+        results
+      },
+      summary: {
+        domain: "recommend",
+        processed: results.length,
+        screened: results.length,
+        passed: 0,
+        candidate_list: {
+          card_count: results.length,
+          cards: results
+        },
+        viewport_health: {
+          stats: { total: results.length },
+          events: results
+        },
+        results
+      },
+      checkpoint: {
+        updatedAt: new Date().toISOString(),
+        results
+      }
+    },
+    launch_payload: {
+      run: {
+        run_id: runId,
+        state: "completed",
+        result: {
+          status: "COMPLETED",
+          results
+        }
+      }
+    }
+  }, null, 2)}\n`, "utf8");
+
+  const status = await callTool(TOOL_GET_SCHEDULE, { schedule_id: scheduleId }, 328);
+  const serialized = JSON.stringify(status);
+  assert.equal(status.status, "OK");
+  assert.equal(status.schedule.run.result.results_count, results.length);
+  assert.equal(status.schedule.run.summary.results_count, results.length);
+  assert.equal(status.schedule.run.checkpoint.results_count, results.length);
+  assert.equal(status.schedule.launch_payload.run.result.results_count, results.length);
+  assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.run.result, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.run.summary, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.run.checkpoint, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(status.schedule.launch_payload.run.result, "results"), false);
+  assert.equal(serialized.includes(marker), false);
+  assert.ok(serialized.length < 25000);
 }
 
 async function observeRecommendWorkflowOptions(args, id) {
@@ -1343,6 +1463,77 @@ async function testRecommendListRunsReturnsCompactLatest() {
   assert.equal(JSON.stringify(payload).includes("large progress should not appear"), false);
   assert.ok(JSON.stringify(payload).length < 8000);
   assert.equal(payload.message.includes("PowerShell"), true);
+}
+
+async function testRecommendCompletedStatusOmitsInlineResults() {
+  installFakeConnector();
+  const marker = "completed status oversized result marker";
+  const results = makeLargeRecommendResults(35, marker);
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:large-result");
+    runControl.updateProgress({
+      card_count: results.length,
+      target_count: options.maxCandidates,
+      processed: results.length,
+      screened: results.length,
+      detail_opened: results.length,
+      passed: results.filter((item) => item.screening.passed).length
+    });
+    runControl.checkpoint({
+      results,
+      checkpoint_marker: marker
+    });
+    return {
+      domain: "recommend",
+      processed: results.length,
+      screened: results.length,
+      detail_opened: results.length,
+      passed: results.filter((item) => item.screening.passed).length,
+      list_end_reason: "target_reached",
+      candidate_list: {
+        card_count: results.length,
+        cards: results
+      },
+      viewport_health: {
+        stats: {
+          total: results.length
+        },
+        events: results
+      },
+      refresh_attempts: results,
+      results
+    };
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 326);
+  assert.equal(started.status, "ACCEPTED");
+  await waitForRecommendRun(started.run_id, (run) => run?.state === "completed");
+  const payload = await callTool(TOOL_GET, { run_id: started.run_id }, 327);
+  const serialized = JSON.stringify(payload);
+
+  assert.equal(payload.status, "RUN_STATUS");
+  assert.equal(payload.run.state, "completed");
+  assert.equal(payload.run.result.results_count, results.length);
+  assert.equal(payload.run.result.results_available, true);
+  assert.equal(payload.run.summary.results_count, results.length);
+  assert.equal(payload.run.checkpoint.results_count, results.length);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.run.result, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.run.summary, "results"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.run.checkpoint, "results"), false);
+  assert.equal(serialized.includes(marker), false);
+  assert.ok(serialized.length < 25000);
+
+  const runStatePath = path.join(process.env.BOSS_RECOMMEND_HOME, "runs", `${started.run_id}.json`);
+  const runStateRaw = fs.readFileSync(runStatePath, "utf8");
+  assert.equal(runStateRaw.includes(marker), false);
+  assert.ok(runStateRaw.length < 25000);
+
+  const report = JSON.parse(fs.readFileSync(payload.run.result.report_json, "utf8"));
+  assert.equal(report.summary.results.length, results.length);
+  assert.equal(JSON.stringify(report).includes(marker), true);
+  const checkpoint = JSON.parse(fs.readFileSync(payload.run.result.checkpoint_path, "utf8"));
+  assert.equal(checkpoint.results.length, results.length);
+  assert.equal(JSON.stringify(checkpoint).includes(marker), true);
 }
 
 async function testRecommendDetachedCancelSocketFailureFinalizesCanceled() {
@@ -1895,6 +2086,8 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendScheduleWorkerStartsSavedPayload();
     resetRecommendMcpStateForTests();
+    await testRecommendScheduleStatusCompactsPersistedInlineRun();
+    resetRecommendMcpStateForTests();
     await testRecommendDetailLimitDefaultsToTargetCount();
     resetRecommendMcpStateForTests();
     await testRecommendDetailLimitZeroRequiresDebugFlag();
@@ -1912,6 +2105,8 @@ async function main() {
     await testRecommendDiskCancelRequestedDeadPidIsReconciledAsCanceled();
     resetRecommendMcpStateForTests();
     await testRecommendListRunsReturnsCompactLatest();
+    resetRecommendMcpStateForTests();
+    await testRecommendCompletedStatusOmitsInlineResults();
     resetRecommendMcpStateForTests();
     await testRecommendDetachedCancelSocketFailureFinalizesCanceled();
     resetRecommendMcpStateForTests();

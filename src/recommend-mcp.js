@@ -54,6 +54,7 @@ import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 const DEFAULT_RECOMMEND_HOST = "127.0.0.1";
 const DEFAULT_RECOMMEND_PORT = 9222;
 const DEFAULT_RECOMMEND_POLL_AFTER_SEC = 10;
+const STATUS_METHOD_LOG_TAIL_LIMIT = 25;
 const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screening; scan continues until that many candidates pass or the list ends";
 const RUN_MODE_ASYNC = "async";
 const REST_LEVEL_OPTIONS = ["low", "medium", "high"];
@@ -310,6 +311,14 @@ function methodSummary(methodLog = []) {
   return summary;
 }
 
+function compactMethodLogForStatus(methodLog = []) {
+  if (!Array.isArray(methodLog)) return [];
+  return methodLog.slice(-STATUS_METHOD_LOG_TAIL_LIMIT).map((entry) => ({
+    method: normalizeText(entry?.method || entry || ""),
+    at: normalizeText(entry?.at || "")
+  }));
+}
+
 function clonePlain(value, fallback = null) {
   try {
     return value === undefined ? fallback : JSON.parse(JSON.stringify(value));
@@ -505,6 +514,140 @@ function normalizeLegacyProgress(progress = {}, summary = null) {
   };
 }
 
+const STATUS_COUNT_KEYS = [
+  "processed",
+  "screened",
+  "detail_opened",
+  "passed",
+  "skipped",
+  "llm_screened",
+  "greet_count",
+  "post_action_clicked",
+  "image_capture_failed",
+  "detail_open_failed",
+  "transient_recovered",
+  "colleague_contact_checked",
+  "recent_colleague_contact_skipped",
+  "colleague_contact_panel_missing",
+  "context_recoveries",
+  "human_rest_count",
+  "human_rest_ms",
+  "card_count",
+  "refresh_rounds"
+];
+
+function compactPositiveInteger(value, fallback = null) {
+  return Number.isInteger(value) && value >= 0 ? value : fallback;
+}
+
+function compactSmallRecord(value, fallback = null) {
+  const record = plainRecord(value);
+  if (!Object.keys(record).length) return fallback;
+  return clonePlain(record, fallback);
+}
+
+function compactRecommendSummaryForStatus(summary) {
+  if (!summary || typeof summary !== "object" || Array.isArray(summary)) return null;
+  const compact = {
+    domain: normalizeText(summary.domain || "recommend") || "recommend"
+  };
+  for (const key of STATUS_COUNT_KEYS) {
+    if (Number.isInteger(summary[key])) compact[key] = summary[key];
+  }
+  if (summary.target_url) compact.target_url = normalizeText(summary.target_url);
+  if (summary.list_end_reason) compact.list_end_reason = normalizeText(summary.list_end_reason);
+  if (Array.isArray(summary.results)) {
+    compact.results_count = summary.results.length;
+  } else if (Number.isInteger(summary.results_count)) {
+    compact.results_count = summary.results_count;
+  }
+  if (Array.isArray(summary.refresh_attempts)) {
+    compact.refresh_attempt_count = summary.refresh_attempts.length;
+  }
+  if (Array.isArray(summary.context_recoveries)) {
+    compact.context_recovery_count = summary.context_recoveries.length;
+  } else if (Number.isInteger(summary.context_recoveries)) {
+    compact.context_recoveries = summary.context_recoveries;
+  }
+  if (summary.job_selection) compact.job_selection = compactSmallRecord(summary.job_selection);
+  if (summary.page_scope) compact.page_scope = compactSmallRecord(summary.page_scope);
+  if (summary.filter) compact.filter = compactSmallRecord(summary.filter);
+  if (summary.candidate_list) {
+    const candidateList = plainRecord(summary.candidate_list);
+    compact.candidate_list = {
+      total_count: compactPositiveInteger(candidateList.total_count ?? candidateList.card_count, null),
+      visible_count: compactPositiveInteger(candidateList.visible_count, null),
+      list_end_reason: normalizeText(candidateList.list_end_reason || "")
+    };
+  }
+  if (summary.viewport_health?.stats) {
+    compact.viewport_health = {
+      stats: clonePlain(summary.viewport_health.stats, {})
+    };
+  }
+  if (summary.human_behavior) {
+    compact.human_behavior = {
+      enabled: summary.human_behavior.enabled === true,
+      profile: normalizeText(summary.human_behavior.profile || ""),
+      restLevel: normalizeText(summary.human_behavior.restLevel || summary.human_behavior.rest_level || "")
+    };
+  }
+  if (summary.human_rest) {
+    const humanRest = plainRecord(summary.human_rest);
+    compact.human_rest = {
+      enabled: humanRest.enabled === true,
+      restLevel: normalizeText(humanRest.restLevel || humanRest.rest_level || ""),
+      rest_count: compactPositiveInteger(humanRest.rest_count ?? humanRest.count, null),
+      total_pause_ms: compactPositiveInteger(humanRest.total_pause_ms ?? humanRest.pause_ms, null)
+    };
+  }
+  return compact;
+}
+
+function compactRecommendCheckpointForStatus(checkpoint) {
+  if (!checkpoint || typeof checkpoint !== "object" || Array.isArray(checkpoint)) return {};
+  const compact = {};
+  if (checkpoint.updatedAt || checkpoint.updated_at) {
+    compact.updatedAt = normalizeText(checkpoint.updatedAt || checkpoint.updated_at);
+  }
+  if (Array.isArray(checkpoint.results)) {
+    compact.results_count = checkpoint.results.length;
+  } else if (Number.isInteger(checkpoint.results_count)) {
+    compact.results_count = checkpoint.results_count;
+  }
+  for (const key of STATUS_COUNT_KEYS) {
+    if (Number.isInteger(checkpoint[key])) compact[key] = checkpoint[key];
+  }
+  return compact;
+}
+
+function compactRecommendResultForStatus(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result || null;
+  const compact = {
+    ...result
+  };
+  if (Array.isArray(result.results)) {
+    compact.results_count = result.results.length;
+    compact.results_available = result.results.length > 0;
+  } else if (Number.isInteger(result.results_count)) {
+    compact.results_count = result.results_count;
+    compact.results_available = result.results_available === true || result.results_count > 0;
+  }
+  delete compact.results;
+  return compact;
+}
+
+export function compactRecommendRunForStatus(run) {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return run || null;
+  const compact = {
+    ...run
+  };
+  if (compact.result) compact.result = compactRecommendResultForStatus(compact.result);
+  if (compact.summary) compact.summary = compactRecommendSummaryForStatus(compact.summary);
+  if (compact.checkpoint) compact.checkpoint = compactRecommendCheckpointForStatus(compact.checkpoint);
+  return compact;
+}
+
 function completionReason(status) {
   if (status === RUN_STATUS_COMPLETED) return "completed";
   if (status === RUN_STATUS_CANCELED) return "canceled_by_user";
@@ -689,7 +832,8 @@ function buildLegacyRecommendResult(snapshot) {
     target_count_semantics: TARGET_COUNT_SEMANTICS,
     error: snapshot.error || null,
     recovery: buildConstrainedAgentRecovery(snapshot, meta, artifacts),
-    results: resultRows
+    results_count: resultRows.length,
+    results_available: resultRows.length > 0
   };
 }
 
@@ -716,6 +860,8 @@ function normalizeRunSnapshot(snapshot) {
   };
   return {
     ...snapshot,
+    checkpoint: compactRecommendCheckpointForStatus(snapshot.checkpoint),
+    summary: compactRecommendSummaryForStatus(summary),
     progress,
     run_id: snapshot.runId,
     mode: RUN_MODE_ASYNC,
@@ -874,7 +1020,7 @@ function persistRecommendRunSnapshot(snapshot, {
   normalized.control = mergePersistedControlRequest(normalized, existing);
   normalized = coerceCanceledTerminalSnapshot(normalized, existing);
   if (persistActiveCheckpoint) {
-    persistRecommendCheckpointSnapshot(normalized);
+    persistRecommendCheckpointSnapshot(snapshot);
   }
   const payload = {
     run_id: normalized.run_id,
@@ -972,12 +1118,14 @@ function persistRecommendLifecycleSnapshot(snapshot, event = {}) {
 
 function attachMethodEvidence(payload, runId) {
   const meta = getRecommendRunMeta(runId);
-  assertNoForbiddenCdpCalls(meta.methodLog || []);
+  const methodLog = meta.methodLog || [];
+  assertNoForbiddenCdpCalls(methodLog);
   return {
     ...payload,
     runtime_evaluate_used: false,
-    method_summary: methodSummary(meta.methodLog || []),
-    method_log: meta.methodLog || [],
+    method_summary: methodSummary(methodLog),
+    method_log: compactMethodLogForStatus(methodLog),
+    method_log_total: Array.isArray(methodLog) ? methodLog.length : 0,
     chrome: meta.chrome || null
   };
 }
@@ -1949,12 +2097,12 @@ export function getRecommendPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecommendRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: normalizedRun
+      run: compactRecommendRunForStatus(normalizedRun)
     }, runId);
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
-      const reconciled = reconcilePersistedRecommendRunIfNeeded(persisted);
+      const reconciled = compactRecommendRunForStatus(reconcilePersistedRecommendRunIfNeeded(persisted));
       return {
         status: "RUN_STATUS",
         run: reconciled,
@@ -1988,7 +2136,7 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
       const normalizedBefore = persistRecommendRunSnapshot(before);
       return attachMethodEvidence({
         status: "PAUSE_IGNORED",
-        run: normalizedBefore,
+        run: compactRecommendRunForStatus(normalizedBefore),
         message: "目标任务已结束，无需暂停。"
       }, runId);
     }
@@ -1996,7 +2144,7 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
       const normalizedBefore = persistRecommendRunSnapshot(before);
       return attachMethodEvidence({
         status: "PAUSE_IGNORED",
-        run: normalizedBefore,
+        run: compactRecommendRunForStatus(normalizedBefore),
         message: "目标任务已经处于 paused 状态。"
       }, runId);
     }
@@ -2004,7 +2152,7 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecommendRunSnapshot(run);
     return attachMethodEvidence({
       status: "PAUSE_REQUESTED",
-      run: normalizedRun,
+      run: compactRecommendRunForStatus(normalizedRun),
       message: "暂停请求已接收，将在当前候选人处理完成后进入 paused。"
     }, runId);
   } catch {
@@ -2012,7 +2160,7 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
     if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
       return {
         status: "PAUSE_IGNORED",
-        run: persisted,
+        run: compactRecommendRunForStatus(persisted),
         message: "目标任务已结束，无需暂停。",
         runtime_evaluate_used: false,
         method_summary: {},
@@ -2037,7 +2185,7 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
           message: "目标任务已结束，无法继续。",
           retryable: false
         },
-        run: normalizedBefore
+        run: compactRecommendRunForStatus(normalizedBefore)
       }, runId);
     }
     if (before.status !== RUN_STATUS_PAUSED) {
@@ -2049,7 +2197,7 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
           message: "仅 paused 状态的 run 才能继续。",
           retryable: true
         },
-        run: normalizedBefore
+        run: compactRecommendRunForStatus(normalizedBefore)
       }, runId);
     }
     const run = recommendRunService.resumeRecommendRun(runId);
@@ -2061,7 +2209,7 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecommendRunSnapshot(run);
     return attachMethodEvidence({
       status: "RESUME_REQUESTED",
-      run: normalizedRun,
+      run: compactRecommendRunForStatus(normalizedRun),
       poll_after_sec: DEFAULT_RECOMMEND_POLL_AFTER_SEC,
       message: "已恢复 Recommend run，请使用 get_recommend_pipeline_run 按需轮询。"
     }, runId);
@@ -2077,7 +2225,7 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
             : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
           retryable: !TERMINAL_STATUSES.has(persisted.state)
         },
-        run: persisted,
+        run: compactRecommendRunForStatus(persisted),
         persistence: {
           source: "disk",
           active_control_available: false
@@ -2100,7 +2248,7 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
       const normalizedBefore = persistRecommendRunSnapshot(before);
       return attachMethodEvidence({
         status: "CANCEL_IGNORED",
-        run: normalizedBefore,
+        run: compactRecommendRunForStatus(normalizedBefore),
         message: "目标任务已结束，无需取消。"
       }, runId);
     }
@@ -2108,7 +2256,7 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecommendRunSnapshot(run);
     return attachMethodEvidence({
       status: "CANCEL_REQUESTED",
-      run: normalizedRun,
+      run: compactRecommendRunForStatus(normalizedRun),
       message: "已收到取消请求，将在当前候选人处理完成后安全停止。"
     }, runId);
   } catch {
@@ -2116,7 +2264,7 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
     if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
       return {
         status: "CANCEL_IGNORED",
-        run: persisted,
+        run: compactRecommendRunForStatus(persisted),
         message: "目标任务已结束，无需取消。",
         runtime_evaluate_used: false,
         method_summary: {},
@@ -2136,7 +2284,7 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
     if (patched) {
       return {
         status: "CANCEL_REQUESTED",
-        run: patched,
+        run: compactRecommendRunForStatus(patched),
         message: cancelMessage,
         persistence: {
           source: "disk",
