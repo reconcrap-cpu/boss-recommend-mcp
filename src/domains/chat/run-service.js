@@ -91,6 +91,8 @@ import {
 import { getChatRoots } from "./roots.js";
 
 const DETAIL_SOURCES = new Set(["cascade", "network", "dom", "image"]);
+const CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS = 5000;
+const CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS = 8000;
 
 function normalizeDetailSource(value) {
   const normalized = String(value || "").trim().toLowerCase();
@@ -942,7 +944,12 @@ export async function runChatWorkflow({
   const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
     legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
   });
-  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
+  const normalizedDetailSource = normalizeDetailSource(detailSource);
+  const normalizedScreeningMode = normalizeText(criteria) ? normalizeScreeningMode(screeningMode) : "collect_cv";
+  const collectCvOnly = normalizedScreeningMode === "collect_cv" || !normalizeText(criteria);
+  const useLlmScreening = normalizedScreeningMode === "llm" && !collectCvOnly;
+  const collectCvPerCandidateRestEnabled = collectCvOnly && effectiveHumanBehavior.enabled;
+  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled || collectCvPerCandidateRestEnabled;
   configureHumanInteraction(client, {
     enabled: effectiveHumanBehavior.enabled,
     clickMovementEnabled: effectiveHumanBehavior.clickMovement,
@@ -954,12 +961,11 @@ export async function runChatWorkflow({
     enabled: effectiveHumanRestEnabled,
     shortRestEnabled: effectiveHumanBehavior.shortRest,
     batchRestEnabled: effectiveHumanBehavior.batchRest,
-    restLevel: effectiveHumanBehavior.restLevel
+    restLevel: effectiveHumanBehavior.restLevel,
+    perCandidateRestEnabled: collectCvPerCandidateRestEnabled,
+    perCandidateRestMinMs: CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS,
+    perCandidateRestMaxMs: CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS
   });
-  const normalizedDetailSource = normalizeDetailSource(detailSource);
-  const normalizedScreeningMode = normalizeText(criteria) ? normalizeScreeningMode(screeningMode) : "collect_cv";
-  const collectCvOnly = normalizedScreeningMode === "collect_cv" || !normalizeText(criteria);
-  const useLlmScreening = normalizedScreeningMode === "llm" && !collectCvOnly;
   const processedLimit = Math.max(1, Number(maxCandidates) || 1);
   const passTarget = Number.isFinite(Number(targetPassCount)) && Number(targetPassCount) > 0
     ? Number(targetPassCount)
@@ -1180,6 +1186,9 @@ export async function runChatWorkflow({
       human_behavior_profile: effectiveHumanBehavior.profile,
       human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
+      human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
+      human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
+      human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
       human_rest_count: humanRestController.getState().rest_count,
       human_rest_ms: humanRestController.getState().total_rest_ms,
       last_human_event: lastHumanEvent
@@ -1241,7 +1250,17 @@ export async function runChatWorkflow({
     scroll_count: 0,
     context_recoveries: contextRecoveryAttempts,
     viewport_checks: viewportGuard.getStats().checks,
-    viewport_recoveries: viewportGuard.getStats().recoveries
+    viewport_recoveries: viewportGuard.getStats().recoveries,
+    human_behavior_enabled: effectiveHumanBehavior.enabled,
+    human_behavior_profile: effectiveHumanBehavior.profile,
+    human_rest_level: effectiveHumanBehavior.restLevel,
+    human_rest_enabled: effectiveHumanRestEnabled,
+    human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
+    human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
+    human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
+    human_rest_count: humanRestController.getState().rest_count,
+    human_rest_ms: humanRestController.getState().total_rest_ms,
+    last_human_event: lastHumanEvent
   });
 
   while (
@@ -2030,6 +2049,9 @@ export async function runChatWorkflow({
       human_behavior_profile: effectiveHumanBehavior.profile,
       human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
+      human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
+      human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
+      human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
       human_rest_count: humanRestController.getState().rest_count,
       human_rest_ms: humanRestController.getState().total_rest_ms,
       last_human_event: lastHumanEvent,
@@ -2073,6 +2095,7 @@ export async function runChatWorkflow({
         runControl.updateProgress({
           human_rest_enabled: effectiveHumanRestEnabled,
           human_rest_level: effectiveHumanBehavior.restLevel,
+          human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
           human_rest_count: humanRestController.getState().rest_count,
           human_rest_ms: humanRestController.getState().total_rest_ms,
           human_rest_last: restResult,
@@ -2175,12 +2198,14 @@ export function createChatRunService({
     if (!client) throw new Error("startChatRun requires a guarded CDP client");
     const normalizedDetailSource = normalizeDetailSource(detailSource);
     const normalizedScreeningMode = normalizeText(criteria) ? normalizeScreeningMode(screeningMode) : "collect_cv";
+    const collectCvOnly = normalizedScreeningMode === "collect_cv" || !normalizeText(criteria);
     const processedLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? processedLimit : Math.max(0, Number(detailLimit) || 0);
     const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
       legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
     });
-    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
+    const collectCvPerCandidateRestEnabled = collectCvOnly && effectiveHumanBehavior.enabled;
+    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled || collectCvPerCandidateRestEnabled;
     return manager.startRun({
       runId,
       name,
@@ -2221,7 +2246,9 @@ export function createChatRunService({
         human_behavior: effectiveHumanBehavior,
         human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
-        cv_collection_mode: normalizedScreeningMode === "collect_cv"
+        human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
+        human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
+        human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null
       },
       progress: {
         card_count: 0,
@@ -2242,6 +2269,9 @@ export function createChatRunService({
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
+        human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
+        human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
+        human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
         human_rest_count: 0,
         human_rest_ms: 0,
         last_human_event: null

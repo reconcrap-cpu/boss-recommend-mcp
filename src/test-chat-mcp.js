@@ -320,6 +320,10 @@ async function testChatBlankCriteriaStartsCvCollectionWithoutLlmConfig() {
     assert.equal(started.run.context.screening_mode, "collect_cv");
     assert.equal(started.run.context.cv_collection_mode, true);
     assert.equal(started.run.context.llm_configured, false);
+    assert.equal(started.run.context.human_rest_enabled, true);
+    assert.equal(started.run.context.human_rest_per_candidate_enabled, true);
+    assert.equal(started.run.context.human_rest_per_candidate_min_ms, 5000);
+    assert.equal(started.run.context.human_rest_per_candidate_max_ms, 8000);
     const completed = await waitForChatRun(started.run_id, (run) => run?.status === "completed");
     assert.equal(completed.result.requested_count, 1);
   } finally {

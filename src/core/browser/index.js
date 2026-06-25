@@ -462,6 +462,9 @@ export function createHumanRestController({
   shortRestProbability = 0.08,
   shortRestMinMs = 3000,
   shortRestMaxMs = 7000,
+  perCandidateRestEnabled = false,
+  perCandidateRestMinMs = 0,
+  perCandidateRestMaxMs = 0,
   batchThresholdBase = 25,
   batchThresholdJitter = 8,
   batchRestMinMs = 15000,
@@ -470,7 +473,10 @@ export function createHumanRestController({
   const nextRandom = normalizeRandom(random);
   const readNow = typeof nowFn === "function" ? nowFn : Date.now;
   const normalizedRestLevel = normalizeHumanRestLevel(restLevel);
-  const budgetProfile = (shortRestEnabled !== false || batchRestEnabled !== false)
+  const perCandidateMinMs = Math.max(0, Number(perCandidateRestMinMs) || 0);
+  const perCandidateMaxMs = Math.max(perCandidateMinMs, Number(perCandidateRestMaxMs) || perCandidateMinMs);
+  const perCandidateEnabled = enabled === true && perCandidateRestEnabled === true && perCandidateMaxMs > 0;
+  const budgetProfile = !perCandidateEnabled && (shortRestEnabled !== false || batchRestEnabled !== false)
     ? HUMAN_REST_LEVEL_PROFILES[normalizedRestLevel] || null
     : null;
   const nextBudgetRestInterval = () => budgetProfile
@@ -479,6 +485,9 @@ export function createHumanRestController({
   const state = {
     enabled: enabled === true,
     rest_level: normalizedRestLevel,
+    per_candidate_rest_enabled: perCandidateEnabled,
+    per_candidate_rest_min_ms: perCandidateMinMs,
+    per_candidate_rest_max_ms: perCandidateMaxMs,
     short_rest_enabled: enabled === true && shortRestEnabled !== false,
     batch_rest_enabled: enabled === true && batchRestEnabled !== false,
     rest_counter: 0,
@@ -569,6 +578,40 @@ export function createHumanRestController({
     }
     const sleeper = typeof sleepFn === "function" ? sleepFn : sleep;
     updateActiveElapsed();
+    if (state.per_candidate_rest_enabled) {
+      state.rest_counter += 1;
+      state.processed_count += 1;
+      state.candidates_since_last_rest += 1;
+      const pauseMs = Math.round(randomBetween(
+        nextRandom,
+        state.per_candidate_rest_min_ms,
+        state.per_candidate_rest_max_ms
+      ));
+      await sleeper(pauseMs);
+      state.rest_count += 1;
+      state.total_rest_ms += pauseMs;
+      state.last_active_at_ms = Number(readNow()) || state.last_active_at_ms;
+      const event = {
+        kind: "per_candidate_rest",
+        rest_level: normalizedRestLevel,
+        pause_ms: pauseMs,
+        processed_since_last_rest: state.candidates_since_last_rest
+      };
+      state.candidates_since_last_rest = 0;
+      return {
+        enabled: true,
+        rested: true,
+        pause_ms: pauseMs,
+        rest_level: normalizedRestLevel,
+        rest_counter: state.rest_counter,
+        rest_threshold: state.rest_threshold,
+        processed_count: state.processed_count,
+        active_elapsed_ms: state.active_elapsed_ms,
+        rest_count: state.rest_count,
+        total_rest_ms: state.total_rest_ms,
+        events: [event]
+      };
+    }
     if (budgetProfile) {
       const budgetEvent = await takeBudgetBreakIfNeeded(sleeper);
       const pauseMs = budgetEvent?.pause_ms || 0;

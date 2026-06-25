@@ -785,6 +785,34 @@ async function testHumanRestController() {
   assert.deepEqual(sleepCalls, [10, 10, 20]);
   assert.equal(enabled.getState().rest_count, 3);
   assert.equal(enabled.getState().total_rest_ms, 40);
+
+  sleepCalls.length = 0;
+  const perCandidate = createHumanRestController({
+    enabled: true,
+    restLevel: "high",
+    perCandidateRestEnabled: true,
+    perCandidateRestMinMs: 5000,
+    perCandidateRestMaxMs: 8000,
+    random: createSequenceRandom([0, 0, 0.5, 1])
+  });
+  const perCandidateFirst = await perCandidate.takeBreakIfNeeded({
+    sleepFn: async (ms) => sleepCalls.push(ms)
+  });
+  const perCandidateSecond = await perCandidate.takeBreakIfNeeded({
+    sleepFn: async (ms) => sleepCalls.push(ms)
+  });
+  const perCandidateThird = await perCandidate.takeBreakIfNeeded({
+    sleepFn: async (ms) => sleepCalls.push(ms)
+  });
+  assert.equal(perCandidateFirst.rested, true);
+  assert.equal(perCandidateFirst.events[0].kind, "per_candidate_rest");
+  assert.equal(perCandidateSecond.events[0].kind, "per_candidate_rest");
+  assert.equal(perCandidateThird.events[0].kind, "per_candidate_rest");
+  assert.deepEqual(sleepCalls, [5000, 6500, 8000]);
+  assert.equal(perCandidate.getState().processed_count, 3);
+  assert.equal(perCandidate.getState().rest_count, 3);
+  assert.equal(perCandidate.getState().total_rest_ms, 19500);
+  assert.equal(perCandidate.getState().per_candidate_rest_enabled, true);
 }
 
 async function simulateBudgetRestLevel(restLevel, candidateActiveMs) {
