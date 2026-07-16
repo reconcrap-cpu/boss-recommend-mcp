@@ -375,6 +375,8 @@ Inputs that must be preserved:
 - `degree`
 - `gender`
 - `recent_not_view`
+- `current_city_only`
+- `activity_level`
 - `criteria`
 - `target_count`
 - `post_action`
@@ -386,7 +388,8 @@ Behavior:
 - Ask for missing or unconfirmed values before browser work.
 - Read job options only after page readiness.
 - Require final confirmation before async start.
-- Use DOM/Input only for all UI interaction.
+- Use CDP DOM/Accessibility reads and Input events only for all UI interaction; page-context JavaScript, `*.evaluate`, `page.js`, and script injection are forbidden.
+- Apply job -> page scope -> current-city state -> activity/other filters, and reapply the same desired state after refresh/recovery.
 - Leave selected filters applied for real runs.
 - Use network CV first, image fallback second.
 - Write CSV and JSON reports under the run artifact directory.

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { parseRecommendInstruction } from "./parser.js";
+import { normalizeActivityLevel, parseRecommendInstruction } from "./parser.js";
 
 const REPRODUCTION_INSTRUCTION = `启动boss推荐任务。条件如下：
 
@@ -25,6 +25,8 @@ function testFavoriteInstructionRequiresPostActionChoice() {
   assert.deepEqual(result.searchParams.degree, ["不限"]);
   assert.equal(result.searchParams.gender, "男");
   assert.equal(result.searchParams.recent_not_view, "近14天没有");
+  assert.equal(result.searchParams.current_city_only, false);
+  assert.equal(result.searchParams.activity_level, "不限");
   assert.equal(result.screenParams.criteria, "有大模型平台经验");
   assert.equal(result.proposed_post_action, null);
   assert.equal(result.needs_filters_confirmation, false);
@@ -39,6 +41,206 @@ function testFavoriteInstructionRequiresPostActionChoice() {
   assert.equal(postActionQuestion.options.some((item) => item.value === "favorite"), false);
   assert.equal(postActionQuestion.options.some((item) => item.value === "greet"), true);
   assert.equal(postActionQuestion.options.some((item) => item.value === "none"), true);
+}
+
+function testOptionalCityAndActivityOverridesAndDefaults() {
+  const defaults = parseRecommendInstruction({
+    instruction: "推荐页筛选候选人，要求有算法经验",
+    confirmation: null,
+    overrides: null
+  });
+  assert.equal(defaults.searchParams.current_city_only, false);
+  assert.equal(defaults.searchParams.activity_level, "不限");
+  assert.equal(defaults.pending_questions.some((item) => item.field === "current_city_only"), false);
+  assert.equal(defaults.pending_questions.some((item) => item.field === "activity_level"), false);
+
+  const activityLevels = ["不限", "刚刚活跃", "今日活跃", "3日内活跃", "本周活跃", "本月活跃"];
+  for (const activityLevel of activityLevels) {
+    const result = parseRecommendInstruction({
+      instruction: "推荐页筛选候选人，要求有算法经验",
+      confirmation: null,
+      overrides: {
+        current_city_only: true,
+        activity_level: activityLevel
+      }
+    });
+    assert.equal(result.searchParams.current_city_only, true);
+    assert.equal(result.searchParams.activity_level, activityLevel);
+    assert.equal(result.suspicious_fields.length, 0);
+  }
+
+  const spaced = parseRecommendInstruction({
+    instruction: "current_city_only，推荐页筛选候选人，要求有算法经验",
+    confirmation: null,
+    overrides: { activity_level: "3 日内活跃" }
+  });
+  assert.equal(spaced.searchParams.current_city_only, true);
+  assert.equal(spaced.searchParams.activity_level, "3日内活跃");
+}
+
+function testOptionalCityAndActivityInstructionAliasesStayOutOfCriteria() {
+  const structuredInstruction = `页面：推荐
+筛选条件：必须有算法工程经验
+current_city_only：true
+活跃度：今日活跃
+岗位：算法工程师`;
+  for (const instruction of [structuredInstruction, structuredInstruction.replace(/\s+/g, " ")]) {
+    const structured = parseRecommendInstruction({
+      instruction,
+      confirmation: null,
+      overrides: null
+    });
+    assert.equal(structured.searchParams.current_city_only, true);
+    assert.equal(structured.searchParams.activity_level, "今日活跃");
+    assert.equal(structured.screenParams.criteria, "必须有算法工程经验");
+    assert.equal(structured.screenParams.criteria.includes("current_city_only"), false);
+    assert.equal(structured.screenParams.criteria.includes("活跃度"), false);
+  }
+
+  const natural = parseRecommendInstruction({
+    instruction: "仅推荐期望城市为本城市的牛人，选择本月活跃。筛选条件：必须有多模态项目经验",
+    confirmation: null,
+    overrides: null
+  });
+  assert.equal(natural.searchParams.current_city_only, true);
+  assert.equal(natural.searchParams.activity_level, "本月活跃");
+  assert.equal(natural.screenParams.criteria, "必须有多模态项目经验");
+
+  for (const instruction of [
+    "取消仅推荐期望城市为本城市的牛人，筛选条件：必须有算法经验",
+    "关闭仅推荐期望城市为本城市的牛人，筛选条件：必须有算法经验"
+  ]) {
+    const disabled = parseRecommendInstruction({
+      instruction,
+      confirmation: null,
+      overrides: null
+    });
+    assert.equal(disabled.searchParams.current_city_only, false);
+    assert.equal(disabled.screenParams.criteria, "必须有算法经验");
+  }
+}
+
+function testActivityIntentNormalizationAndFallback() {
+  const normalizationCases = [
+    ["刚上线", "刚刚活跃"],
+    ["active now", "刚刚活跃"],
+    ["过去 2 小时", "刚刚活跃"],
+    ["高活跃", "刚刚活跃"],
+    ["非常活跃", "刚刚活跃"],
+    ["high activity", "刚刚活跃"],
+    ["very active", "刚刚活跃"],
+    ["今天活跃", "今日活跃"],
+    ["active today", "今日活跃"],
+    ["过去 6 小时", "今日活跃"],
+    ["今曰活跃", "今日活跃"],
+    ["todai active", "今日活跃"],
+    ["昨天活跃", "3日内活跃"],
+    ["last 3 days", "3日内活跃"],
+    ["最近五天", "本周活跃"],
+    ["this week", "本周活跃"],
+    ["本舟活跃", "本周活跃"],
+    ["中等活跃", "本周活跃"],
+    ["一般活跃", "本周活跃"],
+    ["medium activity", "本周活跃"],
+    ["moderately active", "本周活跃"],
+    ["近20天", "本月活跃"],
+    ["this month", "本月活跃"],
+    ["低活跃", "本月活跃"],
+    ["偶尔活跃", "本月活跃"],
+    ["low activity", "本月活跃"],
+    ["occasionally active", "本月活跃"],
+    ["no preference", "不限"],
+    ["不限", "不限"],
+    ["不限或今日活跃", "不限"],
+    ["不限制或本周活跃", "不限"],
+    ["无要求但本月活跃", "不限"],
+    ["活跃一点", "不限"],
+    ["本活跃", "不限"],
+    ["today or this week", "不限"],
+    ["本周还是本月", "不限"],
+    ["非常活跃或偶尔活跃", "不限"],
+    ["very active or occasionally active", "不限"],
+    ["high or low activity", "不限"],
+    ["low or medium activity", "不限"],
+    ["not high activity", "本月活跃"],
+    ["blue pineapple", "不限"],
+    ["", "不限"]
+  ];
+  for (const [input, expected] of normalizationCases) {
+    assert.equal(normalizeActivityLevel(input), expected, input);
+    const parsed = parseRecommendInstruction({
+      instruction: "推荐页筛选候选人，筛选条件：必须有算法经验",
+      confirmation: { final_confirmed: true },
+      overrides: { activity_level: input }
+    });
+    assert.equal(parsed.searchParams.activity_level, expected, input);
+    assert.equal(parsed.suspicious_fields.some((item) => item.field === "activity_level"), false, input);
+    assert.equal(parsed.screenParams.criteria, "必须有算法经验", input);
+  }
+
+  const durationBoundaryCases = [
+    ["1 day", "今日活跃"],
+    ["2 days", "3日内活跃"],
+    ["4 days", "3日内活跃"],
+    ["5 days", "本周活跃"],
+    ["7 days", "本周活跃"],
+    ["10 days", "本周活跃"],
+    ["18 days", "本周活跃"],
+    ["19 days", "本月活跃"],
+    ["20 days", "本月活跃"],
+    ["30 days", "本月活跃"],
+    ["2 weeks", "本周活跃"],
+    ["3 weeks", "本月活跃"]
+  ];
+  for (const [input, expected] of durationBoundaryCases) {
+    assert.equal(normalizeActivityLevel(input), expected, `duration boundary: ${input}`);
+  }
+
+  const structuredCases = [
+    ["activity level：active today；筛选条件：必须有算法经验", "今日活跃"],
+    ["活跃度：昨天活跃；筛选条件：必须有算法经验", "3日内活跃"],
+    ["活跃度：blue pineapple；筛选条件：必须有算法经验", "不限"],
+    ["活跃度：；筛选条件：必须有算法经验", "不限"]
+  ];
+  for (const [instruction, expected] of structuredCases) {
+    const parsed = parseRecommendInstruction({
+      instruction,
+      confirmation: { final_confirmed: true },
+      overrides: null
+    });
+    assert.equal(parsed.searchParams.activity_level, expected, instruction);
+    assert.equal(parsed.suspicious_fields.some((item) => item.field === "activity_level"), false, instruction);
+    assert.equal(parsed.screenParams.criteria, "必须有算法经验", instruction);
+  }
+
+  const naturalCases = [
+    ["只看最近五天活跃的人，必须有算法经验", "本周活跃", "必须有算法经验"],
+    ["active within the last three days, must have algorithm experience", "3日内活跃", "must have algorithm experience"],
+    ["active in the last week, must have algorithm experience", "本周活跃", "must have algorithm experience"]
+  ];
+  for (const [instruction, expected, expectedCriteria] of naturalCases) {
+    const natural = parseRecommendInstruction({
+      instruction,
+      confirmation: null,
+      overrides: null
+    });
+    assert.equal(natural.searchParams.activity_level, expected, instruction);
+    assert.equal(natural.screenParams.criteria, expectedCriteria, instruction);
+  }
+
+  const overrideWins = parseRecommendInstruction({
+    instruction: "活跃度：今日活跃；筛选条件：必须有算法经验",
+    confirmation: null,
+    overrides: { activity_level: "past week" }
+  });
+  assert.equal(overrideWins.searchParams.activity_level, "本周活跃");
+
+  const explicitUnknownOverrideWinsWithSafeDefault = parseRecommendInstruction({
+    instruction: "活跃度：今日活跃；筛选条件：必须有算法经验",
+    confirmation: null,
+    overrides: { activity_level: "blue pineapple" }
+  });
+  assert.equal(explicitUnknownOverrideWinsWithSafeDefault.searchParams.activity_level, "不限");
 }
 
 function testConfirmedPostActionAndOverrides() {
@@ -696,6 +898,9 @@ function testMetaHintsShouldBeProposedFromInstruction() {
 
 function main() {
   testFavoriteInstructionRequiresPostActionChoice();
+  testOptionalCityAndActivityOverridesAndDefaults();
+  testOptionalCityAndActivityInstructionAliasesStayOutOfCriteria();
+  testActivityIntentNormalizationAndFallback();
   testConfirmedPostActionAndOverrides();
   testMissingRecentNotViewValueCanBeRecoveredFromInstruction();
   testDefaultFilterValuesDoNotRequireFieldConfirmation();

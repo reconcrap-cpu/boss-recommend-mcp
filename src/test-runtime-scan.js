@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -7,6 +8,21 @@ const scannerPath = path.join(process.cwd(), "scripts", "scan-forbidden-runtime.
 const boundaryScannerPath = path.join(process.cwd(), "scripts", "scan-legacy-boundary.js");
 const packageBoundaryScannerPath = path.join(process.cwd(), "scripts", "scan-package-boundary.js");
 const phase9GatePath = path.join(process.cwd(), "scripts", "phase9-static-gate.js");
+const scannerSource = fs.readFileSync(scannerPath, "utf8");
+
+for (const patternId of [
+  "page-dollar-eval",
+  "page-add-script-to-evaluate",
+  "global-eval",
+  "function-constructor",
+  "script-element-injection",
+  "javascript-navigation-call",
+  "javascript-location-assignment",
+  "page-js-file"
+]) {
+  assert.ok(scannerSource.includes(patternId), `runtime scanner is missing ${patternId}`);
+}
+assert.match(scannerSource, /subdirs: \["bin", "src", "scripts", "legacy", "vendor"\]/);
 
 function runScanner(args = []) {
   return spawnSync(process.execPath, [scannerPath, ...args], {

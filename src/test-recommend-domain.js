@@ -12,17 +12,20 @@ import {
   closeRecommendJobDropdownFully,
   createRecoverableImageCaptureEvidence,
   chooseFirstSafeFilterOption,
+  ensureRecommendCurrentCityOnly,
   findRecommendBlockingPanel,
   findRecommendCardNodeForCandidateKey,
   getRecommendPageScopeStatus,
   isActiveOption,
   isRecoverableImageCaptureError,
   isRecoverableRecommendDetailError,
+  isRecommendActivityGroupText,
   isRetryableRecommendFilterReapplyError,
   isRetryableRecommendJobSelectionError,
   isSafeFilterOptionLabel,
   isStaleRecommendNodeError,
   jobLabelMatches,
+  listFilterOptions,
   listRecommendPageScopeTabs,
   matchesRecommendDetailNetwork,
   normalizeFilterOptionLabel,
@@ -37,6 +40,7 @@ import {
   resolveRecommendCardDetailClickPoint,
   selectRecommendJob,
   selectRecommendJobWithRootRefresh,
+  selectAndConfirmFirstSafeFilter,
   selectRecommendPageScope,
   inspectRecentColleagueContact,
   isDateWithinWindow,
@@ -150,6 +154,569 @@ function testTargetedFilterChoice() {
     labels: ["本科", "硕士", "博士"]
   });
   assert.deepEqual(multi.map((item) => item.option?.node_id), [3, 4, 5]);
+
+  const unlimited = [{ group: "activity", label: "不限", active: false, node_id: 9 }];
+  assert.equal(chooseFilterOptionByLabels(unlimited, {
+    group: "activity",
+    labels: ["不限"]
+  }), null);
+  assert.equal(chooseFilterOptionByLabels(unlimited, {
+    group: "activity",
+    labels: ["不限"],
+    allowUnlimited: true
+  })?.node_id, 9);
+}
+
+function createRecommendActivityFilterClient({
+  activeLabel = "今日活跃",
+  rowPresent = true,
+  optionNodesPresent = true
+} = {}) {
+  const labels = ["不限", "刚刚活跃", "今日活跃", "3日内活跃", "本周活跃", "本月活跃"];
+  const state = {
+    panelOpen: false,
+    activeLabel,
+    optionClickCount: 0,
+    clearClickCount: 0,
+    confirmClickCount: 0,
+    triggerClickCount: 0
+  };
+  const nodeForLabel = new Map(labels.map((label, index) => [31 + index, label]));
+  function boxForNode(nodeId) {
+    const left = Number(nodeId) * 10;
+    return [left, 10, left + 8, 10, left + 8, 38, left, 38];
+  }
+  function nodeAtX(x) {
+    for (const nodeId of [10, ...nodeForLabel.keys(), 40, 41]) {
+      const left = Number(nodeId) * 10;
+      if (x >= left && x <= left + 8) return nodeId;
+    }
+    return 0;
+  }
+  return {
+    state,
+    client: {
+      DOM: {
+        async querySelector({ nodeId, selector }) {
+          if (nodeId !== 99) return { nodeId: 0 };
+          if (selector === ".filter-label-wrap") return { nodeId: 10 };
+          if (selector === ".filter-panel") return { nodeId: state.panelOpen ? 20 : 0 };
+          return { nodeId: 0 };
+        },
+        async querySelectorAll({ nodeId, selector }) {
+          if (nodeId === 20 && String(selector).includes(".option")) {
+            return {
+              nodeIds: state.panelOpen && optionNodesPresent ? [...nodeForLabel.keys()] : []
+            };
+          }
+          if (nodeId !== 99) return { nodeIds: [] };
+          if (selector === ".filter-label-wrap") return { nodeIds: [10] };
+          if (selector === ".filter-panel") return { nodeIds: state.panelOpen ? [20] : [] };
+          if (String(selector).includes("check-box.activity")) {
+            return { nodeIds: state.panelOpen && rowPresent ? [20] : [] };
+          }
+          if (selector === ".filter-panel .check-box") {
+            return { nodeIds: state.panelOpen && rowPresent ? [20] : [] };
+          }
+          if (String(selector).includes(".filter-panel .btn")) {
+            return { nodeIds: state.panelOpen ? [40, 41] : [] };
+          }
+          if (String(selector).includes("active")) {
+            const activeNode = [...nodeForLabel.entries()].find(([, label]) => label === state.activeLabel)?.[0];
+            return { nodeIds: state.panelOpen && activeNode ? [activeNode] : [] };
+          }
+          return { nodeIds: [] };
+        },
+        async getAttributes({ nodeId }) {
+          if (nodeId === 10) return { attributes: ["class", "filter-label-wrap"] };
+          if (nodeId === 20) return { attributes: ["class", "check-box activity"] };
+          if (nodeForLabel.has(nodeId)) {
+            const active = nodeForLabel.get(nodeId) === state.activeLabel;
+            return { attributes: ["class", `option${active ? " active" : ""}`] };
+          }
+          return { attributes: ["class", "btn"] };
+        },
+        async getOuterHTML({ nodeId }) {
+          if (nodeId === 10) return { outerHTML: '<button class="filter-label-wrap">筛选</button>' };
+          if (nodeId === 20) {
+            return {
+              outerHTML: `<div class="check-box activity"><span>活跃度[单选]</span>${labels.map((label) => `<span class="option">${label}</span>`).join("")}</div>`
+            };
+          }
+          if (nodeForLabel.has(nodeId)) {
+            const label = nodeForLabel.get(nodeId);
+            const active = label === state.activeLabel ? " active" : "";
+            return { outerHTML: `<span class="option${active}">${label}</span>` };
+          }
+          if (nodeId === 40) return { outerHTML: '<button class="btn">清除</button>' };
+          if (nodeId === 41) return { outerHTML: '<button class="btn">确定</button>' };
+          return { outerHTML: "<div></div>" };
+        },
+        async getBoxModel({ nodeId }) {
+          return { model: { border: boxForNode(nodeId) } };
+        },
+        async scrollIntoViewIfNeeded() {
+          return {};
+        }
+      },
+      Input: {
+        async dispatchKeyEvent() {
+          return {};
+        },
+        async dispatchMouseEvent(event) {
+          if (event.type !== "mouseReleased") return {};
+          const nodeId = nodeAtX(event.x);
+          if (nodeId === 10) {
+            state.panelOpen = !state.panelOpen;
+            state.triggerClickCount += 1;
+          } else if (nodeForLabel.has(nodeId)) {
+            state.activeLabel = nodeForLabel.get(nodeId);
+            state.optionClickCount += 1;
+          } else if (nodeId === 40) {
+            state.clearClickCount += 1;
+          } else if (nodeId === 41) {
+            state.panelOpen = false;
+            state.confirmClickCount += 1;
+          }
+          return {};
+        }
+      }
+    }
+  };
+}
+
+async function testRecommendActivityFilterSelectionAndStickyVerification() {
+  assert.equal(isRecommendActivityGroupText("活跃度 [单选] 不限 刚刚活跃 今日活跃"), true);
+  assert.equal(isRecommendActivityGroupText("近期没有看过 不限 近14天没有"), false);
+
+  const { client, state } = createRecommendActivityFilterClient({ activeLabel: "今日活跃" });
+  const result = await selectAndConfirmFirstSafeFilter(client, 99, {
+    filterGroups: [{
+      group: "activity",
+      labels: ["不限"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    }],
+    afterConfirmSettleMs: 0,
+    stickySettleMs: 0
+  });
+  assert.equal(result.confirmed, true);
+  assert.deepEqual(result.requested_groups, [{
+    group: "activity",
+    labels: ["不限"],
+    select_all_labels: false,
+    allow_unlimited: true,
+    verify_sticky: true
+  }]);
+  assert.equal(result.selected_option.label, "不限");
+  assert.equal(result.selected_option.clicked, true);
+  assert.equal(result.sticky_verification.verified, true);
+  assert.deepEqual(result.sticky_verification.groups[0].active_labels, ["不限"]);
+  assert.equal(result.initial_close_attempts.includes("Escape"), true);
+  assert.equal(result.open_attempts.length, 1);
+  assert.equal(result.open_attempts[0].node_id, 10);
+  assert.equal(result.confirm_attempts.length, 1);
+  assert.equal(result.confirm_attempts[0].clicked, true);
+  assert.equal(state.optionClickCount, 1);
+  assert.equal(state.clearClickCount, 0);
+  assert.equal(state.confirmClickCount, 2);
+
+  const alreadyActive = createRecommendActivityFilterClient({ activeLabel: "不限" });
+  const alreadyActiveResult = await selectAndConfirmFirstSafeFilter(alreadyActive.client, 99, {
+    filterGroups: [{
+      group: "activity",
+      labels: ["不限"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    }],
+    afterConfirmSettleMs: 0,
+    stickySettleMs: 0
+  });
+  assert.equal(alreadyActiveResult.selected_option.was_active, true);
+  assert.equal(alreadyActiveResult.selected_option.clicked, false);
+  assert.equal(alreadyActive.state.optionClickCount, 0);
+}
+
+async function testRecommendActivityUnavailableDefaultAndUnreadableControl() {
+  const unavailable = createRecommendActivityFilterClient({ rowPresent: false });
+  const defaultResult = await selectAndConfirmFirstSafeFilter(unavailable.client, 99, {
+    filterGroups: [{
+      group: "activity",
+      labels: ["不限"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    }],
+    afterConfirmSettleMs: 0,
+    stickySettleMs: 0
+  });
+  assert.equal(defaultResult.unavailable, true);
+  assert.equal(defaultResult.unavailable_groups[0].reason, "activity_control_unavailable_default");
+  assert.equal(defaultResult.sticky_verification.verified, true);
+  assert.equal(defaultResult.sticky_verification.groups[0].unavailable, true);
+
+  const unavailableRequested = createRecommendActivityFilterClient({ rowPresent: false });
+  await assert.rejects(
+    selectAndConfirmFirstSafeFilter(unavailableRequested.client, 99, {
+      filterGroups: [{
+        group: "activity",
+        labels: ["今日活跃"],
+        selectAllLabels: false,
+        allowUnlimited: true,
+        verifySticky: true
+      }],
+      afterConfirmSettleMs: 0,
+      stickySettleMs: 0
+    }),
+    /No matching recommend filter option/
+  );
+
+  const unreadable = createRecommendActivityFilterClient({ optionNodesPresent: false });
+  unreadable.state.panelOpen = true;
+  await assert.rejects(
+    listFilterOptions(unreadable.client, 99, { groupOrder: ["activity"] }),
+    /visible but its options could not be read/
+  );
+}
+
+function createMissingRecommendFilterPanelClient() {
+  return {
+    DOM: {
+      async querySelector() {
+        return { nodeId: 0 };
+      },
+      async querySelectorAll() {
+        return { nodeIds: [] };
+      }
+    }
+  };
+}
+
+async function testRecommendMissingFilterPanelDefaultSafety() {
+  const defaultOptions = {
+    filterGroups: [{
+      group: "activity",
+      labels: ["不限"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    }],
+    afterConfirmSettleMs: 0,
+    stickySettleMs: 0
+  };
+  const defaultResult = await selectAndConfirmFirstSafeFilter(
+    createMissingRecommendFilterPanelClient(),
+    99,
+    defaultOptions
+  );
+  assert.equal(defaultResult.opened_panel, false);
+  assert.equal(defaultResult.confirmed, true);
+  assert.equal(defaultResult.unavailable, true);
+  assert.equal(defaultResult.unavailable_default, true);
+  assert.equal(defaultResult.confirm_label, "unavailable-default");
+  assert.deepEqual(defaultResult.unavailable_groups, [{
+    group: "activity",
+    requested_labels: ["不限"],
+    reason: "activity_control_unavailable_default",
+    scope: "filter_panel"
+  }]);
+  assert.equal(defaultResult.sticky_verification.verified, true);
+  assert.equal(defaultResult.sticky_verification.groups[0].unavailable, true);
+
+  await assert.rejects(
+    selectAndConfirmFirstSafeFilter(createMissingRecommendFilterPanelClient(), 99, {
+      filterGroups: [{
+        group: "activity",
+        labels: ["今日活跃"],
+        selectAllLabels: false,
+        allowUnlimited: true,
+        verifySticky: true
+      }],
+      afterConfirmSettleMs: 0
+    }),
+    /Recommend filter trigger was not found/
+  );
+
+  await assert.rejects(
+    selectAndConfirmFirstSafeFilter(createMissingRecommendFilterPanelClient(), 99, {
+      filterGroups: [{
+        group: "degree",
+        labels: ["不限"],
+        selectAllLabels: false,
+        allowUnlimited: true
+      }],
+      afterConfirmSettleMs: 0
+    }),
+    /Recommend filter trigger was not found/
+  );
+
+  await assert.rejects(
+    selectAndConfirmFirstSafeFilter(createMissingRecommendFilterPanelClient(), 99, {
+      filterGroups: [
+        defaultOptions.filterGroups[0],
+        {
+          group: "school",
+          labels: ["985"],
+          selectAllLabels: true
+        }
+      ],
+      afterConfirmSettleMs: 0
+    }),
+    /Recommend filter trigger was not found/
+  );
+}
+
+
+function createRecommendLocationClient({
+  checked = false,
+  popupOpen = false,
+  checkboxAvailable = true,
+  stateReadable = true,
+  staleStateReadOnce = false,
+  triggerOpens = true
+} = {}) {
+  const state = {
+    checked,
+    popupOpen,
+    checkboxAvailable,
+    stateReadable,
+    staleStateReadOnce,
+    triggerOpens,
+    triggerClickCount: 0,
+    checkboxClickCount: 0,
+    confirmClickCount: 0,
+    clearClickCount: 0,
+    escapeCount: 0
+  };
+  function boxForNode(nodeId) {
+    const left = Number(nodeId) * 10;
+    return [left, 20, left + 8, 20, left + 8, 48, left, 48];
+  }
+  function nodeAtX(x) {
+    for (const nodeId of [10, 20, 21, 30, 31]) {
+      const left = nodeId * 10;
+      if (x >= left && x <= left + 8) return nodeId;
+    }
+    return 0;
+  }
+  return {
+    state,
+    client: {
+      DOM: {
+        async querySelectorAll({ nodeId, selector }) {
+          if (nodeId === 99 && selector === ".city-selecter-wrap") {
+            return { nodeIds: [10] };
+          }
+          if (nodeId === 99 && selector === ".check-area-warp, .check-area-bottom") {
+            return { nodeIds: state.popupOpen ? [100] : [] };
+          }
+          if (nodeId === 99 && String(selector).includes('[role="checkbox"]')) {
+            return {
+              nodeIds: state.popupOpen && state.checkboxAvailable ? [20] : []
+            };
+          }
+          if (nodeId === 20 && String(selector).includes('input[type="checkbox"]')) {
+            return { nodeIds: state.stateReadable ? [21] : [] };
+          }
+          if (nodeId === 100 && String(selector).includes("button")) {
+            return { nodeIds: state.popupOpen ? [31, 30] : [] };
+          }
+          return { nodeIds: [] };
+        },
+        async getAttributes({ nodeId }) {
+          if (nodeId === 10) {
+            return { attributes: ["class", "city-selecter-wrap", "data-city", "上海"] };
+          }
+          if (nodeId === 20) {
+            if (state.staleStateReadOnce) {
+              state.staleStateReadOnce = false;
+              throw new Error("Could not find node with given id");
+            }
+            return {
+              attributes: [
+                "class",
+                state.stateReadable
+                  ? `checkbox${state.checked ? " checked" : ""}`
+                  : "city-choice"
+              ]
+            };
+          }
+          if (nodeId === 21) {
+            return {
+              attributes: state.checked
+                ? ["type", "checkbox", "checked", ""]
+                : ["type", "checkbox"]
+            };
+          }
+          return { attributes: ["class", "btn"] };
+        },
+        async getOuterHTML({ nodeId }) {
+          if (nodeId === 10) {
+            return { outerHTML: '<button class="city-selecter-wrap" data-city="上海">上海</button>' };
+          }
+          if (nodeId === 20) {
+            return {
+              outerHTML: `<label class="checkbox${state.checked ? " checked" : ""}"><input type="checkbox"${state.checked ? " checked" : ""}><span>仅推荐期望城市为本城市的牛人</span></label>`
+            };
+          }
+          if (nodeId === 21) {
+            return { outerHTML: `<input type="checkbox"${state.checked ? " checked" : ""}>` };
+          }
+          if (nodeId === 100) return { outerHTML: '<div class="check-area-warp"></div>' };
+          if (nodeId === 30) return { outerHTML: '<button class="btn">确认</button>' };
+          if (nodeId === 31) return { outerHTML: '<button class="btn">清除</button>' };
+          return { outerHTML: "<div></div>" };
+        },
+        async getBoxModel({ nodeId }) {
+          if ([20, 21, 30, 31, 100].includes(nodeId) && !state.popupOpen) {
+            throw new Error("Could not compute box model");
+          }
+          return { model: { border: boxForNode(nodeId) } };
+        },
+        async describeNode({ nodeId }) {
+          const parents = { 20: 100, 21: 20, 30: 100, 31: 100, 100: 99 };
+          return { node: { nodeId, parentId: parents[nodeId] || 0 } };
+        }
+      },
+      Input: {
+        async dispatchKeyEvent(event) {
+          if (event.key === "Escape" && event.type === "keyUp") {
+            state.popupOpen = false;
+            state.escapeCount += 1;
+          }
+          return {};
+        },
+        async dispatchMouseEvent(event) {
+          if (event.type !== "mouseReleased") return {};
+          const nodeId = nodeAtX(event.x);
+          if (nodeId === 10) {
+            if (state.triggerOpens) state.popupOpen = !state.popupOpen;
+            state.triggerClickCount += 1;
+          } else if ([20, 21].includes(nodeId)) {
+            state.checked = !state.checked;
+            state.checkboxClickCount += 1;
+          } else if (nodeId === 30) {
+            state.popupOpen = false;
+            state.confirmClickCount += 1;
+          } else if (nodeId === 31) {
+            state.clearClickCount += 1;
+          }
+          return {};
+        }
+      }
+    }
+  };
+}
+
+async function testRecommendCurrentCityOnlyStateAndStickyVerification() {
+  const { client, state } = createRecommendLocationClient({ checked: false });
+  const result = await ensureRecommendCurrentCityOnly(client, 99, {
+    enabled: true,
+    timeoutMs: 0,
+    intervalMs: 0,
+    settleMs: 0
+  });
+  assert.equal(result.requested, true);
+  assert.equal(result.effective, true);
+  assert.equal(result.available, true);
+  assert.equal(result.clicked, true);
+  assert.equal(result.current_city_label, "上海");
+  assert.equal(result.before.checked, false);
+  assert.equal(result.after_toggle.checked, true);
+  assert.equal(result.confirmation.label, "确认");
+  assert.equal(result.sticky_verification.verified, true);
+  assert.equal(result.sticky_verification.actual, true);
+  assert.equal(state.checkboxClickCount, 1);
+  assert.equal(state.confirmClickCount, 2);
+  assert.equal(state.clearClickCount, 0);
+}
+
+async function testRecommendCurrentCityOnlyAlreadyOpenAndUnavailablePolicy() {
+  const alreadyOpen = createRecommendLocationClient({ checked: false, popupOpen: true });
+  const result = await ensureRecommendCurrentCityOnly(alreadyOpen.client, 99, {
+    enabled: false,
+    timeoutMs: 0,
+    intervalMs: 0,
+    settleMs: 0
+  });
+  assert.equal(result.clicked, false);
+  assert.equal(result.reason, "already_in_requested_state");
+  assert.equal(alreadyOpen.state.checkboxClickCount, 0);
+  assert.equal(alreadyOpen.state.triggerClickCount, 1);
+  assert.equal(alreadyOpen.state.confirmClickCount, 2);
+
+  const unavailable = createRecommendLocationClient({ checkboxAvailable: false });
+  const unavailableResult = await ensureRecommendCurrentCityOnly(unavailable.client, 99, {
+    enabled: false,
+    timeoutMs: 0,
+    intervalMs: 0,
+    settleMs: 0
+  });
+  assert.equal(unavailableResult.effective, false);
+  assert.equal(unavailableResult.unavailable, true);
+  assert.equal(unavailableResult.reason, "current_city_control_unavailable");
+  assert.equal(unavailable.state.escapeCount, 1);
+  assert.equal(unavailable.state.confirmClickCount, 0);
+
+  const unavailableEnabled = createRecommendLocationClient({ checkboxAvailable: false });
+  await assert.rejects(
+    ensureRecommendCurrentCityOnly(unavailableEnabled.client, 99, {
+      enabled: true,
+      timeoutMs: 0,
+      intervalMs: 0,
+      settleMs: 0,
+      attemptsLimit: 1
+    }),
+    /unavailable for an enabled request/
+  );
+
+  const unreadable = createRecommendLocationClient({ stateReadable: false });
+  await assert.rejects(
+    ensureRecommendCurrentCityOnly(unreadable.client, 99, {
+      enabled: false,
+      timeoutMs: 0,
+      intervalMs: 0,
+      settleMs: 0,
+      attemptsLimit: 1
+    }),
+    /visible but its state is unreadable/
+  );
+}
+
+async function testRecommendCurrentCityOnlyRetriesStaleControlState() {
+  const { client, state } = createRecommendLocationClient({
+    checked: false,
+    staleStateReadOnce: true
+  });
+  const result = await ensureRecommendCurrentCityOnly(client, 99, {
+    enabled: true,
+    timeoutMs: 0,
+    intervalMs: 0,
+    settleMs: 0,
+    attemptsLimit: 2
+  });
+  assert.equal(result.effective, true);
+  assert.equal(result.sticky_verification.verified, true);
+  assert.equal(state.escapeCount, 1);
+  assert.equal(state.clearClickCount, 0);
+}
+
+async function testRecommendCurrentCityOnlyDoesNotTreatFailedOpenAsUnavailable() {
+  const { client, state } = createRecommendLocationClient({ triggerOpens: false });
+  await assert.rejects(
+    ensureRecommendCurrentCityOnly(client, 99, {
+      enabled: false,
+      timeoutMs: 0,
+      intervalMs: 0,
+      settleMs: 0,
+      attemptsLimit: 1,
+      openAttemptsLimit: 3
+    }),
+    /location_popover_did_not_open/
+  );
+  assert.equal(state.triggerClickCount, 3);
 }
 
 function testNetworkPatterns() {
@@ -1348,6 +1915,13 @@ testJobLabelMatchingIgnoresSalaryFormatting();
 testRecoverableImageCaptureEvidencePreservesPartialPages();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
+await testRecommendActivityFilterSelectionAndStickyVerification();
+await testRecommendActivityUnavailableDefaultAndUnreadableControl();
+await testRecommendMissingFilterPanelDefaultSafety();
+await testRecommendCurrentCityOnlyStateAndStickyVerification();
+await testRecommendCurrentCityOnlyAlreadyOpenAndUnavailablePolicy();
+await testRecommendCurrentCityOnlyRetriesStaleControlState();
+await testRecommendCurrentCityOnlyDoesNotTreatFailedOpenAsUnavailable();
 testNetworkPatterns();
 testColleagueContactDateParsing();
 await testColleagueContactInspectorSelectsColleagueTab();

@@ -21,11 +21,18 @@ Active runtime code must not use:
 - `Runtime.evaluate`
 - `Runtime.callFunctionOn`
 - `page.evaluate`
+- Puppeteer/Playwright `$eval` or `$$eval`
+- `Page.addScriptToEvaluateOnNewDocument`
+- a `page.js` page-context helper or equivalent injected browser script
+- global `eval(...)`, `Function(...)`, or `new Function(...)`
+- injected `<script>` elements or `javascript:` navigation
 - lowercase or wrapper equivalents such as `runtime.evaluate`
 - generated page-code strings such as `build*Expression`
 - page-context DOM action strings such as executable `document.querySelector(...)` or `.click()`
 
 The only permitted references to forbidden method names are in guard/scanner code that blocks or reports them.
+
+Non-script CDP `Page.navigate`, `Page.reload`, and `Page.captureScreenshot` remain allowed. They are protocol operations and do not execute JavaScript in the Boss page.
 
 ## Required interaction pattern
 

@@ -22,13 +22,17 @@ const inputRows = buildLegacyScreenInputRows({
     school_tag: ["985", "211"],
     degree: ["本科", "硕士"],
     gender: "男",
-    recent_not_view: "近14天没有"
+    recent_not_view: "近14天没有",
+    current_city_only: true,
+    activity_level: "本周活跃"
   },
   effectiveSearchParams: {
     school_tag: ["985", "211"],
     degree: ["本科", "硕士"],
     gender: "男",
-    recent_not_view: "近14天没有"
+    recent_not_view: "近14天没有",
+    current_city_only: true,
+    activity_level: "本周活跃"
   },
   screenParams: {
     criteria: "只判断通过与否",
@@ -122,6 +126,9 @@ const csv = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "");
 assert.equal(csv.includes("\"运行输入字段\",\"运行输入值\""), true);
 assert.equal(csv.includes("selected_job.label"), true);
 assert.equal(csv.includes("user_search_params.school_tag"), true);
+assert.equal(csv.includes('"user_search_params.current_city_only","true"'), true);
+assert.equal(csv.includes('"user_search_params.activity_level","本周活跃"'), true);
+assert.equal(csv.indexOf("user_search_params.current_city_only") < csv.indexOf("user_search_params.activity_level"), true);
 assert.equal(csv.includes(LEGACY_RESULT_HEADER.join(",")), false);
 assert.equal(csv.includes(LEGACY_RESULT_HEADER.map((header) => `"${header}"`).join(",")), true);
 assert.equal(csv.includes("完整 CoT / reasoning_content"), true);

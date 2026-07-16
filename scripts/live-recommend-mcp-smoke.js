@@ -29,11 +29,14 @@ function parseArgs(argv) {
     detailLimit: 0,
     delayMs: 1600,
     pauseAfterProcessed: 1,
+    restLevel: "medium",
     slowLive: true,
     allowNavigate: true,
     timeoutMs: 360000,
     noFilter: true,
     degreeLabels: [],
+    currentCityOnly: false,
+    activityLevel: "不限",
     postAction: "none",
     maxGreetCount: null,
     executePostAction: true,
@@ -59,12 +62,25 @@ function parseArgs(argv) {
     if (arg === "--pause-after-processed") {
       result.pauseAfterProcessed = parsePositiveInt(argv[++index], result.pauseAfterProcessed);
     }
+    if (arg === "--rest-level") result.restLevel = String(argv[++index] || "").trim().toLowerCase();
     if (arg === "--slow-live") result.slowLive = true;
     if (arg === "--no-slow-live") result.slowLive = false;
     if (arg === "--no-navigate") result.allowNavigate = false;
     if (arg === "--timeout-ms") result.timeoutMs = parsePositiveInt(argv[++index], result.timeoutMs);
     if (arg === "--no-filter") result.noFilter = true;
     if (arg === "--filter") result.noFilter = false;
+    if (arg === "--current-city-only") {
+      result.currentCityOnly = true;
+      result.noFilter = false;
+    }
+    if (arg === "--no-current-city-only") {
+      result.currentCityOnly = false;
+      result.noFilter = false;
+    }
+    if (arg === "--activity-level") {
+      result.activityLevel = String(argv[++index] || "").trim() || "不限";
+      result.noFilter = false;
+    }
     if (arg === "--post-action") result.postAction = String(argv[++index] || "none").trim() || "none";
     if (arg === "--max-greet-count") result.maxGreetCount = parsePositiveInt(argv[++index], result.maxGreetCount);
     if (arg === "--execute-post-action") {
@@ -123,6 +139,10 @@ async function waitForRun(runId, predicate, {
   while (Date.now() - started <= timeoutMs) {
     lastPayload = await callTool(TOOL_GET, { run_id: runId }, 2000);
     if (predicate(lastPayload.run, lastPayload)) return lastPayload;
+    if (["failed", "canceled", "completed"].includes(lastPayload.run?.status)) {
+      const terminalError = lastPayload.run?.error?.message || lastPayload.run?.result?.error?.message || "terminal state reached";
+      throw new Error(`Recommend MCP run ${runId} ended as ${lastPayload.run.status}: ${terminalError}`);
+    }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error(`Timed out waiting for recommend MCP run ${runId}; last=${JSON.stringify(lastPayload?.run || null)}`);
@@ -144,18 +164,28 @@ function summarizeMethods(methodLog = []) {
 }
 
 function assertNoRuntime(methodLog = []) {
-  const runtimeMethods = methodLog
+  const forbiddenMethods = methodLog
     .map((entry) => entry.method)
-    .filter((method) => String(method || "").startsWith("Runtime."));
-  if (runtimeMethods.length) {
-    throw new Error(`Forbidden Runtime CDP calls observed: ${runtimeMethods.join(", ")}`);
+    .filter((method) => (
+      String(method || "").startsWith("Runtime.")
+      || String(method || "").startsWith("Page.addScript")
+    ));
+  if (forbiddenMethods.length) {
+    throw new Error(`Forbidden page-JS CDP calls observed: ${forbiddenMethods.join(", ")}`);
   }
 }
 
 function buildRecommendArgs(options) {
   const degreeValue = options.degreeLabels.length ? options.degreeLabels : "不限";
+  const activityLevels = new Set(["不限", "刚刚活跃", "今日活跃", "3日内活跃", "本周活跃", "本月活跃"]);
+  if (!activityLevels.has(options.activityLevel)) {
+    throw new Error(`Unsupported activity level: ${options.activityLevel}`);
+  }
   if (!["greet", "none"].includes(options.postAction)) {
     throw new Error(`Unsupported recommend post action: ${options.postAction}. Use greet or none.`);
+  }
+  if (!["low", "medium", "high"].includes(options.restLevel)) {
+    throw new Error(`Unsupported rest level: ${options.restLevel}. Use low, medium, or high.`);
   }
   const maxGreetCount = options.maxGreetCount;
   const postAction = options.postAction;
@@ -186,6 +216,8 @@ function buildRecommendArgs(options) {
     degree: degreeValue,
     gender: "不限",
     recent_not_view: "不限",
+    current_city_only: options.currentCityOnly,
+    activity_level: options.activityLevel,
     criteria: options.criteria,
     target_count: options.targetCount,
     post_action: postAction,
@@ -209,7 +241,10 @@ function buildRecommendArgs(options) {
     delay_ms: options.delayMs,
     no_filter: options.noFilter,
     execute_post_action: options.executePostAction,
-    dry_run_post_action: options.dryRunPostAction
+    dry_run_post_action: options.dryRunPostAction,
+    human_behavior: {
+      restLevel: options.restLevel
+    }
   };
   if (options.actionTimeoutMs !== null) args.action_timeout_ms = options.actionTimeoutMs;
   if (options.actionIntervalMs !== null) args.action_interval_ms = options.actionIntervalMs;

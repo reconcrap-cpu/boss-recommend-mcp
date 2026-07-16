@@ -154,8 +154,9 @@ boss-recommend-mcp schedule-status --schedule-id <schedule_id>
 ## 设计特点
 
 - 页面目标固定为 `https://www.zhipin.com/web/chat/recommend`
-- 活跃浏览器自动化为 CDP-only；硬静态门禁会阻止活跃路径重新引入 `Runtime.evaluate` / 页面 JS。
-- 支持推荐页原生筛选：学校标签 / 学历 / 性别 / 近14天没有
+- 活跃浏览器自动化为 CDP-only；硬静态门禁会阻止活跃路径重新引入 `Runtime.evaluate`、`page.evaluate` / `$eval` / `$$eval`、`page.js`、脚本注入或其他页面 JS。
+- 支持推荐页原生筛选：当前城市限定 / 活跃度 / 学校标签 / 学历 / 性别 / 近14天没有
+- `current_city_only` 默认为 `false`，只切换“仅推荐期望城市为本城市的牛人”，不会改变 Boss 当前已选择的城市；`activity_level` 接受自然语言并归一化到最靠近用户意图的 `不限/刚刚活跃/今日活跃/3日内活跃/本周活跃/本月活跃`，无法理解或有冲突时安全回退为 `不限`
 - 支持推荐页岗位列表只读读取：`list_recommend_jobs` / `boss-recommend-mcp list-jobs`
 - 支持推荐页 page scope：`推荐` / `精选` / `最新`
 - 学校标签支持多选语义：如“985、211”会同时勾选这两项
@@ -551,6 +552,8 @@ Trae-CN / 长对话防循环建议：
     "degree": ["本科", "硕士", "博士"],
     "gender": "女",
     "recent_not_view": "近14天没有",
+    "current_city_only": true,
+    "activity_level": "今日活跃",
     "criteria": "候选人需要有 AI Agent 或 MCP 工具开发经验",
     "job": "算法工程师（视频/图像模型方向） _ 杭州",
     "target_count": 20,

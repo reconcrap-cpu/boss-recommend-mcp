@@ -63,7 +63,9 @@ import {
   waitForRecommendCardNodeIds
 } from "./cards.js";
 import { selectAndConfirmFirstSafeFilter } from "./filters.js";
+import { ensureRecommendCurrentCityOnly } from "./location.js";
 import {
+  applyRecommendFilterEnvelopeStages,
   buildRecommendFilterSelectionOptions,
   refreshRecommendListAtEnd
 } from "./refresh.js";
@@ -109,21 +111,41 @@ function normalizeFilter(filter = {}) {
       : [];
   return {
     enabled: filter.enabled !== false,
+    currentCityOnly: filter.currentCityOnly === true || filter.current_city_only === true,
     group: String(filter.group || ""),
     labels: normalizeLabels(filter.labels || filter.filterLabels || []),
     selectAllLabels: Boolean(filter.selectAllLabels),
+    allowUnlimited: filter.allowUnlimited === true,
+    verifySticky: filter.verifySticky === true,
     filterGroups: filterGroups.map((group) => ({
       group: String(group?.group || ""),
       labels: normalizeLabels(group?.labels || group?.filterLabels || []),
-      selectAllLabels: group?.selectAllLabels !== false
+      selectAllLabels: group?.selectAllLabels !== false,
+      allowUnlimited: group?.allowUnlimited === true,
+      verifySticky: group?.verifySticky === true
     })).filter((group) => group.group || group.labels.length)
   };
 }
 
-function compactFilterResult(filterResult) {
+export function compactFilterResult(filterResult) {
   if (!filterResult) return null;
   return {
     opened_panel: Boolean(filterResult.opened_panel),
+    requested_groups: (filterResult.requested_groups || []).map((group) => ({
+      group: group.group,
+      labels: group.labels || [],
+      select_all_labels: group.select_all_labels !== false,
+      allow_unlimited: Boolean(group.allow_unlimited),
+      verify_sticky: Boolean(group.verify_sticky)
+    })),
+    effective_groups: (filterResult.sticky_verification?.groups || []).map((group) => ({
+      group: group.group,
+      requested_labels: group.requested_labels || [],
+      active_labels: group.active_labels || [],
+      verified: Boolean(group.verified),
+      unavailable: Boolean(group.unavailable),
+      reason: group.reason || null
+    })),
     selected_option: filterResult.selected_option
       ? {
           group: filterResult.selected_option.group,
@@ -138,9 +160,58 @@ function compactFilterResult(filterResult) {
       was_active: Boolean(option.was_active),
       clicked: option.clicked !== false
     })),
+    unavailable: Boolean(filterResult.unavailable),
+    unavailable_groups: filterResult.unavailable_groups || [],
     confirmed: Boolean(filterResult.confirmed),
+    sticky_verification: filterResult.sticky_verification || null,
+    attempts: {
+      initial_close: filterResult.initial_close_attempts || [],
+      open: (filterResult.open_attempts || []).map((attempt) => ({
+        selector: attempt.selector || null,
+        node_id: attempt.node_id || null,
+        click_target: attempt.click_target || null
+      })),
+      confirmation: (filterResult.confirm_attempts || []).map((attempt) => ({
+        node_id: attempt.node_id || null,
+        label: attempt.label || null,
+        clicked: Boolean(attempt.clicked),
+        errors: (attempt.errors || []).map((error) => ({
+          node_id: error.node_id || null,
+          message: error.message || String(error)
+        }))
+      }))
+    },
     before_counts: filterResult.before_counts,
     after_confirm_counts: filterResult.after_confirm_counts
+  };
+}
+
+function compactCurrentCityOnlyResult(result) {
+  if (!result) return null;
+  return {
+    requested: Boolean(result.requested),
+    effective: typeof result.effective === "boolean" ? result.effective : null,
+    available: result.available !== false,
+    unavailable: Boolean(result.unavailable),
+    reason: result.reason || null,
+    clicked: Boolean(result.clicked),
+    current_city_label: result.current_city_label || null,
+    before: result.before || null,
+    after_toggle: result.after_toggle || null,
+    confirmation: result.confirmation || null,
+    sticky_verification: result.sticky_verification
+      ? {
+          verified: Boolean(result.sticky_verification.verified),
+          expected: Boolean(result.sticky_verification.expected),
+          actual: typeof result.sticky_verification.actual === "boolean"
+            ? result.sticky_verification.actual
+            : null,
+          state_source: result.sticky_verification.state_source || null,
+          close_confirmation: result.sticky_verification.close_confirmation || null
+        }
+      : null,
+    attempts: Array.isArray(result.attempts) ? result.attempts : [],
+    evidence: result.evidence || null
   };
 }
 
@@ -404,7 +475,25 @@ function compactRefreshAttempt(refreshAttempt) {
       before_card_count: attempt.before_card_count || 0,
       after_card_count: attempt.after_card_count || 0,
       card_count: attempt.card_count || 0,
-      elapsed_ms: attempt.elapsed_ms || 0
+      elapsed_ms: attempt.elapsed_ms || 0,
+      current_city_only: compactCurrentCityOnlyResult(attempt.current_city_only),
+      current_city_only_attempts: (attempt.current_city_only_attempts || []).map((cityAttempt) => ({
+        ok: Boolean(cityAttempt.ok),
+        method: cityAttempt.method || "current_city_only_reapply",
+        reason: cityAttempt.reason || null,
+        error: cityAttempt.error || null,
+        attempt: cityAttempt.attempt || 0,
+        result: compactCurrentCityOnlyResult(cityAttempt.result)
+      })),
+      filter: compactFilterResult(attempt.filter)
+    })),
+    current_city_only_attempts: (refreshAttempt.current_city_only_attempts || []).map((attempt) => ({
+      ok: Boolean(attempt.ok),
+      method: attempt.method || "current_city_only_reapply",
+      reason: attempt.reason || null,
+      error: attempt.error || null,
+      attempt: attempt.attempt || 0,
+      result: compactCurrentCityOnlyResult(attempt.result)
     })),
     filter_reapply_attempts: (refreshAttempt.filter_reapply_attempts || []).map((attempt) => ({
       ok: Boolean(attempt.ok),
@@ -425,6 +514,7 @@ function compactRefreshAttempt(refreshAttempt) {
     })),
     job_selection: compactJobSelection(refreshAttempt.job_selection),
     page_scope: compactPageScopeSelection(refreshAttempt.page_scope),
+    current_city_only: compactCurrentCityOnlyResult(refreshAttempt.current_city_only),
     filter: compactFilterResult(refreshAttempt.filter)
   };
 }
@@ -752,6 +842,7 @@ export async function runRecommendWorkflow({
   const candidateRecoveryCounts = new Map();
   let jobSelection = null;
   let pageScopeSelection = null;
+  let currentCityOnlyResult = null;
   let filterResult = null;
   let rootState = null;
   let cardNodeIds = [];
@@ -816,6 +907,9 @@ export async function runRecommendWorkflow({
       human_rest_enabled: effectiveHumanRestEnabled,
       skip_recent_colleague_contacted: shouldSkipRecentColleagueContacted,
       colleague_contact_window_days: normalizedColleagueContactWindowDays,
+      current_city_only_requested: normalizedFilter.currentCityOnly,
+      current_city_only_effective: currentCityOnlyResult?.effective ?? null,
+      current_city_only_unavailable: Boolean(currentCityOnlyResult?.unavailable),
       human_rest_count: humanRestState.rest_count,
       human_rest_ms: humanRestState.total_rest_ms,
       last_human_event: lastHumanEvent,
@@ -862,6 +956,7 @@ export async function runRecommendWorkflow({
     const started = Date.now();
     runControl.setPhase("recommend:recover-context");
     contextRecoveryAttempts += 1;
+    const effectiveForceRecentNotView = normalizedFilter.enabled && forceRecentNotView;
     const refreshResult = await refreshRecommendListAtEnd(client, {
       rootState,
       jobLabel,
@@ -871,7 +966,7 @@ export async function runRecommendWorkflow({
       preferEndRefreshButton: false,
       forceNavigate: true,
       targetUrl: targetUrl || RECOMMEND_TARGET_URL,
-      forceRecentNotView,
+      forceRecentNotView: effectiveForceRecentNotView,
       cardTimeoutMs,
       buttonSettleMs: refreshButtonSettleMs,
       reloadSettleMs: refreshReloadSettleMs
@@ -905,10 +1000,16 @@ export async function runRecommendWorkflow({
     if (!refreshResult.ok) {
       updateRecommendProgress({
         refresh_method: refreshResult.method || null,
-        refresh_forced_recent_not_view: forceRecentNotView,
+        refresh_forced_recent_not_view: effectiveForceRecentNotView,
         recovery_reason: reason
       });
       throw new Error(`Recommend context recovery failed after ${reason}: ${refreshResult.reason || refreshResult.error || "refresh returned no cards"}`);
+    }
+    if (refreshResult.current_city_only) {
+      currentCityOnlyResult = refreshResult.current_city_only;
+    }
+    if (refreshResult.filter) {
+      filterResult = refreshResult.filter;
     }
     if (!blockingPanelClose?.closed) {
       const panelError = createRecommendBlockingPanelCloseFailureError(blockingPanelClose, `recover:${reason}`);
@@ -927,7 +1028,7 @@ export async function runRecommendWorkflow({
       method: refreshResult.method,
       metadata: {
         card_count: cardNodeIds.length,
-        forced_recent_not_view: forceRecentNotView,
+        forced_recent_not_view: effectiveForceRecentNotView,
         counters: countRecommendResultStatuses(results, { greetCount })
       }
     });
@@ -935,7 +1036,7 @@ export async function runRecommendWorkflow({
     updateRecommendProgress({
       card_count: cardNodeIds.length,
       refresh_method: refreshResult.method || null,
-      refresh_forced_recent_not_view: forceRecentNotView,
+      refresh_forced_recent_not_view: effectiveForceRecentNotView,
       recovery_reason: reason
     });
     return refreshResult;
@@ -992,24 +1093,45 @@ export async function runRecommendWorkflow({
     page_scope: compactPageScopeSelection(pageScopeSelection)
   });
 
-  if (normalizedFilter.enabled) {
-    await runControl.waitIfPaused();
-    runControl.throwIfCanceled();
-    runControl.setPhase("recommend:filter");
-    filterResult = await selectAndConfirmFirstSafeFilter(
-      client,
-      rootState.iframe.documentNodeId,
-      buildRecommendFilterSelectionOptions(normalizedFilter)
-    );
-    if (!filterResult.confirmed) {
-      throw new Error("Recommend run filter selection was not confirmed");
+  const initialFilterStages = await applyRecommendFilterEnvelopeStages(normalizedFilter, {
+    applyCurrentCityOnly: async () => {
+      await runControl.waitIfPaused();
+      runControl.throwIfCanceled();
+      runControl.setPhase("recommend:current-city-only");
+      const result = await ensureRecommendCurrentCityOnly(
+        client,
+        rootState.iframe.documentNodeId,
+        { enabled: normalizedFilter.currentCityOnly }
+      );
+      rootState = await getRecommendRoots(client);
+      rootState = await ensureRecommendViewport(rootState, "current_city_only");
+      runControl.checkpoint({
+        current_city_only: compactCurrentCityOnlyResult(result)
+      });
+      return result;
+    },
+    applyFilterPanel: async () => {
+      await runControl.waitIfPaused();
+      runControl.throwIfCanceled();
+      runControl.setPhase("recommend:filter");
+      const result = await selectAndConfirmFirstSafeFilter(
+        client,
+        rootState.iframe.documentNodeId,
+        buildRecommendFilterSelectionOptions(normalizedFilter)
+      );
+      if (!result.confirmed) {
+        throw new Error("Recommend run filter selection was not confirmed");
+      }
+      rootState = await getRecommendRoots(client);
+      rootState = await ensureRecommendViewport(rootState, "filter");
+      runControl.checkpoint({
+        filter: compactFilterResult(result)
+      });
+      return result;
     }
-    rootState = await getRecommendRoots(client);
-    rootState = await ensureRecommendViewport(rootState, "filter");
-    runControl.checkpoint({
-      filter: compactFilterResult(filterResult)
-    });
-  }
+  });
+  currentCityOnlyResult = initialFilterStages.current_city_only;
+  filterResult = initialFilterStages.filter;
 
   await runControl.waitIfPaused();
   runControl.throwIfCanceled();
@@ -1089,7 +1211,7 @@ export async function runRecommendWorkflow({
           pageScope: pageScopeSelection?.effective_scope || requestedPageScope,
           fallbackPageScope: normalizedFallbackPageScope,
           filter: normalizedFilter,
-          forceRecentNotView: true,
+          forceRecentNotView: normalizedFilter.enabled,
           cardTimeoutMs,
           buttonSettleMs: refreshButtonSettleMs,
           reloadSettleMs: refreshReloadSettleMs
@@ -1103,10 +1225,16 @@ export async function runRecommendWorkflow({
         updateRecommendProgress({
           card_count: refreshResult.card_count || cardNodeIds.length,
           refresh_method: refreshResult.method || null,
-          refresh_forced_recent_not_view: true,
+          refresh_forced_recent_not_view: Boolean(refreshResult.forced_recent_not_view),
           list_end_reason: listEndReason
         });
         if (refreshResult.ok) {
+          if (refreshResult.current_city_only) {
+            currentCityOnlyResult = refreshResult.current_city_only;
+          }
+          if (refreshResult.filter) {
+            filterResult = refreshResult.filter;
+          }
           rootState = refreshResult.root_state || await getRecommendRoots(client);
           rootState = await ensureRecommendViewport(rootState, "refresh_after");
           cardNodeIds = await waitForRecommendCardNodeIds(client, rootState.iframe.documentNodeId, {
@@ -1119,7 +1247,7 @@ export async function runRecommendWorkflow({
             method: refreshResult.method,
             metadata: {
               card_count: cardNodeIds.length,
-              forced_recent_not_view: true
+              forced_recent_not_view: Boolean(refreshResult.forced_recent_not_view)
             }
           });
           listEndReason = "";
@@ -1500,7 +1628,7 @@ export async function runRecommendWorkflow({
               ok: false,
               reason: "context_recovery_failed",
               error: error?.message || String(error),
-              forced_recent_not_view: true
+              forced_recent_not_view: Boolean(normalizedFilter.enabled)
             }
           };
         }
@@ -1606,6 +1734,7 @@ export async function runRecommendWorkflow({
     target_url: targetUrl,
     job_selection: compactJobSelection(jobSelection),
     page_scope: compactPageScopeSelection(pageScopeSelection),
+    current_city_only: compactCurrentCityOnlyResult(currentCityOnlyResult),
     filter: compactFilterResult(filterResult),
     card_count: cardNodeIds.length,
     candidate_list: compactInfiniteListState(listState),
@@ -1704,6 +1833,7 @@ export function createRecommendRunService({
         requested_page_scope: requestedPageScope,
         fallback_page_scope: normalizedFallbackPageScope,
         filter: normalizedFilter,
+        current_city_only_requested: normalizedFilter.currentCityOnly,
         max_candidates: maxCandidates,
         max_candidates_semantics: "passed_candidates",
         detail_limit: normalizedDetailLimit,
@@ -1757,6 +1887,9 @@ export function createRecommendRunService({
         recent_colleague_contact_skipped: 0,
         colleague_contact_panel_missing: 0,
         context_recoveries: 0,
+        current_city_only_requested: normalizedFilter.currentCityOnly,
+        current_city_only_effective: null,
+        current_city_only_unavailable: false,
         human_behavior_enabled: effectiveHumanBehavior.enabled,
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_rest_level: effectiveHumanBehavior.restLevel,

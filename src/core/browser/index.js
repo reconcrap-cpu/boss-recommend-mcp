@@ -26,6 +26,9 @@ export const ALLOWED_CDP_DOMAINS = new Set([
 ]);
 
 export const FORBIDDEN_CDP_DOMAINS = new Set(["Runtime"]);
+export const FORBIDDEN_CDP_METHODS = new Set([
+  "Page.addScriptToEvaluateOnNewDocument"
+]);
 
 const BOSS_LOGIN_URL_PATTERN = /(?:zhipin\.com\/web\/user(?:\/|\?|$)|passport\.zhipin\.com|login\.zhipin\.com)/i;
 const BOSS_LOGIN_TEXT_PATTERN = /扫码登录|验证码登录|密码登录|登录后|请登录|登录BOSS直聘|Boss登录|BOSS登录/i;
@@ -318,8 +321,9 @@ function normalizeTargetMatcher({ targetUrlIncludes, targetPredicate } = {}) {
 }
 
 function isForbiddenMethod(methodName) {
-  const [domain] = String(methodName || "").split(".");
-  return FORBIDDEN_CDP_DOMAINS.has(domain);
+  const canonicalMethod = String(methodName || "").replace(/:retry_after_reconnect$/, "");
+  const [domain] = canonicalMethod.split(".");
+  return FORBIDDEN_CDP_DOMAINS.has(domain) || FORBIDDEN_CDP_METHODS.has(canonicalMethod);
 }
 
 function methodName(domain, method) {

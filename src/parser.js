@@ -28,6 +28,50 @@ const DEGREE_ORDER = [
 ];
 const GENDER_OPTIONS = ["不限", "男", "女"];
 const RECENT_NOT_VIEW_OPTIONS = ["不限", "近14天没有"];
+const ACTIVITY_LEVEL_OPTIONS = [
+  "不限",
+  "刚刚活跃",
+  "今日活跃",
+  "3日内活跃",
+  "本周活跃",
+  "本月活跃"
+];
+const ACTIVITY_LEVEL_ALIASES = Object.freeze({
+  "不限": [
+    "不限", "不限制", "无要求", "没有要求", "任意", "全部", "都可以", "均可", "随便", "无所谓",
+    "nolimit", "norestriction", "unrestricted", "any", "all", "anytime", "nopreference", "doesntmatter", "whatever"
+  ],
+  "刚刚活跃": [
+    "刚刚活跃", "刚才活跃", "刚刚", "刚才", "刚上线", "刚刚上线", "当前在线", "现在在线", "正在在线", "在线", "最近活跃", "近期活跃",
+    "高活跃", "高活跃度", "活跃度高", "高度活跃", "非常活跃", "很活跃", "超级活跃", "极其活跃", "最活跃", "高频活跃",
+    "activenow", "online", "onlinenow", "justnow", "justactive", "justonline", "currentlyactive", "currentlyonline",
+    "recentlyactive", "activerecently", "highactivity", "highlyactive", "veryactive", "superactive", "extremelyactive", "mostactive"
+  ],
+  "今日活跃": [
+    "今日活跃", "今天活跃", "今日", "今天", "当日", "当天", "当天活跃", "24小时内", "近24小时", "最近24小时", "过去24小时",
+    "today", "activetoday", "todayactive", "daily", "dailyactive", "每日活跃", "sameday", "withinthelastday", "inthelastday", "duringthecurrentday",
+    "within24hours", "last24hours", "past24hours"
+  ],
+  "3日内活跃": [
+    "3日内活跃", "3天内活跃", "三日内活跃", "三天内活跃", "3日内", "3天内", "三日内", "三天内",
+    "近3日", "近3天", "最近3日", "最近3天", "过去3日", "过去3天", "昨日", "昨天", "前天", "最近几天",
+    "within3days", "last3days", "past3days", "recent3days", "yesterday", "daybeforeyesterday", "recentfewdays"
+  ],
+  "本周活跃": [
+    "本周活跃", "本舟活跃", "这周活跃", "本周", "这周", "这个星期", "本星期", "本礼拜", "这礼拜", "一周内", "近一周", "最近一周", "近7天", "最近7天", "7日内", "7天内",
+    "中等活跃", "中度活跃", "一般活跃", "普通活跃", "适度活跃", "活跃度一般", "中等活跃度",
+    "thisweek", "currentweek", "thisweekend", "weekend", "withinweek", "withinaweek", "withinthelastweek", "inthelastweek", "inthepastweek",
+    "duringthecurrentweek", "overthelastweek", "overthepastweek", "lastweek", "pastweek", "weekly", "recent7days", "last7days", "past7days",
+    "mediumactivity", "moderatelyactive", "mediumactive", "fairlyactive", "averageactivity", "averagelyactive", "normallyactive"
+  ],
+  "本月活跃": [
+    "本月活跃", "这个月活跃", "本月", "这个月", "当月", "一个月内", "近一个月", "最近一个月", "近30天", "最近30天", "30日内", "30天内",
+    "低活跃", "低活跃度", "活跃度低", "活跃度不高", "低度活跃", "不太活跃", "偶尔活跃", "较少活跃", "很少活跃", "低频活跃",
+    "thismonth", "currentmonth", "withinmonth", "withinamonth", "withinthelastmonth", "inthelastmonth", "inthepastmonth", "duringthecurrentmonth",
+    "overthelastmonth", "overthepastmonth", "lastmonth", "pastmonth", "monthly", "recent30days", "last30days", "past30days",
+    "lowactivity", "lowactive", "lessactive", "notveryactive", "occasionallyactive", "rarelyactive", "infrequentlyactive", "seldomactive"
+  ]
+});
 const FILTER_CONFIRM_OPTIONS = [
   { label: "筛选项无误，继续", value: "confirm" },
   { label: "筛选项需要调整", value: "revise" }
@@ -97,10 +141,11 @@ const MAX_GREET_COUNT_PATTERNS = [
   /最多(?:打招呼|沟通|联系)\s*(\d+)\s*(?:位|人|个)?/i,
   /(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多)(?:为|是|:|：)?\s*(\d+)/i
 ];
+const RUN_META_FIELD_LABEL_PATTERN = "(?:页面选择|学校标签|院校标签|学历|学位|性别|是否过滤近14天看过|当前城市筛选|仅推荐本城市|仅推荐期望城市为本城市(?:的牛人)?|current[_\\s-]?city[_\\s-]?only|活跃度|活动度|activity[_\\s-]?level|筛选条件|目标筛选数|目标通过人数|通过筛选后动作|最大招呼数|最大打招呼数|岗位)";
 const CRITERIA_EXPLICIT_MARKER_PATTERN = /筛选条件\s*[：:]/i;
-const CRITERIA_EXPLICIT_STOP_PATTERN = /(?:^|[\n；;])\s*(?:页面选择|学校标签|院校标签|学历|学位|性别|是否过滤近14天看过|目标筛选数|目标通过人数|通过筛选后动作|最大招呼数|最大打招呼数|岗位)\s*[：:]/i;
+const CRITERIA_EXPLICIT_STOP_PATTERN = new RegExp(`(?:^|[\\s；;])\\s*${RUN_META_FIELD_LABEL_PATTERN}\\s*[：:]`, "i");
 const CRITERIA_META_FIELD_PREFIX_PATTERNS = [
-  /^(?:页面选择|学校标签|院校标签|学历|学位|性别|是否过滤近14天看过|目标筛选数|目标通过人数|通过筛选后动作|最大招呼数|最大打招呼数|岗位)\s*(?:[:：]|$)/i,
+  new RegExp(`^${RUN_META_FIELD_LABEL_PATTERN}\\s*(?:[:：]|$)`, "i"),
   /^(?:近?14天(?:内)?(?:没有|没看过|未查看)|(?:不过滤|保留|过滤|排除)[^。；;\n]{0,12}14天)\s*(?:[:：]|$)?/i,
   /^(?:目标(?:处理|筛选|通过)?(?:人数|数量)?|至少(?:处理|筛选|通过)|(?:处理|筛选|通过)\s*\d+\s*(?:位|人))(?:[:：\s]|$)/i,
   /^(?:最多(?:打招呼|沟通|联系)|(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多))(?:[:：\s]|$)/i,
@@ -302,13 +347,244 @@ function normalizeRecentNotView(value) {
   return RECENT_NOT_VIEW_OPTIONS.includes(normalized) ? normalized : null;
 }
 
+function normalizeActivityIntentText(value) {
+  return normalizeText(value)
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[內内]/g, "内")
+    .replace(/[週周]/g, "周")
+    .replace(/[剛刚]/g, "刚")
+    .replace(/[當当]/g, "当")
+    .replace(/[無无]/g, "无")
+    .replace(/[躍跃]/g, "跃");
+}
+
+function compactActivityIntentText(value) {
+  return normalizeActivityIntentText(value).replace(/[\s_\-—–:：,，。；;、/|()[\]{}'"“”‘’]+/g, "");
+}
+
+function stripActivityIntentWrappers(value) {
+  let current = compactActivityIntentText(value);
+  for (let index = 0; index < 4; index += 1) {
+    const previous = current;
+    current = current
+      .replace(/^(?:please|showme|iwant|want|setto|select|choose|filterby|activitylevel|activitystatus|activity|active|活跃度单选|活跃度|活动度|请选择|请选|选择|设置为|设为|设置|筛选为|筛选|仅推荐|只推荐|推荐|仅看|只看|只要|仅要|要求|希望|我要|想要|选项为|选项是|为|是|选)/, "")
+      .replace(/(?:candidates?|people|users?|talents?|option|active|的牛人|牛人|的候选人|候选人|的人选|人选|的人才|人才|的用户|用户|的人|选项|档位|程度|活跃度|活跃)$/u, "")
+      .replace(/^(?:为|是|to|is)/, "");
+    if (current === previous) break;
+  }
+  return current;
+}
+
+function parseChineseActivityNumber(value) {
+  const normalized = String(value || "");
+  if (/^\d+(?:\.\d+)?$/.test(normalized)) return Number(normalized);
+  if (normalized === "半") return 0.5;
+  const englishNumbers = {
+    half: 0.5,
+    one: 1,
+    two: 2,
+    couple: 2,
+    three: 3,
+    few: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    twenty: 20,
+    thirty: 30
+  };
+  if (Object.prototype.hasOwnProperty.call(englishNumbers, normalized.toLowerCase())) {
+    return englishNumbers[normalized.toLowerCase()];
+  }
+  const digits = { 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  if (normalized === "十") return 10;
+  if (normalized.includes("十")) {
+    const [tens, ones] = normalized.split("十");
+    return (tens ? digits[tens] || 0 : 1) * 10 + (ones ? digits[ones] || 0 : 0);
+  }
+  return digits[normalized] ?? null;
+}
+
+function activityLevelForRelativeDuration(value) {
+  const normalized = normalizeActivityIntentText(value);
+  const match = normalized.match(
+    /(?:近|最近|过去|过去的|within\s*|last\s*|past\s*)?(\d+(?:\.\d+)?|半|[一二两三四五六七八九十]+|half|one|two|couple|three|few|four|five|six|seven|eight|nine|ten|twenty|thirty)\s*(?:个)?\s*(小时|hours?|hrs?|hr|h|天|日|days?|day|d|周|星期|weeks?|week|w|月|months?|month)(?:内|以内|之内|ago)?/i
+  );
+  if (!match) return null;
+  const amount = parseChineseActivityNumber(match[1]);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  const unit = match[2].toLowerCase();
+  if (/^(?:小时|hours?|hrs?|hr|h)$/.test(unit)) {
+    if (amount <= 2) return "刚刚活跃";
+    if (amount <= 24) return "今日活跃";
+    return activityLevelForRelativeDuration(`${Math.ceil(amount / 24)}天`);
+  }
+  if (/^(?:天|日|days?|day|d)$/.test(unit)) {
+    if (amount <= 1) return "今日活跃";
+    const nominalWindows = [
+      { days: 3, activityLevel: "3日内活跃" },
+      { days: 7, activityLevel: "本周活跃" },
+      { days: 30, activityLevel: "本月活跃" }
+    ];
+    return nominalWindows.reduce((closest, candidate) => {
+      const closestDistance = Math.abs(amount - closest.days);
+      const candidateDistance = Math.abs(amount - candidate.days);
+      if (candidateDistance < closestDistance) return candidate;
+      if (candidateDistance === closestDistance && candidate.days > closest.days) return candidate;
+      return closest;
+    }, nominalWindows[0]).activityLevel;
+  }
+  if (/^(?:周|星期|weeks?|week|w)$/.test(unit)) {
+    return activityLevelForRelativeDuration(`${amount * 7}天`);
+  }
+  return "本月活跃";
+}
+
+function activityLevelsForSemanticPhrase(value) {
+  const normalized = normalizeActivityIntentText(value);
+  const compact = compactActivityIntentText(normalized);
+  const englishQualitativeText = normalized
+    .replace(/\bnot\s+(?:very|highly|high|super|extremely)\b/g, " low ");
+  const highQualitativeText = compact
+    .replace(/not(?:very|highly|high|super|extremely)active|nothighactivity/g, "")
+    .replace(/不太活跃|很少活跃|较少活跃|偶尔活跃|低频活跃|低度活跃|低活跃|活跃度不高|活跃度低/g, "");
+  const hasEnglishActivityContext = /\b(?:activity|active)\b/i.test(englishQualitativeText);
+  const hasChineseActivityContext = /活跃/.test(normalized);
+  const hasHighQualitativeIntent = (
+    /highactivity|highlyactive|veryactive|superactive|extremelyactive|mostactive|高活跃|活跃度高|高度活跃|非常活跃|很活跃|超级活跃|极其活跃|最活跃|高频活跃/.test(highQualitativeText)
+    || (hasEnglishActivityContext && /\b(?:high|highly|very|super|extremely|most)\b/i.test(englishQualitativeText))
+    || (hasChineseActivityContext && /高|非常|超级|极其|最活跃/.test(highQualitativeText))
+  );
+  const hasMediumQualitativeIntent = (
+    /mediumactivity|moderatelyactive|mediumactive|fairlyactive|averageactivity|averagelyactive|normallyactive|中等活跃|中度活跃|一般活跃|普通活跃|适度活跃|活跃度一般/.test(compact)
+    || (hasEnglishActivityContext && /\b(?:medium|moderate|moderately|fair|fairly|average|normal|normally)\b/i.test(englishQualitativeText))
+    || (hasChineseActivityContext && /中等|中度|一般|普通|适度/.test(normalized))
+  );
+  const hasLowQualitativeIntent = (
+    /lowactivity|lowactive|lessactive|notveryactive|nothighactivity|occasionallyactive|rarelyactive|infrequentlyactive|seldomactive|低活跃|活跃度低|活跃度不高|低度活跃|不太活跃|偶尔活跃|较少活跃|很少活跃|低频活跃/.test(compact)
+    || (hasEnglishActivityContext && /\b(?:low|less|rare|rarely|occasional|occasionally|infrequent|infrequently|seldom)\b/i.test(englishQualitativeText))
+    || (hasChineseActivityContext && /低|不太|偶尔|较少|很少|低频/.test(normalized))
+  );
+  const matches = [];
+  if (
+    /(?:no|without)(?:activity)?(?:limit|restriction|preference)|notrestricted|notactive|notonline|anyactivity|allactivity|dontcare|doesntmatter|不限|不限制|无要求|没有要求|任意|都可以|均可|无所谓/.test(compact)
+  ) {
+    matches.push("不限");
+  }
+  if (/justnow|rightnow|currentlyactive|currentlyonline|onlinenow|刚刚|刚才|刚上线|当前在线|现在在线/.test(compact)) {
+    matches.push("刚刚活跃");
+  }
+  if (hasHighQualitativeIntent) {
+    matches.push("刚刚活跃");
+  }
+  if (/activetoday|todayactive|today|sameday|(?:within|during|in|over)?(?:the)?(?:last|past|current)(?:one)?day|今日|今天|当日|当天/.test(compact)) {
+    matches.push("今日活跃");
+  }
+  if (/yesterday|daybeforeyesterday|recentfewdays|昨日|昨天|前天|最近几天/.test(compact)) {
+    matches.push("3日内活跃");
+  }
+  if (/(?:this|current)week|(?:within|during|in|over)?(?:the)?(?:last|past)(?:one)?week|thisweekend|weekend|本周|这周|这个星期|本星期/.test(compact)) {
+    matches.push("本周活跃");
+  }
+  if (hasMediumQualitativeIntent) {
+    matches.push("本周活跃");
+  }
+  if (/(?:this|current)month|(?:within|during|in|over)?(?:the)?(?:last|past)(?:one)?month|本月|这个月|当月/.test(compact)) {
+    matches.push("本月活跃");
+  }
+  if (hasLowQualitativeIntent) {
+    matches.push("本月活跃");
+  }
+  return uniqueList(matches);
+}
+
+function activityEditDistance(left, right) {
+  const a = String(left || "");
+  const b = String(right || "");
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= a.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= b.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + (a[leftIndex - 1] === b[rightIndex - 1] ? 0 : 1)
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[b.length];
+}
+
+function resolveActivityLevelIntent(value) {
+  const normalized = normalizeActivityIntentText(value);
+  if (!normalized) return { value: "不限", recognized: false, method: "fallback" };
+  const compact = compactActivityIntentText(normalized);
+  const stripped = stripActivityIntentWrappers(compact);
+  const candidates = uniqueList([compact, stripped]);
+
+  for (const [activityLevel, aliases] of Object.entries(ACTIVITY_LEVEL_ALIASES)) {
+    const compactAliases = aliases.map((alias) => compactActivityIntentText(alias));
+    if (candidates.some((candidate) => compactAliases.includes(candidate))) {
+      return { value: activityLevel, recognized: true, method: "alias" };
+    }
+  }
+
+  const durationLevel = activityLevelForRelativeDuration(normalized)
+    || activityLevelForRelativeDuration(stripped);
+  const semanticLevels = activityLevelsForSemanticPhrase(normalized);
+  const inferredLevels = uniqueList([...semanticLevels, durationLevel]);
+  if (inferredLevels.length === 1) {
+    return {
+      value: inferredLevels[0],
+      recognized: true,
+      method: durationLevel ? "duration" : "semantic"
+    };
+  }
+  if (inferredLevels.length > 1) {
+    return { value: "不限", recognized: false, method: "ambiguous" };
+  }
+
+  const fuzzyMatches = [];
+  for (const [activityLevel, aliases] of Object.entries(ACTIVITY_LEVEL_ALIASES)) {
+    for (const alias of aliases) {
+      const compactAlias = compactActivityIntentText(alias);
+      if (compactAlias.length < 4) continue;
+      for (const candidate of candidates) {
+        if (candidate.length < 4 || Math.abs(candidate.length - compactAlias.length) > 1) continue;
+        const distance = activityEditDistance(candidate, compactAlias);
+        if (distance <= 1) fuzzyMatches.push({ activityLevel, distance });
+      }
+    }
+  }
+  if (fuzzyMatches.length) {
+    const minimumDistance = Math.min(...fuzzyMatches.map((item) => item.distance));
+    const closestLevels = uniqueList(
+      fuzzyMatches.filter((item) => item.distance === minimumDistance).map((item) => item.activityLevel)
+    );
+    if (closestLevels.length === 1) {
+      return { value: closestLevels[0], recognized: true, method: "fuzzy" };
+    }
+  }
+
+  return { value: "不限", recognized: false, method: "fallback" };
+}
+
+function normalizeActivityLevel(value) {
+  return resolveActivityLevelIntent(value).value;
+}
+
 function normalizeBooleanOverride(value) {
   if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
   const normalized = normalizeText(value).toLowerCase();
   if (!normalized) return null;
-  if (["true", "yes", "y", "1", "on", "enable", "enabled", "需要", "是", "开启"].includes(normalized)) return true;
-  if (["false", "no", "n", "0", "off", "disable", "disabled", "不需要", "否", "关闭"].includes(normalized)) return false;
+  if (["true", "yes", "y", "1", "on", "enable", "enabled", "需要", "是", "开启", "启用", "勾选", "选中"].includes(normalized)) return true;
+  if (["false", "no", "n", "0", "off", "disable", "disabled", "不需要", "否", "关闭", "不启用", "不勾选", "未选中"].includes(normalized)) return false;
   return null;
 }
 
@@ -383,6 +659,65 @@ function extractRecentNotView(text) {
   return null;
 }
 
+function extractStructuredRunMetaValue(rawText, labelPattern) {
+  const normalized = String(rawText || "").replace(/\r\n/g, "\n");
+  const match = normalized.match(new RegExp(
+    `(?:^|[\\s；;])\\s*(?:${labelPattern})\\s*[：:]\\s*([\\s\\S]*?)(?=(?:[\\s；;]\\s*${RUN_META_FIELD_LABEL_PATTERN}\\s*[：:])|$)`,
+    "i"
+  ));
+  return match ? normalizeText(String(match[1] || "").replace(/[。；;]+$/, "")) : null;
+}
+
+function extractActivityLevel(rawText) {
+  const structured = extractStructuredRunMetaValue(rawText, "(?:活跃度|活动度|activity[_\\s-]?level)");
+  if (structured !== null) {
+    return {
+      explicit: true,
+      raw: structured || "（空值）",
+      value: normalizeActivityLevel(structured)
+    };
+  }
+  const normalized = normalizeText(rawText);
+  for (const value of ACTIVITY_LEVEL_OPTIONS.filter((item) => item !== "不限")) {
+    if (normalized.includes(value)) {
+      return { explicit: false, raw: value, value };
+    }
+  }
+  const activityClauses = String(rawText || "")
+    .split(/[，,。；;\n]+/)
+    .map((item) => normalizeText(item))
+    .filter((item) => /活[跃躍越]|在线|上[线線]|activity|active|online/i.test(item));
+  for (const clause of activityClauses) {
+    const resolved = resolveActivityLevelIntent(clause);
+    if (resolved.recognized) {
+      return { explicit: false, raw: clause, value: resolved.value };
+    }
+  }
+  return { explicit: false, raw: null, value: null };
+}
+
+function extractCurrentCityOnly(rawText) {
+  const structured = extractStructuredRunMetaValue(
+    rawText,
+    "(?:current[_\\s-]?city[_\\s-]?only|当前城市筛选|仅推荐本城市|仅推荐期望城市为本城市(?:的牛人)?)"
+  );
+  const structuredValue = normalizeBooleanOverride(structured);
+  if (structured !== null) return structuredValue;
+
+  const normalized = normalizeText(rawText);
+  if (
+    /(?:不限|不限制)期望城市|(?:关闭|取消|禁用|去掉|取消勾选)\s*(?:当前城市筛选|仅推荐本城市|仅推荐期望城市为本城市(?:的牛人)?|只推荐期望城市(?:是|为)?本城市)/i.test(normalized)
+  ) {
+    return false;
+  }
+  if (
+    /\bcurrent[_\s-]?city[_\s-]?only\b|仅推荐期望城市为本城市(?:的牛人)?|只推荐期望城市(?:是|为)?本城市|仅推荐本城市/i.test(normalized)
+  ) {
+    return true;
+  }
+  return null;
+}
+
 function extractTargetCount(text) {
   for (const pattern of TARGET_COUNT_PATTERNS) {
     const match = text.match(pattern);
@@ -411,7 +746,10 @@ function extractMaxGreetCount(text) {
 
 function extractJobSelectionHint(text) {
   const normalized = String(text || "").replace(/\r\n/g, "\n");
-  const match = normalized.match(/(?:^|[\n；;])\s*(?:岗位|职位|job)\s*[：:]\s*([^\n；;]+)/i);
+  const match = normalized.match(new RegExp(
+    `(?:^|[\\s；;])\\s*(?:岗位|职位|job)\\s*[：:]\\s*([\\s\\S]*?)(?=(?:[\\s；;]\\s*${RUN_META_FIELD_LABEL_PATTERN}\\s*[：:])|$)`,
+    "i"
+  ));
   if (!match?.[1]) return null;
   return normalizeText(String(match[1] || "").replace(/[。；;]+$/, "").trim());
 }
@@ -437,6 +775,20 @@ function isMetaClause(clause) {
   if (!withoutNumbering) return true;
   if (CRITERIA_META_FIELD_PREFIX_PATTERNS.some((pattern) => pattern.test(withoutNumbering))) return true;
   if (META_CLAUSE_PATTERNS.some((pattern) => pattern.test(withoutNumbering))) return true;
+  const activityCandidate = stripActivityIntentWrappers(withoutNumbering);
+  const activityIntent = resolveActivityLevelIntent(withoutNumbering);
+  const isKnownActivityAlias = Object.values(ACTIVITY_LEVEL_ALIASES)
+    .flat()
+    .map((item) => stripActivityIntentWrappers(item))
+    .includes(activityCandidate);
+  const isRelativeActivityDuration = /^(?:近|最近|过去|过去的|(?:(?:within|during|in|over)?(?:the)?(?:last|past)?))?(?:\d+(?:\.\d+)?|半|[一二两三四五六七八九十]+|half|one|two|couple|three|few|four|five|six|seven|eight|nine|ten|twenty|thirty)(?:个)?(?:小时|hours?|hrs?|hr|h|天|日|days?|day|d|周|星期|weeks?|week|w|月|months?|month)(?:内|以内|之内|ago)?$/i
+    .test(activityCandidate);
+  if (
+    activityIntent.recognized
+    && (isKnownActivityAlias || isRelativeActivityDuration || activityIntent.method === "fuzzy")
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -655,6 +1007,18 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
   const confirmationGender = normalizeGender(confirmation?.gender_value);
   const overrideRecentNotView = normalizeRecentNotView(overrides?.recent_not_view);
   const confirmationRecentNotView = normalizeRecentNotView(confirmation?.recent_not_view_value);
+  const hasCurrentCityOnlyOverride = Object.prototype.hasOwnProperty.call(overrides || {}, "current_city_only");
+  const currentCityOnly = hasCurrentCityOnlyOverride
+    ? normalizeBooleanOverride(overrides?.current_city_only) ?? false
+    : extractCurrentCityOnly(rawInstruction) ?? false;
+  const hasActivityLevelOverride = Object.prototype.hasOwnProperty.call(overrides || {}, "activity_level");
+  const overrideActivityLevel = hasActivityLevelOverride
+    ? normalizeActivityLevel(overrides?.activity_level)
+    : null;
+  const instructionActivityLevel = extractActivityLevel(rawInstruction);
+  const activityLevel = hasActivityLevelOverride
+    ? overrideActivityLevel
+    : instructionActivityLevel.value || "不限";
   const overrideCriteria = overrides?.criteria;
   const criteriaResolution = buildCriteria({
     instruction: text,
@@ -694,7 +1058,9 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
           : ["不限"])
     ),
     gender: overrideGender || confirmationGender || extractGender(text) || "不限",
-    recent_not_view: overrideRecentNotView || confirmationRecentNotView || extractRecentNotView(text) || "不限"
+    recent_not_view: overrideRecentNotView || confirmationRecentNotView || extractRecentNotView(text) || "不限",
+    current_city_only: currentCityOnly,
+    activity_level: activityLevel
   };
   const screenParams = {
     criteria: criteriaResolution.raw || criteriaResolution.normalized || null,
@@ -919,10 +1285,12 @@ export function parseRecommendInstruction({ instruction, confirmation, overrides
 }
 
 export {
+  ACTIVITY_LEVEL_OPTIONS,
   DEGREE_OPTIONS,
   GENDER_OPTIONS,
   POST_ACTION_LABELS,
   POST_ACTION_OPTIONS,
   RECENT_NOT_VIEW_OPTIONS,
-  SCHOOL_TAG_OPTIONS
+  SCHOOL_TAG_OPTIONS,
+  normalizeActivityLevel
 };

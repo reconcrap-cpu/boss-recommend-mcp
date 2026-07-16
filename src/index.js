@@ -880,6 +880,14 @@ function createRunInputSchema() {
             type: "string",
             enum: ["不限", "近14天没有"]
           },
+          current_city_only: {
+            type: "boolean",
+            description: "可选；true 表示仅推荐期望城市为当前已选城市的牛人，默认 false。不会切换城市。"
+          },
+          activity_level: {
+            type: "string",
+            description: "可选活跃度单选。标准选项：不限、刚刚活跃、今日活跃、3日内活跃、本周活跃、本月活跃。允许同义词、相对时间、英文和轻微错别字；系统会归一化为最靠近用户意图的标准选项，完全无法理解时默认 不限。"
+          },
           skip_recent_colleague_contacted: {
             type: "boolean",
             description: "推荐页默认 true，用于跳过近14天同事沟通过的人选。搜索页请使用 recruit 工具的 filter_recent_colleague_contacted。"
@@ -1417,6 +1425,11 @@ function createCompactRunInputSchema() {
           },
           gender: { type: "string" },
           recent_not_view: { type: "string" },
+          current_city_only: { type: "boolean" },
+          activity_level: {
+            type: "string",
+            description: "标准选项为 不限、刚刚活跃、今日活跃、3日内活跃、本周活跃、本月活跃；非精确输入会按最靠近的用户意图归一化，无法理解时默认 不限。"
+          },
           skip_recent_colleague_contacted: { type: "boolean" },
           filter_recent_colleague_contacted: {
             type: "boolean",

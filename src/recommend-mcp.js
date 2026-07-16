@@ -385,7 +385,9 @@ function recommendSearchParamsForCsv(searchParams = {}) {
     school_tag: Object.prototype.hasOwnProperty.call(searchParams, "school_tag") ? searchParams.school_tag : "不限",
     degree: Object.prototype.hasOwnProperty.call(searchParams, "degree") ? searchParams.degree : "不限",
     gender: Object.prototype.hasOwnProperty.call(searchParams, "gender") ? searchParams.gender : "不限",
-    recent_not_view: Object.prototype.hasOwnProperty.call(searchParams, "recent_not_view") ? searchParams.recent_not_view : "不限"
+    recent_not_view: Object.prototype.hasOwnProperty.call(searchParams, "recent_not_view") ? searchParams.recent_not_view : "不限",
+    current_city_only: Object.prototype.hasOwnProperty.call(searchParams, "current_city_only") ? searchParams.current_city_only : false,
+    activity_level: Object.prototype.hasOwnProperty.call(searchParams, "activity_level") ? searchParams.activity_level : "不限"
   };
 }
 
@@ -427,7 +429,9 @@ function buildRecommendCsvInputRows(snapshot = {}, meta = {}) {
     school_tag: overrides.school_tag ?? confirmation.school_tag_value,
     degree: overrides.degree ?? confirmation.degree_value,
     gender: overrides.gender ?? confirmation.gender_value,
-    recent_not_view: overrides.recent_not_view ?? confirmation.recent_not_view_value
+    recent_not_view: overrides.recent_not_view ?? confirmation.recent_not_view_value,
+    current_city_only: overrides.current_city_only ?? false,
+    activity_level: overrides.activity_level ?? "不限"
   });
   const parsedScreenParams = meta.parsed?.screenParams || {};
   const screenParams = {
@@ -1679,7 +1683,13 @@ function buildRecommendFilter(parsed, args = {}) {
     return { enabled: false };
   }
 
-  const groups = [];
+  const groups = [{
+    group: "activity",
+    labels: [parsed.searchParams?.activity_level || "不限"],
+    selectAllLabels: false,
+    allowUnlimited: true,
+    verifySticky: true
+  }];
   const recentNotView = withoutUnlimited(parsed.searchParams?.recent_not_view);
   if (recentNotView.length) {
     groups.push({
@@ -1716,7 +1726,11 @@ function buildRecommendFilter(parsed, args = {}) {
     });
   }
 
-  return groups.length ? { filterGroups: groups } : { enabled: false };
+  return {
+    enabled: true,
+    currentCityOnly: parsed.searchParams?.current_city_only === true,
+    filterGroups: groups
+  };
 }
 
 function normalizeRecommendStartInput(args = {}, parsed, configResolution = null) {

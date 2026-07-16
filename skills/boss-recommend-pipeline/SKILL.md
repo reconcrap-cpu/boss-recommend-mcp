@@ -29,7 +29,7 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - 禁止 agent 自行“设置合理参数”并代替用户确认。
   - 禁止在用户未明确回复前，把 `final_confirmed=true`。
   - 旧版 `*_confirmed` 字段仍兼容，但新流程不要逐项设置；把规范化后的值写入 `overrides`，总确认后只需要 `confirmation.final_confirmed=true`。
-  - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job/rest_level`。
+  - 禁止在用户未明确回复前，自行填充 `page_scope/school_tag/degree/gender/recent_not_view/criteria/target_count/post_action/max_greet_count/job/rest_level`。两个可选新筛选项使用公开默认值：`current_city_only=false`、`activity_level=不限`，并在总确认中展示。
   - 每次 run 必须明确询问用户本次休息强度 `rest_level`：`low`（旧策略）/ `medium`（约 5 小时或 700 人累计休息 30 分钟）/ `high`（约 5 小时或 700 人累计休息 1 小时）；不得默认使用配置文件里的值替用户决定。
   - 若工具返回 `pending_questions`，只追问这些缺口；若只返回 `final_review`，不要再拆成逐字段确认。
 
@@ -55,6 +55,8 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
 
 - `page_scope`：`recommend|latest|featured`
 - `school_tag`、`degree`、`gender`、`recent_not_view`
+- `current_city_only`：`true|false`，默认 `false`；只限定期望城市等于 Boss 当前城市，不改变城市选择
+- `activity_level`：接受用户原话，并归一化到 `不限|刚刚活跃|今日活跃|3日内活跃|本周活跃|本月活跃` 中最靠近用户意图的一项；同义词、相对时间、英文和轻微错别字均可。若输入冲突、歧义或完全无法理解，使用 `不限`。最终总确认只展示归一化后的标准值。
 - `criteria`（开放文本）
 - `target_count`（可空）
 - `post_action`：`greet|none`
@@ -92,6 +94,9 @@ description: "Use when users want Boss recommend-page filtering/screening via bo
   - `degree`: `不限/初中及以下/中专/中技/高中/大专/本科/硕士/博士`
   - `gender`: `不限/男/女`
   - `recent_not_view`: `不限/近14天没有`
+  - `current_city_only`: `false/true`
+  - `activity_level`: `不限/刚刚活跃/今日活跃/3日内活跃/本周活跃/本月活跃`
+    - 非精确输入必须选择最靠近用户意图的标准值；冲突、歧义或无法理解时使用 `不限`，不得新增选项。
   - `post_action`: `greet/none`
   - `rest_level`: `low/medium/high`
 
@@ -108,7 +113,7 @@ Trae/Trae-CN split-server config exposes these under the `boss-recommend` MCP se
   - 必填：`instruction`
   - 关键输入：
     - `confirmation`：新流程只需要 `{ "final_confirmed": true }`；旧版 `page_confirmed/page_value/.../job_confirmed/job_value` 仍兼容但不要主动制造逐项确认。
-    - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/criteria/job/target_count/post_action/max_greet_count`
+    - `overrides`：`page_scope/school_tag/degree/gender/recent_not_view/current_city_only/activity_level/criteria/job/target_count/post_action/max_greet_count`
     - `human_behavior`：必须包含本次用户确认的 `restLevel`（例如 `{ "restLevel": "medium" }`）
     - 不要传 `follow_up.chat`；该路径属于 legacy-only 行为
   - 若返回 `ACCEPTED + run_id`：记录 `run_id` 并停止本轮，不自动轮询。

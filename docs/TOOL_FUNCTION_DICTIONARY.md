@@ -153,6 +153,8 @@ Inputs:
 - `instruction`: required natural-language user request.
 - `confirmation`: optional object with explicit user confirmations.
 - `overrides`: optional object for normalized values.
+- `overrides.current_city_only`: optional boolean; defaults to `false` and only toggles the “expected city equals current Boss city” checkbox.
+- `overrides.activity_level`: optional free-form activity intent. It is normalized to the closest single-select value among `不限`, `刚刚活跃`, `今日活跃`, `3日内活跃`, `本周活跃`, and `本月活跃`; conflicting, ambiguous, or unintelligible input falls back to `不限`.
 - `follow_up`: currently legacy-only; do not use for new recommend-to-chat chaining.
 - `detail_limit`: optional advanced cap for opened candidate details/CVs. Default follows `target_count`/`max_candidates`.
 - `allow_card_only_screening`: optional debug escape hatch. Only when this is `true` will `detail_limit: 0` be honored.
@@ -179,7 +181,7 @@ Expected behavior:
 Run behavior after accepted:
 
 - Select job and page scope.
-- Apply filters.
+- Deterministically apply current-city state, then activity and the remaining filter-panel values; reapply them after refresh/recovery.
 - Process candidates from infinite list.
 - Open candidate detail/CV by default for real screening.
 - Ignore accidental `detail_limit: 0` in production screening unless `allow_card_only_screening=true`.

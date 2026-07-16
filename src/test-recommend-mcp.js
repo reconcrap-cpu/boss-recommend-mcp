@@ -100,6 +100,13 @@ async function testMcpToolsetFilteringKeepsRecommendSmallAndFirst() {
   ]);
   assert.equal(recommendNames.includes(TOOL_CHAT_START), false);
   assert.equal(recommendNames.includes(TOOL_RECRUIT_START), false);
+  const compactStartTool = recommendTools.find((tool) => tool.name === TOOL_START);
+  assert.equal(compactStartTool.inputSchema.properties.overrides.properties.current_city_only.type, "boolean");
+  const compactActivitySchema = compactStartTool.inputSchema.properties.overrides.properties.activity_level;
+  assert.equal(compactActivitySchema.type, "string");
+  assert.equal(compactActivitySchema.enum, undefined);
+  assert.match(compactActivitySchema.description, /最靠近.*用户意图/);
+  assert.match(compactActivitySchema.description, /无法理解时默认 不限/);
 
   const chatNames = createToolsSchema("chat").map((tool) => tool.name);
   assert.deepEqual(chatNames, [
@@ -318,6 +325,12 @@ async function testToolListIncludesRecommendTools() {
   assert.deepEqual(startTool.inputSchema.properties.human_behavior.properties.rest_level.enum, ["low", "medium", "high"]);
   assert.deepEqual(startTool.inputSchema.properties.confirmation.properties.post_action_value.enum, ["greet", "none"]);
   assert.deepEqual(startTool.inputSchema.properties.overrides.properties.post_action.enum, ["greet", "none"]);
+  assert.equal(startTool.inputSchema.properties.overrides.properties.current_city_only.type, "boolean");
+  const fullActivitySchema = startTool.inputSchema.properties.overrides.properties.activity_level;
+  assert.equal(fullActivitySchema.type, "string");
+  assert.equal(fullActivitySchema.enum, undefined);
+  assert.match(fullActivitySchema.description, /最靠近用户意图/);
+  assert.match(fullActivitySchema.description, /无法理解时默认 不限/);
   const prepareTool = tools.find((tool) => tool.name === TOOL_PREPARE);
   assert.equal(prepareTool.description.includes("run_recommend"), true);
   assert.equal(prepareTool.description.includes("start_recommend_pipeline_run"), true);
@@ -599,6 +612,44 @@ async function testRecommendPrepareReadyDoesNotStartRun() {
   assert.equal(payload.message.includes("Do not call prepare_recommend_pipeline_run again"), true);
   assert.equal(payload.post_action.requested, "none");
   assert.equal(payload.review.current_screen_params.criteria, readyArgs().overrides.criteria);
+  assert.equal(payload.review.current_search_params.current_city_only, false);
+  assert.equal(payload.review.current_search_params.activity_level, "不限");
+  assert.equal(payload.review.pending_questions.some((item) => item.field === "current_city_only"), false);
+  assert.equal(payload.review.pending_questions.some((item) => item.field === "activity_level"), false);
+  assert.equal(connectorCalled, false);
+}
+
+async function testRecommendActivityIntentNormalizesWithoutBrowserConnect() {
+  let connectorCalled = false;
+  setRecommendMcpConnectorForTests(async () => {
+    connectorCalled = true;
+    throw new Error("prepare must not connect while normalizing activity intent");
+  });
+  const base = readyArgs();
+  const cases = [
+    ["active today", "今日活跃"],
+    ["昨天活跃", "3日内活跃"],
+    ["本舟活跃", "本周活跃"],
+    ["very active", "刚刚活跃"],
+    ["一般活跃", "本周活跃"],
+    ["occasionally active", "本月活跃"],
+    ["10 days", "本周活跃"],
+    ["very active or occasionally active", "不限"],
+    ["不限或今日活跃", "不限"],
+    ["blue pineapple", "不限"]
+  ];
+  for (const [input, expected] of cases) {
+    const payload = await callTool(TOOL_PREPARE, readyArgs({
+      overrides: {
+        ...base.overrides,
+        activity_level: input
+      }
+    }), `4_1_${input}`);
+    assert.equal(payload.status, "READY", input);
+    assert.equal(payload.review.current_search_params.activity_level, expected, input);
+    assert.equal(payload.review.suspicious_fields.some((item) => item.field === "activity_level"), false, input);
+    assert.equal(payload.review.current_screen_params.criteria, base.overrides.criteria, input);
+  }
   assert.equal(connectorCalled, false);
 }
 
@@ -695,6 +746,24 @@ async function testRecommendFullySpecifiedPayloadAsksSkipRecentColleagueContacte
   assert.equal(payload.pending_questions[0].options[1].value, false);
 }
 
+async function testRecommendOptionalFiltersUseOnlyFinalReviewGate() {
+  const base = singleReviewArgs();
+  const payload = await callTool(TOOL_PREPARE, singleReviewArgs({
+    confirmation: {},
+    overrides: {
+      ...base.overrides,
+      current_city_only: true,
+      activity_level: "刚刚活跃",
+      skip_recent_colleague_contacted: true
+    }
+  }), 151_1);
+  assert.equal(payload.status, "NEED_CONFIRMATION");
+  assert.deepEqual(payload.required_confirmations, ["final_review"]);
+  assert.deepEqual(payload.pending_questions.map((item) => item.field), ["final_review"]);
+  assert.equal(payload.pending_questions[0].value.search_params.current_city_only, true);
+  assert.equal(payload.pending_questions[0].value.search_params.activity_level, "刚刚活跃");
+}
+
 async function testRecommendGreetWithoutMaxGreetCountIsReady() {
   const base = readyArgs();
   const payload = await callTool(TOOL_PREPARE, readyArgs({
@@ -780,8 +849,14 @@ async function testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler() 
     };
   });
   try {
+    const base = singleReviewArgs();
     const payload = await callTool(TOOL_SCHEDULE, singleReviewArgs({
-      schedule_delay_seconds: 60
+      schedule_delay_seconds: 60,
+      overrides: {
+        ...base.overrides,
+        current_city_only: true,
+        activity_level: "3日内活跃"
+      }
     }), 153);
     assert.equal(payload.status, "SCHEDULED");
     assert.equal(payload.schedule_created, true);
@@ -791,6 +866,10 @@ async function testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler() 
     assert.equal(payload.schedule.args.confirmation.final_confirmed, true);
     assert.equal(payload.schedule.args.confirmation.page_confirmed, undefined);
     assert.equal(payload.schedule.args.human_behavior.restLevel, "high");
+    assert.equal(payload.schedule.args.overrides.current_city_only, true);
+    assert.equal(payload.schedule.args.overrides.activity_level, "3日内活跃");
+    assert.equal(payload.prepare.review.current_search_params.current_city_only, true);
+    assert.equal(payload.prepare.review.current_search_params.activity_level, "3日内活跃");
   } finally {
     setRecommendSchedulerSpawnForTests(null);
   }
@@ -1828,15 +1907,55 @@ async function testRecommendMultiSelectFilterMapping() {
     overrides: {
       ...readyArgs().overrides,
       degree: ["本科", "硕士", "博士"],
-      recent_not_view: "近14天没有"
+      recent_not_view: "近14天没有",
+      current_city_only: true,
+      activity_level: "本周活跃"
     }
   }), 8);
   assert.equal(started.status, "ACCEPTED");
   await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(observedFilter.enabled, true);
+  assert.equal(observedFilter.currentCityOnly, true);
   assert.deepEqual(observedFilter.filterGroups, [
-    { group: "recentNotView", labels: ["近14天没有"], selectAllLabels: true },
-    { group: "degree", labels: ["本科", "硕士", "博士"], selectAllLabels: true }
+    {
+      group: "activity",
+      labels: ["本周活跃"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    },
+    {
+      group: "recentNotView",
+      labels: ["近14天没有"],
+      selectAllLabels: true,
+      allowUnlimited: false,
+      verifySticky: false
+    },
+    {
+      group: "degree",
+      labels: ["本科", "硕士", "博士"],
+      selectAllLabels: true,
+      allowUnlimited: false,
+      verifySticky: false
+    }
   ]);
+}
+
+async function testRecommendFilterBypassDisablesDeterministicResets() {
+  const noFilterOptions = await observeRecommendWorkflowOptions(readyArgs({
+    no_filter: true,
+    debug_test_mode: true
+  }), 8_1);
+  assert.equal(noFilterOptions.filter.enabled, false);
+  assert.deepEqual(noFilterOptions.filter.filterGroups, []);
+
+  const disabledOptions = await observeRecommendWorkflowOptions(readyArgs({
+    no_filter: false,
+    filter_enabled: false,
+    debug_test_mode: true
+  }), 8_2);
+  assert.equal(disabledOptions.filter.enabled, false);
+  assert.deepEqual(disabledOptions.filter.filterGroups, []);
 }
 
 async function testRecommendPostActionWiresIntoRunService() {
@@ -1983,13 +2102,28 @@ async function testRecommendArtifactsUseConfiguredOutputDir(outputDir) {
     };
   });
 
-  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 121);
+  const base = readyArgs();
+  const started = await callTool(TOOL_START, readyArgs({
+    delay_ms: 0,
+    overrides: {
+      ...base.overrides,
+      current_city_only: true,
+      activity_level: "本月活跃"
+    }
+  }), 121);
   assert.equal(started.status, "ACCEPTED");
+  assert.equal(started.run.context.overrides.current_city_only, true);
+  assert.equal(started.run.context.overrides.activity_level, "本月活跃");
   const completed = await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  assert.equal(completed.result.search_params.current_city_only, true);
+  assert.equal(completed.result.search_params.activity_level, "本月活跃");
   assert.equal(path.dirname(completed.result.output_csv), outputDir);
   assert.equal(path.dirname(completed.result.report_json), outputDir);
   assert.equal(fs.existsSync(completed.result.output_csv), true);
   assert.equal(fs.existsSync(completed.result.report_json), true);
+  const csv = fs.readFileSync(completed.result.output_csv, "utf8");
+  assert.equal(csv.includes('"user_search_params.current_city_only","true"'), true);
+  assert.equal(csv.includes('"user_search_params.activity_level","本月活跃"'), true);
 }
 
 async function main() {
@@ -2060,6 +2194,8 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendPrepareReadyDoesNotStartRun();
     resetRecommendMcpStateForTests();
+    await testRecommendActivityIntentNormalizesWithoutBrowserConnect();
+    resetRecommendMcpStateForTests();
     await testRecommendPreparedCronPayloadStartsAccepted();
     resetRecommendMcpStateForTests();
     await testRecommendJobListLoginRequiredBlocksCronSetup();
@@ -2067,6 +2203,8 @@ async function main() {
     await testRecommendPreparePreservesCriteriaVerbatim();
     resetRecommendMcpStateForTests();
     await testRecommendFullySpecifiedPayloadAsksSkipRecentColleagueContacted();
+    resetRecommendMcpStateForTests();
+    await testRecommendOptionalFiltersUseOnlyFinalReviewGate();
     resetRecommendMcpStateForTests();
     await testRecommendGreetWithoutMaxGreetCountIsReady();
     resetRecommendMcpStateForTests();
@@ -2117,6 +2255,8 @@ async function main() {
     await testRecommendFailedRunIncludesConstrainedRecoveryGuidance();
     resetRecommendMcpStateForTests();
     await testRecommendMultiSelectFilterMapping();
+    resetRecommendMcpStateForTests();
+    await testRecommendFilterBypassDisablesDeterministicResets();
     resetRecommendMcpStateForTests();
     await testRecommendPostActionWiresIntoRunService();
     resetRecommendMcpStateForTests();

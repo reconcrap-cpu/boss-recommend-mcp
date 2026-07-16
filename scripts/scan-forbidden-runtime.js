@@ -18,7 +18,14 @@ const PATTERNS = [
   { id: "runtime-evaluate", regex: /\bRuntime\.evaluate\b/ },
   { id: "runtime-call-function-on", regex: /\bRuntime\.callFunctionOn\b/ },
   { id: "page-evaluate", regex: /\bpage\.evaluate\b/ },
+  { id: "page-dollar-eval", regex: /\b(?:page|frame)\.\$\$?eval\s*\(/ },
+  { id: "page-add-script-to-evaluate", regex: /\bPage\.addScriptToEvaluateOnNewDocument\b/ },
   { id: "lowercase-runtime-evaluate", regex: /\bruntime\.evaluate\b/ },
+  { id: "global-eval", regex: /(^|[^A-Za-z0-9_.])eval\s*\(/ },
+  { id: "function-constructor", regex: /\b(?:new\s+)?Function\s*\(/ },
+  { id: "script-element-injection", regex: /\b(?:document\.)?createElement\s*\(\s*["']script["']/i },
+  { id: "javascript-navigation-call", regex: /\b(?:Page\.navigate|location\.(?:assign|replace))\b[^\n]*\bjavascript\s*:/i },
+  { id: "javascript-location-assignment", regex: /\b(?:window\.)?location(?:\.href)?\s*=\s*["'`]\s*javascript\s*:/i },
   { id: "generated-expression-helper", regex: /\bbuild[A-Za-z0-9_]*Expression\b/ },
   { id: "page-document-query", regex: /\bdocument\.querySelector(?:All)?\b/ },
   { id: "page-click-call", regex: /\.click\(\)/ }
@@ -28,6 +35,10 @@ const ALLOWLIST = [
   {
     relativePath: path.normalize("src/core/browser/index.js"),
     reason: "CDP guard module blocks forbidden methods; it does not execute page JS."
+  },
+  {
+    relativePath: path.normalize("scripts/scan-forbidden-runtime.js"),
+    reason: "Static scanner names forbidden APIs so it can reject them; it does not execute page JS."
   }
 ];
 
@@ -115,6 +126,23 @@ function scanFile({ label, root, filePath }) {
     : quarantineEntry
       ? "legacy-quarantined"
       : "active";
+  if (path.basename(filePath).toLowerCase() === "page.js") {
+    findings.push({
+      label,
+      domain: domainFor(label, filePath),
+      path: filePath,
+      relative_path: path.relative(root, filePath),
+      line_number: 1,
+      pattern: "page-js-file",
+      line: "Forbidden page.js file",
+      status,
+      allowed: status === "allowed",
+      quarantined: status === "legacy-quarantined",
+      reachable_from_entrypoint: status === "active",
+      allowlist_reason: allowlistEntry?.reason || undefined,
+      quarantine_reason: quarantineEntry?.reason || undefined
+    });
+  }
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     for (const pattern of PATTERNS) {
@@ -267,7 +295,7 @@ function main() {
       {
         label: "recommend-project",
         root: process.cwd(),
-        subdirs: ["bin", "src", "legacy", "vendor"]
+        subdirs: ["bin", "src", "scripts", "legacy", "vendor"]
       }
     ];
 

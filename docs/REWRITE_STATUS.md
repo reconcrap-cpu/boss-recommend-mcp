@@ -1638,3 +1638,18 @@ Next task: run the remaining product polish/static package checks for the curren
 - Dev verification: `npm run test:core-cv-acquisition`; `npm run test:core-capture`; `npm run test:chat-run-service`; `npm run test:chat-domain`; `npm run test:chat-mcp`; `npm run scan:runtime:package:strict`.
 - Remaining blocker: not published to npm yet. Before publishing, rerun the full recommend/search/chat smoke set from the installed package, because this turn only live-verified the chat image-quality path.
 - Next exact task: either apply the same stop-boundary configuration to recommend/search if their image artifacts show tail noise, or publish a patch after installed-package smoke tests pass.
+
+## 2026-07-16 17:56 Asia/Shanghai - Optional Current-City And Activity Filters
+
+- Scope: Boss Recommend only. Added `overrides.current_city_only` (default `false`) and `overrides.activity_level` (default `不限`; canonical values `不限`, `刚刚活跃`, `今日活跃`, `3日内活跃`, `本周活跃`, `本月活跃`; natural-language input is normalized to the closest intent and conflicting or unintelligible input falls back to `不限`) across parsing, review, MCP schemas, schedules, run snapshots, CSV metadata, runtime recovery, and the packaged skill.
+- CDP behavior: current-city state is controlled through the location popover and exact checkbox text `仅推荐期望城市为本城市的牛人`; activity is a single-select group in the normal filter panel. Both use physical `Input` clicks plus DOM/Accessibility reads and sticky verification. Omitted values actively restore unchecked/`不限`; `no_filter=true` bypasses all native-filter interaction.
+- Live test date/time: final post-review rerun 2026-07-16 18:05-18:06 Asia/Shanghai.
+- Chrome target: `127.0.0.1:9222`, `https://www.zhipin.com/web/chat/recommend`.
+- Exact command: `node scripts/live-recommend-filter-acceptance.js "科研算法实习生（3D重建与生成）-可转正 _ 杭州"`.
+- Server-load pacing: the live harness waits `3000 ms` between every different setting state (default precondition, non-default apply, default reset, refresh/reapply, and final cleanup).
+- Result: PASS. Applied city-only `true` with detected city `杭州` and activity `今日活跃`; reset to city-only `false` and activity `不限`; reloaded via `Page.reload` and sticky-reapplied both non-defaults with 21 cards present; final cleanup restored city-only `false` and activity `不限`.
+- CDP-only evidence: 5,424 logged protocol calls; forbidden method counts `Runtime.*=0` and script injection `=0`. The log contains only allowed DOM, Accessibility, Input, Network, non-script Page, layout, and window-state operations.
+- Artifacts: `.live-artifacts\recommend-filter-acceptance\result.json`, `01-applied-city-and-today.png`, `02-reset-defaults.png`, and `03-refresh-reapplied.png`.
+- Verification: `npm run test:parser`; `npm run test:core-reporting`; `npm run test:recommend-domain`; `npm run test:recommend-run-service`; `npm run test:recommend-mcp`; `npm run test:runtime-scan`; `npm run test:async`; `npm run scan:runtime:strict`; `npm run scan:runtime:package:strict`; `npm run gate:phase9-static`; `npm pack --dry-run --json`; `git diff --check` - all PASS.
+- Release state: no version bump, publication, installation, commit, or push was performed.
+- Operator follow-up: at 2026-07-16 18:12 Asia/Shanghai, `node scripts/live-recommend-filter-apply.js` applied and left the page at current-city-only `true` (`杭州`), activity `今日活跃`, and exact school tags `985` plus `211`. Every setting change used a `3000 ms` cooldown. Sticky verification passed for all three groups; the closed page header showed `仅看杭州` and `筛选:3`; the 845-call CDP log recorded `Runtime.*=0` and script injection `=0`. Artifacts: `.live-artifacts\recommend-filter-apply\result.json` and `applied.png`.

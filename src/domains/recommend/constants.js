@@ -31,6 +31,13 @@ export const RECOMMEND_FILTER_SELECTORS = Object.freeze({
   trigger: ".filter-label-wrap",
   panel: ".filter-panel",
   groups: Object.freeze({
+    activity: [
+      ".filter-panel .check-box.activation",
+      ".filter-panel .check-box.activity",
+      ".filter-panel .check-box.activeTime",
+      ".filter-panel .check-box.activityLevel",
+      ".filter-panel .check-box.activity-level"
+    ].join(", "),
     recentNotView: ".filter-panel .check-box.recentNotView",
     degree: ".filter-panel .check-box.degree",
     gender: ".filter-panel .check-box.gender",
@@ -46,8 +53,70 @@ export const RECOMMEND_FILTER_GROUP_ORDER = Object.freeze([
   "recentNotView",
   "degree",
   "gender",
-  "school"
+  "school",
+  "activity"
 ]);
+
+export const RECOMMEND_ACTIVITY_GROUP = "activity";
+
+export const RECOMMEND_ACTIVITY_GROUP_HEADING = "活跃度[单选]";
+
+export const RECOMMEND_ACTIVITY_LEVELS = Object.freeze([
+  "不限",
+  "刚刚活跃",
+  "今日活跃",
+  "3日内活跃",
+  "本周活跃",
+  "本月活跃"
+]);
+
+export const RECOMMEND_CURRENT_CITY_ONLY_LABEL = "仅推荐期望城市为本城市的牛人";
+
+export const RECOMMEND_LOCATION_SELECTORS = Object.freeze({
+  trigger: [
+    ".city-or-area-name",
+    ".city-selecter-wrap",
+    ".city-selector-wrap",
+    ".location-selecter-wrap",
+    ".location-selector-wrap",
+    ".city-select",
+    ".location-select",
+    ".recommend-city",
+    ".recommend-location",
+    '[class*="city-select"]',
+    '[class*="location-select"]',
+    '[class*="recommend-city"]'
+  ],
+  popoverCandidates: [
+    ".check-area-warp",
+    ".check-area-bottom"
+  ].join(", "),
+  checkboxCalibrated: [
+    ".check-area-warp label.checkbox",
+    ".check-area-bottom label.checkbox",
+    ".check-area-warp .my-checkbox"
+  ].join(", "),
+  checkboxCandidates: [
+    "label",
+    '[role="checkbox"]',
+    "input[type=\"checkbox\"]",
+    ".checkbox",
+    ".check-box",
+    '[class*="checkbox"]',
+    '[class*="check-box"]',
+    "span"
+  ].join(", "),
+  checkboxInput: 'input[type="checkbox"], [role="checkbox"]',
+  confirmCandidates: [
+    '[class*="city"] button',
+    '[class*="city"] .btn',
+    '[class*="location"] button',
+    '[class*="location"] .btn',
+    "button",
+    ".btn",
+    '[role="button"]'
+  ].join(", ")
+});
 
 export const RECOMMEND_RECENT_NOT_VIEW_LABEL = "近14天没有";
 

@@ -46,6 +46,8 @@ const SEARCH_PARAM_ORDER = [
   "degrees",
   "gender",
   "recent_not_view",
+  "current_city_only",
+  "activity_level",
   "city",
   "schools",
   "keyword",

@@ -4,8 +4,13 @@ import {
   RUN_STATUS_PAUSED
 } from "./core/run/index.js";
 import {
+  applyRecommendFilterEnvelopeStages,
+  compactFilterResult,
+  buildRecommendFilterGroups,
+  buildRecommendFilterSelectionOptions,
   countRecommendResultStatuses,
-  createRecommendRunService
+  createRecommendRunService,
+  selectAndConfirmFirstSafeFilter
 } from "./domains/recommend/index.js";
 
 async function waitUntil(predicate, timeoutMs = 2500) {
@@ -30,16 +35,21 @@ async function testLifecycleDelegation() {
       assert.equal(options.maxRefreshRounds, 3);
       assert.equal(options.postAction, "none");
       assert.equal(options.executePostAction, true);
+      assert.equal(options.filter.currentCityOnly, true);
       assert.deepEqual(options.filter.filterGroups, [
         {
           group: "degree",
           labels: ["本科", "硕士", "博士"],
-          selectAllLabels: true
+          selectAllLabels: true,
+          allowUnlimited: false,
+          verifySticky: false
         },
         {
-          group: "recentNotView",
-          labels: ["近14天没有"],
-          selectAllLabels: true
+          group: "activity",
+          labels: ["不限"],
+          selectAllLabels: false,
+          allowUnlimited: true,
+          verifySticky: true
         }
       ]);
       for (let processed = 1; processed <= 20; processed += 1) {
@@ -66,6 +76,7 @@ async function testLifecycleDelegation() {
     jobLabel: "算法工程师",
     pageScope: "featured",
     filter: {
+      currentCityOnly: true,
       filterGroups: [
         {
           group: "degree",
@@ -73,9 +84,11 @@ async function testLifecycleDelegation() {
           selectAllLabels: true
         },
         {
-          group: "recentNotView",
-          labels: ["近14天没有"],
-          selectAllLabels: true
+          group: "activity",
+          labels: ["不限"],
+          selectAllLabels: false,
+          allowUnlimited: true,
+          verifySticky: true
         }
       ]
     },
@@ -83,7 +96,9 @@ async function testLifecycleDelegation() {
     detailLimit: 1,
     maxRefreshRounds: 3
   });
-  assert.deepEqual(started.context.filter.filterGroups.map((item) => item.group), ["degree", "recentNotView"]);
+  assert.deepEqual(started.context.filter.filterGroups.map((item) => item.group), ["degree", "activity"]);
+  assert.equal(started.context.filter.currentCityOnly, true);
+  assert.equal(started.context.current_city_only_requested, true);
   assert.equal(started.context.job_label, "算法工程师");
   assert.equal(started.context.requested_page_scope, "featured");
   assert.equal(started.context.fallback_page_scope, "recommend");
@@ -105,6 +120,245 @@ async function testLifecycleDelegation() {
   const final = await service.waitForRecommendRun(started.runId);
   assert.equal(final.status, RUN_STATUS_CANCELED);
 }
+
+function testRefreshFilterEnvelopePreservesActivitySafetyFlags() {
+  const filter = {
+    enabled: true,
+    currentCityOnly: false,
+    filterGroups: [
+      {
+        group: "activity",
+        labels: ["不限"],
+        selectAllLabels: false,
+        allowUnlimited: true,
+        verifySticky: true
+      }
+    ]
+  };
+  assert.deepEqual(buildRecommendFilterGroups(filter), filter.filterGroups);
+  assert.deepEqual(buildRecommendFilterSelectionOptions(filter), {
+    filterGroups: filter.filterGroups
+  });
+
+  const forced = buildRecommendFilterSelectionOptions(filter, { forceRecentNotView: true });
+  assert.deepEqual(forced.filterGroups.map((group) => group.group), ["recentNotView", "activity"]);
+  assert.deepEqual(forced.filterGroups[0], {
+    group: "recentNotView",
+    labels: ["近14天没有"],
+    selectAllLabels: true,
+    allowUnlimited: false,
+    verifySticky: false
+  });
+  assert.equal(forced.filterGroups[1].allowUnlimited, true);
+  assert.equal(forced.filterGroups[1].verifySticky, true);
+}
+
+async function testNativeFilterStageOrderingAndBypass() {
+  const calls = [];
+  const applied = await applyRecommendFilterEnvelopeStages({ enabled: true }, {
+    applyCurrentCityOnly: async () => {
+      calls.push("current_city_only");
+      return { requested: false, effective: false };
+    },
+    applyFilterPanel: async () => {
+      calls.push("filter_panel");
+      return { confirmed: true };
+    }
+  });
+  assert.deepEqual(calls, ["current_city_only", "filter_panel"]);
+  assert.equal(applied.applied, true);
+  assert.equal(applied.current_city_only.effective, false);
+  assert.equal(applied.filter.confirmed, true);
+
+  const bypassCalls = [];
+  const bypassed = await applyRecommendFilterEnvelopeStages({ enabled: false }, {
+    applyCurrentCityOnly: async () => bypassCalls.push("current_city_only"),
+    applyFilterPanel: async () => bypassCalls.push("filter_panel")
+  });
+  assert.deepEqual(bypassCalls, []);
+  assert.deepEqual(bypassed, {
+    applied: false,
+    skipped: true,
+    current_city_only: null,
+    filter: null
+  });
+
+  const failureCalls = [];
+  await assert.rejects(
+    applyRecommendFilterEnvelopeStages({ enabled: true }, {
+      applyCurrentCityOnly: async () => {
+        failureCalls.push("current_city_only");
+        throw new Error("location verification failed");
+      },
+      applyFilterPanel: async () => failureCalls.push("filter_panel")
+    }),
+    /location verification failed/
+  );
+  assert.deepEqual(failureCalls, ["current_city_only"]);
+}
+
+function createRunServiceMissingFilterPanelClient() {
+  return {
+    DOM: {
+      async querySelector() {
+        return { nodeId: 0 };
+      },
+      async querySelectorAll() {
+        return { nodeIds: [] };
+      }
+    }
+  };
+}
+
+async function testRunServiceMissingFilterPanelDefaultPolicy() {
+  const filter = {
+    enabled: true,
+    currentCityOnly: false,
+    filterGroups: [{
+      group: "activity",
+      labels: ["不限"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    }]
+  };
+  const result = await selectAndConfirmFirstSafeFilter(
+    createRunServiceMissingFilterPanelClient(),
+    99,
+    buildRecommendFilterSelectionOptions(filter)
+  );
+  assert.equal(result.confirmed, true);
+  assert.equal(result.unavailable_default, true);
+  const compact = compactFilterResult(result);
+  assert.deepEqual(compact.requested_groups[0], {
+    group: "activity",
+    labels: ["不限"],
+    select_all_labels: false,
+    allow_unlimited: true,
+    verify_sticky: true
+  });
+  assert.deepEqual(compact.effective_groups[0], {
+    group: "activity",
+    requested_labels: ["不限"],
+    active_labels: [],
+    verified: true,
+    unavailable: true,
+    reason: "activity_control_unavailable_default"
+  });
+  assert.equal(compact.sticky_verification.verified, true);
+  assert.deepEqual(compact.attempts, {
+    initial_close: [],
+    open: [],
+    confirmation: []
+  });
+
+  const stages = await applyRecommendFilterEnvelopeStages(filter, {
+    applyCurrentCityOnly: async () => ({ requested: false, effective: false }),
+    applyFilterPanel: async () => result
+  });
+  assert.equal(stages.applied, true);
+  assert.equal(stages.filter.confirmed, true);
+  assert.equal(stages.filter.unavailable, true);
+
+  for (const failingFilter of [
+    {
+      enabled: true,
+      filterGroups: [{
+        group: "activity",
+        labels: ["今日活跃"],
+        selectAllLabels: false,
+        allowUnlimited: true,
+        verifySticky: true
+      }]
+    },
+    {
+      enabled: true,
+      filterGroups: [{
+        group: "school",
+        labels: ["985"],
+        selectAllLabels: true
+      }]
+    }
+  ]) {
+    await assert.rejects(
+      selectAndConfirmFirstSafeFilter(
+        createRunServiceMissingFilterPanelClient(),
+        99,
+        buildRecommendFilterSelectionOptions(failingFilter)
+      ),
+      /Recommend filter trigger was not found/
+    );
+  }
+}
+
+function testCompactFilterResultPreservesActivityEvidenceAndAttempts() {
+  const compact = compactFilterResult({
+    opened_panel: true,
+    requested_groups: [{
+      group: "activity",
+      labels: ["今日活跃"],
+      select_all_labels: false,
+      allow_unlimited: true,
+      verify_sticky: true
+    }],
+    selected_option: {
+      group: "activity",
+      label: "今日活跃",
+      was_active: false,
+      clicked: true
+    },
+    selected_options: [],
+    unavailable: false,
+    unavailable_groups: [],
+    confirmed: true,
+    sticky_verification: {
+      verified: true,
+      groups: [{
+        group: "activity",
+        requested_labels: ["今日活跃"],
+        active_labels: ["今日活跃"],
+        verified: true,
+        unavailable: false
+      }]
+    },
+    initial_close_attempts: ["Escape"],
+    open_attempts: [{
+      selector: ".filter-label-wrap",
+      node_id: 10,
+      click_target: { x: 100, y: 50 },
+      click_result: { dispatched: true }
+    }],
+    confirm_attempts: [{
+      node_id: 41,
+      label: "确定",
+      clicked: true,
+      errors: []
+    }],
+    before_counts: { filter_panel: 0 },
+    after_confirm_counts: { filter_panel: 0 }
+  });
+  assert.equal(compact.selected_option.group, "activity");
+  assert.equal(compact.selected_option.label, "今日活跃");
+  assert.equal(compact.selected_option.clicked, true);
+  assert.deepEqual(compact.requested_groups[0].labels, ["今日活跃"]);
+  assert.deepEqual(compact.effective_groups[0].active_labels, ["今日活跃"]);
+  assert.equal(compact.sticky_verification.verified, true);
+  assert.deepEqual(compact.attempts, {
+    initial_close: ["Escape"],
+    open: [{
+      selector: ".filter-label-wrap",
+      node_id: 10,
+      click_target: { x: 100, y: 50 }
+    }],
+    confirmation: [{
+      node_id: 41,
+      label: "确定",
+      clicked: true,
+      errors: []
+    }]
+  });
+}
+
 
 async function testPostActionOptionDelegation() {
   let observedOptions = null;
@@ -251,6 +505,10 @@ function testRecommendStatusCountersPreserveProgressAfterRecovery() {
 await testLifecycleDelegation();
 await testPostActionOptionDelegation();
 await testDetailLimitDefaultsToUnlimitedForPassTarget();
+await testNativeFilterStageOrderingAndBypass();
+await testRunServiceMissingFilterPanelDefaultPolicy();
+testCompactFilterResultPreservesActivityEvidenceAndAttempts();
+testRefreshFilterEnvelopePreservesActivitySafetyFlags();
 testRecommendStatusCountersPreserveProgressAfterRecovery();
 
 console.log("recommend run service tests passed");

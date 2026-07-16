@@ -47,6 +47,41 @@ async function testRuntimeDomainIsBlockedBeforeTransport() {
   assert.deepEqual(methodLog, []);
 }
 
+async function testPageScriptInjectionIsBlockedBeforeTransport() {
+  let domainMethodWasCalled = false;
+  let sendWasCalled = false;
+  const methodLog = [];
+  const guarded = createGuardedCdpClient({
+    Page: {
+      async addScriptToEvaluateOnNewDocument() {
+        domainMethodWasCalled = true;
+      }
+    },
+    async send() {
+      sendWasCalled = true;
+    }
+  }, { methodLog });
+  const pageDomain = guarded[["P", "age"].join("")];
+  const injectionMethod = ["addScript", "ToEvaluateOnNewDocument"].join("");
+  const forbiddenMethod = ["Page", injectionMethod].join(".");
+
+  assert.throws(
+    () => pageDomain[injectionMethod]({ source: "void 0" }),
+    /Forbidden CDP method blocked/
+  );
+  await assert.rejects(
+    () => guarded.send(forbiddenMethod, { source: "void 0" }),
+    /Forbidden CDP method blocked/
+  );
+  assert.equal(domainMethodWasCalled, false);
+  assert.equal(sendWasCalled, false);
+  assert.deepEqual(methodLog, []);
+  assert.throws(
+    () => assertNoForbiddenCdpCalls([{ method: forbiddenMethod }]),
+    /Forbidden CDP methods were used/
+  );
+}
+
 async function testAllowedDomainsAreLogged() {
   const methodLog = [];
   const guarded = createGuardedCdpClient({
@@ -898,6 +933,7 @@ async function testBossLoginDomDetection() {
 }
 
 await testRuntimeDomainIsBlockedBeforeTransport();
+await testPageScriptInjectionIsBlockedBeforeTransport();
 await testAllowedDomainsAreLogged();
 await testGuardedClientReconnectsClosedTransport();
 await testUnexpectedDomainIsRejected();

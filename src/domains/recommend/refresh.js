@@ -16,6 +16,7 @@ import {
   RECOMMEND_TARGET_URL
 } from "./constants.js";
 import { selectAndConfirmFirstSafeFilter } from "./filters.js";
+import { ensureRecommendCurrentCityOnly } from "./location.js";
 import {
   selectRecommendJob,
   verifyRecommendJobSelection
@@ -35,7 +36,9 @@ function normalizeFilterGroup(spec = {}) {
   return {
     group: String(spec.group || "").trim(),
     labels: normalizeLabels(spec.labels || spec.filterLabels || []),
-    selectAllLabels: spec.selectAllLabels !== false
+    selectAllLabels: spec.selectAllLabels !== false,
+    allowUnlimited: spec.allowUnlimited === true,
+    verifySticky: spec.verifySticky === true
   };
 }
 
@@ -70,7 +73,9 @@ export function buildRecommendFilterGroups(filter = {}, {
       groups.unshift({
         group: "recentNotView",
         labels: [RECOMMEND_RECENT_NOT_VIEW_LABEL],
-        selectAllLabels: true
+        selectAllLabels: true,
+        allowUnlimited: false,
+        verifySticky: false
       });
     }
   }
@@ -90,13 +95,42 @@ export function buildRecommendFilterSelectionOptions(filter = {}, {
     return {
       group: singleGroup.group,
       labels: singleGroup.labels,
-      selectAllLabels: singleGroup.selectAllLabels
+      selectAllLabels: singleGroup.selectAllLabels,
+      allowUnlimited: singleGroup.allowUnlimited,
+      verifySticky: singleGroup.verifySticky
     };
   }
   return {
     group: filter.group || "",
     labels: normalizeLabels(filter.labels || filter.filterLabels || []),
-    selectAllLabels: filter.selectAllLabels !== false
+    selectAllLabels: filter.selectAllLabels !== false,
+    allowUnlimited: filter.allowUnlimited === true,
+    verifySticky: filter.verifySticky === true
+  };
+}
+
+export async function applyRecommendFilterEnvelopeStages(filter = {}, {
+  applyCurrentCityOnly,
+  applyFilterPanel
+} = {}) {
+  if (filter.enabled === false) {
+    return {
+      applied: false,
+      skipped: true,
+      current_city_only: null,
+      filter: null
+    };
+  }
+  if (typeof applyCurrentCityOnly !== "function" || typeof applyFilterPanel !== "function") {
+    throw new Error("Recommend native filter stages require location and filter-panel callbacks");
+  }
+  const currentCityOnlyResult = await applyCurrentCityOnly();
+  const filterResult = await applyFilterPanel();
+  return {
+    applied: true,
+    skipped: false,
+    current_city_only: currentCityOnlyResult,
+    filter: filterResult
   };
 }
 
@@ -308,6 +342,67 @@ async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
   throw wrapped;
 }
 
+function compactCurrentCityOnlyReapplyError(error) {
+  return error?.message || String(error || "Recommend current-city-only reapply failed");
+}
+
+function isRetryableRecommendCurrentCityOnlyReapplyError(error) {
+  if (isStaleRecommendNodeError(error)) return true;
+  const message = compactCurrentCityOnlyReapplyError(error);
+  return /current-city|current city|location|popover|trigger|checkbox|stale|did not (?:open|mount|close)/i.test(message)
+    && !/unavailable/i.test(message);
+}
+
+async function ensureRefreshCurrentCityOnly(client, rootState, {
+  enabled = false,
+  maxAttempts = 3,
+  retryDelayMs = 1500
+} = {}) {
+  const attempts = [];
+  let currentRootState = rootState;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const result = await ensureRecommendCurrentCityOnly(
+        client,
+        currentRootState.iframe.documentNodeId,
+        { enabled }
+      );
+      attempts.push({
+        ok: true,
+        method: "current_city_only_reapply",
+        attempt,
+        result
+      });
+      return {
+        current_city_only: result,
+        root_state: currentRootState,
+        attempts
+      };
+    } catch (error) {
+      lastError = error;
+      attempts.push({
+        ok: false,
+        method: "current_city_only_reapply",
+        reason: "current_city_only_reapply_failed",
+        error: compactCurrentCityOnlyReapplyError(error),
+        attempt
+      });
+      if (attempt >= maxAttempts || !isRetryableRecommendCurrentCityOnlyReapplyError(error)) {
+        break;
+      }
+      if (retryDelayMs > 0) await sleep(retryDelayMs);
+      currentRootState = await getRecommendRoots(client);
+    }
+  }
+
+  const wrapped = new Error(compactCurrentCityOnlyReapplyError(lastError));
+  wrapped.cause = lastError;
+  wrapped.current_city_only_attempts = attempts;
+  throw wrapped;
+}
+
 async function applyRefreshMethod(client, method, {
   jobLabel = "",
   pageScope = "recommend",
@@ -323,6 +418,8 @@ async function applyRefreshMethod(client, method, {
   let jobSelection = null;
   let jobSelectionAttempts = [];
   let pageScopeResult = null;
+  let currentCityOnlyResult = null;
+  let currentCityOnlyAttempts = [];
   let filterResult = null;
   let filterReapplyAttempts = [];
   let recoverySettle = null;
@@ -375,17 +472,31 @@ async function applyRefreshMethod(client, method, {
       throw new Error(`Recommend page scope was not selected after refresh reload: ${pageScopeResult.reason || pageScope}`);
     }
     currentRootState = await getRecommendRoots(client);
-    const filterSelection = await selectAndConfirmRefreshFilter(
-      client,
-      currentRootState,
-      buildRecommendFilterSelectionOptions(filter, { forceRecentNotView }),
-      {
-        retryDelayMs: Math.max(1200, Math.min(5000, Math.floor((reloadSettleMs || 8000) / 2)))
+    const retryDelayMs = Math.max(1200, Math.min(5000, Math.floor((reloadSettleMs || 8000) / 2)));
+    const filterStages = await applyRecommendFilterEnvelopeStages(filter, {
+      applyCurrentCityOnly: async () => {
+        const selection = await ensureRefreshCurrentCityOnly(client, currentRootState, {
+          enabled: filter.currentCityOnly === true || filter.current_city_only === true,
+          retryDelayMs
+        });
+        currentCityOnlyAttempts = selection.attempts;
+        currentRootState = await getRecommendRoots(client);
+        return selection.current_city_only;
+      },
+      applyFilterPanel: async () => {
+        const selection = await selectAndConfirmRefreshFilter(
+          client,
+          currentRootState,
+          buildRecommendFilterSelectionOptions(filter, { forceRecentNotView }),
+          { retryDelayMs }
+        );
+        filterReapplyAttempts = selection.attempts;
+        currentRootState = await getRecommendRoots(client);
+        return selection.filter;
       }
-    );
-    filterResult = filterSelection.filter;
-    filterReapplyAttempts = filterSelection.attempts;
-    currentRootState = await getRecommendRoots(client);
+    });
+    currentCityOnlyResult = filterStages.current_city_only;
+    filterResult = filterStages.filter;
     const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
       timeoutMs: cardTimeoutMs,
       intervalMs: 500
@@ -401,11 +512,13 @@ async function applyRefreshMethod(client, method, {
       job_selection_attempts: jobSelectionAttempts,
       recovery_settle: recoverySettle,
       page_scope: pageScopeResult,
+      current_city_only: currentCityOnlyResult,
+      current_city_only_attempts: currentCityOnlyAttempts,
       filter: filterResult,
       filter_reapply_attempts: filterReapplyAttempts,
       card_count: cardNodeIds.length,
       root_state: currentRootState,
-      forced_recent_not_view: forceRecentNotView,
+      forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false),
       elapsed_ms: Date.now() - started
     };
   } catch (error) {
@@ -419,11 +532,13 @@ async function applyRefreshMethod(client, method, {
       job_selection_attempts: error?.job_selection_attempts || jobSelectionAttempts,
       recovery_settle: error?.recovery_settle || recoverySettle,
       page_scope: pageScopeResult,
+      current_city_only: currentCityOnlyResult,
+      current_city_only_attempts: error?.current_city_only_attempts || currentCityOnlyAttempts,
       filter: filterResult,
       filter_reapply_attempts: error?.filter_reapply_attempts || filterReapplyAttempts,
       card_count: 0,
       root_state: currentRootState,
-      forced_recent_not_view: forceRecentNotView,
+      forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false),
       elapsed_ms: Date.now() - started
     };
   }
@@ -455,9 +570,14 @@ export async function refreshRecommendListAtEnd(client, {
     );
     attempts.push(buttonResult);
     if (buttonResult.ok) {
+      let pageScopeResult = null;
+      let currentCityOnlyResult = null;
+      let currentCityOnlyAttempts = [];
+      let filterResult = null;
+      let filterReapplyAttempts = [];
       try {
         currentRootState = await getRecommendRoots(client);
-        const pageScopeResult = await selectRecommendPageScope(
+        pageScopeResult = await selectRecommendPageScope(
           client,
           currentRootState.iframe.documentNodeId,
           {
@@ -471,16 +591,31 @@ export async function refreshRecommendListAtEnd(client, {
           throw new Error(`Recommend page scope was not selected after end refresh: ${pageScopeResult.reason || pageScope}`);
         }
         currentRootState = await getRecommendRoots(client);
-        const filterSelection = await selectAndConfirmRefreshFilter(
-          client,
-          currentRootState,
-          buildRecommendFilterSelectionOptions(filter, { forceRecentNotView }),
-          {
-            retryDelayMs: Math.max(1200, Math.min(5000, Math.floor((buttonSettleMs || 8000) / 2)))
+        const retryDelayMs = Math.max(1200, Math.min(5000, Math.floor((buttonSettleMs || 8000) / 2)));
+        const filterStages = await applyRecommendFilterEnvelopeStages(filter, {
+          applyCurrentCityOnly: async () => {
+            const selection = await ensureRefreshCurrentCityOnly(client, currentRootState, {
+              enabled: filter.currentCityOnly === true || filter.current_city_only === true,
+              retryDelayMs
+            });
+            currentCityOnlyAttempts = selection.attempts;
+            currentRootState = await getRecommendRoots(client);
+            return selection.current_city_only;
+          },
+          applyFilterPanel: async () => {
+            const selection = await selectAndConfirmRefreshFilter(
+              client,
+              currentRootState,
+              buildRecommendFilterSelectionOptions(filter, { forceRecentNotView }),
+              { retryDelayMs }
+            );
+            filterReapplyAttempts = selection.attempts;
+            currentRootState = await getRecommendRoots(client);
+            return selection.filter;
           }
-        );
-        const filterResult = filterSelection.filter;
-        currentRootState = await getRecommendRoots(client);
+        });
+        currentCityOnlyResult = filterStages.current_city_only;
+        filterResult = filterStages.filter;
         const cardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
           timeoutMs: cardTimeoutMs,
           intervalMs: 500
@@ -490,18 +625,26 @@ export async function refreshRecommendListAtEnd(client, {
           method: "end_refresh_button",
           attempts,
           page_scope: pageScopeResult,
+          current_city_only: currentCityOnlyResult,
+          current_city_only_attempts: currentCityOnlyAttempts,
           filter: filterResult,
-          filter_reapply_attempts: filterSelection.attempts,
+          filter_reapply_attempts: filterReapplyAttempts,
           card_count: cardNodeIds.length,
           root_state: currentRootState,
-          forced_recent_not_view: forceRecentNotView
+          forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false)
         };
       } catch (error) {
         attempts.push({
           ok: false,
           method: "end_refresh_button_after_click",
           reason: "end_refresh_reapply_failed",
-          error: error?.message || String(error)
+          error: error?.message || String(error),
+          page_scope: pageScopeResult,
+          current_city_only: currentCityOnlyResult,
+          current_city_only_attempts: error?.current_city_only_attempts || currentCityOnlyAttempts,
+          filter: filterResult,
+          filter_reapply_attempts: error?.filter_reapply_attempts || filterReapplyAttempts,
+          forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false)
         });
       }
     }
@@ -548,7 +691,7 @@ export async function refreshRecommendListAtEnd(client, {
       error: "Recommend refresh did not run",
       card_count: 0,
       root_state: currentRootState,
-      forced_recent_not_view: forceRecentNotView
+      forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false)
     }),
     attempts
   };
