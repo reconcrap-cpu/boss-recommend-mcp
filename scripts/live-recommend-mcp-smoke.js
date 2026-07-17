@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { __testables } from "../src/index.js";
 
 const { handleRequest, resetRecommendMcpStateForTests } = __testables;
@@ -17,6 +18,30 @@ function parsePositiveInt(raw, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function parseRequiredPositiveInt(raw, label) {
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return parsed;
+}
+
+function parseLabelList(raw) {
+  const protectedSlashLabel = "__BOSS_MCP_DEGREE_ZHONGZHUAN_ZHONGJI__";
+  return String(raw || "")
+    .replaceAll("中专/中技", protectedSlashLabel)
+    .split(/[,，、|/;；]/)
+    .map((item) => item.replaceAll(protectedSlashLabel, "中专/中技").trim())
+    .filter(Boolean);
+}
+
+function readTextFile(filePath, label) {
+  const resolved = path.resolve(String(filePath || ""));
+  const content = fs.readFileSync(resolved, "utf8").replace(/^\uFEFF/, "").trim();
+  if (!content) throw new Error(`${label} file is empty: ${resolved}`);
+  return content;
+}
+
 function parseArgs(argv) {
   const result = {
     host: "127.0.0.1",
@@ -25,6 +50,7 @@ function parseArgs(argv) {
     job: "算法工程师",
     pageScope: "recommend",
     targetCount: 8,
+    instruction: "推荐页筛选算法候选人，目标处理候选人",
     criteria: "候选人具备算法、数据、机器学习或软件开发相关经历",
     detailLimit: 0,
     delayMs: 1600,
@@ -34,9 +60,13 @@ function parseArgs(argv) {
     allowNavigate: true,
     timeoutMs: 360000,
     noFilter: true,
+    schoolTags: [],
     degreeLabels: [],
+    gender: "不限",
+    recentNotView: "不限",
     currentCityOnly: false,
     activityLevel: "不限",
+    skipRecentColleagueContacted: true,
     postAction: "none",
     maxGreetCount: null,
     executePostAction: true,
@@ -44,6 +74,10 @@ function parseArgs(argv) {
     actionTimeoutMs: null,
     actionIntervalMs: null,
     actionAfterClickDelayMs: null,
+    stopAfterProcessed: null,
+    debugForceListEndAfterProcessed: null,
+    debugForceContextRecoveryAfterProcessed: null,
+    debugForceCdpReconnectAfterProcessed: null,
     completeWithoutCancel: false
   };
 
@@ -57,6 +91,9 @@ function parseArgs(argv) {
     if (arg === "--page-scope") result.pageScope = argv[++index];
     if (arg === "--target-count") result.targetCount = parsePositiveInt(argv[++index], result.targetCount);
     if (arg === "--criteria") result.criteria = argv[++index];
+    if (arg === "--criteria-file") result.criteria = readTextFile(argv[++index], "criteria");
+    if (arg === "--instruction") result.instruction = argv[++index];
+    if (arg === "--instruction-file") result.instruction = readTextFile(argv[++index], "instruction");
     if (arg === "--detail-limit") result.detailLimit = Math.max(0, Number(argv[++index]));
     if (arg === "--delay-ms") result.delayMs = Math.max(0, Number(argv[++index]));
     if (arg === "--pause-after-processed") {
@@ -67,8 +104,41 @@ function parseArgs(argv) {
     if (arg === "--no-slow-live") result.slowLive = false;
     if (arg === "--no-navigate") result.allowNavigate = false;
     if (arg === "--timeout-ms") result.timeoutMs = parsePositiveInt(argv[++index], result.timeoutMs);
+    if (arg === "--stop-after-processed") {
+      result.stopAfterProcessed = parseRequiredPositiveInt(argv[++index], "--stop-after-processed");
+    }
+    if (arg === "--debug-force-list-end-after-processed") {
+      result.debugForceListEndAfterProcessed = parseRequiredPositiveInt(
+        argv[++index],
+        "--debug-force-list-end-after-processed"
+      );
+    }
+    if (arg === "--debug-force-context-recovery-after-processed") {
+      result.debugForceContextRecoveryAfterProcessed = parseRequiredPositiveInt(
+        argv[++index],
+        "--debug-force-context-recovery-after-processed"
+      );
+    }
+    if (arg === "--debug-force-cdp-reconnect-after-processed") {
+      result.debugForceCdpReconnectAfterProcessed = parseRequiredPositiveInt(
+        argv[++index],
+        "--debug-force-cdp-reconnect-after-processed"
+      );
+    }
     if (arg === "--no-filter") result.noFilter = true;
     if (arg === "--filter") result.noFilter = false;
+    if (arg === "--school-tags" || arg === "--school-tag") {
+      result.schoolTags = parseLabelList(argv[++index]);
+      result.noFilter = false;
+    }
+    if (arg === "--gender") {
+      result.gender = String(argv[++index] || "").trim() || "不限";
+      result.noFilter = false;
+    }
+    if (arg === "--recent-not-view") {
+      result.recentNotView = String(argv[++index] || "").trim() || "不限";
+      result.noFilter = false;
+    }
     if (arg === "--current-city-only") {
       result.currentCityOnly = true;
       result.noFilter = false;
@@ -80,6 +150,12 @@ function parseArgs(argv) {
     if (arg === "--activity-level") {
       result.activityLevel = String(argv[++index] || "").trim() || "不限";
       result.noFilter = false;
+    }
+    if (arg === "--skip-recent-colleague-contacted") {
+      result.skipRecentColleagueContacted = true;
+    }
+    if (arg === "--no-skip-recent-colleague-contacted") {
+      result.skipRecentColleagueContacted = false;
     }
     if (arg === "--post-action") result.postAction = String(argv[++index] || "none").trim() || "none";
     if (arg === "--max-greet-count") result.maxGreetCount = parsePositiveInt(argv[++index], result.maxGreetCount);
@@ -98,13 +174,24 @@ function parseArgs(argv) {
       result.actionAfterClickDelayMs = Math.max(0, Number(argv[++index]));
     }
     if (arg === "--complete-without-cancel") result.completeWithoutCancel = true;
-    if (arg === "--degree-labels") {
-      result.degreeLabels = String(argv[++index] || "")
-        .split(/[,，、|/]/)
-        .map((item) => item.trim())
-        .filter(Boolean);
+    if (arg === "--degree-labels" || arg === "--degree") {
+      result.degreeLabels = parseLabelList(argv[++index]);
       result.noFilter = false;
     }
+  }
+  const debugBoundaries = [
+    result.debugForceListEndAfterProcessed,
+    result.debugForceContextRecoveryAfterProcessed,
+    result.debugForceCdpReconnectAfterProcessed
+  ].filter((value) => value !== null);
+  if (debugBoundaries.length > 1) {
+    throw new Error("debug force boundary flags are mutually exclusive");
+  }
+  if (debugBoundaries.length === 1) {
+    result.stopAfterProcessed = Math.max(
+      result.stopAfterProcessed || 0,
+      debugBoundaries[0] + 1
+    );
   }
   return result;
 }
@@ -127,6 +214,7 @@ async function callTool(name, args = {}, id = 1) {
   if (!payload) {
     throw new Error(`Tool ${name} did not return structuredContent`);
   }
+  assertNoRuntime(payload.method_log || []);
   return payload;
 }
 
@@ -141,11 +229,153 @@ async function waitForRun(runId, predicate, {
     if (predicate(lastPayload.run, lastPayload)) return lastPayload;
     if (["failed", "canceled", "completed"].includes(lastPayload.run?.status)) {
       const terminalError = lastPayload.run?.error?.message || lastPayload.run?.result?.error?.message || "terminal state reached";
-      throw new Error(`Recommend MCP run ${runId} ended as ${lastPayload.run.status}: ${terminalError}`);
+      const error = new Error(`Recommend MCP run ${runId} ended as ${lastPayload.run.status}: ${terminalError}`);
+      error.runPayload = lastPayload;
+      throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error(`Timed out waiting for recommend MCP run ${runId}; last=${JSON.stringify(lastPayload?.run || null)}`);
+}
+
+function isTerminalRun(run) {
+  return ["failed", "canceled", "completed"].includes(run?.status);
+}
+
+function compactCancelObservation(kind, payload, sequence) {
+  return {
+    kind,
+    sequence,
+    at: new Date().toISOString(),
+    tool_status: payload?.status || null,
+    run_status: payload?.run?.status || payload?.run?.state || null,
+    processed: Number(payload?.run?.progress?.processed) || 0,
+    phase: payload?.run?.phase || payload?.run?.stage || null
+  };
+}
+
+async function cancelRunUntilTerminal(runId, {
+  timeoutMs = 60000,
+  intervalMs = 2000,
+  callToolImpl = callTool,
+  sleepImpl = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  nowImpl = Date.now
+} = {}) {
+  const started = nowImpl();
+  const events = [];
+  const payloads = [];
+  let retryCount = 0;
+  let pollCount = 0;
+
+  const initial = await callToolImpl(TOOL_CANCEL, { run_id: runId }, 50);
+  payloads.push(initial);
+  events.push(compactCancelObservation("cancel", initial, events.length + 1));
+  if (!["CANCEL_REQUESTED", "CANCEL_IGNORED"].includes(initial.status)) {
+    const error = new Error(`Unexpected initial cancel status: ${initial.status}`);
+    error.cancelFollowup = {
+      interval_ms: intervalMs,
+      timeout_ms: timeoutMs,
+      retry_count: retryCount,
+      poll_count: pollCount,
+      events
+    };
+    throw error;
+  }
+  if (isTerminalRun(initial.run)) {
+    return {
+      initial,
+      final: initial,
+      payloads,
+      summary: {
+        interval_ms: intervalMs,
+        timeout_ms: timeoutMs,
+        retry_count: retryCount,
+        poll_count: pollCount,
+        terminal_status: initial.run.status,
+        events
+      }
+    };
+  }
+
+  let lastPayload = initial;
+  while (nowImpl() - started < timeoutMs) {
+    const remainingMs = timeoutMs - (nowImpl() - started);
+    await sleepImpl(Math.min(intervalMs, Math.max(0, remainingMs)));
+
+    const statusPayload = await callToolImpl(
+      TOOL_GET,
+      { run_id: runId },
+      60 + pollCount + retryCount
+    );
+    pollCount += 1;
+    lastPayload = statusPayload;
+    payloads.push(statusPayload);
+    events.push(compactCancelObservation("poll", statusPayload, events.length + 1));
+    if (isTerminalRun(statusPayload.run)) {
+      return {
+        initial,
+        final: statusPayload,
+        payloads,
+        summary: {
+          interval_ms: intervalMs,
+          timeout_ms: timeoutMs,
+          retry_count: retryCount,
+          poll_count: pollCount,
+          terminal_status: statusPayload.run.status,
+          events
+        }
+      };
+    }
+
+    const retryPayload = await callToolImpl(
+      TOOL_CANCEL,
+      { run_id: runId },
+      600 + retryCount
+    );
+    retryCount += 1;
+    lastPayload = retryPayload;
+    payloads.push(retryPayload);
+    events.push(compactCancelObservation("cancel_retry", retryPayload, events.length + 1));
+    if (!["CANCEL_REQUESTED", "CANCEL_IGNORED"].includes(retryPayload.status)) {
+      const error = new Error(`Unexpected cancel retry status: ${retryPayload.status}`);
+      error.runPayload = retryPayload;
+      error.cancelFollowup = {
+        interval_ms: intervalMs,
+        timeout_ms: timeoutMs,
+        retry_count: retryCount,
+        poll_count: pollCount,
+        events
+      };
+      throw error;
+    }
+    if (isTerminalRun(retryPayload.run)) {
+      return {
+        initial,
+        final: retryPayload,
+        payloads,
+        summary: {
+          interval_ms: intervalMs,
+          timeout_ms: timeoutMs,
+          retry_count: retryCount,
+          poll_count: pollCount,
+          terminal_status: retryPayload.run.status,
+          events
+        }
+      };
+    }
+  }
+
+  const error = new Error(`Timed out canceling recommend MCP run ${runId} after ${timeoutMs}ms`);
+  error.runPayload = lastPayload;
+  error.cancelFollowup = {
+    interval_ms: intervalMs,
+    timeout_ms: timeoutMs,
+    retry_count: retryCount,
+    poll_count: pollCount,
+    terminal_status: null,
+    events
+  };
+  throw error;
 }
 
 function writeJsonFile(filePath, payload) {
@@ -166,18 +396,109 @@ function summarizeMethods(methodLog = []) {
 function assertNoRuntime(methodLog = []) {
   const forbiddenMethods = methodLog
     .map((entry) => entry.method)
-    .filter((method) => (
-      String(method || "").startsWith("Runtime.")
-      || String(method || "").startsWith("Page.addScript")
-    ));
+    .filter((method) => {
+      const canonical = String(method || "").replace(/:retry_after_reconnect$/, "");
+      return canonical.startsWith("Runtime.")
+        || canonical.startsWith("Page.addScript");
+    });
   if (forbiddenMethods.length) {
-    throw new Error(`Forbidden page-JS CDP calls observed: ${forbiddenMethods.join(", ")}`);
+    throw new Error(`Forbidden Runtime/script-injection CDP calls observed: ${forbiddenMethods.join(", ")}`);
   }
 }
 
+function recordCdpEvidence(result, ...payloads) {
+  const candidates = payloads
+    .filter(Boolean)
+    .map((payload) => ({
+      methodLog: Array.isArray(payload.method_log) ? payload.method_log : [],
+      methodLogTotal: Number(payload.method_log_total) || payload.method_log?.length || 0
+    }));
+  for (const candidate of candidates) assertNoRuntime(candidate.methodLog);
+  const selected = candidates.sort((left, right) => right.methodLogTotal - left.methodLogTotal)[0] || {
+    methodLog: [],
+    methodLogTotal: 0
+  };
+  result.runtime_evaluate_used = false;
+  result.script_injection_used = false;
+  result.method_summary = summarizeMethods(selected.methodLog);
+  result.method_log = selected.methodLog;
+  result.method_log_total = selected.methodLogTotal;
+}
+
+function buildDiagnosticEvidence(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const run = payload.run && typeof payload.run === "object" ? payload.run : {};
+  const runResult = run.result && typeof run.result === "object" ? run.result : {};
+  const error = run.error || runResult.error || payload.error || null;
+  const errorRecord = error && typeof error === "object" ? error : {};
+  const diagnostics = run.diagnostics && typeof run.diagnostics === "object" ? run.diagnostics : {};
+  return {
+    run_id: run.id || run.runId || run.run_id || payload.run_id || null,
+    status: run.status || run.state || payload.status || null,
+    phase: errorRecord.phase || run.phase || run.stage || diagnostics.phase || null,
+    cdp_method: errorRecord.cdp_method
+      || errorRecord.method
+      || errorRecord.cdp?.method
+      || diagnostics.cdp_method
+      || null,
+    cdp_at: errorRecord.cdp_at || diagnostics.cdp_at || null,
+    node_id: errorRecord.cdp_node_id
+      || errorRecord.cdp_backend_node_id
+      || errorRecord.node_id
+      || errorRecord.nodeId
+      || errorRecord.card_node_id
+      || errorRecord.backend_node_id
+      || diagnostics.node_id
+      || null,
+    checkpoint: run.checkpoint || runResult.checkpoint || null,
+    progress: run.progress || null,
+    last_human_event: run.progress?.last_human_event || null,
+    error,
+    method_log_total: Number(payload.method_log_total) || payload.method_log?.length || 0,
+    method_log_tail: Array.isArray(payload.method_log) ? payload.method_log : []
+  };
+}
+
+function debugBoundaryRequirementSatisfied(run, options) {
+  const progress = run?.progress || {};
+  if (options.debugForceListEndAfterProcessed !== null) {
+    return Number(progress.refresh_rounds || 0) >= 1
+      && Number(progress.debug_force_list_end_count || 0) >= 1;
+  }
+  if (options.debugForceContextRecoveryAfterProcessed !== null) {
+    return Number(progress.context_recoveries || 0) >= 1
+      && Number(progress.debug_force_context_recovery_count || 0) >= 1;
+  }
+  if (options.debugForceCdpReconnectAfterProcessed !== null) {
+    return Number(progress.debug_force_cdp_reconnect_count || 0) >= 1;
+  }
+  return true;
+}
+
 function buildRecommendArgs(options) {
+  const schoolValue = options.schoolTags.length ? options.schoolTags : "不限";
   const degreeValue = options.degreeLabels.length ? options.degreeLabels : "不限";
+  const schoolTags = new Set(["不限", "985", "211", "双一流院校", "留学", "国内外名校", "公办本科"]);
+  const degrees = new Set(["不限", "初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士"]);
+  const genders = new Set(["不限", "男", "女"]);
+  const recentNotViewValues = new Set(["不限", "近14天没有"]);
   const activityLevels = new Set(["不限", "刚刚活跃", "今日活跃", "3日内活跃", "本周活跃", "本月活跃"]);
+  const invalidSchoolTags = (Array.isArray(schoolValue) ? schoolValue : [schoolValue])
+    .filter((value) => !schoolTags.has(value));
+  const invalidDegrees = (Array.isArray(degreeValue) ? degreeValue : [degreeValue])
+    .filter((value) => !degrees.has(value));
+  if (invalidSchoolTags.length) {
+    throw new Error(`Unsupported school tag(s): ${invalidSchoolTags.join(", ")}`);
+  }
+  if (invalidDegrees.length) {
+    throw new Error(`Unsupported degree label(s): ${invalidDegrees.join(", ")}`);
+  }
+  if (!genders.has(options.gender)) {
+    throw new Error(`Unsupported gender: ${options.gender}`);
+  }
+  if (!recentNotViewValues.has(options.recentNotView)) {
+    throw new Error(`Unsupported recent-not-view value: ${options.recentNotView}`);
+  }
   if (!activityLevels.has(options.activityLevel)) {
     throw new Error(`Unsupported activity level: ${options.activityLevel}`);
   }
@@ -194,13 +515,15 @@ function buildRecommendArgs(options) {
     page_value: options.pageScope,
     filters_confirmed: true,
     school_tag_confirmed: true,
-    school_tag_value: "不限",
+    school_tag_value: schoolValue,
     degree_confirmed: true,
     degree_value: degreeValue,
     gender_confirmed: true,
-    gender_value: "不限",
+    gender_value: options.gender,
     recent_not_view_confirmed: true,
-    recent_not_view_value: "不限",
+    recent_not_view_value: options.recentNotView,
+    skip_recent_colleague_contacted_confirmed: true,
+    skip_recent_colleague_contacted_value: options.skipRecentColleagueContacted,
     criteria_confirmed: true,
     target_count_confirmed: true,
     target_count_value: options.targetCount,
@@ -212,15 +535,16 @@ function buildRecommendArgs(options) {
   };
   const overrides = {
     page_scope: options.pageScope,
-    school_tag: "不限",
+    school_tag: schoolValue,
     degree: degreeValue,
-    gender: "不限",
-    recent_not_view: "不限",
+    gender: options.gender,
+    recent_not_view: options.recentNotView,
     current_city_only: options.currentCityOnly,
     activity_level: options.activityLevel,
     criteria: options.criteria,
     target_count: options.targetCount,
     post_action: postAction,
+    skip_recent_colleague_contacted: options.skipRecentColleagueContacted,
     job: options.job
   };
   if (postAction === "greet" && maxGreetCount !== null) {
@@ -229,7 +553,7 @@ function buildRecommendArgs(options) {
     overrides.max_greet_count = maxGreetCount;
   }
   const args = {
-    instruction: "推荐页筛选算法候选人，目标处理候选人",
+    instruction: options.instruction,
     confirmation,
     overrides,
     host: options.host,
@@ -251,17 +575,53 @@ function buildRecommendArgs(options) {
   if (options.actionAfterClickDelayMs !== null) {
     args.action_after_click_delay_ms = options.actionAfterClickDelayMs;
   }
+  if (options.debugForceListEndAfterProcessed !== null) {
+    args.debug_test_mode = true;
+    args.debug_force_list_end_after_processed = options.debugForceListEndAfterProcessed;
+  }
+  if (options.debugForceContextRecoveryAfterProcessed !== null) {
+    args.debug_test_mode = true;
+    args.debug_force_context_recovery_after_processed = options.debugForceContextRecoveryAfterProcessed;
+  }
+  if (options.debugForceCdpReconnectAfterProcessed !== null) {
+    args.debug_test_mode = true;
+    args.debug_force_cdp_reconnect_after_processed = options.debugForceCdpReconnectAfterProcessed;
+  }
   return args;
 }
 
 async function run() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.stopAfterProcessed !== null && options.completeWithoutCancel) {
+    throw new Error("--stop-after-processed cannot be combined with --complete-without-cancel");
+  }
   const result = {
     status: "UNKNOWN",
     generated_at: new Date().toISOString(),
     chrome: {
       host: options.host,
       port: options.port
+    },
+    requested: {
+      instruction: options.instruction,
+      criteria: options.criteria,
+      job: options.job,
+      page_scope: options.pageScope,
+      school_tag: options.schoolTags.length ? options.schoolTags : ["不限"],
+      degree: options.degreeLabels.length ? options.degreeLabels : ["不限"],
+      gender: options.gender,
+      recent_not_view: options.recentNotView,
+      current_city_only: options.currentCityOnly,
+      activity_level: options.activityLevel,
+      skip_recent_colleague_contacted: options.skipRecentColleagueContacted,
+      target_count: options.targetCount,
+      post_action: options.postAction,
+      max_greet_count: options.maxGreetCount,
+      rest_level: options.restLevel,
+      stop_after_processed: options.stopAfterProcessed,
+      debug_force_list_end_after_processed: options.debugForceListEndAfterProcessed,
+      debug_force_context_recovery_after_processed: options.debugForceContextRecoveryAfterProcessed,
+      debug_force_cdp_reconnect_after_processed: options.debugForceCdpReconnectAfterProcessed
     },
     lifecycle: {}
   };
@@ -287,6 +647,54 @@ async function run() {
 
     result.post_action = startPayload.post_action || null;
 
+    if (options.stopAfterProcessed !== null) {
+      const boundary = await waitForRun(
+        runId,
+        (run) => (
+          (
+            (run?.progress?.processed || 0) >= options.stopAfterProcessed
+            && debugBoundaryRequirementSatisfied(run, options)
+          )
+          || isTerminalRun(run)
+        ),
+        { timeoutMs: options.timeoutMs }
+      );
+      result.lifecycle.stop_boundary = boundary;
+      result.stop_boundary_evidence = buildDiagnosticEvidence(boundary);
+      recordCdpEvidence(result, startPayload, boundary);
+
+      if (isTerminalRun(boundary.run)) {
+        result.lifecycle.final = boundary;
+        result.failure_evidence = buildDiagnosticEvidence(boundary);
+        const terminalError = boundary.run?.error?.message
+          || boundary.run?.result?.error?.message
+          || "terminal state reached before the stop boundary could be canceled";
+        throw new Error(`Recommend MCP run ${runId} ended as ${boundary.run.status}: ${terminalError}`);
+      }
+
+      const cancellation = await cancelRunUntilTerminal(runId, {
+        timeoutMs: options.timeoutMs,
+        intervalMs: 2000
+      });
+      const cancelPayload = cancellation.initial;
+      const final = cancellation.final;
+      result.lifecycle.cancel_requested = cancelPayload;
+      result.lifecycle.cancel_followup = cancellation.summary;
+      result.lifecycle.final = final;
+      result.final_evidence = buildDiagnosticEvidence(final);
+      recordCdpEvidence(result, startPayload, boundary, ...cancellation.payloads);
+      if (final.run.status !== "canceled") {
+        throw new Error(`Expected canceled final status after stop boundary, got ${final.run.status}`);
+      }
+      result.status = "PASS";
+
+      if (options.saveReport) {
+        result.saved_report_path = writeJsonFile(options.saveReport, result);
+      }
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+
     if (options.completeWithoutCancel) {
       const final = await waitForRun(
         runId,
@@ -297,11 +705,7 @@ async function run() {
       if (final.run.status !== "completed") {
         throw new Error(`Expected completed final status, got ${final.run.status}`);
       }
-      const methodLog = final.method_log || startPayload.method_log || [];
-      assertNoRuntime(methodLog);
-      result.runtime_evaluate_used = false;
-      result.method_summary = summarizeMethods(methodLog);
-      result.method_log = methodLog;
+      recordCdpEvidence(result, startPayload, final);
       result.status = "PASS";
 
       if (options.saveReport) {
@@ -359,27 +763,20 @@ async function run() {
     );
     result.lifecycle.resumed = resumed;
 
-    const cancelPayload = await callTool(TOOL_CANCEL, { run_id: runId }, 50);
+    const cancellation = await cancelRunUntilTerminal(runId, {
+      timeoutMs: options.timeoutMs,
+      intervalMs: 2000
+    });
+    const cancelPayload = cancellation.initial;
+    const final = cancellation.final;
     result.lifecycle.cancel_requested = cancelPayload;
-    if (cancelPayload.status !== "CANCEL_REQUESTED") {
-      throw new Error(`Unexpected cancel status: ${cancelPayload.status}`);
-    }
-
-    const final = await waitForRun(
-      runId,
-      (run) => ["canceled", "completed", "failed"].includes(run?.status),
-      { timeoutMs: options.timeoutMs }
-    );
+    result.lifecycle.cancel_followup = cancellation.summary;
     result.lifecycle.final = final;
     if (final.run.status !== "canceled") {
       throw new Error(`Expected canceled final status, got ${final.run.status}`);
     }
 
-    const methodLog = final.method_log || cancelPayload.method_log || resumed.method_log || [];
-    assertNoRuntime(methodLog);
-    result.runtime_evaluate_used = false;
-    result.method_summary = summarizeMethods(methodLog);
-    result.method_log = methodLog;
+    recordCdpEvidence(result, startPayload, resumed, ...cancellation.payloads);
     result.status = "PASS";
 
     if (options.saveReport) {
@@ -387,6 +784,18 @@ async function run() {
     }
     console.log(JSON.stringify(result, null, 2));
   } catch (error) {
+    if (error?.cancelFollowup) {
+      result.lifecycle.cancel_followup = error.cancelFollowup;
+    }
+    if (error?.runPayload) {
+      result.lifecycle.failure_snapshot = error.runPayload;
+      result.failure_evidence = buildDiagnosticEvidence(error.runPayload);
+    } else if (!result.failure_evidence) {
+      const terminalPayload = Object.values(result.lifecycle)
+        .find((payload) => isTerminalRun(payload?.run));
+      if (terminalPayload) result.failure_evidence = buildDiagnosticEvidence(terminalPayload);
+    }
+    recordCdpEvidence(result, ...Object.values(result.lifecycle));
     result.status = "FAIL";
     result.error = {
       name: error?.name || "Error",
@@ -402,4 +811,15 @@ async function run() {
   }
 }
 
-await run();
+const isMain = Boolean(process.argv[1])
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isMain) await run();
+
+export {
+  assertNoRuntime,
+  buildRecommendArgs,
+  cancelRunUntilTerminal,
+  parseArgs,
+  parseLabelList
+};

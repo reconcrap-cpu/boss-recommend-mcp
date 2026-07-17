@@ -995,6 +995,21 @@ function createRunInputSchema() {
         type: "boolean",
         description: "高级测试开关；默认 false。只有显式为 true 时才允许 deterministic/local scorer、跳过筛选器、card-only、dry-run 后置动作等调试路径"
       },
+      debug_force_list_end_after_processed: {
+        type: "integer",
+        minimum: 1,
+        description: "仅限 debug_test_mode=true 的 live 诊断：在完成指定候选人数后的循环边界恰好一次模拟列表到底，并进入真实 Page.reload 刷新/筛选重放分支。与另外两个 debug_force_*_after_processed 参数互斥。"
+      },
+      debug_force_context_recovery_after_processed: {
+        type: "integer",
+        minimum: 1,
+        description: "仅限 debug_test_mode=true 的 live 诊断：在完成指定候选人数后的循环边界恰好一次调用真实 recommend 上下文恢复与筛选重放。与另外两个 debug_force_*_after_processed 参数互斥。"
+      },
+      debug_force_cdp_reconnect_after_processed: {
+        type: "integer",
+        minimum: 1,
+        description: "仅限 debug_test_mode=true 的 live 诊断：在完成指定候选人数后的循环边界恰好一次关闭当前原始 CDP 连接，随后依赖 guarded client 原生重连继续。不会执行页面脚本。与另外两个 debug_force_*_after_processed 参数互斥。"
+      },
       screening_mode: {
         type: "string",
         enum: ["llm", "deterministic"],
@@ -1347,10 +1362,49 @@ function createListRecommendJobsInputSchema() {
 
 function createScheduleRunInputSchema() {
   const base = createRunInputSchema();
+  const properties = { ...base.properties };
+  for (const field of [
+    "debug_test_mode",
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ]) {
+    delete properties[field];
+  }
+  properties.screening_mode = {
+    ...properties.screening_mode,
+    enum: ["llm"],
+    description: "定时 Recommend 仅允许生产 LLM 筛选；deterministic/local 调试模式不可定时。"
+  };
+  properties.use_llm = {
+    ...properties.use_llm,
+    enum: [true],
+    description: "定时 Recommend 仅允许 true；use_llm=false 属于调试模式。"
+  };
+  properties.detail_limit = {
+    ...properties.detail_limit,
+    minimum: 1
+  };
+  properties.allow_card_only_screening = {
+    ...properties.allow_card_only_screening,
+    enum: [false]
+  };
+  properties.dry_run_post_action = {
+    ...properties.dry_run_post_action,
+    enum: [false]
+  };
+  properties.no_filter = {
+    ...properties.no_filter,
+    enum: [false]
+  };
+  properties.filter_enabled = {
+    ...properties.filter_enabled,
+    enum: [true]
+  };
   return {
     ...base,
     properties: {
-      ...base.properties,
+      ...properties,
       schedule_id: {
         type: "string",
         description: "可选，自定义定时任务 id；默认自动生成"
@@ -1463,6 +1517,10 @@ function createCompactRunInputSchema() {
       slow_live: { type: "boolean" },
       delay_ms: { type: "integer", minimum: 0 },
       detail_limit: { type: "integer", minimum: 0 },
+      debug_test_mode: { type: "boolean" },
+      debug_force_list_end_after_processed: { type: "integer", minimum: 1 },
+      debug_force_context_recovery_after_processed: { type: "integer", minimum: 1 },
+      debug_force_cdp_reconnect_after_processed: { type: "integer", minimum: 1 },
       execute_post_action: { type: "boolean" },
       no_filter: { type: "boolean" },
       dry_run: { type: "boolean" }
@@ -1474,10 +1532,31 @@ function createCompactRunInputSchema() {
 
 function createCompactScheduleRunInputSchema() {
   const base = createCompactRunInputSchema();
+  const properties = { ...base.properties };
+  for (const field of [
+    "debug_test_mode",
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ]) {
+    delete properties[field];
+  }
+  properties.detail_limit = {
+    ...properties.detail_limit,
+    minimum: 1
+  };
+  properties.no_filter = {
+    ...properties.no_filter,
+    enum: [false]
+  };
+  properties.dry_run = {
+    ...properties.dry_run,
+    enum: [false]
+  };
   return {
     ...base,
     properties: {
-      ...base.properties,
+      ...properties,
       schedule_id: {
         type: "string",
         description: "可选，自定义定时任务 id；默认自动生成"
@@ -1835,6 +1914,31 @@ function validateRunArgs(args) {
   }
   if (!args.instruction || typeof args.instruction !== "string") {
     return "instruction is required and must be a string";
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(args, "debug_test_mode")
+    && typeof args.debug_test_mode !== "boolean"
+  ) {
+    return "debug_test_mode must be a boolean";
+  }
+  const debugBoundaryFields = [
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ];
+  const configuredDebugBoundaries = [];
+  for (const field of debugBoundaryFields) {
+    if (!Object.prototype.hasOwnProperty.call(args, field)) continue;
+    if (!Number.isInteger(args[field]) || args[field] <= 0) {
+      return `${field} must be a positive integer`;
+    }
+    configuredDebugBoundaries.push(field);
+  }
+  if (configuredDebugBoundaries.length > 1) {
+    return `${configuredDebugBoundaries.join(", ")} are mutually exclusive`;
+  }
+  if (configuredDebugBoundaries.length && args.debug_test_mode !== true) {
+    return `${configuredDebugBoundaries[0]} requires debug_test_mode=true`;
   }
   return null;
 }
@@ -3124,7 +3228,7 @@ async function handleRequest(message, workspaceRoot) {
       );
     }
 
-    if ([TOOL_RUN_RECOMMEND, TOOL_START_RUN].includes(toolName)) {
+    if ([TOOL_RUN_RECOMMEND, TOOL_START_RUN, TOOL_PREPARE_RUN].includes(toolName)) {
       const inputError = validateRunArgs(args);
       if (inputError) {
         return createJsonRpcError(id, -32602, inputError);

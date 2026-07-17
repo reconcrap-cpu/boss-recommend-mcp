@@ -176,6 +176,27 @@ async function testGuardedClientReconnectsClosedTransport() {
   assertNoForbiddenCdpCalls(methodLog);
 }
 
+async function testGuardedClientAnnotatesCdpNodeErrors() {
+  const guarded = createGuardedCdpClient({
+    DOM: {
+      async querySelector() {
+        throw new Error("Could not find node with given id");
+      }
+    }
+  });
+
+  await assert.rejects(
+    () => guarded.DOM.querySelector({ nodeId: 42, selector: ".candidate-card" }),
+    (error) => {
+      assert.equal(error.cdp_method, "DOM.querySelector");
+      assert.match(error.cdp_at, /^\d{4}-\d{2}-\d{2}T/);
+      assert.equal(error.cdp_node_id, 42);
+      assert.deepEqual(error.cdp_param_keys, ["nodeId", "selector"]);
+      return true;
+    }
+  );
+}
+
 async function testUnexpectedDomainIsRejected() {
   const guarded = createGuardedCdpClient({
     Runtime: {
@@ -936,6 +957,7 @@ await testRuntimeDomainIsBlockedBeforeTransport();
 await testPageScriptInjectionIsBlockedBeforeTransport();
 await testAllowedDomainsAreLogged();
 await testGuardedClientReconnectsClosedTransport();
+await testGuardedClientAnnotatesCdpNodeErrors();
 await testUnexpectedDomainIsRejected();
 testBossLoginUrlDetection();
 testBossLoginRequiredErrorShape();

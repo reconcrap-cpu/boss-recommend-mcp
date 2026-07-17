@@ -1700,6 +1700,26 @@ function cloneCdpParams(params = {}) {
   }
 }
 
+function annotateCdpError(error, method, params = {}) {
+  if (!error || (typeof error !== "object" && typeof error !== "function")) return error;
+  if (!error.cdp_method) error.cdp_method = String(method || "");
+  if (!error.cdp_at) error.cdp_at = nowIso();
+  const nodeId = Number(params?.nodeId);
+  const backendNodeId = Number(params?.backendNodeId);
+  const searchId = String(params?.searchId || "").trim();
+  if (Number.isInteger(nodeId) && nodeId > 0 && !error.cdp_node_id) {
+    error.cdp_node_id = nodeId;
+  }
+  if (Number.isInteger(backendNodeId) && backendNodeId > 0 && !error.cdp_backend_node_id) {
+    error.cdp_backend_node_id = backendNodeId;
+  }
+  if (searchId && !error.cdp_search_id) error.cdp_search_id = searchId;
+  if (!Array.isArray(error.cdp_param_keys)) {
+    error.cdp_param_keys = Object.keys(params || {}).sort();
+  }
+  return error;
+}
+
 function shouldReplayCdpSetupCall(domain, method) {
   return method === "enable"
     || (domain === "Network" && method === "setCacheDisabled")
@@ -1748,6 +1768,7 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
   async function invokeWithReconnect({
     methodNameForLog,
     invoke,
+    params = {},
     retryable = true
   }) {
     recordMethod(methodLog, methodNameForLog);
@@ -1755,11 +1776,15 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
       return await invoke(currentClient);
     } catch (error) {
       if (!retryable || !isClosedCdpTransportError(error) || typeof reconnect !== "function") {
-        throw error;
+        throw annotateCdpError(error, methodNameForLog, params);
       }
       await reconnectClient();
       recordMethod(methodLog, `${methodNameForLog}:retry_after_reconnect`);
-      return invoke(currentClient);
+      try {
+        return await invoke(currentClient);
+      } catch (retryError) {
+        throw annotateCdpError(retryError, methodNameForLog, params);
+      }
     }
   }
 
@@ -1772,6 +1797,7 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
           }
           return invokeWithReconnect({
             methodNameForLog: method,
+            params,
             invoke: (activeClient) => activeClient.send(method, params)
           });
         };
@@ -1815,6 +1841,7 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
             }
             return invokeWithReconnect({
               methodNameForLog: fullMethod,
+              params,
               invoke: (activeClient) => {
                 const activeDomain = activeClient?.[property];
                 const activeMethod = activeDomain?.[method];

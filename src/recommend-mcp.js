@@ -8,6 +8,7 @@ import {
   createBossLoginRequiredError,
   detectBossLoginState,
   enableDomains,
+  FORBIDDEN_CDP_METHODS,
   getMainFrameUrl,
   isBossLoginUrl,
   waitForMainFrameUrl,
@@ -284,6 +285,15 @@ function collectRecommendDebugTestOptions(args = {}, normalized = {}) {
   if (parseNonNegativeInteger(args.detail_limit, null) === 0) reasons.push("detail_limit=0");
   if (args.no_filter === true) reasons.push("no_filter");
   if (args.filter_enabled === false) reasons.push("filter_enabled=false");
+  if (args.debug_force_list_end_after_processed != null) {
+    reasons.push("debug_force_list_end_after_processed");
+  }
+  if (args.debug_force_context_recovery_after_processed != null) {
+    reasons.push("debug_force_context_recovery_after_processed");
+  }
+  if (args.debug_force_cdp_reconnect_after_processed != null) {
+    reasons.push("debug_force_cdp_reconnect_after_processed");
+  }
   if (args.dry_run_post_action === true) reasons.push("dry_run_post_action");
   if (args.execute_post_action === false && normalized.postAction && normalized.postAction !== "none") {
     reasons.push("execute_post_action=false");
@@ -306,17 +316,35 @@ function resolveRecommendDetailLimit(args = {}, normalized = {}) {
 function methodSummary(methodLog = []) {
   const summary = {};
   for (const entry of methodLog || []) {
-    summary[entry.method] = (summary[entry.method] || 0) + 1;
+    const method = compactCdpMethodName(entry?.method || entry || "");
+    if (!method) continue;
+    summary[method] = (summary[method] || 0) + 1;
   }
   return summary;
 }
 
+function compactCdpMethodName(value) {
+  const method = normalizeText(value);
+  return /^[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*(?::retry_after_reconnect)?$/.test(method)
+    ? method
+    : "";
+}
+
+function compactCdpMethodTimestamp(value) {
+  const timestamp = normalizeText(value);
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : "";
+}
+
 function compactMethodLogForStatus(methodLog = []) {
   if (!Array.isArray(methodLog)) return [];
-  return methodLog.slice(-STATUS_METHOD_LOG_TAIL_LIMIT).map((entry) => ({
-    method: normalizeText(entry?.method || entry || ""),
-    at: normalizeText(entry?.at || "")
-  }));
+  return methodLog
+    .map((entry) => ({
+      method: compactCdpMethodName(entry?.method || entry || ""),
+      at: compactCdpMethodTimestamp(entry?.at || "")
+    }))
+    .filter((entry) => Boolean(entry.method))
+    .slice(-STATUS_METHOD_LOG_TAIL_LIMIT);
 }
 
 function clonePlain(value, fallback = null) {
@@ -334,6 +362,126 @@ function plainRecord(value) {
 function nonEmptyRecord(value) {
   const record = plainRecord(value);
   return Object.keys(record).length ? record : null;
+}
+
+function compactMethodSummaryForStatus(value = {}) {
+  const compact = {};
+  for (const [rawMethod, rawCount] of Object.entries(plainRecord(value))) {
+    const method = compactCdpMethodName(rawMethod);
+    const count = Number(rawCount);
+    if (!method || !Number.isInteger(count) || count < 1) continue;
+    compact[method] = count;
+  }
+  return compact;
+}
+
+function compactChromeEvidenceUrl(value) {
+  const text = normalizeText(value);
+  if (!text) return null;
+  try {
+    const parsed = new URL(text);
+    parsed.username = "";
+    parsed.password = "";
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return text.split(/[?#]/, 1)[0] || null;
+  }
+}
+
+function compactChromeAutoLaunchEvidence(value = {}) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  const booleanKeys = [
+    "launched",
+    "reused",
+    "guard_checked",
+    "required_flags_ok",
+    "replaced",
+    "target_created",
+    "fallback_target",
+    "fallback_any_page"
+  ];
+  for (const key of booleanKeys) {
+    if (typeof source[key] === "boolean") compact[key] = source[key];
+  }
+  for (const key of ["port", "target_count", "command_line_args_count"]) {
+    if (Number.isInteger(source[key]) && source[key] >= 0) compact[key] = source[key];
+  }
+  for (const key of ["close_method", "command_line_source"]) {
+    const text = normalizeText(source[key]);
+    if (text) compact[key] = text;
+  }
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactChromeEvidence(value = {}) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  const host = normalizeText(source.host);
+  const targetId = normalizeText(source.target_id);
+  const targetUrl = compactChromeEvidenceUrl(source.target_url);
+  if (host) compact.host = host;
+  if (Number.isInteger(source.port) && source.port > 0) compact.port = source.port;
+  if (targetUrl) compact.target_url = targetUrl;
+  if (targetId) compact.target_id = targetId;
+  const autoLaunch = compactChromeAutoLaunchEvidence(source.auto_launch);
+  if (autoLaunch) compact.auto_launch = autoLaunch;
+  return Object.keys(compact).length ? compact : null;
+}
+
+function methodEvidenceFlags(methodSummaryValue = {}) {
+  const methods = Object.keys(methodSummaryValue);
+  return {
+    runtime_evaluate_used: methods.some((method) => method.split(".", 1)[0] === "Runtime"),
+    script_injection_used: methods.some((method) => (
+      FORBIDDEN_CDP_METHODS.has(method.replace(/:retry_after_reconnect$/, ""))
+    ))
+  };
+}
+
+function buildPersistedCdpEvidence({ meta = {}, persisted = {} } = {}) {
+  const hasLiveMethodLog = Array.isArray(meta.methodLog);
+  const persistedMethodLog = compactMethodLogForStatus(persisted.method_log);
+  const methodLog = hasLiveMethodLog
+    ? compactMethodLogForStatus(meta.methodLog)
+    : persistedMethodLog;
+  const persistedSummary = compactMethodSummaryForStatus(persisted.method_summary);
+  const summary = hasLiveMethodLog
+    ? methodSummary(meta.methodLog)
+    : Object.keys(persistedSummary).length
+      ? persistedSummary
+      : methodSummary(methodLog);
+  const liveTotal = hasLiveMethodLog ? meta.methodLog.length : null;
+  const persistedTotal = Number(persisted.method_log_total);
+  const methodLogTotal = Number.isInteger(liveTotal)
+    ? liveTotal
+    : Number.isInteger(persistedTotal) && persistedTotal >= methodLog.length
+      ? persistedTotal
+      : methodLog.length;
+  const inferredFlags = methodEvidenceFlags(summary);
+  return {
+    runtime_evaluate_used: hasLiveMethodLog
+      ? inferredFlags.runtime_evaluate_used
+      : persisted.runtime_evaluate_used === true || inferredFlags.runtime_evaluate_used,
+    script_injection_used: hasLiveMethodLog
+      ? inferredFlags.script_injection_used
+      : persisted.script_injection_used === true || inferredFlags.script_injection_used,
+    method_summary: summary,
+    method_log: methodLog,
+    method_log_total: methodLogTotal,
+    chrome: compactChromeEvidence(meta.chrome || persisted.chrome)
+  };
+}
+
+function attachPersistedCdpEvidence(payload, persisted = {}) {
+  return {
+    ...payload,
+    ...buildPersistedCdpEvidence({ persisted })
+  };
 }
 
 function normalizeRunId(runId) {
@@ -506,7 +654,7 @@ function normalizeLegacyProgress(progress = {}, summary = null) {
     : Number.isInteger(summary?.passed)
       ? summary.passed
       : 0;
-  return {
+  const normalized = {
     ...progress,
     processed,
     inspected: processed,
@@ -516,6 +664,17 @@ function normalizeLegacyProgress(progress = {}, summary = null) {
     greet_count: Number.isInteger(progress.greet_count) ? progress.greet_count : 0,
     post_action_clicked: Number.isInteger(progress.post_action_clicked) ? progress.post_action_clicked : 0
   };
+  if (Object.prototype.hasOwnProperty.call(normalized, "last_list_read_stale_diagnostic")) {
+    normalized.last_list_read_stale_diagnostic = compactListReadStaleDiagnosticForStatus(
+      normalized.last_list_read_stale_diagnostic
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(normalized, "list_read_stale_diagnostics")) {
+    normalized.list_read_stale_diagnostics = compactListReadStaleDiagnosticsForStatus(
+      normalized.list_read_stale_diagnostics
+    );
+  }
+  return normalized;
 }
 
 const STATUS_COUNT_KEYS = [
@@ -548,6 +707,68 @@ function compactSmallRecord(value, fallback = null) {
   const record = plainRecord(value);
   if (!Object.keys(record).length) return fallback;
   return clonePlain(record, fallback);
+}
+
+function compactListReadStaleDiagnosticForStatus(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  for (const key of ["code", "message", "phase", "cdp_method", "cdp_at", "recovery_mode"]) {
+    const text = normalizeText(source[key] || "");
+    if (text) compact[key] = text.slice(0, key === "message" ? 500 : 200);
+  }
+  for (const key of ["cdp_node_id", "cdp_backend_node_id", "attempt"]) {
+    if (Number.isInteger(source[key]) && source[key] >= 0) compact[key] = source[key];
+  }
+  for (const key of ["exhausted", "recovery_applied", "recovered"]) {
+    if (typeof source[key] === "boolean") compact[key] = source[key];
+  }
+  for (const key of ["at", "recovery_applied_at", "recovered_at"]) {
+    const text = normalizeText(source[key] || "");
+    if (text && Number.isFinite(Date.parse(text))) compact[key] = new Date(text).toISOString();
+  }
+  if (Array.isArray(source.cdp_param_keys)) {
+    compact.cdp_param_keys = source.cdp_param_keys
+      .map((key) => normalizeText(key))
+      .filter((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key))
+      .slice(0, 20);
+  }
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactListReadStaleDiagnosticsForStatus(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => compactListReadStaleDiagnosticForStatus(item))
+    .filter(Boolean)
+    .slice(-12);
+}
+
+function compactListReadStaleCheckpointEvent(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  const diagnostic = compactListReadStaleDiagnosticForStatus(source.diagnostic || source.trigger);
+  if (diagnostic) compact.diagnostic = diagnostic;
+  const recentDiagnostics = compactListReadStaleDiagnosticsForStatus(source.recent_diagnostics);
+  if (recentDiagnostics.length) compact.recent_diagnostics = recentDiagnostics;
+  for (const key of ["recovery_count", "recovery_applied_count"]) {
+    if (Number.isInteger(source[key]) && source[key] >= 0) compact[key] = source[key];
+  }
+  if (source.recovery_error) {
+    const recoveryError = compactListReadStaleDiagnosticForStatus(source.recovery_error);
+    if (recoveryError) compact.recovery_error = recoveryError;
+  }
+  if (source.candidate_list) {
+    const candidateList = plainRecord(source.candidate_list);
+    compact.candidate_list = {};
+    for (const key of ["seen_count", "queued_count", "processed_count", "read_error_count", "scroll_count"]) {
+      if (Number.isInteger(candidateList[key]) && candidateList[key] >= 0) {
+        compact.candidate_list[key] = candidateList[key];
+      }
+    }
+  }
+  return Object.keys(compact).length ? compact : null;
 }
 
 function compactRecommendSummaryForStatus(summary) {
@@ -605,6 +826,22 @@ function compactRecommendSummaryForStatus(summary) {
       total_pause_ms: compactPositiveInteger(humanRest.total_pause_ms ?? humanRest.pause_ms, null)
     };
   }
+  for (const key of [
+    "list_read_stale_recovery_attempts",
+    "list_read_stale_recovery_applied",
+    "list_read_stale_recoveries"
+  ]) {
+    if (Number.isInteger(summary[key]) && summary[key] >= 0) compact[key] = summary[key];
+  }
+  if (summary.last_list_read_recovery_mode) {
+    compact.last_list_read_recovery_mode = normalizeText(summary.last_list_read_recovery_mode).slice(0, 100);
+  }
+  const lastStaleDiagnostic = compactListReadStaleDiagnosticForStatus(
+    summary.last_list_read_stale_diagnostic
+  );
+  if (lastStaleDiagnostic) compact.last_list_read_stale_diagnostic = lastStaleDiagnostic;
+  const staleDiagnostics = compactListReadStaleDiagnosticsForStatus(summary.list_read_stale_diagnostics);
+  if (staleDiagnostics.length) compact.list_read_stale_diagnostics = staleDiagnostics;
   return compact;
 }
 
@@ -621,6 +858,16 @@ function compactRecommendCheckpointForStatus(checkpoint) {
   }
   for (const key of STATUS_COUNT_KEYS) {
     if (Number.isInteger(checkpoint[key])) compact[key] = checkpoint[key];
+  }
+  for (const key of [
+    "list_read_stale_recovery",
+    "list_read_stale_recovery_applied",
+    "list_read_stale_recovered",
+    "list_read_stale_recovery_exhausted",
+    "list_read_stale_recovery_failed"
+  ]) {
+    const event = compactListReadStaleCheckpointEvent(checkpoint[key]);
+    if (event) compact[key] = event;
   }
   return compact;
 }
@@ -1026,6 +1273,10 @@ function persistRecommendRunSnapshot(snapshot, {
   if (persistActiveCheckpoint) {
     persistRecommendCheckpointSnapshot(snapshot);
   }
+  const cdpEvidence = buildPersistedCdpEvidence({
+    meta: getRecommendRunMeta(normalized.run_id),
+    persisted: existing || {}
+  });
   const payload = {
     run_id: normalized.run_id,
     mode: normalized.mode,
@@ -1046,7 +1297,9 @@ function persistRecommendRunSnapshot(snapshot, {
     recovery: normalized.recovery,
     result: normalized.result,
     summary: normalized.summary,
-    artifacts: normalized.artifacts
+    checkpoint: normalized.checkpoint,
+    artifacts: normalized.artifacts,
+    ...cdpEvidence
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
   return normalized;
@@ -1126,11 +1379,10 @@ function attachMethodEvidence(payload, runId) {
   assertNoForbiddenCdpCalls(methodLog);
   return {
     ...payload,
-    runtime_evaluate_used: false,
-    method_summary: methodSummary(methodLog),
-    method_log: compactMethodLogForStatus(methodLog),
-    method_log_total: Array.isArray(methodLog) ? methodLog.length : 0,
-    chrome: meta.chrome || null
+    ...buildPersistedCdpEvidence({
+      meta,
+      persisted: readRecommendRunState(runId) || {}
+    })
   };
 }
 
@@ -1822,6 +2074,19 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
     humanBehavior,
     skipRecentColleagueContacted: normalized.skipRecentColleagueContacted,
     colleagueContactWindowDays: normalized.colleagueContactWindowDays,
+    debugTestMode: isDebugTestMode(args),
+    debugForceListEndAfterProcessed: parsePositiveInteger(
+      args.debug_force_list_end_after_processed,
+      null
+    ),
+    debugForceContextRecoveryAfterProcessed: parsePositiveInteger(
+      args.debug_force_context_recovery_after_processed,
+      null
+    ),
+    debugForceCdpReconnectAfterProcessed: parsePositiveInteger(
+      args.debug_force_cdp_reconnect_after_processed,
+      null
+    ),
     name: "mcp-recommend-pipeline-run",
     parsed
   };
@@ -2117,19 +2382,16 @@ export function getRecommendPipelineRunTool({ args = {} } = {}) {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
       const reconciled = compactRecommendRunForStatus(reconcilePersistedRecommendRunIfNeeded(persisted));
-      return {
+      const persistedEvidence = readRecommendRunState(runId) || persisted;
+      return attachPersistedCdpEvidence({
         status: "RUN_STATUS",
         run: reconciled,
         persistence: {
           source: "disk",
           active_control_available: false,
           stale_process_reconciled: reconciled?.state !== persisted.state
-        },
-        runtime_evaluate_used: false,
-        method_summary: {},
-        method_log: [],
-        chrome: null
-      };
+        }
+      }, persistedEvidence);
     }
     return {
       status: "FAILED",
@@ -2172,15 +2434,11 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
-      return {
+      return attachPersistedCdpEvidence({
         status: "PAUSE_IGNORED",
         run: compactRecommendRunForStatus(persisted),
-        message: "目标任务已结束，无需暂停。",
-        runtime_evaluate_used: false,
-        method_summary: {},
-        method_log: [],
-        chrome: null
-      };
+        message: "目标任务已结束，无需暂停。"
+      }, persisted);
     }
     return getRecommendPipelineRunTool({ args });
   }
@@ -2230,7 +2488,7 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
-      return {
+      return attachPersistedCdpEvidence({
         status: "FAILED",
         error: {
           code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
@@ -2243,12 +2501,8 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
         persistence: {
           source: "disk",
           active_control_available: false
-        },
-        runtime_evaluate_used: false,
-        method_summary: {},
-        method_log: [],
-        chrome: null
-      };
+        }
+      }, persisted);
     }
     return getRecommendPipelineRunTool({ args });
   }
@@ -2276,15 +2530,11 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted && TERMINAL_STATUSES.has(persisted.state)) {
-      return {
+      return attachPersistedCdpEvidence({
         status: "CANCEL_IGNORED",
         run: compactRecommendRunForStatus(persisted),
-        message: "目标任务已结束，无需取消。",
-        runtime_evaluate_used: false,
-        method_summary: {},
-        method_log: [],
-        chrome: null
-      };
+        message: "目标任务已结束，无需取消。"
+      }, persisted);
     }
     const cancelMessage = "已收到取消请求，将由 detached worker 在下一个安全边界停止。";
     const patched = patchPersistedRecommendRunControl(runId, {
@@ -2296,7 +2546,7 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
       message: cancelMessage
     });
     if (patched) {
-      return {
+      return attachPersistedCdpEvidence({
         status: "CANCEL_REQUESTED",
         run: compactRecommendRunForStatus(patched),
         message: cancelMessage,
@@ -2304,12 +2554,8 @@ export function cancelRecommendPipelineRunTool({ args = {} } = {}) {
           source: "disk",
           active_control_available: false,
           detached_control_requested: true
-        },
-        runtime_evaluate_used: false,
-        method_summary: {},
-        method_log: [],
-        chrome: null
-      };
+        }
+      }, patched);
     }
     return getRecommendPipelineRunTool({ args });
   }

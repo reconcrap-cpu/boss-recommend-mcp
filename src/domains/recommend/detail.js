@@ -388,8 +388,17 @@ export async function readRecommendDetailHtml(client, detailState) {
 }
 
 export function isStaleRecommendNodeError(error) {
-  const message = String(error?.message || error || "");
-  return /Could not find node with given id|No node with given id|Node is detached|Cannot find node|Could not compute box model/i.test(message);
+  const pattern = /Could not find node with given id|No node with given id|Node is detached|Cannot find node|Could not compute box model/i;
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 5; depth += 1) {
+    if ((typeof current === "object" || typeof current === "function") && seen.has(current)) break;
+    if (typeof current === "object" || typeof current === "function") seen.add(current);
+    const message = String(current?.message || current || "");
+    if (pattern.test(message)) return true;
+    current = current?.cause || null;
+  }
+  return false;
 }
 
 export function isRecommendDetailOpenMissError(error) {

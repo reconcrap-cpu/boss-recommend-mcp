@@ -311,6 +311,30 @@ async function testSkipsReadErrors() {
   assert.equal(compactInfiniteListState(state).read_error_count, 1);
 }
 
+async function testRethrowsSelectedReadErrors() {
+  const { client } = createFakeScrollClient();
+  const state = createInfiniteListState({ domain: "recommend", listName: "recommend-candidates" });
+  const staleError = new Error("Could not find node with given id");
+  staleError.cdp_method = "DOM.getOuterHTML";
+  await assert.rejects(
+    () => getNextInfiniteListCandidate({
+      client,
+      state,
+      findNodeIds: async () => [1, 2],
+      readCandidate: async (nodeId) => {
+        if (nodeId === 1) throw staleError;
+        return { domain: "recommend", id: "unreachable", attributes: {} };
+      },
+      shouldRethrowReadError: (error) => error === staleError,
+      settleMs: 0
+    }),
+    (error) => error === staleError
+  );
+  const compact = compactInfiniteListState(state);
+  assert.equal(compact.read_error_count, 1);
+  assert.equal(state.ledger.at(-1)?.event, "candidate_read_error");
+}
+
 async function testResolvesContainerFallbackPoint() {
   const { client } = createFakeScrollClient({
     queryMap: {
@@ -548,6 +572,7 @@ await testDetectsStableEndOfList();
 await testDoesNotTreatSlowAppendAsEndAfterOneStableSignature();
 await testBottomMarkerStopsBeforeStableFallback();
 await testSkipsReadErrors();
+await testRethrowsSelectedReadErrors();
 await testResolvesContainerFallbackPoint();
 await testContainerFallbackClampsTallVirtualListToViewport();
 await testAllowedSourcesCanForceItemUnionFallbackPoint();

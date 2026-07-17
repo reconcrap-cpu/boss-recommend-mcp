@@ -39,6 +39,23 @@ function errorDiagnostic(error) {
     message: error?.message || String(error)
   };
   if (error?.code) diagnostic.code = error.code;
+  if (error?.cdp_method) diagnostic.cdp_method = error.cdp_method;
+  if (error?.cdp_at) diagnostic.cdp_at = error.cdp_at;
+  if (Number.isInteger(error?.cdp_node_id)) diagnostic.cdp_node_id = error.cdp_node_id;
+  if (Number.isInteger(error?.cdp_backend_node_id)) diagnostic.cdp_backend_node_id = error.cdp_backend_node_id;
+  if (error?.cdp_search_id) diagnostic.cdp_search_id = error.cdp_search_id;
+  if (Array.isArray(error?.cdp_param_keys)) diagnostic.cdp_param_keys = error.cdp_param_keys.slice(0, 20);
+  if (error?.stack) diagnostic.stack = String(error.stack).split(/\r?\n/).slice(0, 12).join("\n");
+  if (error?.cause && error.cause !== error) {
+    diagnostic.cause = {
+      name: error.cause?.name || "Error",
+      message: error.cause?.message || String(error.cause),
+      code: error.cause?.code || undefined,
+      cdp_method: error.cause?.cdp_method || undefined,
+      cdp_at: error.cause?.cdp_at || undefined,
+      cdp_node_id: Number.isInteger(error.cause?.cdp_node_id) ? error.cause.cdp_node_id : undefined
+    };
+  }
   return diagnostic;
 }
 

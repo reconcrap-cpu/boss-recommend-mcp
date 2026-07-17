@@ -107,6 +107,52 @@ async function testMcpToolsetFilteringKeepsRecommendSmallAndFirst() {
   assert.equal(compactActivitySchema.enum, undefined);
   assert.match(compactActivitySchema.description, /最靠近.*用户意图/);
   assert.match(compactActivitySchema.description, /无法理解时默认 不限/);
+  for (const field of [
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ]) {
+    assert.equal(compactStartTool.inputSchema.properties[field].type, "integer");
+    assert.equal(compactStartTool.inputSchema.properties[field].minimum, 1);
+  }
+  const fullTools = createToolsSchema("all");
+  const fullStartTool = fullTools.find((tool) => tool.name === TOOL_START);
+  for (const field of [
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ]) {
+    assert.equal(fullStartTool.inputSchema.properties[field].type, "integer");
+    assert.equal(fullStartTool.inputSchema.properties[field].minimum, 1);
+  }
+  const compactScheduleTool = recommendTools.find((tool) => tool.name === TOOL_SCHEDULE);
+  for (const field of [
+    "debug_test_mode",
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ]) {
+    assert.equal(compactScheduleTool.inputSchema.properties[field], undefined);
+  }
+  const fullScheduleTool = fullTools.find((tool) => tool.name === TOOL_SCHEDULE);
+  for (const field of [
+    "debug_test_mode",
+    "debug_force_list_end_after_processed",
+    "debug_force_context_recovery_after_processed",
+    "debug_force_cdp_reconnect_after_processed"
+  ]) {
+    assert.equal(fullScheduleTool.inputSchema.properties[field], undefined);
+  }
+  assert.deepEqual(fullScheduleTool.inputSchema.properties.screening_mode.enum, ["llm"]);
+  assert.deepEqual(fullScheduleTool.inputSchema.properties.use_llm.enum, [true]);
+  assert.equal(fullScheduleTool.inputSchema.properties.detail_limit.minimum, 1);
+  assert.deepEqual(fullScheduleTool.inputSchema.properties.allow_card_only_screening.enum, [false]);
+  assert.deepEqual(fullScheduleTool.inputSchema.properties.dry_run_post_action.enum, [false]);
+  assert.deepEqual(fullScheduleTool.inputSchema.properties.no_filter.enum, [false]);
+  assert.deepEqual(fullScheduleTool.inputSchema.properties.filter_enabled.enum, [true]);
+  assert.equal(compactScheduleTool.inputSchema.properties.detail_limit.minimum, 1);
+  assert.deepEqual(compactScheduleTool.inputSchema.properties.no_filter.enum, [false]);
+  assert.deepEqual(compactScheduleTool.inputSchema.properties.dry_run.enum, [false]);
 
   const chatNames = createToolsSchema("chat").map((tool) => tool.name);
   assert.deepEqual(chatNames, [
@@ -617,6 +663,40 @@ async function testRecommendPrepareReadyDoesNotStartRun() {
   assert.equal(payload.review.pending_questions.some((item) => item.field === "current_city_only"), false);
   assert.equal(payload.review.pending_questions.some((item) => item.field === "activity_level"), false);
   assert.equal(connectorCalled, false);
+}
+
+async function testRecommendDebugBoundaryInputGate() {
+  const missingGate = await handleRequest(makeToolCall(801, TOOL_PREPARE, {
+    instruction: "筛选算法候选人",
+    debug_force_list_end_after_processed: 10
+  }), process.cwd());
+  assert.equal(missingGate.error.code, -32602);
+  assert.match(missingGate.error.message, /requires debug_test_mode=true/);
+
+  const invalidThreshold = await handleRequest(makeToolCall(802, TOOL_PREPARE, {
+    instruction: "筛选算法候选人",
+    debug_test_mode: true,
+    debug_force_context_recovery_after_processed: 0
+  }), process.cwd());
+  assert.equal(invalidThreshold.error.code, -32602);
+  assert.match(invalidThreshold.error.message, /positive integer/);
+
+  const mutuallyExclusive = await handleRequest(makeToolCall(803, TOOL_PREPARE, {
+    instruction: "筛选算法候选人",
+    debug_test_mode: true,
+    debug_force_list_end_after_processed: 10,
+    debug_force_cdp_reconnect_after_processed: 10
+  }), process.cwd());
+  assert.equal(mutuallyExclusive.error.code, -32602);
+  assert.match(mutuallyExclusive.error.message, /mutually exclusive/);
+
+  const valid = await handleRequest(makeToolCall(804, TOOL_PREPARE, {
+    instruction: "筛选算法候选人",
+    debug_test_mode: true,
+    debug_force_cdp_reconnect_after_processed: 10
+  }), process.cwd());
+  assert.equal(valid.error, undefined);
+  assert.ok(valid.result?.structuredContent);
 }
 
 async function testRecommendActivityIntentNormalizesWithoutBrowserConnect() {
@@ -1160,6 +1240,99 @@ async function testRecommendDetailLimitZeroRequiresDebugFlag() {
   assert.equal(observedOptions.detailLimit, 0);
 }
 
+async function testRecommendScheduleRejectsDiagnosticOptionsBeforePersistOrSpawn() {
+  let spawnCount = 0;
+  setRecommendSchedulerSpawnForTests(() => {
+    spawnCount += 1;
+    throw new Error("diagnostic schedule must not launch a worker");
+  });
+  const base = readyArgs();
+  const cases = [
+    { extra: { debug_test_mode: true }, expected: "debug_test_mode" },
+    { extra: { allow_debug_test_mode: true }, expected: "allow_debug_test_mode" },
+    {
+      extra: { debug_test_mode: true, debug_force_list_end_after_processed: 2 },
+      expected: "debug_force_list_end_after_processed"
+    },
+    {
+      extra: { debug_test_mode: true, debug_force_context_recovery_after_processed: 2 },
+      expected: "debug_force_context_recovery_after_processed"
+    },
+    {
+      extra: { debug_test_mode: true, debug_force_cdp_reconnect_after_processed: 2 },
+      expected: "debug_force_cdp_reconnect_after_processed"
+    },
+    { extra: { screening_mode: "deterministic" }, expected: "screening_mode=deterministic" },
+    { extra: { screening_mode: "local_scorer" }, expected: "screening_mode=local_scorer" },
+    { extra: { use_llm: false }, expected: "use_llm=false" },
+    { extra: { allow_card_only_screening: true }, expected: "allow_card_only_screening" },
+    { extra: { detail_limit: 0 }, expected: "detail_limit=0" },
+    { extra: { no_filter: true }, expected: "no_filter" },
+    { extra: { filter_enabled: false }, expected: "filter_enabled=false" },
+    { extra: { dry_run_post_action: true }, expected: "dry_run_post_action" },
+    { extra: { dry_run: true }, expected: "dry_run" },
+    {
+      extra: {
+        confirmation: {
+          ...base.confirmation,
+          post_action_value: "greet"
+        },
+        overrides: {
+          ...base.overrides,
+          post_action: "greet"
+        },
+        execute_post_action: false
+      },
+      expected: "execute_post_action=false"
+    }
+  ];
+
+  try {
+    for (let index = 0; index < cases.length; index += 1) {
+      const { extra, expected } = cases[index];
+      const scheduleId = `mcp_recommend_schedule_debug_forbidden_${index}`;
+      const schedulePath = path.join(
+        process.env.BOSS_RECOMMEND_HOME,
+        "schedules",
+        `${scheduleId}.json`
+      );
+      const payload = await callTool(TOOL_SCHEDULE, readyArgs({
+        ...extra,
+        schedule_id: scheduleId,
+        schedule_delay_seconds: 60
+      }), 1700 + index);
+      assert.equal(payload.status, "FAILED");
+      assert.equal(payload.schedule_created, false);
+      assert.equal(payload.cron_ready, false);
+      assert.equal(payload.error.code, "RECOMMEND_SCHEDULE_DEBUG_OPTIONS_FORBIDDEN");
+      assert.equal(payload.error.retryable, false);
+      assert.equal(payload.forbidden_debug_options.includes(expected), true);
+      assert.equal(fs.existsSync(schedulePath), false);
+    }
+    assert.equal(spawnCount, 0);
+  } finally {
+    setRecommendSchedulerSpawnForTests(null);
+  }
+}
+
+async function testRecommendDebugBoundaryOptionsReachWorkflow() {
+  const cases = [
+    ["debug_force_list_end_after_processed", "debugForceListEndAfterProcessed"],
+    ["debug_force_context_recovery_after_processed", "debugForceContextRecoveryAfterProcessed"],
+    ["debug_force_cdp_reconnect_after_processed", "debugForceCdpReconnectAfterProcessed"]
+  ];
+  for (let index = 0; index < cases.length; index += 1) {
+    if (index > 0) resetRecommendMcpStateForTests();
+    const [inputField, workflowField] = cases[index];
+    const observedOptions = await observeRecommendWorkflowOptions(readyArgs({
+      debug_test_mode: true,
+      [inputField]: 10
+    }), 140 + index);
+    assert.equal(observedOptions.debugTestMode, true);
+    assert.equal(observedOptions[workflowField], 10);
+  }
+}
+
 async function testRecommendLoadsLlmConfigByDefault() {
   const observedOptions = await observeRecommendWorkflowOptions(readyArgs({ delay_ms: 0 }), 15);
   assert.equal(observedOptions.screeningMode, "llm");
@@ -1333,6 +1506,89 @@ async function testRecommendActiveRunPersistsProgressToDisk() {
 
   const completed = await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
   assert.equal(completed.progress.processed, 1);
+}
+
+async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
+  installFakeConnector();
+  const diagnostics = Array.from({ length: 15 }, (_, index) => ({
+    code: "RECOMMEND_LIST_READ_STALE_NODE",
+    message: "Could not find node with given id",
+    phase: "recommend:list-read",
+    cdp_method: "DOM.querySelectorAll:retry_after_reconnect",
+    cdp_at: `2026-07-17T10:00:${String(index).padStart(2, "0")}.000Z`,
+    cdp_node_id: 1000 + index,
+    cdp_param_keys: ["nodeId", "selector", "unsafe-key!"],
+    attempt: index + 1,
+    exhausted: index === 14,
+    recovery_mode: index === 0 ? "root_reacquire" : "context_reapply",
+    candidate_name: "must-not-persist"
+  }));
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:list-read");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 10,
+      screened: 10,
+      list_read_stale_recovery_attempts: 3,
+      list_read_stale_recovery_applied: 2,
+      list_read_stale_recoveries: 1,
+      last_list_read_recovery_mode: "context_reapply",
+      last_list_read_stale_diagnostic: diagnostics.at(-1)
+    });
+    runControl.checkpoint({
+      list_read_stale_recovery_exhausted: {
+        diagnostic: diagnostics.at(-1),
+        recent_diagnostics: diagnostics,
+        candidate_list: {
+          seen_count: 10,
+          queued_count: 0,
+          processed_count: 10
+        },
+        candidate_name: "must-not-persist"
+      }
+    });
+    return {
+      domain: "recommend",
+      processed: 10,
+      screened: 10,
+      passed: 0,
+      list_read_stale_recovery_attempts: 3,
+      list_read_stale_recovery_applied: 2,
+      list_read_stale_recoveries: 1,
+      last_list_read_recovery_mode: "context_reapply",
+      last_list_read_stale_diagnostic: diagnostics.at(-1),
+      list_read_stale_diagnostics: diagnostics,
+      results: []
+    };
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 311);
+  assert.equal(started.status, "ACCEPTED");
+  const statePath = started.run.artifacts.run_state_path;
+  await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  const status = await callTool(TOOL_GET, { run_id: started.run_id }, 312);
+  assert.equal(status.run.summary.list_read_stale_recovery_attempts, 3);
+  assert.equal(status.run.summary.list_read_stale_recovery_applied, 2);
+  assert.equal(status.run.summary.list_read_stale_recoveries, 1);
+  assert.equal(status.run.summary.last_list_read_recovery_mode, "context_reapply");
+  assert.equal(status.run.summary.list_read_stale_diagnostics.length, 12);
+  assert.deepEqual(
+    status.run.summary.last_list_read_stale_diagnostic.cdp_param_keys,
+    ["nodeId", "selector"]
+  );
+  assert.equal(
+    status.run.checkpoint.list_read_stale_recovery_exhausted.recent_diagnostics.length,
+    12
+  );
+  assert.equal(JSON.stringify(status.run).includes("must-not-persist"), false);
+
+  const persisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(persisted.summary.list_read_stale_diagnostics.length, 12);
+  assert.equal(
+    persisted.checkpoint.list_read_stale_recovery_exhausted.diagnostic.cdp_node_id,
+    1014
+  );
+  assert.equal(JSON.stringify(persisted).includes("must-not-persist"), false);
 }
 
 async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
@@ -1941,6 +2197,137 @@ async function testRecommendMultiSelectFilterMapping() {
   ]);
 }
 
+async function testRecommendDetachedDiskFallbackPreservesSafeCdpEvidence() {
+  const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
+  process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  setSpawnProcessImplForTests(() => ({
+    pid: 456791,
+    unref() {}
+  }));
+  const privateMarker = "candidate-private-marker-must-not-persist";
+  const methodLog = Array.from({ length: 31 }, (_, index) => ({
+    method: index % 2 === 0 ? "DOM.getDocument" : "Input.dispatchMouseEvent",
+    at: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    params: {
+      candidate_name: privateMarker,
+      nodeId: index + 1
+    }
+  }));
+  try {
+    setRecommendMcpConnectorForTests(async (options = {}) => ({
+      client: { guarded: true },
+      target: {
+        id: "fake-evidence-target",
+        url: `https://www.zhipin.com/web/chat/recommend?candidate=${privateMarker}`,
+        type: "page"
+      },
+      methodLog,
+      navigation: {
+        navigated: false,
+        url: `https://www.zhipin.com/web/chat/recommend?candidate=${privateMarker}`
+      },
+      chrome: {
+        launched: false,
+        reused: true,
+        port: options.port,
+        target_count: 2,
+        required_flags_ok: true,
+        unsafe_candidate_marker: privateMarker
+      },
+      health: { status: "healthy" },
+      async close() {}
+    }));
+    setRecommendMcpWorkflowForTests(async (options, runControl) => {
+      runControl.setPhase("recommend:detached-evidence-test");
+      runControl.updateProgress({
+        card_count: 1,
+        target_count: options.maxCandidates,
+        processed: 1,
+        screened: 1,
+        passed: 0
+      });
+      await runControl.sleep(10);
+      return {
+        domain: "recommend",
+        processed: 1,
+        screened: 1,
+        detail_opened: 0,
+        passed: 0,
+        results: []
+      };
+    });
+
+    const started = await callTool(TOOL_START, readyArgs({
+      host: "127.0.0.1",
+      port: 9778,
+      delay_ms: 0,
+      debug_test_mode: true,
+      screening_mode: "deterministic",
+      no_filter: true,
+      detail_limit: 1,
+      execute_post_action: false
+    }), 341);
+    assert.equal(started.status, "ACCEPTED");
+    const workerResult = await runDetachedWorkerForTests({
+      runId: started.run_id,
+      workerPid: 456791
+    });
+    assert.equal(workerResult.ok, true);
+
+    const inMemory = await callTool(TOOL_GET, { run_id: started.run_id }, 342);
+    assert.equal(inMemory.run.state, "completed");
+    assert.equal(inMemory.method_log_total, 31);
+    assert.equal(inMemory.method_log.length, 25);
+    assert.equal(inMemory.method_summary["DOM.getDocument"], 16);
+    assert.equal(inMemory.method_summary["Input.dispatchMouseEvent"], 15);
+    assert.equal(inMemory.runtime_evaluate_used, false);
+    assert.equal(inMemory.script_injection_used, false);
+
+    const runStatePath = inMemory.run.artifacts.run_state_path;
+    const persistedBeforeReset = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+    assert.equal(persistedBeforeReset.method_log_total, 31);
+    assert.equal(persistedBeforeReset.method_log.length, 25);
+    assert.equal(JSON.stringify(persistedBeforeReset).includes(privateMarker), false);
+
+    resetRecommendMcpStateForTests();
+    const diskPayload = await callTool(TOOL_GET, { run_id: started.run_id }, 343);
+    const serialized = JSON.stringify(diskPayload);
+    assert.equal(diskPayload.status, "RUN_STATUS");
+    assert.equal(diskPayload.persistence.source, "disk");
+    assert.equal(diskPayload.persistence.active_control_available, false);
+    assert.equal(diskPayload.method_log_total, 31);
+    assert.equal(diskPayload.method_log.length, 25);
+    assert.equal(diskPayload.method_log[0].at, methodLog[6].at);
+    assert.deepEqual(Object.keys(diskPayload.method_log[0]).sort(), ["at", "method"]);
+    assert.equal(diskPayload.method_summary["DOM.getDocument"], 16);
+    assert.equal(diskPayload.method_summary["Input.dispatchMouseEvent"], 15);
+    assert.equal(diskPayload.runtime_evaluate_used, false);
+    assert.equal(diskPayload.script_injection_used, false);
+    assert.equal(diskPayload.chrome.host, "127.0.0.1");
+    assert.equal(diskPayload.chrome.port, 9778);
+    assert.equal(diskPayload.chrome.target_id, "fake-evidence-target");
+    assert.equal(diskPayload.chrome.target_url, "https://www.zhipin.com/web/chat/recommend");
+    assert.equal(diskPayload.chrome.auto_launch.reused, true);
+    assert.equal(diskPayload.chrome.auto_launch.target_count, 2);
+    assert.equal(diskPayload.method_log.some((entry) => Object.hasOwn(entry, "params")), false);
+    assert.equal(serialized.includes(privateMarker), false);
+  } finally {
+    setSpawnProcessImplForTests(null);
+    if (previousDetached === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_DETACHED = previousDetached;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+  }
+}
+
 async function testRecommendFilterBypassDisablesDeterministicResets() {
   const noFilterOptions = await observeRecommendWorkflowOptions(readyArgs({
     no_filter: true,
@@ -2177,6 +2564,7 @@ async function main() {
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
     await testMcpToolsetFilteringKeepsRecommendSmallAndFirst();
+    await testRecommendDebugBoundaryInputGate();
     await testToolListIncludesRecommendTools();
     resetRecommendMcpStateForTests();
     await testRecommendJobListTool();
@@ -2220,6 +2608,8 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendScheduleIncompletePayloadDoesNotSpawn();
     resetRecommendMcpStateForTests();
+    await testRecommendScheduleRejectsDiagnosticOptionsBeforePersistOrSpawn();
+    resetRecommendMcpStateForTests();
     await testRecommendScheduleReadyPayloadUsesPackageOwnedWorker();
     resetRecommendMcpStateForTests();
     await testRecommendScheduleWorkerStartsSavedPayload();
@@ -2230,6 +2620,8 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendDetailLimitZeroRequiresDebugFlag();
     resetRecommendMcpStateForTests();
+    await testRecommendDebugBoundaryOptionsReachWorkflow();
+    resetRecommendMcpStateForTests();
     await testRecommendLoadsLlmConfigByDefault();
     resetRecommendMcpStateForTests();
     await testRecommendHumanBehaviorArgsOverrideConfig();
@@ -2237,6 +2629,8 @@ async function main() {
     await testRecommendAsyncPauseResumeCancel();
     resetRecommendMcpStateForTests();
     await testRecommendActiveRunPersistsProgressToDisk();
+    resetRecommendMcpStateForTests();
+    await testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction();
     resetRecommendMcpStateForTests();
     await testRecommendDiskRunningRunWithDeadPidIsReconciled();
     resetRecommendMcpStateForTests();
@@ -2249,6 +2643,8 @@ async function main() {
     await testRecommendDetachedCancelSocketFailureFinalizesCanceled();
     resetRecommendMcpStateForTests();
     await testRecommendDetachedStartUsesWorkerProcess();
+    resetRecommendMcpStateForTests();
+    await testRecommendDetachedDiskFallbackPreservesSafeCdpEvidence();
     resetRecommendMcpStateForTests();
     await testRecommendOpenClawWorkspaceForcesDetachedWorker();
     resetRecommendMcpStateForTests();
