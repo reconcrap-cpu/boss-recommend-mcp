@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   RUN_STATUS_CANCELED,
   RUN_STATUS_COMPLETED,
+  RUN_STATUS_FAILED,
   RUN_STATUS_PAUSED,
   createRunLifecycleManager
 } from "./core/run/index.js";
@@ -91,8 +92,33 @@ async function testPauseResumeCancel() {
   assert.equal(final.status, RUN_STATUS_CANCELED);
 }
 
+async function testFailureSnapshotPreservesCdpDiagnostics() {
+  const manager = createRunLifecycleManager({ idPrefix: "test" });
+  const started = manager.startRun({
+    name: "cdp-diagnostic",
+    task: async (run) => {
+      run.setPhase("recommend:list-read");
+      const error = new Error("Could not find node with given id");
+      error.cdp_method = "DOM.querySelectorAll";
+      error.cdp_at = "2026-07-17T02:00:00.000Z";
+      error.cdp_node_id = 77;
+      error.cdp_param_keys = ["nodeId", "selector"];
+      throw error;
+    }
+  });
+  const final = await manager.waitForRun(started.runId);
+  assert.equal(final.status, RUN_STATUS_FAILED);
+  assert.equal(final.phase, "recommend:list-read");
+  assert.equal(final.error.cdp_method, "DOM.querySelectorAll");
+  assert.equal(final.error.cdp_at, "2026-07-17T02:00:00.000Z");
+  assert.equal(final.error.cdp_node_id, 77);
+  assert.deepEqual(final.error.cdp_param_keys, ["nodeId", "selector"]);
+  assert.match(final.error.stack, /Could not find node with given id/);
+}
+
 await testRunCompletes();
 await testSnapshotHookPersistsProgressAndCheckpointEvents();
 await testPauseResumeCancel();
+await testFailureSnapshotPreservesCdpDiagnostics();
 
 console.log("Core run lifecycle tests passed");

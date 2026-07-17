@@ -138,9 +138,85 @@ function refreshFailureReason(method = "") {
   return method === "page_navigate" ? "page_navigate_failed" : "page_reload_failed";
 }
 
+function safeDiagnosticText(value, maxLength = 4000) {
+  const text = String(value ?? "");
+  return text.length > maxLength ? `${text.slice(0, maxLength)}…` : text;
+}
+
+function safeDiagnosticStack(stack) {
+  if (!stack) return null;
+  return safeDiagnosticText(stack, 8000)
+    .split(/\r?\n/)
+    .slice(0, 12)
+    .join("\n");
+}
+
+function buildErrorDiagnostic(error, {
+  depth = 0,
+  seen = new Set()
+} = {}) {
+  if (!error) return null;
+  const isRecord = typeof error === "object" || typeof error === "function";
+  if (isRecord && seen.has(error)) {
+    return {
+      name: error?.name || "Error",
+      message: safeDiagnosticText(error?.message || String(error)),
+      circular: true
+    };
+  }
+  if (isRecord) seen.add(error);
+  const diagnostic = {
+    name: error?.name || "Error",
+    message: safeDiagnosticText(error?.message || String(error))
+  };
+  if (error?.code !== undefined && error?.code !== null && error.code !== "") {
+    diagnostic.code = typeof error.code === "number"
+      ? error.code
+      : safeDiagnosticText(error.code, 300);
+  }
+  if (error?.phase) diagnostic.phase = safeDiagnosticText(error.phase, 300);
+  if (error?.cdp_method) diagnostic.cdp_method = safeDiagnosticText(error.cdp_method, 300);
+  if (error?.cdp_at) diagnostic.cdp_at = safeDiagnosticText(error.cdp_at, 100);
+  if (Number.isInteger(error?.cdp_node_id)) diagnostic.cdp_node_id = error.cdp_node_id;
+  if (Number.isInteger(error?.cdp_backend_node_id)) {
+    diagnostic.cdp_backend_node_id = error.cdp_backend_node_id;
+  }
+  if (Number.isInteger(error?.node_id)) diagnostic.node_id = error.node_id;
+  if (Number.isInteger(error?.backend_node_id)) diagnostic.backend_node_id = error.backend_node_id;
+  if (error?.cdp_search_id) diagnostic.cdp_search_id = safeDiagnosticText(error.cdp_search_id, 300);
+  if (Array.isArray(error?.cdp_param_keys)) {
+    diagnostic.cdp_param_keys = error.cdp_param_keys
+      .slice(0, 20)
+      .map((key) => safeDiagnosticText(key, 100));
+  }
+  const stack = safeDiagnosticStack(error?.stack);
+  if (stack) diagnostic.stack = stack;
+  if (depth < 2 && error?.cause && error.cause !== error) {
+    diagnostic.cause = buildErrorDiagnostic(error.cause, {
+      depth: depth + 1,
+      seen
+    });
+  }
+  return diagnostic;
+}
+
+export function compactRecommendRefreshErrorDiagnostic(error) {
+  return buildErrorDiagnostic(error);
+}
+
 export function isRetryableRecommendFilterReapplyError(error) {
-  const message = String(error?.message || error || "");
-  return /Recommend filter panel did not open|Recommend filter trigger was not found|Recommend filter confirm button was not found|No matching recommend filter option/i.test(message);
+  const messages = [];
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    if ((typeof current === "object" || typeof current === "function") && seen.has(current)) break;
+    if (typeof current === "object" || typeof current === "function") seen.add(current);
+    if (isStaleRecommendNodeError(current)) return true;
+    messages.push(String(current?.message || current || ""));
+    current = current?.cause;
+  }
+  const message = messages.join("\n");
+  return /Recommend filter panel did not open|Recommend filter trigger was not found|Recommend filter confirm button was not found|No matching recommend filter option|Invalid (?:backend )?node(?:\s*id)?|Node with given id does not exist|No node found for given backend id/i.test(message);
 }
 
 function compactFilterReapplyError(error) {
@@ -165,6 +241,7 @@ function compactJobSelectionAttempt({
     method: "job_select",
     reason: error ? "job_select_failed" : null,
     error: error ? (error?.message || String(error)) : null,
+    error_diagnostic: error ? compactRecommendRefreshErrorDiagnostic(error) : null,
     attempt,
     iframe_document_node_id: iframeDocumentNodeId || 0,
     selected: Boolean(selection?.selected),
@@ -326,6 +403,7 @@ async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
         method: "filter_reapply",
         reason: "filter_reapply_failed",
         error: compactFilterReapplyError(error),
+        error_diagnostic: compactRecommendRefreshErrorDiagnostic(error),
         attempt
       });
       if (attempt >= maxAttempts || !isRetryableRecommendFilterReapplyError(error)) {
@@ -387,6 +465,7 @@ async function ensureRefreshCurrentCityOnly(client, rootState, {
         method: "current_city_only_reapply",
         reason: "current_city_only_reapply_failed",
         error: compactCurrentCityOnlyReapplyError(error),
+        error_diagnostic: compactRecommendRefreshErrorDiagnostic(error),
         attempt
       });
       if (attempt >= maxAttempts || !isRetryableRecommendCurrentCityOnlyReapplyError(error)) {
@@ -527,6 +606,7 @@ async function applyRefreshMethod(client, method, {
       method,
       reason: refreshFailureReason(method),
       error: error?.message || String(error),
+      error_diagnostic: compactRecommendRefreshErrorDiagnostic(error),
       target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
       job_selection_attempts: error?.job_selection_attempts || jobSelectionAttempts,
@@ -639,6 +719,7 @@ export async function refreshRecommendListAtEnd(client, {
           method: "end_refresh_button_after_click",
           reason: "end_refresh_reapply_failed",
           error: error?.message || String(error),
+          error_diagnostic: compactRecommendRefreshErrorDiagnostic(error),
           page_scope: pageScopeResult,
           current_city_only: currentCityOnlyResult,
           current_city_only_attempts: error?.current_city_only_attempts || currentCityOnlyAttempts,

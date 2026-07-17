@@ -15,6 +15,13 @@ const SCHEDULE_WORKER_FLAG = "--schedule-worker";
 const SCHEDULE_ID_FLAG = "--schedule-id";
 const TERMINAL_SCHEDULE_STATES = new Set(["completed", "failed", "canceled"]);
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "canceled"]);
+const SCHEDULE_FORBIDDEN_DEBUG_FIELDS = Object.freeze([
+  "debug_test_mode",
+  "allow_debug_test_mode",
+  "debug_force_list_end_after_processed",
+  "debug_force_context_recovery_after_processed",
+  "debug_force_cdp_reconnect_after_processed"
+]);
 
 let spawnProcessImpl = spawn;
 
@@ -28,6 +35,51 @@ function clonePlain(value, fallback = null) {
   } catch {
     return fallback;
   }
+}
+
+function hasOwn(source, key) {
+  return Boolean(source && Object.prototype.hasOwnProperty.call(source, key));
+}
+
+function collectScheduledRecommendDebugOptions(args = {}) {
+  const options = [];
+  for (const field of SCHEDULE_FORBIDDEN_DEBUG_FIELDS) {
+    if (hasOwn(args, field)) options.push(field);
+  }
+
+  const screeningMode = normalizeText(args.screening_mode || args.screeningMode).toLowerCase();
+  if (["deterministic", "local", "local_scorer"].includes(screeningMode)) {
+    options.push(`screening_mode=${screeningMode}`);
+  }
+  if (args.use_llm === false || args.useLlm === false) {
+    options.push("use_llm=false");
+  }
+  if (args.allow_card_only_screening === true || args.allowCardOnlyScreening === true) {
+    options.push("allow_card_only_screening");
+  }
+  const detailLimit = Number.parseInt(String(args.detail_limit ?? args.detailLimit ?? ""), 10);
+  if (Number.isFinite(detailLimit) && detailLimit === 0) options.push("detail_limit=0");
+  if (args.no_filter === true || args.noFilter === true) options.push("no_filter");
+  if (args.filter_enabled === false || args.filterEnabled === false) options.push("filter_enabled=false");
+  if (args.dry_run_post_action === true || args.dryRunPostAction === true) {
+    options.push("dry_run_post_action");
+  }
+  if (args.dry_run === true || args.dryRun === true) options.push("dry_run");
+
+  const requestedPostAction = normalizeText(
+    args.overrides?.post_action
+      ?? args.confirmation?.post_action_value
+      ?? args.post_action
+      ?? args.postAction
+  ).toLowerCase();
+  if (
+    requestedPostAction
+    && requestedPostAction !== "none"
+    && (args.execute_post_action === false || args.executePostAction === false)
+  ) {
+    options.push("execute_post_action=false");
+  }
+  return Array.from(new Set(options));
 }
 
 function nowIso() {
@@ -231,6 +283,20 @@ function launchScheduleWorker(scheduleId) {
 
 export async function scheduleRecommendPipelineRunTool({ workspaceRoot = "", args = {} } = {}) {
   const runArgs = stripScheduleArgs(args);
+  const forbiddenDebugOptions = collectScheduledRecommendDebugOptions(runArgs);
+  if (forbiddenDebugOptions.length) {
+    return {
+      status: "FAILED",
+      schedule_created: false,
+      cron_ready: false,
+      error: {
+        code: "RECOMMEND_SCHEDULE_DEBUG_OPTIONS_FORBIDDEN",
+        message: `Recommend schedules cannot contain diagnostic-only run options: ${forbiddenDebugOptions.join(", ")}`,
+        retryable: false
+      },
+      forbidden_debug_options: forbiddenDebugOptions
+    };
+  }
   const prepared = prepareRecommendPipelineRunTool({ workspaceRoot, args: runArgs });
   if (prepared.status !== "READY" || prepared.cron_ready !== true) {
     return {

@@ -893,7 +893,8 @@ export async function readVisibleInfiniteListItems({
   nodeIds = [],
   readCandidate,
   keyForCandidate = candidateKeyFromProfile,
-  state = null
+  state = null,
+  shouldRethrowReadError = null
 } = {}) {
   if (typeof readCandidate !== "function") {
     throw new Error("readVisibleInfiniteListItems requires readCandidate");
@@ -914,6 +915,12 @@ export async function readVisibleInfiniteListItems({
           visible_index: visibleIndex,
           error: error?.message || String(error)
         });
+      }
+      if (
+        typeof shouldRethrowReadError === "function"
+        && shouldRethrowReadError(error, { nodeId, visibleIndex })
+      ) {
+        throw error;
       }
       continue;
     }
@@ -1134,6 +1141,7 @@ export async function getNextInfiniteListCandidate({
   readCandidate,
   detectBottomMarker = null,
   keyForCandidate = candidateKeyFromProfile,
+  shouldRethrowReadError = null,
   maxScrolls = 20,
   stableSignatureLimit = 2,
   minScrollsBeforeEnd = 3,
@@ -1160,7 +1168,8 @@ export async function getNextInfiniteListCandidate({
       nodeIds,
       readCandidate,
       keyForCandidate,
-      state
+      state,
+      shouldRethrowReadError
     });
     const signature = updateInfiniteListVisibleSignature(state, items);
     const next = firstUnseenInfiniteListItem(state, items);

@@ -10,6 +10,7 @@ import {
   closeRecommendAvatarPreview,
   closeRecommendDetail,
   closeRecommendJobDropdownFully,
+  compactRecommendRefreshErrorDiagnostic,
   createRecoverableImageCaptureEvidence,
   chooseFirstSafeFilterOption,
   ensureRecommendCurrentCityOnly,
@@ -165,6 +166,17 @@ function testTargetedFilterChoice() {
     labels: ["不限"],
     allowUnlimited: true
   })?.node_id, 9);
+}
+
+function testStaleRecommendNodeClassificationTraversesCause() {
+  const nested = new Error("outer transport failure", {
+    cause: new Error("Could not find node with given id")
+  });
+  assert.equal(isStaleRecommendNodeError(nested), true);
+  assert.equal(isStaleRecommendNodeError(new Error("ordinary network timeout")), false);
+  const circular = new Error("ordinary wrapper");
+  circular.cause = circular;
+  assert.equal(isStaleRecommendNodeError(circular), false);
 }
 
 function createRecommendActivityFilterClient({
@@ -1051,15 +1063,26 @@ async function testCardCandidateReader() {
 
 async function testRefreshRecoveryFallsBackFromNavigateToReload() {
   const calls = [];
+  const navigateCause = new Error("stale navigate node");
+  navigateCause.code = -32000;
+  navigateCause.cdp_method = "Page.navigate";
+  navigateCause.cdp_at = "2026-07-17T01:02:03.000Z";
+  navigateCause.cdp_node_id = 77;
+  const navigateError = new Error("navigate timeout", { cause: navigateCause });
+  const reloadError = new Error("reload timeout");
+  reloadError.cdp_method = "Page.reload";
+  reloadError.cdp_at = "2026-07-17T01:02:04.000Z";
+  reloadError.cdp_backend_node_id = 88;
+  reloadError.cdp_param_keys = ["ignoreCache"];
   const result = await refreshRecommendListAtEnd({
     Page: {
       async navigate() {
         calls.push("navigate");
-        throw new Error("navigate timeout");
+        throw navigateError;
       },
       async reload() {
         calls.push("reload");
-        throw new Error("reload timeout");
+        throw reloadError;
       }
     }
   }, {
@@ -1081,6 +1104,15 @@ async function testRefreshRecoveryFallsBackFromNavigateToReload() {
     "navigate timeout",
     "reload timeout"
   ]);
+  assert.equal(result.attempts[0].error_diagnostic.message, "navigate timeout");
+  assert.equal(result.attempts[0].error_diagnostic.cause.cdp_method, "Page.navigate");
+  assert.equal(result.attempts[0].error_diagnostic.cause.cdp_node_id, 77);
+  assert.match(result.attempts[0].error_diagnostic.stack, /navigate timeout/);
+  assert.equal(result.attempts[1].error_diagnostic.cdp_method, "Page.reload");
+  assert.equal(result.attempts[1].error_diagnostic.cdp_at, "2026-07-17T01:02:04.000Z");
+  assert.equal(result.attempts[1].error_diagnostic.cdp_backend_node_id, 88);
+  assert.deepEqual(result.attempts[1].error_diagnostic.cdp_param_keys, ["ignoreCache"]);
+  assert.deepEqual(result.error_diagnostic, result.attempts[1].error_diagnostic);
 }
 
 async function testOpenRecommendJobDropdownWaitsForLateTrigger() {
@@ -1445,7 +1477,40 @@ function testRetryableRecommendFilterReapplyError() {
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter panel did not open after 6 trigger attempts")), true);
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter trigger was not found")), true);
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Recommend filter confirm button was not found")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Could not find node with given id")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Node is detached from document")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("Invalid NodeId")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("No node found for given backend id")), true);
+  assert.equal(isRetryableRecommendFilterReapplyError(new Error("filter state read failed", {
+    cause: new Error("Could not find node with given id")
+  })), true);
   assert.equal(isRetryableRecommendFilterReapplyError(new Error("Requested recommend job was not selected after refresh reload")), false);
+}
+
+function testRecommendRefreshErrorDiagnosticIsBoundedAndPreservesCdpFields() {
+  const cause = new Error("Could not find node with given id");
+  cause.code = -32000;
+  cause.cdp_method = "DOM.getBoxModel";
+  cause.cdp_at = "2026-07-17T02:03:04.000Z";
+  cause.cdp_node_id = 123;
+  cause.cdp_backend_node_id = 456;
+  cause.node_id = 789;
+  cause.cdp_param_keys = Array.from({ length: 25 }, (_, index) => `key_${index}`);
+  cause.stack = Array.from({ length: 20 }, (_, index) => `stack line ${index}`).join("\n");
+  const wrapped = new Error("filter reapply failed", { cause });
+  wrapped.phase = "recommend:filter-reapply";
+
+  const diagnostic = compactRecommendRefreshErrorDiagnostic(wrapped);
+  assert.equal(diagnostic.message, "filter reapply failed");
+  assert.equal(diagnostic.phase, "recommend:filter-reapply");
+  assert.equal(diagnostic.cause.code, -32000);
+  assert.equal(diagnostic.cause.cdp_method, "DOM.getBoxModel");
+  assert.equal(diagnostic.cause.cdp_at, "2026-07-17T02:03:04.000Z");
+  assert.equal(diagnostic.cause.cdp_node_id, 123);
+  assert.equal(diagnostic.cause.cdp_backend_node_id, 456);
+  assert.equal(diagnostic.cause.node_id, 789);
+  assert.equal(diagnostic.cause.cdp_param_keys.length, 20);
+  assert.equal(diagnostic.cause.stack.split("\n").length, 12);
 }
 
 function testRetryableRecommendJobSelectionError() {
@@ -1912,6 +1977,7 @@ async function testCloseRecommendDetailReportsFinalVerificationWhenStillOpen() {
 
 testFilterOptionHelpers();
 testJobLabelMatchingIgnoresSalaryFormatting();
+testStaleRecommendNodeClassificationTraversesCause();
 testRecoverableImageCaptureEvidencePreservesPartialPages();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
@@ -1930,6 +1996,7 @@ await testRecommendAccountRightsPanelUsesSharedSafeClose();
 testRecommendCardDetailClickPointAvoidsAvatar();
 await testRecommendAvatarPreviewIsNotDetailAndCanClose();
 testRetryableRecommendFilterReapplyError();
+testRecommendRefreshErrorDiagnosticIsBoundedAndPreservesCdpFields();
 testRetryableRecommendJobSelectionError();
 testRecommendCardFieldParser();
 await testCardCandidateReader();

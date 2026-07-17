@@ -12,6 +12,22 @@ import {
   createRecommendRunService,
   selectAndConfirmFirstSafeFilter
 } from "./domains/recommend/index.js";
+import {
+  acquireRecommendListReadWithStaleRecovery,
+  createRecommendDebugBoundaryController,
+  createRecommendRefreshFailureError,
+  normalizeRecommendDebugBoundaryOptions,
+  recoverRecommendListReadStaleContext
+} from "./domains/recommend/run-service.js";
+
+function createListReadStaleError(nodeId = 101) {
+  const error = new Error("Could not find node with given id");
+  error.cdp_method = "DOM.querySelectorAll";
+  error.cdp_at = "2026-07-17T10:00:00.000Z";
+  error.cdp_node_id = nodeId;
+  error.cdp_param_keys = ["nodeId", "selector", "unsafe-key!"];
+  return error;
+}
 
 async function waitUntil(predicate, timeoutMs = 2500) {
   const started = Date.now();
@@ -119,6 +135,283 @@ async function testLifecycleDelegation() {
   service.cancelRecommendRun(started.runId);
   const final = await service.waitForRecommendRun(started.runId);
   assert.equal(final.status, RUN_STATUS_CANCELED);
+}
+
+function testDebugBoundaryValidationAndOnceOnlyController() {
+  assert.throws(
+    () => normalizeRecommendDebugBoundaryOptions({
+      debug_force_list_end_after_processed: 3
+    }),
+    /requires debug_test_mode=true/
+  );
+  assert.throws(
+    () => normalizeRecommendDebugBoundaryOptions({
+      debug_test_mode: true,
+      debug_force_list_end_after_processed: 3,
+      debug_force_context_recovery_after_processed: 3
+    }),
+    /mutually exclusive/
+  );
+  assert.throws(
+    () => normalizeRecommendDebugBoundaryOptions({
+      debug_test_mode: true,
+      debug_force_cdp_reconnect_after_processed: 0
+    }),
+    /positive integer/
+  );
+
+  for (const [field, expectedMode] of [
+    ["debug_force_list_end_after_processed", "list_end"],
+    ["debug_force_context_recovery_after_processed", "context_recovery"],
+    ["debug_force_cdp_reconnect_after_processed", "cdp_reconnect"]
+  ]) {
+    const controller = createRecommendDebugBoundaryController({
+      debug_test_mode: true,
+      [field]: 3
+    });
+    assert.equal(controller.take(2), null);
+    assert.equal(controller.take(3).mode, expectedMode);
+    assert.equal(controller.take(3), null);
+    assert.equal(controller.take(99), null);
+    assert.equal(controller.getState().trigger_count, 1);
+  }
+}
+
+async function testListReadStaleRecoveryThenSuccess() {
+  let acquireCount = 0;
+  let recoverCount = 0;
+  const recoveredDiagnostics = [];
+  const acquisition = await acquireRecommendListReadWithStaleRecovery({
+    maxRetries: 2,
+    acquire: async () => {
+      acquireCount += 1;
+      if (acquireCount === 1) throw createListReadStaleError(111);
+      return { ok: true, item: { key: "candidate:new" } };
+    },
+    recover: async () => {
+      recoverCount += 1;
+      return { recovery_mode: "root_reacquire" };
+    },
+    onRecovered: async ({ diagnostic }) => {
+      recoveredDiagnostics.push(diagnostic);
+    }
+  });
+  assert.equal(acquireCount, 2);
+  assert.equal(recoverCount, 1);
+  assert.equal(acquisition.result.item.key, "candidate:new");
+  assert.equal(acquisition.stale_diagnostics.length, 1);
+  assert.equal(acquisition.stale_diagnostics[0].recovered, true);
+  assert.equal(acquisition.stale_diagnostics[0].cdp_method, "DOM.querySelectorAll");
+  assert.equal(acquisition.stale_diagnostics[0].cdp_node_id, 111);
+  assert.equal(acquisition.stale_diagnostics[0].cdp_at, "2026-07-17T10:00:00.000Z");
+  assert.deepEqual(acquisition.stale_diagnostics[0].cdp_param_keys, ["nodeId", "selector"]);
+  assert.equal(acquisition.stale_diagnostics[0].recovery_mode, "root_reacquire");
+  assert.equal(recoveredDiagnostics.length, 1);
+}
+
+async function testListReadRepeatedStaleIsBounded() {
+  let acquireCount = 0;
+  let recoverCount = 0;
+  await assert.rejects(
+    acquireRecommendListReadWithStaleRecovery({
+      maxRetries: 2,
+      acquire: async () => {
+        acquireCount += 1;
+        throw createListReadStaleError(200 + acquireCount);
+      },
+      recover: async () => {
+        recoverCount += 1;
+      }
+    }),
+    (error) => {
+      assert.equal(error.list_read_stale_recovery_exhausted, true);
+      assert.equal(error.phase, "recommend:list-read");
+      assert.equal(error.list_read_stale_recovery_attempts.length, 3);
+      assert.equal(error.list_read_stale_recovery_attempts[2].exhausted, true);
+      assert.equal(
+        error.list_read_stale_recovery_attempts.filter((item) => item.recovered === true).length,
+        0
+      );
+      return true;
+    }
+  );
+  assert.equal(acquireCount, 3);
+  assert.equal(recoverCount, 2);
+}
+
+async function testListReadRecoveryDoesNotDuplicateResultsOrActions() {
+  const results = [{ candidate_key: "candidate:processed" }];
+  let postActionCount = 1;
+  const processedLedger = new Set(["candidate:processed"]);
+  const queuedLedger = new Set(["candidate:queued"]);
+  let acquireCount = 0;
+  const acquisition = await acquireRecommendListReadWithStaleRecovery({
+    maxRetries: 2,
+    acquire: async () => {
+      acquireCount += 1;
+      if (acquireCount === 1) throw createListReadStaleError(301);
+      return { ok: true, item: { key: "candidate:next" } };
+    },
+    recover: async () => {
+      assert.deepEqual(Array.from(processedLedger), ["candidate:processed"]);
+      assert.deepEqual(Array.from(queuedLedger), ["candidate:queued"]);
+      assert.equal(results.length, 1);
+      assert.equal(postActionCount, 1);
+    }
+  });
+  results.push({ candidate_key: acquisition.result.item.key });
+  postActionCount += 1;
+  assert.deepEqual(results.map((item) => item.candidate_key), [
+    "candidate:processed",
+    "candidate:next"
+  ]);
+  assert.equal(postActionCount, 2);
+}
+
+function createListStateForRecoveryTest() {
+  return {
+    processed_keys: new Set(["candidate:done"]),
+    queued_keys: new Set(["candidate:in-flight"]),
+    stable_signature_count: 3,
+    last_visible_signature: "stale-signature",
+    last_result: { ok: false },
+    ledger: []
+  };
+}
+
+async function testTieredListReadRecoverySelection() {
+  const lightweightState = createListStateForRecoveryTest();
+  let lightweightRootCalls = 0;
+  let lightweightContextCalls = 0;
+  const lightweight = await recoverRecommendListReadStaleContext({
+    staleAttempt: 1,
+    listState: lightweightState,
+    rootReacquire: async () => {
+      lightweightRootCalls += 1;
+      return { card_count: 8 };
+    },
+    contextReapply: async () => {
+      lightweightContextCalls += 1;
+      return { ok: true };
+    }
+  });
+  assert.equal(lightweight.recovery_mode, "root_reacquire");
+  assert.equal(lightweightRootCalls, 1);
+  assert.equal(lightweightContextCalls, 0);
+  assert.deepEqual(Array.from(lightweightState.processed_keys), ["candidate:done"]);
+  assert.equal(lightweightState.queued_keys.size, 0);
+  assert.equal(lightweightState.stable_signature_count, 0);
+  assert.equal(lightweightState.last_visible_signature, "");
+
+  const escalatedState = createListStateForRecoveryTest();
+  let escalatedContextCalls = 0;
+  const escalated = await recoverRecommendListReadStaleContext({
+    staleAttempt: 1,
+    listState: escalatedState,
+    rootReacquire: async () => {
+      throw createListReadStaleError(401);
+    },
+    contextReapply: async () => {
+      escalatedContextCalls += 1;
+      escalatedState.queued_keys.clear();
+      return { ok: true };
+    }
+  });
+  assert.equal(escalated.recovery_mode, "context_reapply");
+  assert.equal(escalated.escalated_from, "root_reacquire");
+  assert.equal(escalatedContextCalls, 1);
+  assert.deepEqual(Array.from(escalatedState.processed_keys), ["candidate:done"]);
+
+  const noCardsState = createListStateForRecoveryTest();
+  let noCardsContextCalls = 0;
+  const noCards = await recoverRecommendListReadStaleContext({
+    staleAttempt: 1,
+    listState: noCardsState,
+    rootReacquire: async () => ({ card_count: 0 }),
+    contextReapply: async () => {
+      noCardsContextCalls += 1;
+      noCardsState.queued_keys.clear();
+      return { ok: true };
+    }
+  });
+  assert.equal(noCards.recovery_mode, "context_reapply");
+  assert.equal(noCards.root_reacquire_error.code, "RECOMMEND_LIST_ROOT_REACQUIRE_NO_CARDS");
+  assert.equal(noCardsContextCalls, 1);
+
+  const repeatedState = createListStateForRecoveryTest();
+  let repeatedRootCalls = 0;
+  let repeatedContextCalls = 0;
+  const repeated = await recoverRecommendListReadStaleContext({
+    staleAttempt: 2,
+    listState: repeatedState,
+    rootReacquire: async () => {
+      repeatedRootCalls += 1;
+      return { card_count: 8 };
+    },
+    contextReapply: async () => {
+      repeatedContextCalls += 1;
+      repeatedState.queued_keys.clear();
+      return { ok: true };
+    }
+  });
+  assert.equal(repeated.recovery_mode, "context_reapply");
+  assert.equal(repeated.escalated_from, "repeated_stale");
+  assert.equal(repeatedRootCalls, 0);
+  assert.equal(repeatedContextCalls, 1);
+}
+
+async function testDebugBoundaryOptionDelegation() {
+  let observedOptions = null;
+  const service = createRecommendRunService({
+    idPrefix: "test_recommend_debug_boundary",
+    workflow: async (options, runControl) => {
+      observedOptions = options;
+      runControl.updateProgress({ processed: 1, screened: 1 });
+      return { processed: 1 };
+    }
+  });
+  const started = service.startRecommendRun({
+    client: {},
+    criteria: "算法",
+    filter: { enabled: false },
+    maxCandidates: 1,
+    debugTestMode: true,
+    debugForceCdpReconnectAfterProcessed: 10
+  });
+  assert.equal(started.context.debug_test_mode, true);
+  assert.equal(started.context.debug_boundary_mode, "cdp_reconnect");
+  assert.equal(started.context.debug_boundary_threshold, 10);
+  const final = await service.waitForRecommendRun(started.runId);
+  assert.equal(final.status, "completed");
+  assert.equal(observedOptions.debugTestMode, true);
+  assert.equal(observedOptions.debugForceCdpReconnectAfterProcessed, 10);
+  assert.equal(observedOptions.debugForceListEndAfterProcessed, null);
+}
+
+function testRefreshFailurePreservesCdpDiagnostic() {
+  const refreshAttempt = {
+    ok: false,
+    reason: "page_reload_failed",
+    error: "Could not find node with given id",
+    error_diagnostic: {
+      name: "Error",
+      message: "Could not find node with given id",
+      cdp_method: "DOM.getBoxModel",
+      cdp_at: "2026-07-17T10:00:00.000Z",
+      cdp_node_id: 4242,
+      cdp_param_keys: ["nodeId"]
+    }
+  };
+  const error = createRecommendRefreshFailureError(refreshAttempt, {
+    listEndReason: "debug_forced_list_end",
+    targetCount: 200,
+    passedCount: 3
+  });
+  assert.equal(error.code, "RECOMMEND_END_REFRESH_FAILED");
+  assert.equal(error.cdp_method, "DOM.getBoxModel");
+  assert.equal(error.cdp_node_id, 4242);
+  assert.deepEqual(error.cdp_param_keys, ["nodeId"]);
+  assert.deepEqual(error.error_diagnostic, refreshAttempt.error_diagnostic);
 }
 
 function testRefreshFilterEnvelopePreservesActivitySafetyFlags() {
@@ -503,6 +796,13 @@ function testRecommendStatusCountersPreserveProgressAfterRecovery() {
 }
 
 await testLifecycleDelegation();
+testDebugBoundaryValidationAndOnceOnlyController();
+await testListReadStaleRecoveryThenSuccess();
+await testListReadRepeatedStaleIsBounded();
+await testListReadRecoveryDoesNotDuplicateResultsOrActions();
+await testTieredListReadRecoverySelection();
+await testDebugBoundaryOptionDelegation();
+testRefreshFailurePreservesCdpDiagnostic();
 await testPostActionOptionDelegation();
 await testDetailLimitDefaultsToUnlimitedForPassTarget();
 await testNativeFilterStageOrderingAndBypass();

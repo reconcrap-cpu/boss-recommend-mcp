@@ -90,6 +90,301 @@ import {
 } from "./actions.js";
 import { getRecommendRoots } from "./roots.js";
 
+const RECOMMEND_DEBUG_BOUNDARY_MODES = Object.freeze({
+  list_end: "debug_force_list_end_after_processed",
+  context_recovery: "debug_force_context_recovery_after_processed",
+  cdp_reconnect: "debug_force_cdp_reconnect_after_processed"
+});
+
+function hasOwn(source, key) {
+  return Boolean(source && Object.prototype.hasOwnProperty.call(source, key));
+}
+
+function readDebugBoundaryValue(source, snakeKey, camelKey) {
+  if (hasOwn(source, snakeKey)) return source[snakeKey];
+  if (hasOwn(source, camelKey)) return source[camelKey];
+  return null;
+}
+
+function normalizeDebugBoundaryThreshold(raw, field) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    const error = new Error(`${field} must be a positive integer`);
+    error.code = "INVALID_RECOMMEND_DEBUG_BOUNDARY";
+    throw error;
+  }
+  return parsed;
+}
+
+export function normalizeRecommendDebugBoundaryOptions(source = {}) {
+  const debugTestMode = source.debugTestMode === true || source.debug_test_mode === true;
+  const thresholds = {
+    list_end: normalizeDebugBoundaryThreshold(
+      readDebugBoundaryValue(
+        source,
+        RECOMMEND_DEBUG_BOUNDARY_MODES.list_end,
+        "debugForceListEndAfterProcessed"
+      ),
+      RECOMMEND_DEBUG_BOUNDARY_MODES.list_end
+    ),
+    context_recovery: normalizeDebugBoundaryThreshold(
+      readDebugBoundaryValue(
+        source,
+        RECOMMEND_DEBUG_BOUNDARY_MODES.context_recovery,
+        "debugForceContextRecoveryAfterProcessed"
+      ),
+      RECOMMEND_DEBUG_BOUNDARY_MODES.context_recovery
+    ),
+    cdp_reconnect: normalizeDebugBoundaryThreshold(
+      readDebugBoundaryValue(
+        source,
+        RECOMMEND_DEBUG_BOUNDARY_MODES.cdp_reconnect,
+        "debugForceCdpReconnectAfterProcessed"
+      ),
+      RECOMMEND_DEBUG_BOUNDARY_MODES.cdp_reconnect
+    )
+  };
+  const configured = Object.entries(thresholds).filter(([, threshold]) => threshold !== null);
+  if (configured.length > 1) {
+    const error = new Error(
+      `${configured.map(([mode]) => RECOMMEND_DEBUG_BOUNDARY_MODES[mode]).join(", ")} are mutually exclusive`
+    );
+    error.code = "RECOMMEND_DEBUG_BOUNDARIES_MUTUALLY_EXCLUSIVE";
+    throw error;
+  }
+  if (configured.length && !debugTestMode) {
+    const error = new Error(
+      `${RECOMMEND_DEBUG_BOUNDARY_MODES[configured[0][0]]} requires debug_test_mode=true`
+    );
+    error.code = "DEBUG_TEST_MODE_REQUIRED";
+    throw error;
+  }
+  const [configuredEntry = null] = configured;
+  return {
+    debugTestMode,
+    mode: configuredEntry?.[0] || null,
+    field: configuredEntry ? RECOMMEND_DEBUG_BOUNDARY_MODES[configuredEntry[0]] : null,
+    threshold: configuredEntry?.[1] ?? null,
+    debugForceListEndAfterProcessed: thresholds.list_end,
+    debugForceContextRecoveryAfterProcessed: thresholds.context_recovery,
+    debugForceCdpReconnectAfterProcessed: thresholds.cdp_reconnect
+  };
+}
+
+export function createRecommendDebugBoundaryController(source = {}) {
+  const config = normalizeRecommendDebugBoundaryOptions(source);
+  let triggered = false;
+  let triggerCount = 0;
+  return {
+    config,
+    take(processedCount) {
+      const processed = Math.max(0, Number(processedCount) || 0);
+      if (triggered || !config.mode || processed < config.threshold) return null;
+      triggered = true;
+      triggerCount += 1;
+      return {
+        mode: config.mode,
+        field: config.field,
+        threshold: config.threshold,
+        processed,
+        trigger_count: triggerCount
+      };
+    },
+    getState() {
+      return {
+        ...config,
+        triggered,
+        trigger_count: triggerCount
+      };
+    }
+  };
+}
+
+function compactListReadStaleDiagnostic(error, {
+  attempt = 0,
+  exhausted = false
+} = {}) {
+  return {
+    code: error?.code || "RECOMMEND_LIST_READ_STALE_NODE",
+    message: String(error?.message || error || "Stale recommend list node").slice(0, 500),
+    phase: "recommend:list-read",
+    cdp_method: error?.cdp_method || null,
+    cdp_at: error?.cdp_at ? String(error.cdp_at).slice(0, 100) : null,
+    cdp_node_id: Number.isInteger(error?.cdp_node_id) ? error.cdp_node_id : null,
+    cdp_backend_node_id: Number.isInteger(error?.cdp_backend_node_id)
+      ? error.cdp_backend_node_id
+      : null,
+    cdp_param_keys: Array.isArray(error?.cdp_param_keys)
+      ? error.cdp_param_keys
+        .map((key) => String(key || "").trim())
+        .filter((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key))
+        .slice(0, 20)
+      : [],
+    attempt,
+    exhausted: Boolean(exhausted),
+    at: new Date().toISOString()
+  };
+}
+
+function annotateListReadStaleFailure(error, diagnostics, {
+  exhausted = false,
+  recoveryFailed = false
+} = {}) {
+  if (!error || typeof error !== "object") return error;
+  error.phase = error.phase || "recommend:list-read";
+  error.list_read_stale_recovery_attempts = diagnostics;
+  if (exhausted) error.list_read_stale_recovery_exhausted = true;
+  if (recoveryFailed) error.list_read_stale_recovery_failed = true;
+  return error;
+}
+
+export async function acquireRecommendListReadWithStaleRecovery({
+  acquire,
+  recover,
+  maxRetries = 2,
+  onStale = null,
+  onRecoveryApplied = null,
+  onRecovered = null,
+  onExhausted = null
+} = {}) {
+  if (typeof acquire !== "function") {
+    throw new Error("acquireRecommendListReadWithStaleRecovery requires acquire");
+  }
+  if (typeof recover !== "function") {
+    throw new Error("acquireRecommendListReadWithStaleRecovery requires recover");
+  }
+  const retryLimit = Math.max(0, Number.isInteger(maxRetries) ? maxRetries : 2);
+  const diagnostics = [];
+  let acquireAttempt = 0;
+  let pendingRecoveryDiagnostic = null;
+  while (true) {
+    acquireAttempt += 1;
+    try {
+      const result = await acquire({
+        acquireAttempt,
+        recoveryCount: diagnostics.filter((item) => item.recovered === true).length
+      });
+      if (pendingRecoveryDiagnostic) {
+        pendingRecoveryDiagnostic.recovered = true;
+        pendingRecoveryDiagnostic.recovered_at = new Date().toISOString();
+        if (typeof onRecovered === "function") {
+          await onRecovered({
+            diagnostic: pendingRecoveryDiagnostic,
+            diagnostics: diagnostics.slice()
+          });
+        }
+        pendingRecoveryDiagnostic = null;
+      }
+      return {
+        result,
+        acquire_attempts: acquireAttempt,
+        stale_diagnostics: diagnostics
+      };
+    } catch (error) {
+      if (!isStaleRecommendNodeError(error)) throw error;
+      pendingRecoveryDiagnostic = null;
+      const staleAttempt = diagnostics.length + 1;
+      const exhausted = staleAttempt > retryLimit;
+      const diagnostic = compactListReadStaleDiagnostic(error, {
+        attempt: staleAttempt,
+        exhausted
+      });
+      diagnostics.push(diagnostic);
+      if (exhausted) {
+        if (typeof onExhausted === "function") {
+          await onExhausted({ error, diagnostic, diagnostics: diagnostics.slice() });
+        }
+        throw annotateListReadStaleFailure(error, diagnostics, { exhausted: true });
+      }
+      if (typeof onStale === "function") {
+        await onStale({ error, diagnostic, diagnostics: diagnostics.slice() });
+      }
+      let recoveryResult = null;
+      try {
+        recoveryResult = await recover({ error, diagnostic, diagnostics: diagnostics.slice() });
+      } catch (recoveryError) {
+        if (recoveryError && typeof recoveryError === "object" && !recoveryError.cause) {
+          recoveryError.cause = error;
+        }
+        throw annotateListReadStaleFailure(recoveryError, diagnostics, {
+          recoveryFailed: true
+        });
+      }
+      diagnostic.recovery_applied = true;
+      diagnostic.recovery_mode = recoveryResult?.recovery_mode || "unknown";
+      diagnostic.recovery_applied_at = new Date().toISOString();
+      pendingRecoveryDiagnostic = diagnostic;
+      if (typeof onRecoveryApplied === "function") {
+        await onRecoveryApplied({
+          error,
+          diagnostic,
+          recoveryResult,
+          diagnostics: diagnostics.slice()
+        });
+      }
+    }
+  }
+}
+
+export async function recoverRecommendListReadStaleContext({
+  staleAttempt = 1,
+  listState,
+  rootReacquire,
+  contextReapply
+} = {}) {
+  if (typeof rootReacquire !== "function") {
+    throw new Error("recoverRecommendListReadStaleContext requires rootReacquire");
+  }
+  if (typeof contextReapply !== "function") {
+    throw new Error("recoverRecommendListReadStaleContext requires contextReapply");
+  }
+  const processedKeys = new Set(listState?.processed_keys || []);
+  try {
+    if (Number(staleAttempt) <= 1) {
+      try {
+        const rootResult = await rootReacquire();
+        if (Number(rootResult?.card_count) <= 0) {
+          const noCardsError = new Error("Recommend list root reacquire returned no candidate cards");
+          noCardsError.code = "RECOMMEND_LIST_ROOT_REACQUIRE_NO_CARDS";
+          throw noCardsError;
+        }
+        resetInfiniteListForRefreshRound(listState, {
+          reason: "list_read_stale_node_root_reacquire",
+          round: 1,
+          method: "root_reacquire",
+          metadata: {
+            card_count: Number(rootResult?.card_count) || 0,
+            processed_count: processedKeys.size
+          }
+        });
+        return {
+          recovery_mode: "root_reacquire",
+          root_reacquire: rootResult || null
+        };
+      } catch (rootReacquireError) {
+        const contextResult = await contextReapply({ rootReacquireError });
+        return {
+          recovery_mode: "context_reapply",
+          escalated_from: "root_reacquire",
+          root_reacquire_error: compactListReadStaleDiagnostic(rootReacquireError, {
+            attempt: 1
+          }),
+          context_reapply: contextResult || null
+        };
+      }
+    }
+    const contextResult = await contextReapply({ rootReacquireError: null });
+    return {
+      recovery_mode: "context_reapply",
+      escalated_from: "repeated_stale",
+      context_reapply: contextResult || null
+    };
+  } finally {
+    for (const key of processedKeys) listState?.processed_keys?.add(key);
+  }
+}
+
 function normalizeLabels(labels = []) {
   return labels.map((label) => String(label || "").trim()).filter(Boolean);
 }
@@ -454,6 +749,7 @@ function compactRefreshAttempt(refreshAttempt) {
     method: refreshAttempt.method || "",
     reason: refreshAttempt.reason || null,
     error: refreshAttempt.error || null,
+    error_diagnostic: refreshAttempt.error_diagnostic || null,
     forced_recent_not_view: Boolean(refreshAttempt.forced_recent_not_view),
     target_url: refreshAttempt.target_url || null,
     card_count: refreshAttempt.card_count || 0,
@@ -471,6 +767,7 @@ function compactRefreshAttempt(refreshAttempt) {
       method: attempt.method || "",
       reason: attempt.reason || null,
       error: attempt.error || null,
+      error_diagnostic: attempt.error_diagnostic || null,
       label: attempt.label || null,
       before_card_count: attempt.before_card_count || 0,
       after_card_count: attempt.after_card_count || 0,
@@ -482,6 +779,7 @@ function compactRefreshAttempt(refreshAttempt) {
         method: cityAttempt.method || "current_city_only_reapply",
         reason: cityAttempt.reason || null,
         error: cityAttempt.error || null,
+        error_diagnostic: cityAttempt.error_diagnostic || null,
         attempt: cityAttempt.attempt || 0,
         result: compactCurrentCityOnlyResult(cityAttempt.result)
       })),
@@ -492,6 +790,7 @@ function compactRefreshAttempt(refreshAttempt) {
       method: attempt.method || "current_city_only_reapply",
       reason: attempt.reason || null,
       error: attempt.error || null,
+      error_diagnostic: attempt.error_diagnostic || null,
       attempt: attempt.attempt || 0,
       result: compactCurrentCityOnlyResult(attempt.result)
     })),
@@ -500,6 +799,7 @@ function compactRefreshAttempt(refreshAttempt) {
       method: attempt.method || "filter_reapply",
       reason: attempt.reason || null,
       error: attempt.error || null,
+      error_diagnostic: attempt.error_diagnostic || null,
       attempt: attempt.attempt || 0
     })),
     job_selection_attempts: (refreshAttempt.job_selection_attempts || []).map((attempt) => ({
@@ -507,6 +807,7 @@ function compactRefreshAttempt(refreshAttempt) {
       method: attempt.method || "job_select",
       reason: attempt.reason || null,
       error: attempt.error || null,
+      error_diagnostic: attempt.error_diagnostic || null,
       attempt: attempt.attempt || 0,
       iframe_document_node_id: attempt.iframe_document_node_id || 0,
       selected: Boolean(attempt.selected),
@@ -588,6 +889,9 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   if (error.refresh_attempt) {
     result.refresh_attempt = error.refresh_attempt;
   }
+  if (error.error_diagnostic) {
+    result.error_diagnostic = error.error_diagnostic;
+  }
   if (error.list_end_reason) {
     result.list_end_reason = error.list_end_reason;
   }
@@ -628,7 +932,45 @@ function createRecommendBlockingPanelCloseFailureError(closeResult, phase = "") 
   return error;
 }
 
-function createRecommendRefreshFailureError(refreshAttempt, {
+function findRecommendRefreshErrorDiagnostic(refreshAttempt) {
+  if (!refreshAttempt || typeof refreshAttempt !== "object") return null;
+  if (refreshAttempt.error_diagnostic) return refreshAttempt.error_diagnostic;
+  const candidates = [
+    ...(refreshAttempt.attempts || []),
+    ...(refreshAttempt.current_city_only_attempts || []),
+    ...(refreshAttempt.filter_reapply_attempts || []),
+    ...(refreshAttempt.job_selection_attempts || [])
+  ].reverse();
+  for (const attempt of candidates) {
+    if (attempt?.error_diagnostic) return attempt.error_diagnostic;
+    const nestedCityAttempts = (attempt?.current_city_only_attempts || []).slice().reverse();
+    for (const cityAttempt of nestedCityAttempts) {
+      if (cityAttempt?.error_diagnostic) return cityAttempt.error_diagnostic;
+    }
+  }
+  return null;
+}
+
+function attachRecommendRefreshErrorDiagnostic(error, refreshAttempt) {
+  const diagnostic = findRecommendRefreshErrorDiagnostic(refreshAttempt);
+  if (!error || !diagnostic) return error;
+  error.error_diagnostic = diagnostic;
+  for (const key of [
+    "cdp_method",
+    "cdp_at",
+    "cdp_node_id",
+    "cdp_backend_node_id",
+    "cdp_search_id",
+    "cdp_param_keys"
+  ]) {
+    if (diagnostic[key] !== undefined && error[key] === undefined) {
+      error[key] = diagnostic[key];
+    }
+  }
+  return error;
+}
+
+export function createRecommendRefreshFailureError(refreshAttempt, {
   listEndReason = "",
   targetCount = 0,
   passedCount = 0
@@ -641,7 +983,7 @@ function createRecommendRefreshFailureError(refreshAttempt, {
   error.list_end_reason = listEndReason || null;
   error.target_count = targetCount;
   error.passed_count = passedCount;
-  return error;
+  return attachRecommendRefreshErrorDiagnostic(error, refreshAttempt);
 }
 
 export function isRecoverableImageCaptureError(error) {
@@ -781,9 +1123,19 @@ export async function runRecommendWorkflow({
   humanRestEnabled = false,
   humanBehavior = null,
   skipRecentColleagueContacted = true,
-  colleagueContactWindowDays = 14
+  colleagueContactWindowDays = 14,
+  debugTestMode = false,
+  debugForceListEndAfterProcessed = null,
+  debugForceContextRecoveryAfterProcessed = null,
+  debugForceCdpReconnectAfterProcessed = null
 } = {}, runControl) {
   if (!client) throw new Error("runRecommendWorkflow requires a guarded CDP client");
+  const debugBoundary = createRecommendDebugBoundaryController({
+    debugTestMode,
+    debugForceListEndAfterProcessed,
+    debugForceContextRecoveryAfterProcessed,
+    debugForceCdpReconnectAfterProcessed
+  });
   const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
     legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
   });
@@ -848,6 +1200,13 @@ export async function runRecommendWorkflow({
   let cardNodeIds = [];
   let listEndReason = "";
   let lastHumanEvent = null;
+  let debugForceReconnectPending = null;
+  let listReadStaleRecoveryAttempts = 0;
+  let listReadStaleRecoveryApplied = 0;
+  let listReadStaleRecoveries = 0;
+  let lastListReadStaleDiagnostic = null;
+  let lastListReadRecoveryMode = null;
+  const listReadStaleDiagnostics = [];
   const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
     rootNodeId: rootState?.iframe?.documentNodeId,
     containerSelectors: RECOMMEND_LIST_CONTAINER_SELECTORS,
@@ -892,6 +1251,7 @@ export async function runRecommendWorkflow({
       target_count: targetPassCount,
       target_count_semantics: "passed_candidates",
       ...counts,
+      transient_recovered: counts.transient_recovered + listReadStaleRecoveries,
       screening_mode: normalizedScreeningMode,
       unique_seen: listSnapshot.seen_count,
       scroll_count: listSnapshot.scroll_count,
@@ -913,6 +1273,15 @@ export async function runRecommendWorkflow({
       human_rest_count: humanRestState.rest_count,
       human_rest_ms: humanRestState.total_rest_ms,
       last_human_event: lastHumanEvent,
+      debug_boundary_mode: debugBoundary.config.mode,
+      debug_boundary_threshold: debugBoundary.config.threshold,
+      debug_boundary_triggered: debugBoundary.getState().triggered,
+      debug_boundary_trigger_count: debugBoundary.getState().trigger_count,
+      list_read_stale_recovery_attempts: listReadStaleRecoveryAttempts,
+      list_read_stale_recovery_applied: listReadStaleRecoveryApplied,
+      list_read_stale_recoveries: listReadStaleRecoveries,
+      last_list_read_recovery_mode: lastListReadRecoveryMode,
+      last_list_read_stale_diagnostic: lastListReadStaleDiagnostic,
       ...extra
     });
   }
@@ -1003,7 +1372,13 @@ export async function runRecommendWorkflow({
         refresh_forced_recent_not_view: effectiveForceRecentNotView,
         recovery_reason: reason
       });
-      throw new Error(`Recommend context recovery failed after ${reason}: ${refreshResult.reason || refreshResult.error || "refresh returned no cards"}`);
+      const recoveryError = new Error(
+        `Recommend context recovery failed after ${reason}: ${refreshResult.reason || refreshResult.error || "refresh returned no cards"}`
+      );
+      recoveryError.code = "RECOMMEND_CONTEXT_RECOVERY_FAILED";
+      recoveryError.refresh_attempt = compactRefresh;
+      recoveryError.recovery_reason = reason;
+      throw attachRecommendRefreshErrorDiagnostic(recoveryError, compactRefresh);
     }
     if (refreshResult.current_city_only) {
       currentCityOnlyResult = refreshResult.current_city_only;
@@ -1154,45 +1529,242 @@ export async function runRecommendWorkflow({
     const timings = {};
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
-    runControl.setPhase("recommend:candidate");
-    rootState = await ensureRecommendViewport(rootState, "candidate_loop");
-
-    const nextCandidateResult = await measureTiming(timings, "card_read_ms", () => getNextInfiniteListCandidate({
-      client,
-      state: listState,
-      maxScrolls: listMaxScrolls,
-      stableSignatureLimit: listStableSignatureLimit,
-      wheelDeltaY: listWheelDeltaY,
-      settleMs: listSettleMs,
-      listScrollJitterEnabled: effectiveHumanBehavior.listScrollJitter,
-      fallbackPoint: listFallbackResolver,
-      findNodeIds: async () => {
-        let currentRootState = await getRecommendRoots(client);
-        currentRootState = await ensureRecommendViewport(currentRootState, "candidate_find_nodes");
-        rootState = currentRootState;
-        const currentCardNodeIds = await waitForRecommendCardNodeIds(client, currentRootState.iframe.documentNodeId, {
-          timeoutMs: Math.min(cardTimeoutMs, 5000),
-          intervalMs: 300
-        });
-        cardNodeIds = currentCardNodeIds;
-        return currentCardNodeIds;
-      },
-      readCandidate: async (nodeId, { visibleIndex }) => readRecommendCardCandidate(client, nodeId, {
-        targetUrl,
-        source: "recommend-run-card",
-        metadata: {
-          run_candidate_index: results.length,
-          visible_index: visibleIndex
+    runControl.setPhase("recommend:list-read");
+    const debugBoundaryAction = debugBoundary.take(results.length);
+    let debugForcedListEnd = false;
+    if (debugBoundaryAction) {
+      const debugProgress = {
+        debug_boundary_mode: debugBoundaryAction.mode,
+        debug_boundary_threshold: debugBoundaryAction.threshold,
+        debug_boundary_triggered: true,
+        debug_boundary_trigger_count: debugBoundaryAction.trigger_count,
+        debug_boundary_processed: debugBoundaryAction.processed
+      };
+      updateRecommendProgress(debugProgress);
+      runControl.checkpoint({
+        debug_boundary: {
+          ...debugProgress,
+          field: debugBoundaryAction.field,
+          triggered_at: new Date().toISOString()
         }
-      }),
-      detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => detectInfiniteListBottomMarker(client, {
-        rootNodeId: rootState?.iframe?.documentNodeId,
-        markerSelectors: RECOMMEND_BOTTOM_MARKER_SELECTORS,
-        refreshSelectors: [RECOMMEND_END_REFRESH_SELECTOR],
-        textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
-        maxTextScanNodes: 500
-      })
-    }));
+      });
+      if (debugBoundaryAction.mode === "context_recovery") {
+        runControl.setPhase("recommend:debug-force-context-recovery");
+        await recoverAndReapplyRecommendContext("debug_force_context_recovery_after_processed", null, {
+          forceRecentNotView: true
+        });
+        updateRecommendProgress({
+          debug_force_context_recovery_count: debugBoundaryAction.trigger_count
+        });
+        runControl.setPhase("recommend:list-read");
+      } else if (debugBoundaryAction.mode === "cdp_reconnect") {
+        debugForceReconnectPending = debugBoundaryAction;
+        updateRecommendProgress({
+          debug_force_cdp_reconnect_pending: true
+        });
+      } else if (debugBoundaryAction.mode === "list_end") {
+        debugForcedListEnd = true;
+        updateRecommendProgress({
+          debug_force_list_end_count: debugBoundaryAction.trigger_count
+        });
+      }
+    }
+    const listReadAcquisition = await acquireRecommendListReadWithStaleRecovery({
+      maxRetries: 2,
+      acquire: async () => {
+        await runControl.waitIfPaused();
+        runControl.throwIfCanceled();
+        runControl.setPhase("recommend:list-read");
+        rootState = await ensureRecommendViewport(rootState, "candidate_loop");
+        if (debugForcedListEnd) {
+          return {
+            ok: false,
+            end_reached: true,
+            reason: "debug_forced_list_end"
+          };
+        }
+        return measureTiming(timings, "card_read_ms", () => getNextInfiniteListCandidate({
+          client,
+          state: listState,
+          maxScrolls: listMaxScrolls,
+          stableSignatureLimit: listStableSignatureLimit,
+          wheelDeltaY: listWheelDeltaY,
+          settleMs: listSettleMs,
+          listScrollJitterEnabled: effectiveHumanBehavior.listScrollJitter,
+          fallbackPoint: listFallbackResolver,
+          findNodeIds: async () => {
+            let currentRootState = await getRecommendRoots(client);
+            currentRootState = await ensureRecommendViewport(currentRootState, "candidate_find_nodes");
+            rootState = currentRootState;
+            if (debugForceReconnectPending) {
+              runControl.setPhase("recommend:debug-force-cdp-reconnect");
+              const rawClient = client.__rawClient;
+              if (!rawClient || typeof rawClient.close !== "function") {
+                const error = new Error("Guarded CDP client does not expose a closable __rawClient");
+                error.code = "RECOMMEND_DEBUG_RAW_CDP_UNAVAILABLE";
+                throw error;
+              }
+              const forcedReconnectAction = debugForceReconnectPending;
+              debugForceReconnectPending = null;
+              await rawClient.close();
+              runControl.checkpoint({
+                debug_cdp_reconnect: {
+                  raw_connection_closed: true,
+                  processed: forcedReconnectAction.processed,
+                  threshold: forcedReconnectAction.threshold,
+                  closed_at: new Date().toISOString()
+                }
+              });
+              updateRecommendProgress({
+                debug_force_cdp_reconnect_pending: false,
+                debug_force_cdp_reconnect_count: forcedReconnectAction.trigger_count
+              });
+              runControl.setPhase("recommend:list-read");
+            }
+            const currentCardNodeIds = await waitForRecommendCardNodeIds(
+              client,
+              currentRootState.iframe.documentNodeId,
+              {
+                timeoutMs: Math.min(cardTimeoutMs, 5000),
+                intervalMs: 300
+              }
+            );
+            cardNodeIds = currentCardNodeIds;
+            return currentCardNodeIds;
+          },
+          readCandidate: async (nodeId, { visibleIndex }) => readRecommendCardCandidate(client, nodeId, {
+            targetUrl,
+            source: "recommend-run-card",
+            metadata: {
+              run_candidate_index: results.length,
+              visible_index: visibleIndex
+            }
+          }),
+          shouldRethrowReadError: isStaleRecommendNodeError,
+          detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => detectInfiniteListBottomMarker(client, {
+            rootNodeId: rootState?.iframe?.documentNodeId,
+            markerSelectors: RECOMMEND_BOTTOM_MARKER_SELECTORS,
+            refreshSelectors: [RECOMMEND_END_REFRESH_SELECTOR],
+            textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
+            maxTextScanNodes: 500
+          })
+        }));
+      },
+      onStale: async ({ diagnostic }) => {
+        listReadStaleRecoveryAttempts += 1;
+        lastListReadStaleDiagnostic = diagnostic;
+        listReadStaleDiagnostics.push(diagnostic);
+        runControl.checkpoint({
+          list_read_stale_recovery: {
+            diagnostic,
+            recent_diagnostics: listReadStaleDiagnostics.slice(-12),
+            counters: countRecommendResultStatuses(results, { greetCount }),
+            candidate_list: compactInfiniteListState(listState)
+          }
+        });
+        updateRecommendProgress();
+      },
+      recover: async ({ error, diagnostic }) => {
+        try {
+          return await recoverRecommendListReadStaleContext({
+            staleAttempt: diagnostic.attempt,
+            listState,
+            rootReacquire: async () => {
+              await runControl.waitIfPaused();
+              runControl.throwIfCanceled();
+              runControl.setPhase("recommend:list-read-root-reacquire");
+              let freshRootState = await getRecommendRoots(client);
+              freshRootState = await ensureRecommendViewport(
+                freshRootState,
+                "list_read_stale_root_reacquire"
+              );
+              const freshCardNodeIds = await waitForRecommendCardNodeIds(
+                client,
+                freshRootState.iframe.documentNodeId,
+                {
+                  timeoutMs: Math.min(cardTimeoutMs, 10000),
+                  intervalMs: 300
+                }
+              );
+              rootState = freshRootState;
+              cardNodeIds = freshCardNodeIds;
+              return {
+                card_count: freshCardNodeIds.length,
+                iframe_document_node_id: freshRootState.iframe.documentNodeId
+              };
+            },
+            contextReapply: async ({ rootReacquireError }) => {
+              await runControl.waitIfPaused();
+              runControl.throwIfCanceled();
+              const recovery = await recoverAndReapplyRecommendContext(
+                "list_read_stale_node",
+                rootReacquireError || error,
+                { forceRecentNotView: true }
+              );
+              return {
+                ok: Boolean(recovery?.ok),
+                method: recovery?.method || null,
+                card_count: recovery?.card_count || 0
+              };
+            }
+          });
+        } catch (recoveryError) {
+          updateRecommendProgress({
+            list_read_stale_recovery_failed: true
+          });
+          runControl.checkpoint({
+            list_read_stale_recovery_failed: {
+              trigger: lastListReadStaleDiagnostic,
+              recent_diagnostics: listReadStaleDiagnostics.slice(-12),
+              recovery_error: compactError(recoveryError, "RECOMMEND_LIST_READ_RECOVERY_FAILED"),
+              candidate_list: compactInfiniteListState(listState)
+            }
+          });
+          throw recoveryError;
+        }
+      },
+      onRecoveryApplied: async ({ diagnostic }) => {
+        listReadStaleRecoveryApplied += 1;
+        lastListReadStaleDiagnostic = diagnostic;
+        lastListReadRecoveryMode = diagnostic.recovery_mode || null;
+        updateRecommendProgress();
+        runControl.checkpoint({
+          list_read_stale_recovery_applied: {
+            diagnostic,
+            recovery_applied_count: listReadStaleRecoveryApplied,
+            candidate_list: compactInfiniteListState(listState)
+          }
+        });
+      },
+      onRecovered: async ({ diagnostic }) => {
+        listReadStaleRecoveries += 1;
+        lastListReadStaleDiagnostic = diagnostic;
+        updateRecommendProgress();
+        runControl.checkpoint({
+          list_read_stale_recovered: {
+            diagnostic,
+            recovery_count: listReadStaleRecoveries,
+            candidate_list: compactInfiniteListState(listState)
+          }
+        });
+      },
+      onExhausted: async ({ diagnostic }) => {
+        listReadStaleRecoveryAttempts += 1;
+        lastListReadStaleDiagnostic = diagnostic;
+        listReadStaleDiagnostics.push(diagnostic);
+        updateRecommendProgress({
+          list_read_stale_recovery_exhausted: true
+        });
+        runControl.checkpoint({
+          list_read_stale_recovery_exhausted: {
+            diagnostic,
+            recent_diagnostics: listReadStaleDiagnostics.slice(-12),
+            candidate_list: compactInfiniteListState(listState)
+          }
+        });
+      }
+    });
+    const nextCandidateResult = listReadAcquisition.result;
     if (!nextCandidateResult.ok) {
       listEndReason = nextCandidateResult.reason || "list_exhausted";
       if (
@@ -1211,6 +1783,7 @@ export async function runRecommendWorkflow({
           pageScope: pageScopeSelection?.effective_scope || requestedPageScope,
           fallbackPageScope: normalizedFallbackPageScope,
           filter: normalizedFilter,
+          preferEndRefreshButton: debugForcedListEnd ? false : undefined,
           forceRecentNotView: normalizedFilter.enabled,
           cardTimeoutMs,
           buttonSettleMs: refreshButtonSettleMs,
@@ -1262,6 +1835,7 @@ export async function runRecommendWorkflow({
       break;
     }
 
+    runControl.setPhase("recommend:candidate");
     const index = results.length;
     let cardNodeId = nextCandidateResult.item.node_id;
     const candidateKey = nextCandidateResult.item.key;
@@ -1603,6 +2177,7 @@ export async function runRecommendWorkflow({
       addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
     }
     if (detailResult && closeDetail && !detailResult.close_result?.closed) {
+      runControl.setPhase("recommend:close-detail");
       detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
       await maybeHumanActionCooldown("after_detail_close", timings);
       if (!detailResult.close_result?.closed) {
@@ -1749,7 +2324,16 @@ export async function runRecommendWorkflow({
     refresh_rounds: refreshRounds,
     refresh_attempts: refreshAttempts,
     context_recoveries: contextRecoveryAttempts,
+    debug_boundary: debugBoundary.getState(),
+    list_read_stale_recovery_attempts: listReadStaleRecoveryAttempts,
+    list_read_stale_recovery_applied: listReadStaleRecoveryApplied,
+    list_read_stale_recoveries: listReadStaleRecoveries,
+    last_list_read_recovery_mode: lastListReadRecoveryMode,
+    last_list_read_stale_diagnostic: lastListReadStaleDiagnostic,
+    list_read_stale_diagnostics: listReadStaleDiagnostics.slice(-12),
     ...countRecommendResultStatuses(results, { greetCount }),
+    transient_recovered: countRecommendResultStatuses(results, { greetCount }).transient_recovered
+      + listReadStaleRecoveries,
     results
   };
 }
@@ -1805,6 +2389,10 @@ export function createRecommendRunService({
     humanBehavior = null,
     skipRecentColleagueContacted = true,
     colleagueContactWindowDays = 14,
+    debugTestMode = undefined,
+    debugForceListEndAfterProcessed = undefined,
+    debugForceContextRecoveryAfterProcessed = undefined,
+    debugForceCdpReconnectAfterProcessed = undefined,
     name = "recommend-domain-run"
   } = {}) {
     if (!client) throw new Error("startRecommendRun requires a guarded CDP client");
@@ -1821,6 +2409,12 @@ export function createRecommendRunService({
     const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     const candidateLimit = Math.max(1, Number(maxCandidates) || 1);
     const normalizedDetailLimit = detailLimit == null ? null : Math.max(0, Number(detailLimit) || 0);
+    const debugBoundaryOptions = normalizeRecommendDebugBoundaryOptions({
+      debugTestMode: debugTestMode === true,
+      debugForceListEndAfterProcessed: debugForceListEndAfterProcessed ?? null,
+      debugForceContextRecoveryAfterProcessed: debugForceContextRecoveryAfterProcessed ?? null,
+      debugForceCdpReconnectAfterProcessed: debugForceCdpReconnectAfterProcessed ?? null
+    });
     return manager.startRun({
       runId,
       name,
@@ -1866,7 +2460,10 @@ export function createRecommendRunService({
         human_behavior_profile: effectiveHumanBehavior.profile,
         human_behavior: effectiveHumanBehavior,
         human_rest_level: effectiveHumanBehavior.restLevel,
-        human_rest_enabled: effectiveHumanRestEnabled
+        human_rest_enabled: effectiveHumanRestEnabled,
+        debug_test_mode: debugBoundaryOptions.debugTestMode,
+        debug_boundary_mode: debugBoundaryOptions.mode,
+        debug_boundary_threshold: debugBoundaryOptions.threshold
       },
       progress: {
         card_count: 0,
@@ -1896,7 +2493,11 @@ export function createRecommendRunService({
         human_rest_enabled: effectiveHumanRestEnabled,
         human_rest_count: 0,
         human_rest_ms: 0,
-        last_human_event: null
+        last_human_event: null,
+        debug_boundary_mode: debugBoundaryOptions.mode,
+        debug_boundary_threshold: debugBoundaryOptions.threshold,
+        debug_boundary_triggered: false,
+        debug_boundary_trigger_count: 0
       },
       checkpoint: {},
       task: (runControl) => workflow({
@@ -1939,7 +2540,11 @@ export function createRecommendRunService({
         humanRestEnabled: effectiveHumanRestEnabled,
         humanBehavior: effectiveHumanBehavior,
         skipRecentColleagueContacted: shouldSkipRecentColleagueContacted,
-        colleagueContactWindowDays: normalizedColleagueContactWindowDays
+        colleagueContactWindowDays: normalizedColleagueContactWindowDays,
+        debugTestMode: debugBoundaryOptions.debugTestMode,
+        debugForceListEndAfterProcessed: debugBoundaryOptions.debugForceListEndAfterProcessed,
+        debugForceContextRecoveryAfterProcessed: debugBoundaryOptions.debugForceContextRecoveryAfterProcessed,
+        debugForceCdpReconnectAfterProcessed: debugBoundaryOptions.debugForceCdpReconnectAfterProcessed
       }, runControl)
     });
   }
