@@ -1,4 +1,3 @@
-import path from "node:path";
 import {
   getOuterHTML,
   querySelectorAll
@@ -20,19 +19,6 @@ const EMPTY_LIST_HINT_PATTERNS = Object.freeze([
   /no (?:unread |more )?(?:messages|candidates|conversations|data)/i,
   /empty/i
 ]);
-
-function timestampSlug() {
-  return new Date().toISOString().replace(/[:.]/g, "-");
-}
-
-function resolveEmptyListScreenshotPath({ evidenceDir, runId, startFrom } = {}) {
-  const baseDir = evidenceDir
-    ? path.resolve(evidenceDir)
-    : path.resolve(".live-artifacts", "chat-empty-list");
-  const safeRunId = normalizeText(runId).replace(/[^a-z0-9_-]+/gi, "_") || "chat";
-  const safeStartFrom = normalizeText(startFrom).replace(/[^a-z0-9_-]+/gi, "_") || "unknown";
-  return path.join(baseDir, `${safeRunId}-${safeStartFrom}-${timestampSlug()}.png`);
-}
 
 function axValueText(value) {
   if (value == null) return "";
@@ -129,7 +115,6 @@ async function readAxText(client) {
 export async function inspectEmptyChatListVisually(client, rootNodeId, {
   startFrom = "unread",
   runId = "",
-  evidenceDir = "",
   selectors = CHAT_CARD_SELECTORS
 } = {}) {
   if (!client) throw new Error("inspectEmptyChatListVisually requires a CDP client");
@@ -137,7 +122,6 @@ export async function inspectEmptyChatListVisually(client, rootNodeId, {
 
   const beforeCounts = await countCandidateSelectors(client, rootNodeId, selectors);
   const screenshot = await captureViewportScreenshot(client, {
-    filePath: resolveEmptyListScreenshotPath({ evidenceDir, runId, startFrom }),
     captureBeyondViewport: false,
     metadata: {
       domain: "chat",

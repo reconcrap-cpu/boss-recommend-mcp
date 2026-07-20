@@ -16,14 +16,23 @@ import {
   sleep
 } from "../../core/browser/index.js";
 import {
+  attemptImageCaptureCheckpointResume,
   compactCvAcquisitionState,
+  createImageCaptureWorkflowRetryTracker,
+  createRequiredImageEvidenceFailure,
+  imageCaptureResumeCheckpoint,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
   DEFAULT_MAX_IMAGE_PAGES,
   getCvNetworkWaitPlan,
+  isFailedClosedImageAcquisition,
+  isIncompleteImageEvidence,
+  isRecoverableImageCaptureWorkflowError,
   recordCvImageFallback,
   recordCvNetworkHit,
   recordCvNetworkMiss,
+  reacquireImageCaptureResumeTarget,
+  requireCompleteImageEvidence,
   summarizeImageEvidence,
   waitForCvNetworkEvents
 } from "../../core/cv-acquisition/index.js";
@@ -52,6 +61,7 @@ import {
   createRecruitDetailNetworkRecorder,
   extractRecruitDetailCandidate,
   openRecruitCardDetail,
+  waitForRecruitDetail,
   waitForRecruitDetailNetworkEvents
 } from "./detail.js";
 import {
@@ -427,14 +437,34 @@ export function isStaleRecruitNodeError(error) {
 }
 
 export function isRecoverableRecruitImageCaptureError(error) {
-  const code = String(error?.code || "");
-  if (code === "IMAGE_CAPTURE_TIMEOUT" || code === "IMAGE_CAPTURE_TOTAL_TIMEOUT") return true;
+  if (isRecoverableImageCaptureWorkflowError(error)) return true;
   if (isStaleRecruitNodeError(error)) return true;
   return /Image fallback capture timed out/i.test(String(error?.message || error || ""));
 }
 
+export function shouldFailClosedRecruitImageAcquisition(detailResult = null) {
+  return isFailedClosedImageAcquisition({
+    source: detailResult?.cv_acquisition?.source,
+    imageEvidence: detailResult?.image_evidence
+  });
+}
+
+export function isTerminalRecruitImageCaptureFailureSource(source = "") {
+  return String(source || "").trim().toLowerCase() === "image_capture_failed";
+}
+
 export function isRecoverableRecruitDetailError(error) {
   return isStaleRecruitNodeError(error);
+}
+
+export function shouldRetryRecruitDetailRecovery({
+  recoveryCount = 0,
+  imageCaptureTerminalFailure = false,
+  retryLimit = 1
+} = {}) {
+  const count = Math.max(0, Math.floor(Number(recoveryCount) || 0));
+  const limit = Math.max(0, Math.floor(Number(retryLimit) || 0));
+  return imageCaptureTerminalFailure !== true && count < limit;
 }
 
 function compactRecoverableDetailError(error) {
@@ -626,6 +656,7 @@ export async function runRecruitWorkflow({
   let refreshRounds = 0;
   let contextRecoveryAttempts = 0;
   const candidateRecoveryCounts = new Map();
+  const imageCaptureWorkflowRetries = createImageCaptureWorkflowRetryTracker();
   let rootState = null;
   let cardNodeIds = [];
   let listEndReason = "";
@@ -989,6 +1020,7 @@ export async function runRecruitWorkflow({
     let detailActionRootNodeIds = [];
     let recoverableDetailError = null;
     let detailStep = "not_started";
+    let imageCaptureTerminalFailure = false;
     if (index < detailCountLimit) {
       try {
         await runControl.waitIfPaused();
@@ -1079,15 +1111,17 @@ export async function runRecruitWorkflow({
               index,
               extension: "jpg"
             });
-            try {
-              detailStep = "capture_image";
-              imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+            const captureImageForTarget = (target, targetWait, resumeCheckpoint = null) => captureScrolledNodeScreenshots(
+              client,
+              target.node_id,
+              {
                 filePath: imageEvidencePath,
                 format: "jpeg",
                 quality: 72,
                 optimize: true,
                 resizeMaxWidth: 1100,
                 captureViewport: false,
+                iframeOwnerNodeId: target?.iframe_node_id || null,
                 padding: 0,
                 maxScreenshots: maxImagePages,
                 wheelDeltaY: imageWheelDeltaY,
@@ -1096,45 +1130,179 @@ export async function runRecruitWorkflow({
                 scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
                 stepTimeoutMs: 45000,
                 totalTimeoutMs: 90000,
-                duplicateStopCount: 1,
+                duplicateStopCount: 2,
                 skipDuplicateScreenshots: true,
+                requireTerminalProof: true,
                 composeForLlm: true,
                 llmPagesPerImage: 3,
                 llmResizeMaxWidth: 1100,
                 llmQuality: 72,
+                resumeCheckpoint,
                 metadata: {
                   domain: "recruit",
                   capture_mode: "scroll_sequence",
                   acquisition_reason: "network_miss_image_fallback",
                   run_candidate_index: index,
                   candidate_key: candidateKey,
-                  capture_target: captureTarget,
-                  capture_target_wait: captureTargetWait
+                  capture_target: target,
+                  capture_target_wait: targetWait,
+                  resumed_from_checkpoint: Boolean(resumeCheckpoint)
                 }
-              }));
-              source = "image";
+              }
+            );
+            try {
+              detailStep = "capture_image";
+              imageEvidence = await measureTiming(
+                timings,
+                "screenshot_capture_ms",
+                () => captureImageForTarget(captureTarget, captureTargetWait)
+              );
+              imageEvidence = requireCompleteImageEvidence(imageEvidence, {
+                code: "IMAGE_CAPTURE_EVIDENCE_MISSING",
+                message: "Recruit CV capture returned no complete persisted evidence",
+                metadata: { domain: "recruit", candidate_key: candidateKey }
+              });
+              source = isIncompleteImageEvidence(imageEvidence) ? "image_capture_failed" : "image";
             } catch (error) {
               if (!isRecoverableRecruitImageCaptureError(error)) throw error;
-              const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
-              if (recoveryCount < 1) {
-                candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
+              const retryReservation = imageCaptureWorkflowRetries.consume(candidateKey);
+              if (retryReservation.allowed) {
                 timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
+                timings.image_capture_workflow_retry = retryReservation;
                 checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
-                await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
-                await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
-                await recoverAndReapplyRecruitContext(`image_capture:${detailStep}`, error, {
-                  forceRecentViewed: true
-                });
-                continue;
+                const resumeCheckpoint = imageCaptureResumeCheckpoint(error);
+                if (resumeCheckpoint) {
+                  detailStep = "resume_image_capture_reacquire";
+                  const resumeAttempt = await attemptImageCaptureCheckpointResume({
+                    checkpoint: resumeCheckpoint,
+                    reacquire: () => reacquireImageCaptureResumeTarget({
+                      domain: "recruit",
+                      getRoots: () => getRecruitRoots(client),
+                      ensureViewport: (freshRoots) => ensureRecruitViewport(
+                        freshRoots,
+                        "image_capture_resume_reacquire"
+                      ),
+                      getDetailState: () => waitForRecruitDetail(client, {
+                        timeoutMs: 4000,
+                        intervalMs: 200
+                      }),
+                      isDetailAvailable: (state) => Boolean(state?.popup || state?.resumeIframe),
+                      waitForTarget: (detailState) => waitForCvCaptureTarget(client, detailState, {
+                        domain: "recruit",
+                        timeoutMs: 4000,
+                        intervalMs: 200
+                      })
+                    }),
+                    capture: (reacquired) => {
+                      rootState = reacquired.root_state;
+                      captureTarget = reacquired.target;
+                      captureTargetWait = reacquired.target_wait;
+                      detailStep = "resume_image_capture";
+                      return measureTiming(
+                        timings,
+                        "screenshot_capture_ms",
+                        () => captureImageForTarget(captureTarget, captureTargetWait, resumeCheckpoint)
+                      );
+                    }
+                  });
+                  if (resumeAttempt.outcome === "reacquire_failed") {
+                    const reacquireError = resumeAttempt.error;
+                    imageEvidence = {
+                      ...createRecoverableRecruitImageCaptureEvidence(reacquireError, {
+                        elapsedMs: timings.screenshot_capture_ms,
+                        filePath: imageEvidencePath,
+                        extension: "jpg",
+                        maxScreenshots: maxImagePages
+                      }),
+                      coverage_complete: false,
+                      resumed_from_checkpoint: true,
+                      resume_checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      coverage_checkpoint: resumeCheckpoint
+                    };
+                    source = "image_capture_failed";
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: false,
+                      phase: "reacquire",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error: compactError(reacquireError, "IMAGE_CAPTURE_RESUME_REACQUIRE_FAILED")
+                    };
+                  }
+                  if (resumeAttempt.outcome === "completed") {
+                    imageEvidence = requireCompleteImageEvidence(resumeAttempt.evidence, {
+                      code: "IMAGE_CAPTURE_RESUME_EVIDENCE_MISSING",
+                      message: "Recruit resumed CV capture returned no complete persisted evidence",
+                      metadata: { domain: "recruit", candidate_key: candidateKey }
+                    });
+                    source = isIncompleteImageEvidence(imageEvidence) ? "image_capture_failed" : "image";
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: !isIncompleteImageEvidence(imageEvidence),
+                      phase: "capture",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      confirmed_screenshot_count: resumeCheckpoint.unique_screenshot_count || 0
+                    };
+                  } else if (resumeAttempt.outcome === "capture_failed") {
+                    const resumeError = resumeAttempt.error;
+                    imageEvidence = {
+                      ...createRecoverableRecruitImageCaptureEvidence(resumeError, {
+                        elapsedMs: timings.screenshot_capture_ms,
+                        filePath: imageEvidencePath,
+                        extension: "jpg",
+                        maxScreenshots: maxImagePages
+                      }),
+                      coverage_complete: false,
+                      resumed_from_checkpoint: true,
+                      resume_checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      coverage_checkpoint: resumeError.capture_checkpoint || resumeCheckpoint
+                    };
+                    source = "image_capture_failed";
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: false,
+                      phase: "capture",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error: compactError(resumeError, "IMAGE_CAPTURE_RESUME_FAILED")
+                    };
+                  }
+                } else {
+                  imageEvidence = {
+                    ...createRecoverableRecruitImageCaptureEvidence(error, {
+                      elapsedMs: timings.screenshot_capture_ms,
+                      filePath: imageEvidencePath,
+                      extension: "jpg",
+                      maxScreenshots: maxImagePages
+                    }),
+                    coverage_complete: false
+                  };
+                  source = "image_capture_failed";
+                  timings.image_capture_resume = {
+                    attempted: false,
+                    ok: false,
+                    phase: "checkpoint",
+                    error: {
+                      code: "IMAGE_CAPTURE_CHECKPOINT_UNAVAILABLE",
+                      message: "Capture failed without a resumable checkpoint"
+                    }
+                  };
+                }
+              } else {
+                imageEvidence = {
+                  ...createRecoverableRecruitImageCaptureEvidence(error, {
+                    elapsedMs: timings.screenshot_capture_ms,
+                    filePath: imageEvidencePath,
+                    extension: "jpg",
+                    maxScreenshots: maxImagePages
+                  }),
+                  coverage_complete: false,
+                  metadata: {
+                    image_capture_workflow_retry: retryReservation
+                  }
+                };
+                source = "image_capture_failed";
               }
-              imageEvidence = createRecoverableRecruitImageCaptureEvidence(error, {
-                elapsedMs: timings.screenshot_capture_ms,
-                filePath: imageEvidencePath,
-                extension: "jpg",
-                maxScreenshots: maxImagePages
-              });
-              source = "image_capture_failed";
             }
+            imageCaptureTerminalFailure = isTerminalRecruitImageCaptureFailureSource(source);
             recordCvImageFallback(cvAcquisitionState, {
               reason: source === "image_capture_failed"
                 ? "network_miss_image_capture_failed"
@@ -1145,6 +1313,15 @@ export async function runRecruitWorkflow({
             });
           } else {
             source = "missing_capture_node";
+            imageEvidence = createRequiredImageEvidenceFailure({
+              code: "IMAGE_CAPTURE_TARGET_UNAVAILABLE",
+              message: "Recruit CV capture target was unavailable after the network fallback missed",
+              metadata: {
+                domain: "recruit",
+                candidate_key: candidateKey,
+                capture_target_wait: captureTargetWait || null
+              }
+            });
             recordCvNetworkMiss(cvAcquisitionState, {
               reason: "network_miss_no_capture_node",
               parsedNetworkProfileCount,
@@ -1189,7 +1366,25 @@ export async function runRecruitWorkflow({
       } catch (error) {
         if (!isRecoverableRecruitDetailError(error)) throw error;
         const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
-        if (recoveryCount < 1) {
+        if (imageCaptureTerminalFailure && detailResult) {
+          timings.detail_cleanup_after_terminal_image_capture = compactRecoverableDetailError(error);
+          detailResult.close_result = {
+            closed: false,
+            error: error?.message || String(error),
+            terminal_image_capture_failure: true
+          };
+          detailResult.cv_acquisition = {
+            ...(detailResult.cv_acquisition || {}),
+            cleanup_error: compactRecoverableDetailError(error),
+            cleanup_retry_suppressed: true,
+            image_capture_workflow_retry_count: imageCaptureWorkflowRetries.count(candidateKey)
+          };
+          await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
+        } else if (shouldRetryRecruitDetailRecovery({
+          recoveryCount,
+          imageCaptureTerminalFailure
+        })) {
           candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
           timings.detail_recovery_trigger = compactRecoverableDetailError(error);
           checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
@@ -1199,12 +1394,13 @@ export async function runRecruitWorkflow({
             forceRecentViewed: true
           });
           continue;
+        } else {
+          recoverableDetailError = error;
+          detailResult = null;
+          timings.detail_recovered_error = compactRecoverableDetailError(error);
+          await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
+          await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
         }
-        recoverableDetailError = error;
-        detailResult = null;
-        timings.detail_recovered_error = compactRecoverableDetailError(error);
-        await closeRecruitDetail(client, { attemptsLimit: 2 }).catch(() => null);
-        await closeRecruitBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
       }
     }
 
@@ -1212,8 +1408,9 @@ export async function runRecruitWorkflow({
     runControl.throwIfCanceled();
     runControl.setPhase("recruit:screening");
     let llmResult = null;
+    const imageAcquisitionFailed = shouldFailClosedRecruitImageAcquisition(detailResult);
     if (useLlmScreening) {
-      if (recoverableDetailError || detailResult?.image_evidence?.ok === false) {
+      if (recoverableDetailError || imageAcquisitionFailed) {
         llmResult = null;
       } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
@@ -1245,10 +1442,10 @@ export async function runRecruitWorkflow({
     }
     const screening = recoverableDetailError
       ? createRecoverableDetailFailureScreening(screeningCandidate, recoverableDetailError)
-      : detailResult?.image_evidence?.ok === false
+      : imageAcquisitionFailed
       ? createImageCaptureFailureScreening(screeningCandidate, {
-        code: detailResult.image_evidence.error_code,
-        message: detailResult.image_evidence.error
+        code: detailResult?.image_evidence?.error_code || "IMAGE_CAPTURE_EVIDENCE_MISSING",
+        message: detailResult?.image_evidence?.error || "Required CV image evidence is unavailable"
       })
       : useLlmScreening
         ? llmResultToScreening(llmResult, screeningCandidate)

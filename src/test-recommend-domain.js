@@ -43,6 +43,7 @@ import {
   selectRecommendJobWithRootRefresh,
   selectAndConfirmFirstSafeFilter,
   selectRecommendPageScope,
+  shouldFailClosedRecommendImageAcquisition,
   inspectRecentColleagueContact,
   isDateWithinWindow,
   waitForRecommendDetail,
@@ -78,9 +79,14 @@ function testRecoverableImageCaptureEvidencePreservesPartialPages() {
     error.code = "IMAGE_CAPTURE_TIMEOUT";
     const staleError = new Error("Could not find node with given id");
     const detailOpenMiss = new Error("Candidate detail did not open or no known detail selectors mounted");
+    const unknownCaptureOutcome = new Error("WebSocket is not open: readyState 3 (CLOSED)");
+    unknownCaptureOutcome.cdp_method = "Page.captureScreenshot";
+    unknownCaptureOutcome.cdp_outcome_unknown = true;
+    unknownCaptureOutcome.cdp_replay_suppressed = true;
 
     assert.equal(isRecoverableImageCaptureError(error), true);
     assert.equal(isRecoverableImageCaptureError(staleError), true);
+    assert.equal(isRecoverableImageCaptureError(unknownCaptureOutcome), true);
     assert.equal(isRecoverableRecommendDetailError(staleError), true);
     assert.equal(isRecoverableRecommendDetailError(detailOpenMiss), true);
     assert.equal(isRecoverableRecommendDetailError(new Error("Boss recommend page is not healthy")), false);
@@ -104,6 +110,29 @@ function testRecoverableImageCaptureEvidencePreservesPartialPages() {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+function testRecommendMissingCaptureTargetFailsClosed() {
+  assert.equal(shouldFailClosedRecommendImageAcquisition({
+    cv_acquisition: { source: "missing_capture_node" },
+    image_evidence: null
+  }), true);
+  assert.equal(shouldFailClosedRecommendImageAcquisition({
+    cv_acquisition: { source: "image" },
+    image_evidence: null
+  }), true);
+  assert.equal(shouldFailClosedRecommendImageAcquisition({
+    cv_acquisition: { source: "network" },
+    image_evidence: null
+  }), false);
+  assert.equal(shouldFailClosedRecommendImageAcquisition({
+    cv_acquisition: { source: "image" },
+    image_evidence: {
+      ok: true,
+      coverage_complete: true,
+      file_paths: ["complete.jpg"]
+    }
+  }), false);
 }
 
 function testDeterministicFilterChoice() {
@@ -173,6 +202,14 @@ function testStaleRecommendNodeClassificationTraversesCause() {
     cause: new Error("Could not find node with given id")
   });
   assert.equal(isStaleRecommendNodeError(nested), true);
+  for (const message of [
+    "Invalid NodeId",
+    "Invalid backend node id",
+    "Node with given id does not exist",
+    "No node found for given backend id"
+  ]) {
+    assert.equal(isStaleRecommendNodeError(new Error(message)), true, message);
+  }
   assert.equal(isStaleRecommendNodeError(new Error("ordinary network timeout")), false);
   const circular = new Error("ordinary wrapper");
   circular.cause = circular;
@@ -1979,6 +2016,7 @@ testFilterOptionHelpers();
 testJobLabelMatchingIgnoresSalaryFormatting();
 testStaleRecommendNodeClassificationTraversesCause();
 testRecoverableImageCaptureEvidencePreservesPartialPages();
+testRecommendMissingCaptureTargetFailsClosed();
 testDeterministicFilterChoice();
 testTargetedFilterChoice();
 await testRecommendActivityFilterSelectionAndStickyVerification();

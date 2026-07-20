@@ -15,7 +15,9 @@ import {
   clickRecruitActionControl,
   findRecruitBlockingPanel,
   ensureRecruitCardInViewport,
+  isRecoverableRecruitImageCaptureError,
   isRecoverableRecruitDetailError,
+  isTerminalRecruitImageCaptureFailureSource,
   isRecruitNationalCity,
   matchesRecruitDetailNetwork,
   normalizeRecruitAgeFilter,
@@ -35,6 +37,8 @@ import {
   setRecruitJobTitle,
   setRecruitKeyword,
   setRecruitSchools,
+  shouldFailClosedRecruitImageAcquisition,
+  shouldRetryRecruitDetailRecovery,
   recruitInstructionParserSemantics
 } from "./domains/recruit/index.js";
 
@@ -1423,6 +1427,11 @@ function testRecruitRecoveryHelpers() {
     isRecoverableRecruitDetailError(new Error("Could not find node with given id")),
     true
   );
+  const unknownCaptureOutcome = new Error("WebSocket is not open: readyState 3 (CLOSED)");
+  unknownCaptureOutcome.cdp_method = "Page.captureScreenshot";
+  unknownCaptureOutcome.cdp_outcome_unknown = true;
+  unknownCaptureOutcome.cdp_replay_suppressed = true;
+  assert.equal(isRecoverableRecruitImageCaptureError(unknownCaptureOutcome), true);
 
   const counts = countRecruitResultStatuses([
     {
@@ -1449,6 +1458,38 @@ function testRecruitRecoveryHelpers() {
   assert.equal(counts.transient_recovered, 2);
 }
 
+function testRecruitMissingCaptureTargetFailsClosed() {
+  assert.equal(shouldFailClosedRecruitImageAcquisition({
+    cv_acquisition: { source: "missing_capture_node" },
+    image_evidence: null
+  }), true);
+  assert.equal(shouldFailClosedRecruitImageAcquisition({
+    cv_acquisition: { source: "image_capture_failed" },
+    image_evidence: null
+  }), true);
+  assert.equal(shouldFailClosedRecruitImageAcquisition({
+    cv_acquisition: { source: "network" },
+    image_evidence: null
+  }), false);
+}
+
+function testRecruitTerminalImageFailureSuppressesDetailRestart() {
+  assert.equal(isTerminalRecruitImageCaptureFailureSource("image_capture_failed"), true);
+  assert.equal(isTerminalRecruitImageCaptureFailureSource("image"), false);
+  assert.equal(shouldRetryRecruitDetailRecovery({
+    recoveryCount: 0,
+    imageCaptureTerminalFailure: false
+  }), true);
+  assert.equal(shouldRetryRecruitDetailRecovery({
+    recoveryCount: 1,
+    imageCaptureTerminalFailure: false
+  }), false);
+  assert.equal(shouldRetryRecruitDetailRecovery({
+    recoveryCount: 0,
+    imageCaptureTerminalFailure: true
+  }), false);
+}
+
 testParserImportSemantics();
 testNetworkPatterns();
 await testRecruitAccountRightsPanelUsesSharedSafeClose();
@@ -1467,5 +1508,7 @@ await testRecruitGenderSelectionUsesVisibleDropdown();
 await testRecruitAgeSelectionSupportsOptionsAndCustomRange();
 await testRecruitKeywordGuardRetriesWhenSearchRewritesInput();
 testRecruitRecoveryHelpers();
+testRecruitMissingCaptureTargetFailsClosed();
+testRecruitTerminalImageFailureSuppressesDetailRestart();
 
 console.log("recruit domain tests passed");

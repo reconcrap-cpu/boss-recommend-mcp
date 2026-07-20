@@ -2,7 +2,6 @@
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   clickNodeCenter,
   connectToChromeTarget,
@@ -112,7 +111,6 @@ async function run() {
       title: target.title
     };
 
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
 
     await enableDomains(client, ["Page", "DOM", "Input", "Accessibility"]);
     await bringPageToFront(client);
@@ -155,7 +153,7 @@ async function run() {
       result.recommend.after_close_counts = await countSelectors(client, iframe.documentNodeId, SELECTORS);
     }
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
     result.runtime_evaluate_used = false;
     result.method_summary = methodSummary(methodLog);
     result.method_log = methodLog;

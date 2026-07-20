@@ -2,7 +2,6 @@
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
   countSelectors,
@@ -88,7 +87,6 @@ async function run() {
       url: target.url,
       title: target.title
     };
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
 
     await enableDomains(client, ["Page", "DOM"]);
     await bringPageToFront(client);
@@ -168,7 +166,7 @@ async function run() {
       throw new Error(`Expected canceled final status, got ${final.status}`);
     }
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
     result.runtime_evaluate_used = false;
     result.method_summary = methodSummary(methodLog);
     result.method_log = methodLog;

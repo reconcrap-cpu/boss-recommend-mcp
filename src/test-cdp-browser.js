@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import {
+  ALLOWED_CDP_DOMAINS,
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   buildBossChromeLaunchArgs,
   chunkHumanText,
   clickPoint,
@@ -17,6 +17,9 @@ import {
   ensureChromeDebugPort,
   generateBezierPath,
   getMissingRequiredChromeFlags,
+  getNodeBox,
+  FORBIDDEN_CDP_DOMAINS,
+  FORBIDDEN_CDP_METHODS,
   humanDelay,
   insertText,
   isChromeDebugUnavailableError,
@@ -24,62 +27,49 @@ import {
   normalizeHumanBehaviorOptions,
   normalizeHumanRestLevel,
   resolveHumanClickPointForBox,
+  scrollNodeIntoView,
   simulateHumanClick
 } from "./core/browser/index.js";
 import { CHAT_TARGET_URL } from "./domains/chat/constants.js";
 import { RECOMMEND_TARGET_URL } from "./domains/recommend/constants.js";
 import { RECRUIT_TARGET_URL } from "./domains/recruit/constants.js";
 
-async function testRuntimeDomainIsBlockedBeforeTransport() {
-  let runtimeWasCalled = false;
-  const methodLog = [];
-  const guarded = createGuardedCdpClient({
-    Runtime: {
-      async evaluate() {
-        runtimeWasCalled = true;
-      }
-    }
-  }, { methodLog });
-
-  const result = await assertRuntimeEvaluateBlocked(guarded);
-  assert.equal(result.blocked, true);
-  assert.equal(runtimeWasCalled, false);
-  assert.deepEqual(methodLog, []);
-}
-
-async function testPageScriptInjectionIsBlockedBeforeTransport() {
-  let domainMethodWasCalled = false;
-  let sendWasCalled = false;
-  const methodLog = [];
-  const guarded = createGuardedCdpClient({
-    Page: {
-      async addScriptToEvaluateOnNewDocument() {
-        domainMethodWasCalled = true;
-      }
-    },
-    async send() {
-      sendWasCalled = true;
-    }
-  }, { methodLog });
-  const pageDomain = guarded[["P", "age"].join("")];
+function testForbiddenCdpConfigurationWithoutExecutingMethods() {
+  const runtimeDomain = ["Run", "time"].join("");
+  const debuggerDomain = ["Debug", "ger"].join("");
   const injectionMethod = ["addScript", "ToEvaluateOnNewDocument"].join("");
   const forbiddenMethod = ["Page", injectionMethod].join(".");
-
+  const documentReplacementMethod = ["Page", ["setDocument", "Content"].join("")].join(".");
+  const frameExpressionMethod = [debuggerDomain, ["evaluate", "OnCallFrame"].join("")].join(".");
+  assert.equal(FORBIDDEN_CDP_DOMAINS.has(runtimeDomain), true);
+  assert.equal(FORBIDDEN_CDP_DOMAINS.has(debuggerDomain), true);
+  assert.equal(ALLOWED_CDP_DOMAINS.has(runtimeDomain), false);
+  assert.equal(ALLOWED_CDP_DOMAINS.has(debuggerDomain), false);
+  assert.equal(FORBIDDEN_CDP_METHODS.has(forbiddenMethod), true);
+  assert.equal(FORBIDDEN_CDP_METHODS.has(documentReplacementMethod), true);
   assert.throws(
-    () => pageDomain[injectionMethod]({ source: "void 0" }),
-    /Forbidden CDP method blocked/
+    () => assertNoForbiddenCdpCalls([{ method: [runtimeDomain, "evaluate"].join(".") }]),
+    /Forbidden CDP methods were used/
   );
-  await assert.rejects(
-    () => guarded.send(forbiddenMethod, { source: "void 0" }),
-    /Forbidden CDP method blocked/
-  );
-  assert.equal(domainMethodWasCalled, false);
-  assert.equal(sendWasCalled, false);
-  assert.deepEqual(methodLog, []);
   assert.throws(
     () => assertNoForbiddenCdpCalls([{ method: forbiddenMethod }]),
     /Forbidden CDP methods were used/
   );
+  assert.throws(
+    () => assertNoForbiddenCdpCalls([{ method: frameExpressionMethod }]),
+    /Forbidden CDP methods were used/
+  );
+  assert.throws(
+    () => assertNoForbiddenCdpCalls([{ method: documentReplacementMethod }]),
+    /Forbidden CDP methods were used/
+  );
+  assert.deepEqual(assertNoForbiddenCdpCalls([{ method: "Page.enable" }]), {
+    verified: true,
+    proof: "method_log_inspection",
+    method_log_count: 1,
+    runtime_domain_method_count: 0,
+    forbidden_method_count: 0
+  });
 }
 
 async function testAllowedDomainsAreLogged() {
@@ -167,13 +157,153 @@ async function testGuardedClientReconnectsClosedTransport() {
     "first:Network.getResponseBody",
     "second:Page.enable",
     "second:Network.enable",
-    "second:Page.bringToFront",
     "second:Network.setCacheDisabled:true",
     "second:Network.responseReceived:true",
     "second:Network.getResponseBody"
   ]);
-  assert.ok(methodLog.some((entry) => entry.method === "Network.getResponseBody:retry_after_reconnect"));
+  const initialBodyCall = methodLog.find((entry) => entry.method === "Network.getResponseBody");
+  const replayedBodyCall = methodLog.find((entry) => entry.method === "Network.getResponseBody:retry_after_reconnect");
+  assert.equal(initialBodyCall?.connection_epoch, 1);
+  assert.equal(initialBodyCall?.replay_policy, "safe_read_only");
+  assert.equal(replayedBodyCall?.connection_epoch, 2);
+  assert.equal(replayedBodyCall?.replay_of_connection_epoch, 1);
+  assert.equal(guarded.__connectionEpoch, 2);
   assertNoForbiddenCdpCalls(methodLog);
+}
+
+async function testGuardedClientDoesNotReplayScreenshot() {
+  const calls = [];
+  const methodLog = [];
+  const first = {
+    Page: {
+      async captureScreenshot() {
+        calls.push("first:Page.captureScreenshot");
+        throw new Error("WebSocket is not open: readyState 3 (CLOSED)");
+      }
+    }
+  };
+  const second = {
+    Page: {
+      async captureScreenshot() {
+        calls.push("second:Page.captureScreenshot");
+        return { data: "unexpected" };
+      }
+    }
+  };
+  const guarded = createGuardedCdpClient(first, {
+    methodLog,
+    reconnect: async () => second
+  });
+
+  assert.equal(guarded.__connectionEpoch, 1);
+  await assert.rejects(
+    () => guarded.Page.captureScreenshot({ format: "jpeg" }),
+    (error) => {
+      assert.equal(error.cdp_method, "Page.captureScreenshot");
+      assert.equal(error.cdp_connection_epoch, 1);
+      assert.equal(error.cdp_outcome_unknown, true);
+      assert.equal(error.cdp_reconnected, true);
+      assert.equal(error.cdp_reconnected_epoch, 2);
+      assert.equal(error.cdp_replay_policy, "not_allowlisted");
+      assert.equal(error.cdp_replay_suppressed, true);
+      return true;
+    }
+  );
+  assert.equal(guarded.__connectionEpoch, 2);
+  assert.deepEqual(calls, ["first:Page.captureScreenshot"]);
+  assert.deepEqual(methodLog.map((entry) => entry.method), ["Page.captureScreenshot"]);
+  assert.equal(methodLog[0].connection_epoch, 1);
+}
+
+async function testGuardedClientDoesNotReplayStateChangingOrUnknownMethods() {
+  async function exercise(method, invoke) {
+    const calls = [];
+    let reconnectCount = 0;
+    function makeClient(name, { fail = false } = {}) {
+      return {
+        Page: {
+          async navigate() {
+            calls.push(`${name}:Page.navigate`);
+            if (fail) throw new Error("Connection closed");
+            return {};
+          },
+          async bringToFront() {
+            calls.push(`${name}:Page.bringToFront`);
+            if (fail) throw new Error("Connection closed");
+            return {};
+          }
+        },
+        DOM: {
+          async futureReadMethod() {
+            calls.push(`${name}:DOM.futureReadMethod`);
+            if (fail) throw new Error("Connection closed");
+            return {};
+          }
+        }
+      };
+    }
+    const guarded = createGuardedCdpClient(makeClient("first", { fail: true }), {
+      reconnect: async () => {
+        reconnectCount += 1;
+        return makeClient("second");
+      }
+    });
+    await assert.rejects(
+      () => invoke(guarded),
+      (error) => {
+        assert.equal(error.cdp_method, method);
+        assert.equal(error.cdp_outcome_unknown, true);
+        assert.equal(error.cdp_replay_suppressed, true);
+        return true;
+      }
+    );
+    assert.equal(reconnectCount, 1);
+    assert.deepEqual(calls, [`first:${method}`]);
+    assert.equal(guarded.__connectionEpoch, 2);
+  }
+
+  await exercise("Page.navigate", (guarded) => guarded.Page.navigate({ url: "https://example.test" }));
+  await exercise("Page.bringToFront", (guarded) => guarded.Page.bringToFront());
+  await exercise("DOM.futureReadMethod", (guarded) => guarded.DOM.futureReadMethod({}));
+}
+
+async function testGuardedClientCanExplicitlyAbandonAndReconnect() {
+  const calls = [];
+  const listener = () => {};
+  function makeClient(name) {
+    return {
+      Page: {
+        async enable() {
+          calls.push(`${name}:Page.enable`);
+          return {};
+        },
+        frameResized(nextListener) {
+          calls.push(`${name}:Page.frameResized:${nextListener === listener}`);
+        }
+      }
+    };
+  }
+  const guarded = createGuardedCdpClient(makeClient("first"), {
+    reconnect: async () => makeClient("second")
+  });
+
+  await guarded.Page.enable();
+  guarded.Page.frameResized(listener);
+  const result = await guarded.__abandonAndReconnect({ reason: "screenshot_timeout" });
+
+  assert.deepEqual(result, {
+    reconnected: true,
+    previous_connection_epoch: 1,
+    connection_epoch: 2,
+    reason: "screenshot_timeout"
+  });
+  assert.equal(guarded.__connectionEpoch, 2);
+  assert.deepEqual(calls, [
+    "first:Page.enable",
+    "first:Page.frameResized:true",
+    "second:Page.enable",
+    "second:Page.frameResized:true"
+  ]);
 }
 
 async function testGuardedClientAnnotatesCdpNodeErrors() {
@@ -192,6 +322,82 @@ async function testGuardedClientAnnotatesCdpNodeErrors() {
       assert.match(error.cdp_at, /^\d{4}-\d{2}-\d{2}T/);
       assert.equal(error.cdp_node_id, 42);
       assert.deepEqual(error.cdp_param_keys, ["nodeId", "selector"]);
+      return true;
+    }
+  );
+}
+
+async function testNodeHelpersPreserveGuardedCdpDiagnostics() {
+  const sourceError = new Error("Connection closed while reading node box");
+  sourceError.cdp_backend_node_id = 501;
+  sourceError.cdp_search_id = "search-7";
+  let secondClientCalls = 0;
+  const guarded = createGuardedCdpClient({
+    DOM: {
+      async getBoxModel() {
+        throw sourceError;
+      }
+    }
+  }, {
+    reconnect: async () => ({
+      DOM: {
+        async getBoxModel() {
+          secondClientCalls += 1;
+          return {};
+        }
+      }
+    })
+  });
+
+  await assert.rejects(
+    () => getNodeBox(guarded, 42),
+    (error) => {
+      assert.equal(error.cause, sourceError);
+      assert.equal(error.cdp_method, "DOM.getBoxModel");
+      assert.equal(error.cdp_node_id, 42);
+      assert.equal(error.cdp_backend_node_id, 501);
+      assert.equal(error.cdp_search_id, "search-7");
+      assert.equal(error.cdp_connection_epoch, 1);
+      assert.equal(error.cdp_replay_policy, "not_allowlisted");
+      assert.equal(error.cdp_reconnected, true);
+      assert.equal(error.cdp_reconnected_epoch, 2);
+      assert.equal(error.cdp_replay_suppressed, true);
+      assert.equal(error.cdp_outcome_unknown, true);
+      assert.deepEqual(error.cdp_param_keys, ["nodeId"]);
+      assert.equal(Object.hasOwn(error, "params"), false);
+      return true;
+    }
+  );
+  assert.equal(secondClientCalls, 0);
+
+  const scrollSourceError = new Error("Session closed while scrolling node");
+  scrollSourceError.cdp_search_id = "search-8";
+  const scrollGuarded = createGuardedCdpClient({
+    DOM: {
+      async scrollIntoViewIfNeeded() {
+        throw scrollSourceError;
+      }
+    }
+  }, {
+    reconnect: async () => {
+      throw new Error("reconnect refused");
+    }
+  });
+
+  await assert.rejects(
+    () => scrollNodeIntoView(scrollGuarded, 73),
+    (error) => {
+      assert.equal(error.cause, scrollSourceError);
+      assert.equal(error.cdp_method, "DOM.scrollIntoViewIfNeeded");
+      assert.equal(error.cdp_node_id, 73);
+      assert.equal(error.cdp_search_id, "search-8");
+      assert.equal(error.cdp_connection_epoch, 1);
+      assert.equal(error.cdp_replay_policy, "not_allowlisted");
+      assert.equal(error.cdp_replay_suppressed, true);
+      assert.equal(error.cdp_outcome_unknown, true);
+      assert.equal(error.cdp_reconnect_error, "reconnect refused");
+      assert.deepEqual(error.cdp_param_keys, ["nodeId"]);
+      assert.equal(Object.hasOwn(error, "params"), false);
       return true;
     }
   );
@@ -953,11 +1159,14 @@ async function testBossLoginDomDetection() {
   assert.ok(queriedSelectors.length > 0);
 }
 
-await testRuntimeDomainIsBlockedBeforeTransport();
-await testPageScriptInjectionIsBlockedBeforeTransport();
+testForbiddenCdpConfigurationWithoutExecutingMethods();
 await testAllowedDomainsAreLogged();
 await testGuardedClientReconnectsClosedTransport();
+await testGuardedClientDoesNotReplayScreenshot();
+await testGuardedClientDoesNotReplayStateChangingOrUnknownMethods();
+await testGuardedClientCanExplicitlyAbandonAndReconnect();
 await testGuardedClientAnnotatesCdpNodeErrors();
+await testNodeHelpersPreserveGuardedCdpDiagnostics();
 await testUnexpectedDomainIsRejected();
 testBossLoginUrlDetection();
 testBossLoginRequiredErrorShape();

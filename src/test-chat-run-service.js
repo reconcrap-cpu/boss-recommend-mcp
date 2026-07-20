@@ -10,20 +10,457 @@ import {
 } from "./core/run/index.js";
 import {
   captureNodeIdFromResumeState,
+  CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS,
+  CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS,
+  CHAT_EDITOR_PRE_ACTION_RETRY_LIMIT,
+  CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS,
+  applyChatProtectedOutcomeSkip,
   chatDetailSkipReasonFromReadyState,
+  consumeChatDetailRecoveryBudget,
   countChatResultStatuses,
+  compactChatCandidateSelectionReadyState,
   createCvCollectionScreening,
   createChatRunService,
+  enforceChatCollectCvProcessingFloor,
+  hasScreenableChatFullCvEvidence,
   isChatCandidateSelectionMismatchError,
   isChatOnlineResumeModalOpenFailureError,
+  isRecoverableChatImageCaptureError,
   isChatResumeModalCloseFailureError,
   makeChatCandidateSelectionMismatchError,
+  requireExactChatCandidateSelection,
   makeChatResumeModalOpenBeforeCandidateClickError,
   CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE,
+  createChatActionJournal,
+  reconcileChatRequestJournalFromExactExistingState,
+  preserveChatRequestOutcomeUnknownWithoutReplay,
   resolveChatDomFallbackWait,
+  sampleChatCollectCvProcessingFloorMs,
+  shouldRetryChatEditorPreAction,
   shouldOpenOnlineResumeForChatDetail,
   summarizeChatFullCvEvidence
 } from "./domains/chat/index.js";
+
+function initializeRequestOutcomeUnknownJournal(journal, {
+  scope,
+  candidateId,
+  greeting,
+  runId = "old-run"
+}) {
+  journal.transition({ scope, candidateId, state: "pre_action", greeting, runId });
+  journal.transition({ scope, candidateId, state: "greeting_send_in_flight", greeting, runId });
+  journal.transition({ scope, candidateId, state: "greeting_confirmed", greeting, runId });
+  journal.transition({ scope, candidateId, state: "request_in_flight", greeting, runId });
+  return journal.transition({
+    scope,
+    candidateId,
+    state: "outcome_unknown",
+    greeting,
+    runId,
+    evidence: { action: "request_resume", reason: "resume_request_message_not_observed" }
+  }).record;
+}
+
+function testExactExistingRequestStateReconcilesUnknownJournal() {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-reconcile-journal-"));
+  try {
+    const journal = createChatActionJournal({ baseDir });
+    const scope = "boss-chat-cdp:127.0.0.1:9222";
+    const candidateId = "candidate-202";
+    const greeting = "Hi同学，能麻烦发下简历吗？";
+    const unknownRecord = initializeRequestOutcomeUnknownJournal(journal, {
+      scope,
+      candidateId,
+      greeting
+    });
+    const checkpoints = [];
+    const reconciled = reconcileChatRequestJournalFromExactExistingState({
+      actionJournal: journal,
+      actionJournalScope: scope,
+      actionJournalRecord: unknownRecord,
+      candidateId,
+      selectionReadyState: {
+        candidate_selection_verified: true,
+        expected_candidate_id: candidateId,
+        active_candidate_id: candidateId
+      },
+      readyState: {
+        already_requested_resume: true,
+        attachment_resume_enabled: true
+      },
+      runId: "recovery-run",
+      greeting,
+      checkpointCritical: (patch) => checkpoints.push(patch)
+    });
+    assert.equal(reconciled.requested, false);
+    assert.equal(reconciled.skipped, true);
+    assert.equal(reconciled.satisfied, true);
+    assert.equal(reconciled.journal_reconciled_existing_state, true);
+    assert.equal(reconciled.action_transaction.state, "request_confirmed");
+    assert.equal(reconciled.action_transaction.evidence.active_candidate_id, candidateId);
+    assert.equal(
+      reconciled.action_transaction.evidence.request_confirmation_source,
+      "exact_requested_resume_state"
+    );
+    assert.equal(checkpoints.length, 1);
+    assert.equal(checkpoints[0].action_transaction.state, "request_confirmed");
+    const stored = journal.read({ scope, candidateId });
+    assert.equal(stored.state, "request_confirmed");
+    assert.equal(stored.last_run_id, "recovery-run");
+    assert.equal(stored.history.at(-1).from_state, "outcome_unknown");
+    assert.equal(stored.history.at(-1).state, "request_confirmed");
+
+    const attachmentCandidateId = "candidate-attachment";
+    journal.transition({ scope, candidateId: attachmentCandidateId, state: "pre_action", greeting, runId: "old-run" });
+    journal.transition({ scope, candidateId: attachmentCandidateId, state: "greeting_send_in_flight", greeting, runId: "old-run" });
+    journal.transition({ scope, candidateId: attachmentCandidateId, state: "greeting_confirmed", greeting, runId: "old-run" });
+    const requestInFlightRecord = journal.transition({
+      scope,
+      candidateId: attachmentCandidateId,
+      state: "request_in_flight",
+      greeting,
+      runId: "old-run"
+    }).record;
+    const attachmentReconciled = reconcileChatRequestJournalFromExactExistingState({
+      actionJournal: journal,
+      actionJournalScope: scope,
+      actionJournalRecord: requestInFlightRecord,
+      candidateId: attachmentCandidateId,
+      selectionReadyState: {
+        candidate_selection_verified: true,
+        expected_candidate_id: attachmentCandidateId,
+        active_candidate_id: attachmentCandidateId
+      },
+      readyState: {
+        already_requested_resume: false,
+        attachment_resume_enabled: true
+      },
+      runId: "recovery-run",
+      greeting,
+      checkpointCritical: (patch) => checkpoints.push(patch)
+    });
+    assert.equal(attachmentReconciled.action_transaction.state, "request_confirmed");
+    assert.equal(
+      attachmentReconciled.action_transaction.evidence.request_confirmation_source,
+      "attachment_resume_available"
+    );
+    assert.equal(attachmentReconciled.action_transaction.evidence.message_observed, false);
+    const attachmentStored = journal.read({ scope, candidateId: attachmentCandidateId });
+    assert.equal(attachmentStored.history.at(-1).from_state, "request_in_flight");
+    assert.equal(attachmentStored.history.at(-1).state, "request_confirmed");
+    assert.equal(reconcileChatRequestJournalFromExactExistingState({
+      actionJournal: journal,
+      actionJournalScope: scope,
+      actionJournalRecord: attachmentStored,
+      candidateId: attachmentCandidateId,
+      selectionReadyState: {
+        candidate_selection_verified: true,
+        expected_candidate_id: attachmentCandidateId,
+        active_candidate_id: attachmentCandidateId
+      },
+      readyState: {
+        already_requested_resume: false,
+        attachment_resume_enabled: true
+      },
+      runId: "recovery-run",
+      greeting,
+      checkpointCritical: (patch) => checkpoints.push(patch)
+    }), null);
+    assert.equal(checkpoints.length, 2);
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function testExistingRequestStateReconciliationFailsClosedWithoutExactEvidence() {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-reconcile-negative-"));
+  try {
+    const journal = createChatActionJournal({ baseDir });
+    const scope = "boss-chat-cdp:127.0.0.1:9222";
+    const candidateId = "candidate-negative";
+    const greeting = "Hi同学，能麻烦发下简历吗？";
+    const unknownRecord = initializeRequestOutcomeUnknownJournal(journal, {
+      scope,
+      candidateId,
+      greeting
+    });
+    const exactSelection = {
+      candidate_selection_verified: true,
+      expected_candidate_id: candidateId,
+      active_candidate_id: candidateId
+    };
+    const readyState = {
+      already_requested_resume: false,
+      attachment_resume_enabled: true
+    };
+    const checkpoints = [];
+    const variants = [
+      { selectionReadyState: { ...exactSelection, candidate_selection_verified: false } },
+      { selectionReadyState: { ...exactSelection, expected_candidate_id: "other" } },
+      { selectionReadyState: { ...exactSelection, active_candidate_id: "other" } },
+      { readyState: { already_requested_resume: false, attachment_resume_enabled: false } },
+      { actionJournalRecord: null },
+      {
+        actionJournalRecord: {
+          ...unknownRecord,
+          state: "outcome_unknown",
+          history: [
+            ...unknownRecord.history.slice(0, -1),
+            { ...unknownRecord.history.at(-1), from_state: "greeting_send_in_flight" }
+          ]
+        }
+      }
+    ];
+    for (const variant of variants) {
+      const result = reconcileChatRequestJournalFromExactExistingState({
+        actionJournal: journal,
+        actionJournalScope: scope,
+        actionJournalRecord: variant.actionJournalRecord === undefined
+          ? unknownRecord
+          : variant.actionJournalRecord,
+        candidateId,
+        selectionReadyState: variant.selectionReadyState || exactSelection,
+        readyState: variant.readyState || readyState,
+        runId: "recovery-run",
+        greeting,
+        checkpointCritical: (patch) => checkpoints.push(patch)
+      });
+      assert.equal(result, null);
+    }
+    assert.equal(checkpoints.length, 0);
+    assert.equal(journal.read({ scope, candidateId }).state, "outcome_unknown");
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function testProtectedRequestOutcomeUnknownIsSkippedWithoutReplay() {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-protected-unknown-"));
+  try {
+    const journal = createChatActionJournal({ baseDir });
+    const scope = "boss-chat-cdp:127.0.0.1:9222";
+    const candidateId = "candidate-protected-request";
+    const greeting = "Hi同学，能麻烦发下简历吗？";
+    const unknownRecord = initializeRequestOutcomeUnknownJournal(journal, {
+      scope,
+      candidateId,
+      greeting
+    });
+    const storedBefore = JSON.stringify(journal.read({ scope, candidateId }));
+    const protectedResult = preserveChatRequestOutcomeUnknownWithoutReplay({
+      actionJournalRecord: unknownRecord,
+      candidateId,
+      activeCandidateId: candidateId,
+      readyEvidence: {
+        already_requested_resume: false,
+        attachment_resume_enabled: false
+      },
+      messageEvidence: {
+        ok: true,
+        count: 0,
+        resume_attachment_count: 0
+      }
+    });
+
+    assert.equal(protectedResult.requested, false);
+    assert.equal(protectedResult.skipped, true);
+    assert.equal(protectedResult.satisfied, false);
+    assert.equal(protectedResult.reason, "outcome_unknown_preserved_no_replay");
+    assert.equal(protectedResult.journal_preserved_outcome_unknown, true);
+    assert.equal(protectedResult.no_replay, true);
+    assert.equal(protectedResult.action_unknown_origin, "request_in_flight");
+    assert.equal(protectedResult.action_transaction.state, "outcome_unknown");
+    assert.equal(protectedResult.request_verification.request_message_count, 0);
+    assert.equal(protectedResult.request_verification.resume_attachment_count, 0);
+    assert.equal(JSON.stringify(journal.read({ scope, candidateId })), storedBefore);
+
+    const protectedScreening = applyChatProtectedOutcomeSkip({
+      status: "pass",
+      passed: true,
+      score: 100,
+      reasons: ["collect_cv:request_cv_available"],
+      candidate: { id: candidateId }
+    }, protectedResult, { id: candidateId });
+    assert.equal(protectedScreening.status, "skip");
+    assert.equal(protectedScreening.passed, false);
+    assert.equal(protectedScreening.score, 0);
+    assert.deepEqual(protectedScreening.reasons, ["outcome_unknown_preserved_no_replay"]);
+
+    const greetingOriginUnknown = {
+      ...unknownRecord,
+      history: [
+        ...unknownRecord.history.slice(0, -1),
+        { ...unknownRecord.history.at(-1), from_state: "greeting_send_in_flight" }
+      ]
+    };
+    const variants = [
+      { activeCandidateId: "other-candidate" },
+      { actionJournalRecord: { ...unknownRecord, candidate_id: "other-candidate" } },
+      { actionJournalRecord: greetingOriginUnknown },
+      { actionJournalRecord: { ...unknownRecord, state: "request_in_flight" } }
+    ];
+    for (const variant of variants) {
+      assert.equal(preserveChatRequestOutcomeUnknownWithoutReplay({
+        actionJournalRecord: variant.actionJournalRecord || unknownRecord,
+        candidateId,
+        activeCandidateId: variant.activeCandidateId || candidateId,
+        readyEvidence: {},
+        messageEvidence: { ok: true, count: 0, resume_attachment_count: 0 }
+      }), null);
+    }
+    const unchangedScreening = { status: "pass", passed: true, candidate: { id: candidateId } };
+    assert.equal(applyChatProtectedOutcomeSkip(unchangedScreening, { skipped: true }, null), unchangedScreening);
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+async function testCollectCvProcessingFloorHelpers() {
+  assert.equal(sampleChatCollectCvProcessingFloorMs({ random: () => 0 }), 10000);
+  assert.equal(sampleChatCollectCvProcessingFloorMs({ random: () => 0.5 }), 12500);
+  assert.equal(sampleChatCollectCvProcessingFloorMs({ random: () => 1 }), 15000);
+
+  let fakeNow = 4000;
+  const sleepCalls = [];
+  const enforced = await enforceChatCollectCvProcessingFloor({
+    candidateStartedAt: 0,
+    targetMs: 15000,
+    nowFn: () => fakeNow,
+    sleepFn: async (ms) => {
+      sleepCalls.push(ms);
+      fakeNow += ms;
+    }
+  });
+  assert.deepEqual(sleepCalls, [11000]);
+  assert.deepEqual(enforced, {
+    enabled: true,
+    target_ms: 15000,
+    elapsed_before_ms: 4000,
+    delay_requested_ms: 11000,
+    delay_elapsed_ms: 11000,
+    elapsed_after_ms: 15000,
+    verified: true
+  });
+
+  let unnecessarySleep = false;
+  const alreadySatisfied = await enforceChatCollectCvProcessingFloor({
+    candidateStartedAt: 0,
+    targetMs: 10000,
+    nowFn: () => 16000,
+    sleepFn: async () => {
+      unnecessarySleep = true;
+    }
+  });
+  assert.equal(unnecessarySleep, false);
+  assert.equal(alreadySatisfied.delay_requested_ms, 0);
+  assert.equal(alreadySatisfied.elapsed_after_ms, 16000);
+  assert.equal(alreadySatisfied.verified, true);
+
+  const disabled = await enforceChatCollectCvProcessingFloor({ enabled: false });
+  assert.equal(disabled.enabled, false);
+  assert.equal(disabled.delay_requested_ms, 0);
+
+  await assert.rejects(
+    enforceChatCollectCvProcessingFloor({
+      candidateStartedAt: 0,
+      targetMs: 10000,
+      nowFn: () => 0,
+      sleepFn: async () => {}
+    }),
+    (error) => error?.code === "CHAT_COLLECT_CV_PROCESSING_FLOOR_CLOCK_STALLED"
+  );
+}
+
+async function testCollectCvProcessingFloorServiceContract() {
+  const service = createChatRunService({
+    idPrefix: "test_chat_floor",
+    workflow: async () => ({ domain: "chat", processed: 0, results: [] })
+  });
+
+  const collectCv = service.startChatRun({
+    client: { guarded: true },
+    criteria: "",
+    maxCandidates: 1,
+    humanBehavior: { enabled: false, profile: "baseline" }
+  });
+  assert.equal(collectCv.context.collect_cv_processing_floor_enabled, true);
+  assert.equal(collectCv.context.collect_cv_processing_floor_min_ms, CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS);
+  assert.equal(collectCv.context.collect_cv_processing_floor_max_ms, CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS);
+  assert.equal(collectCv.context.human_rest_enabled, false);
+  assert.equal(collectCv.context.human_rest_per_candidate_enabled, false);
+  await service.waitForChatRun(collectCv.runId);
+
+  const collectCvWithHighRest = service.startChatRun({
+    client: { guarded: true },
+    criteria: "",
+    maxCandidates: 1,
+    humanBehavior: {
+      enabled: true,
+      profile: "paced_with_rests",
+      restLevel: "high"
+    }
+  });
+  assert.equal(collectCvWithHighRest.context.collect_cv_processing_floor_enabled, true);
+  assert.equal(collectCvWithHighRest.context.human_rest_enabled, true);
+  assert.equal(collectCvWithHighRest.context.human_rest_level, "high");
+  assert.equal(collectCvWithHighRest.context.human_rest_per_candidate_enabled, false);
+  await service.waitForChatRun(collectCvWithHighRest.runId);
+
+  const screening = service.startChatRun({
+    client: { guarded: true },
+    criteria: "算法",
+    maxCandidates: 1,
+    humanBehavior: { enabled: false, profile: "baseline" }
+  });
+  assert.equal(screening.context.collect_cv_processing_floor_enabled, false);
+  assert.equal(screening.context.collect_cv_processing_floor_min_ms, null);
+  assert.equal(screening.context.collect_cv_processing_floor_max_ms, null);
+  await service.waitForChatRun(screening.runId);
+}
+
+function testChatDetailRecoveryBudgetCapsModalRetry() {
+  const counts = new Map();
+  const first = consumeChatDetailRecoveryBudget(counts, "candidate-1");
+  const second = consumeChatDetailRecoveryBudget(counts, "candidate-1");
+  const independentCandidate = consumeChatDetailRecoveryBudget(counts, "candidate-2");
+
+  assert.deepEqual(first, {
+    allowed: true,
+    previous_count: 0,
+    count: 1,
+    retry_limit: 1
+  });
+  assert.deepEqual(second, {
+    allowed: false,
+    previous_count: 1,
+    count: 1,
+    retry_limit: 1
+  });
+  assert.equal(independentCandidate.allowed, true);
+  assert.equal(counts.get("candidate-1"), 1);
+  assert.equal(counts.get("candidate-2"), 1);
+}
+
+function testChatEditorRetryIsLimitedToPreAction() {
+  const mismatch = Object.assign(new Error("CHAT_EDITOR_MESSAGE_MISMATCH"), {
+    code: "CHAT_EDITOR_MESSAGE_MISMATCH"
+  });
+  assert.equal(CHAT_EDITOR_PRE_ACTION_RETRY_LIMIT, 1);
+  assert.equal(CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS, 1500);
+  assert.equal(shouldRetryChatEditorPreAction(mismatch, { state: "pre_action" }, 0), true);
+  assert.equal(shouldRetryChatEditorPreAction(mismatch, { state: "pre_action" }, 1), false);
+  assert.equal(shouldRetryChatEditorPreAction(mismatch, { state: "greeting_send_in_flight" }, 0), false);
+  assert.equal(shouldRetryChatEditorPreAction(mismatch, { state: "request_in_flight" }, 0), false);
+  assert.equal(shouldRetryChatEditorPreAction(mismatch, { state: "outcome_unknown" }, 0), false);
+  assert.equal(
+    shouldRetryChatEditorPreAction(
+      Object.assign(new Error("Connection closed"), { code: "CDP_CONNECTION_CLOSED" }),
+      { state: "pre_action" },
+      0
+    ),
+    false
+  );
+}
 
 async function waitUntil(predicate, timeoutMs = 2500) {
   const started = Date.now();
@@ -143,6 +580,55 @@ function testChatPreDetailAttachmentResumeSkipReason() {
   assert.equal(mismatch.selection_ready_state.active_candidate_id, "active-2");
   assert.equal(isChatCandidateSelectionMismatchError(mismatch), true);
   assert.equal(isChatCandidateSelectionMismatchError(new Error("different")), false);
+
+  const exactSelection = {
+    ready: {
+      ok: true,
+      reason: "online_resume_probe_skipped",
+      expected_candidate_id: "expected-1",
+      active_candidate_id: "expected-1",
+      candidate_selection_verified: true,
+      activeCandidate: {
+        node_id: 42,
+        selector: ".geek-item.selected[data-id]",
+        candidate_id: "expected-1",
+        label: "候选人一",
+        outer_html_length: 128
+      }
+    }
+  };
+  assert.equal(
+    requireExactChatCandidateSelection(exactSelection, { id: "expected-1" }),
+    exactSelection.ready
+  );
+  assert.deepEqual(compactChatCandidateSelectionReadyState(exactSelection.ready), {
+    ok: true,
+    reason: "online_resume_probe_skipped",
+    elapsed_ms: null,
+    expected_candidate_id: "expected-1",
+    active_candidate_id: "expected-1",
+    candidate_selection_verified: true,
+    active_candidate: {
+      node_id: 42,
+      selector: ".geek-item.selected[data-id]",
+      candidate_id: "expected-1",
+      label: "候选人一",
+      outer_html_length: 128
+    }
+  });
+  const invalidSelections = [
+    [{ ready: { ...exactSelection.ready, candidate_selection_verified: false } }, { id: "expected-1" }],
+    [{ ready: { ...exactSelection.ready, expected_candidate_id: "other" } }, { id: "expected-1" }],
+    [{ ready: { ...exactSelection.ready, active_candidate_id: "other" } }, { id: "expected-1" }],
+    [{ ready: exactSelection.ready }, { id: "" }],
+    [{ ready: null }, { id: "expected-1" }]
+  ];
+  for (const [selected, candidate] of invalidSelections) {
+    assert.throws(
+      () => requireExactChatCandidateSelection(selected, candidate),
+      (error) => error?.code === "CHAT_ACTIVE_CANDIDATE_MISMATCH"
+    );
+  }
 
   const modalError = new Error("Chat online resume modal did not open");
   modalError.code = CHAT_ONLINE_RESUME_MODAL_NOT_OPEN_CODE;
@@ -303,9 +789,10 @@ async function testFinalFailureScreenshotArtifact() {
   assert.equal(captured, true);
   assert.equal(final.checkpoint.final_failure_artifact.kind, "chat_final_failure_page");
   assert.equal(final.checkpoint.final_failure_artifact.page_state.is_chat_shell, true);
-  const filePath = final.checkpoint.final_failure_artifact.screenshot.file_path;
-  assert.match(filePath, /chat-final-failure-candidate-001\.jpg$/);
-  assert.equal(fs.existsSync(filePath), true);
+  const screenshot = final.checkpoint.final_failure_artifact.screenshot;
+  assert.equal(screenshot.file_path, null);
+  assert.equal(screenshot.persistence, "forbidden_uncropped_viewport");
+  assert.deepEqual(fs.readdirSync(imageOutputDir), [], "final-failure capture must not persist viewport bytes");
   fs.rmSync(imageOutputDir, { recursive: true, force: true });
 }
 
@@ -527,6 +1014,7 @@ function testChatFullCvEvidenceGate() {
     },
     imageEvidence: {
       ok: true,
+      coverage_complete: true,
       llm_file_paths: ["C:/tmp/cv.jpg"],
       llm_screenshot_count: 1
     }
@@ -534,9 +1022,62 @@ function testChatFullCvEvidenceGate() {
   assert.equal(imageResume.full_cv_acquired, true);
   assert.equal(imageResume.source, "image");
   assert.equal(imageResume.network_profile_only_count, 1);
+
+  const incompleteImageResume = summarizeChatFullCvEvidence({
+    imageEvidence: {
+      ok: true,
+      coverage_complete: false,
+      screenshot_count: 4,
+      file_paths: ["partial-page.jpg"],
+      llm_file_paths: ["partial-page.jpg"]
+    }
+  });
+  assert.equal(incompleteImageResume.full_cv_acquired, false);
+  assert.equal(incompleteImageResume.image_full_cv, false);
+  assert.equal(incompleteImageResume.image_summary.ok, false);
+  assert.equal(hasScreenableChatFullCvEvidence({ full_cv_acquired: true }, {
+    ok: true,
+    coverage_complete: false,
+    file_paths: ["partial-page.jpg"]
+  }), false);
+  assert.equal(hasScreenableChatFullCvEvidence({ full_cv_acquired: true }, {
+    ok: true,
+    coverage_complete: true,
+    file_paths: ["complete-page.jpg"]
+  }), true);
+  assert.equal(hasScreenableChatFullCvEvidence({
+    full_cv_acquired: true,
+    source: "image"
+  }, null), false);
+  assert.equal(hasScreenableChatFullCvEvidence({
+    full_cv_acquired: true,
+    source: "image"
+  }, {
+    ok: true,
+    coverage_complete: true,
+    file_paths: []
+  }), false);
+
+  const unknownCaptureOutcome = new Error("Connection closed");
+  unknownCaptureOutcome.cdp_method = "Page.captureScreenshot";
+  unknownCaptureOutcome.cdp_outcome_unknown = true;
+  unknownCaptureOutcome.cdp_replay_suppressed = true;
+  assert.equal(isRecoverableChatImageCaptureError(unknownCaptureOutcome), true);
+  assert.equal(isRecoverableChatImageCaptureError({
+    cdp_method: "DOM.getBoxModel",
+    cdp_outcome_unknown: true,
+    cdp_replay_suppressed: true
+  }), true);
 }
 
 testChatFullCvEvidenceGate();
+testExactExistingRequestStateReconcilesUnknownJournal();
+testExistingRequestStateReconciliationFailsClosedWithoutExactEvidence();
+testProtectedRequestOutcomeUnknownIsSkippedWithoutReplay();
+await testCollectCvProcessingFloorHelpers();
+await testCollectCvProcessingFloorServiceContract();
+testChatDetailRecoveryBudgetCapsModalRetry();
+testChatEditorRetryIsLimitedToPreAction();
 testChatResumeCaptureTarget();
 testChatPreDetailAttachmentResumeSkipReason();
 testCollectCvModeDoesNotOpenOnlineResumeDetail();

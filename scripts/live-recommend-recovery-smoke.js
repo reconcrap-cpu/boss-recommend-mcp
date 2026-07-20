@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
@@ -242,7 +241,6 @@ async function run() {
       url: target.url,
       title: target.title
     };
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
     await enableDomains(client, ["Page", "DOM", "Input", "Accessibility"]);
     await bringPageToFront(client);
 
@@ -273,7 +271,7 @@ async function run() {
     const afterState = await summarizeRecommendState(client);
     result.after = afterState.summary;
     result.method_summary = methodSummary(methodLog);
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
 
     if (!refreshResult.ok) {
       throw new Error(`Recommend recovery refresh failed: ${refreshResult.reason || refreshResult.error || "unknown"}`);

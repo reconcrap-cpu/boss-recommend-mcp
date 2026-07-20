@@ -177,6 +177,8 @@ boss-recommend-mcp schedule-status --schedule-id <schedule_id>
 - 不会对每位候选人重复确认
 - 推荐页详情处理完成后，会强制关闭详情页并确认已关闭
 - 简历提取优先使用 Network 响应；没有可解析 Network CV 时，回退到完整滚动截图序列再交给多模态模型判断
+- recommend / search / chat 共用同一条截图安全路径：浏览器只截取可见视口（`captureBeyondViewport:false`、`fromSurface:true`、不传 `clip`），再由现有 Sharp 依赖在本地裁剪 CV 区域；滚动序列至少保留 20% 重叠，只有在连续两次滚动且图像与可用 DOM 锚点均无进展后才判定到底。达到页数上限但没有终止证据时会 fail closed，不会把可能截断的简历交给模型。
+- `Page.captureScreenshot` 不会在 CDP 断线后自动重放；超时或连接关闭会放弃原 session、重新获取 document / iframe / CV target，并且每位候选人最多做一次工作流级恢复。视口健康度始终相对最初稳定基线比较宽度和高度，恢复后需要连续两次稳定读数。
 - recommend / search / 带 `criteria` 的 chat 正式运行默认全部使用 `screening-config.json` 配置的 LLM 筛选；chat 的 `criteria` 留空时进入收集简历模式，不需要 LLM 配置。deterministic/local scorer 只保留给明确测试场景，必须显式传 `debug_test_mode=true` 且 `screening_mode=deterministic` 或 `use_llm=false`。
 - `detail_limit=0`、`no_filter`、`filter_enabled=false`、后置动作 dry-run、chat 求简历 dry-run 等调试路径不会在正式 live run 默认启用；需要测试时必须显式传 `debug_test_mode=true`。
 - 提供显式运维自愈工具：只在手动调用 `run_recommend_self_heal` 时运行，不会接入正常 run / doctor / preflight 自动链路
@@ -464,6 +466,8 @@ node src/cli.js chat prepare-run --slow-live --port 9222
 说明：
 
 - `start_from` / `target_count` 为必填；`criteria` 可选，留空时 chat run 进入收集简历模式：不触发 LLM 筛选，针对没有在线/附件简历的人选发送求简历消息并点击求简历按钮
+- 收集简历模式会为每位已识别的人选随机设定 `10-15` 秒的最低处理时长；已有在线/附件简历、已发送过简历请求或需要新发请求都适用。候选人处理本身已达到目标时不再额外补时，否则只等待剩余差额。
+- 该最低处理时长独立于 `human_behavior.restLevel`：补时结束后仍按用户选择的 `low/medium/high` 执行原有休息预算；显式 `delay_ms` 也继续作为后续的额外延时。
 - `greeting_text` 可选（兼容 `greetingText`）
 - `profile` 可选，默认 `default`
 - `job` 与 `port` 继承 recommend run 已选岗位和调试端口
@@ -501,6 +505,7 @@ chat-only 交互建议：
 - 然后基于 `job_options` 让用户选择 `job`，并补齐 `start_from`、`target_count` 后调用 `start_boss_chat_run` 启动任务；若要筛选再求简历，提供 `criteria`，若只想收集缺失简历则留空。
 - `greeting_text` 可选；未传时使用 `screening-config.json.greetingMessage`，若未配置则使用默认招呼语（`Hi同学，能麻烦发下简历吗？`）。
 - `target_count` 支持正整数、`all`、`-1`；若用户给出 `全部候选人` / `所有候选人`，会自动按不限（扫到底）处理。
+- `criteria` 留空的收集简历模式固定保证每位人选从识别到提交结果至少停留随机 `10-15` 秒；该产品级下限无需新增参数，且不会替代所选休息强度。
 
 Trae-CN / 长对话防循环建议：
 

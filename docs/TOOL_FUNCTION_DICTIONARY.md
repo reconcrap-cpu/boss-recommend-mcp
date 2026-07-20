@@ -544,10 +544,10 @@ Required inputs:
 - `job`
 - `start_from`: `unread` or `all`
 - `target_count`: positive integer or all-token.
-- `criteria`
 
 Optional inputs:
 
+- `criteria`: blank enables collect-CV mode.
 - `profile`
 - `greeting_text` or `greetingText`
 - `port`
@@ -568,6 +568,7 @@ Expected behavior:
 - Start async chat run service and return `ACCEPTED` with `run_id`.
 - For passed candidates, request CV unless already available/requested.
 - For `target_count=all`, process until list end and complete even if no candidate passes.
+- In collect-CV mode, enforce a random 10-15 second minimum handling time for every identified candidate regardless of existing-CV/request state. Wait only for the remaining deficit, then apply the selected human-rest policy and any explicit `delay_ms` as separate later layers.
 
 Failure behavior:
 
@@ -1210,6 +1211,7 @@ Expected behavior:
 - Normalize target-count all tokens.
 - Persist chat artifacts under boss-chat data dir.
 - Preserve request-CV action information in CSV/report.
+- Persist collect-CV processing-floor configuration and observed per-candidate/cumulative timing evidence in run context, progress, report, and CSV metadata.
 
 ### `src/chat-runtime-config.js`
 

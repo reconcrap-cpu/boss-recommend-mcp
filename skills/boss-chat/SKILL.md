@@ -63,6 +63,7 @@ Trae/Trae-CN split-server config exposes these under the `boss-chat` MCP server.
 ## Hard Rules
 
 - 有筛选 `criteria` 时，LLM 配置必须复用 `boss-recommend-mcp` 的 `screening-config.json`；不要再向用户单独要 `baseUrl/apiKey/model`。`criteria` 留空的收集简历模式不需要 LLM 配置。
+- `criteria` 留空的收集简历模式固定为每位已识别人选执行随机 `10-15` 秒最低处理时长，无论已有在线/附件简历、请求已发送或需要新发请求；无需也不得向用户追问额外节奏参数。该下限只补足处理时长差额，之后仍独立执行用户选择的 `rest_level` 休息策略。
 - 路由护栏（强制）：
   - 只在用户明确是 chat-only 任务时使用本 skill。
   - 只要用户提到推荐页、先找人后沟通、或需要推荐筛选阶段，禁止直接调用 `start_boss_chat_run`；必须先交给 `boss-recommend-pipeline` 完成推荐页任务。

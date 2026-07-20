@@ -17,14 +17,31 @@ const DEFAULT_RECRUIT_ROOT = path.resolve(
 const PATTERNS = [
   { id: "runtime-evaluate", regex: /\bRuntime\.evaluate\b/ },
   { id: "runtime-call-function-on", regex: /\bRuntime\.callFunctionOn\b/ },
+  { id: "debugger-evaluate-on-call-frame", regex: /\bDebugger\.evaluateOnCallFrame\b/ },
   { id: "page-evaluate", regex: /\bpage\.evaluate\b/ },
   { id: "page-dollar-eval", regex: /\b(?:page|frame)\.\$\$?eval\s*\(/ },
+  { id: "page-evaluate-on-new-document", regex: /\bpage\.evaluateOnNewDocument\s*\(/ },
+  { id: "playwright-add-init-script", regex: /\b(?:page|context|browserContext)\.addInitScript\s*\(/ },
   { id: "page-add-script-to-evaluate", regex: /\bPage\.addScriptToEvaluateOnNewDocument\b/ },
+  { id: "page-set-document-content", regex: /\bPage\.setDocumentContent\s*\(/ },
+  { id: "dom-set-outer-html", regex: /\bDOM\.setOuterHTML\s*\(/ },
+  { id: "dom-set-attribute-value", regex: /\bDOM\.setAttributeValue\s*\(/ },
+  { id: "dom-set-attributes-as-text", regex: /\bDOM\.setAttributesAsText\s*\(/ },
+  { id: "dom-set-node-value", regex: /\bDOM\.setNodeValue\s*\(/ },
+  {
+    id: "cdp-send-expression-execution",
+    regex: /\bsend\s*\(\s*["'`](?:Runtime\.(?:evaluate|callFunctionOn)|Debugger\.evaluateOnCallFrame|Page\.(?:addScriptToEvaluateOnNewDocument|setDocumentContent))["'`]/
+  },
   { id: "lowercase-runtime-evaluate", regex: /\bruntime\.evaluate\b/ },
   { id: "global-eval", regex: /(^|[^A-Za-z0-9_.])eval\s*\(/ },
   { id: "function-constructor", regex: /\b(?:new\s+)?Function\s*\(/ },
   { id: "script-element-injection", regex: /\b(?:document\.)?createElement\s*\(\s*["']script["']/i },
+  {
+    id: "script-markup-injection",
+    regex: /\b(?:innerHTML\s*=|insertAdjacentHTML\s*\(|document\.write(?:ln)?\s*\(|Page\.setDocumentContent\s*\()[^\n]*<script\b/i
+  },
   { id: "javascript-navigation-call", regex: /\b(?:Page\.navigate|location\.(?:assign|replace))\b[^\n]*\bjavascript\s*:/i },
+  { id: "javascript-browser-navigation", regex: /\b(?:page\.goto|window\.open)\s*\(\s*["'`]\s*javascript\s*:/i },
   { id: "javascript-location-assignment", regex: /\b(?:window\.)?location(?:\.href)?\s*=\s*["'`]\s*javascript\s*:/i },
   { id: "generated-expression-helper", regex: /\bbuild[A-Za-z0-9_]*Expression\b/ },
   { id: "page-document-query", regex: /\bdocument\.querySelector(?:All)?\b/ },
@@ -32,10 +49,6 @@ const PATTERNS = [
 ];
 
 const ALLOWLIST = [
-  {
-    relativePath: path.normalize("src/core/browser/index.js"),
-    reason: "CDP guard module blocks forbidden methods; it does not execute page JS."
-  },
   {
     relativePath: path.normalize("scripts/scan-forbidden-runtime.js"),
     reason: "Static scanner names forbidden APIs so it can reject them; it does not execute page JS."
@@ -77,9 +90,13 @@ function parseArgs(argv) {
   };
 }
 
-function isAllowedFinding(root, filePath) {
+function getAllowlistEntry(root, filePath, { pattern, line }) {
   const relativePath = path.normalize(path.relative(root, filePath));
-  return ALLOWLIST.find((entry) => entry.relativePath === relativePath) || null;
+  return ALLOWLIST.find((entry) => (
+    entry.relativePath === relativePath
+    && (!entry.pattern || entry.pattern === pattern)
+    && (!entry.lineRegex || entry.lineRegex.test(line))
+  )) || null;
 }
 
 function getQuarantineEntry(label, root, filePath) {
@@ -119,14 +136,18 @@ function scanFile({ label, root, filePath }) {
   const text = fs.readFileSync(filePath, "utf8");
   const lines = text.split(/\r?\n/);
   const findings = [];
-  const allowlistEntry = isAllowedFinding(root, filePath);
-  const quarantineEntry = allowlistEntry ? null : getQuarantineEntry(label, root, filePath);
-  const status = allowlistEntry
-    ? "allowed"
-    : quarantineEntry
-      ? "legacy-quarantined"
-      : "active";
+  const quarantineEntry = getQuarantineEntry(label, root, filePath);
   if (path.basename(filePath).toLowerCase() === "page.js") {
+    const line = "Forbidden page.js file";
+    const allowlistEntry = getAllowlistEntry(root, filePath, {
+      pattern: "page-js-file",
+      line
+    });
+    const status = allowlistEntry
+      ? "allowed"
+      : quarantineEntry
+        ? "legacy-quarantined"
+        : "active";
     findings.push({
       label,
       domain: domainFor(label, filePath),
@@ -134,7 +155,7 @@ function scanFile({ label, root, filePath }) {
       relative_path: path.relative(root, filePath),
       line_number: 1,
       pattern: "page-js-file",
-      line: "Forbidden page.js file",
+      line,
       status,
       allowed: status === "allowed",
       quarantined: status === "legacy-quarantined",
@@ -147,6 +168,15 @@ function scanFile({ label, root, filePath }) {
     const line = lines[index];
     for (const pattern of PATTERNS) {
       if (!pattern.regex.test(line)) continue;
+      const allowlistEntry = getAllowlistEntry(root, filePath, {
+        pattern: pattern.id,
+        line
+      });
+      const status = allowlistEntry
+        ? "allowed"
+        : quarantineEntry
+          ? "legacy-quarantined"
+          : "active";
       findings.push({
         label,
         domain: domainFor(label, filePath),

@@ -14,6 +14,7 @@ import {
 import { CHAT_TARGET_URL } from "./constants.js";
 
 export const CHAT_FORBIDDEN_TOP_LEVEL_RESUME_CODE = "CHAT_FORBIDDEN_TOP_LEVEL_RESUME_NAVIGATION";
+export const BOSS_SECURITY_VERIFICATION_REQUIRED_CODE = "BOSS_SECURITY_VERIFICATION_REQUIRED";
 
 export function isChatShellUrl(url = "") {
   const value = String(url || "");
@@ -23,6 +24,10 @@ export function isChatShellUrl(url = "") {
 
 export function isForbiddenChatResumeTopLevelUrl(url = "") {
   return /https?:\/\/[^/]*zhipin\.com\/web\/frame\/c-resume\/?/i.test(String(url || ""));
+}
+
+export function isBossSecurityVerificationUrl(url = "") {
+  return /https?:\/\/[^/]*zhipin\.com\/web\/passport\/zp\/verify\.html(?:[?#]|$)/i.test(String(url || ""));
 }
 
 export async function getChatTopLevelState(client) {
@@ -37,8 +42,25 @@ export async function getChatTopLevelState(client) {
     url,
     is_chat_shell: isChatShellUrl(url),
     is_forbidden_resume_top_level: isForbiddenChatResumeTopLevelUrl(url),
+    is_security_verification: isBossSecurityVerificationUrl(url),
     error
   };
+}
+
+export function makeBossSecurityVerificationRequiredError(pageState, context = "chat") {
+  const error = new Error(
+    `BOSS_SECURITY_VERIFICATION_REQUIRED during ${context}: ${pageState?.url || "unknown"}`
+  );
+  error.code = BOSS_SECURITY_VERIFICATION_REQUIRED_CODE;
+  error.requires_user_verification = true;
+  error.retryable = true;
+  error.page_state = pageState || null;
+  return error;
+}
+
+export function isBossSecurityVerificationRequiredError(error) {
+  return error?.code === BOSS_SECURITY_VERIFICATION_REQUIRED_CODE
+    || /BOSS_SECURITY_VERIFICATION_REQUIRED/i.test(String(error?.message || error || ""));
 }
 
 export function makeForbiddenChatResumeNavigationError(pageState, message = "") {
@@ -57,6 +79,9 @@ export async function assertChatShellNotResumeTopLevel(client, {
   context = "chat"
 } = {}) {
   const state = await getChatTopLevelState(client);
+  if (state.is_security_verification) {
+    throw makeBossSecurityVerificationRequiredError(state, context);
+  }
   if (state.is_forbidden_resume_top_level) {
     throw makeForbiddenChatResumeNavigationError(
       state,
@@ -75,6 +100,9 @@ export async function recoverChatShell(client, {
   settleAfterNavigate = false
 } = {}) {
   const before = await getChatTopLevelState(client);
+  if (before.is_security_verification) {
+    throw makeBossSecurityVerificationRequiredError(before, "chat_shell_recovery");
+  }
   if (before.is_chat_shell && !forceNavigate) {
     return {
       recovered: false,
@@ -89,11 +117,18 @@ export async function recoverChatShell(client, {
   if (forceNavigate && settleMs > 0) {
     await sleep(settleMs);
   }
-  const waited = await waitForMainFrameUrl(client, isChatShellUrl, {
-    timeoutMs,
-    intervalMs
-  });
+  const waited = await waitForMainFrameUrl(
+    client,
+    (url) => isChatShellUrl(url) || isBossSecurityVerificationUrl(url),
+    {
+      timeoutMs,
+      intervalMs
+    }
+  );
   const after = await getChatTopLevelState(client);
+  if (after.is_security_verification) {
+    throw makeBossSecurityVerificationRequiredError(after, "chat_shell_recovery");
+  }
   let miniFreshStart = null;
   if (after.is_chat_shell && settleAfterNavigate) {
     miniFreshStart = await waitForMiniFreshStartSettle(client, {

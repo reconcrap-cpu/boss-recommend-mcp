@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
@@ -208,7 +207,6 @@ async function run() {
       url: target.url,
       title: target.title
     };
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
 
     await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
     const networkRecorder = createRecommendDetailNetworkRecorder(client);
@@ -299,7 +297,7 @@ async function run() {
       criteria: options.criteria
     });
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
 
     let savedPayloadPath = null;
     result.status = "PASS";

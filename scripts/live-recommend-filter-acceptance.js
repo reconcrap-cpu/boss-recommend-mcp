@@ -69,7 +69,11 @@ async function ensureState(client, currentCityOnly, activityLevel) {
 }
 
 async function capture(client, name) {
-  const screenshot = await client.Page.captureScreenshot({ format: "png", fromSurface: true });
+  const screenshot = await client.Page.captureScreenshot({
+    format: "png",
+    fromSurface: true,
+    captureBeyondViewport: false
+  });
   const screenshotPath = path.join(outputDir, `${name}.png`);
   fs.writeFileSync(screenshotPath, Buffer.from(screenshot.data, "base64"));
   return screenshotPath;

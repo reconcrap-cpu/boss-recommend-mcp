@@ -2277,6 +2277,20 @@ function parseDetachedWorkerOptions(argv = process.argv.slice(2)) {
   };
 }
 
+function canonicalExecutablePath(value = "") {
+  const resolved = path.resolve(String(value || ""));
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+function isMainModulePath(argvPath = "", modulePath = "") {
+  if (!argvPath || !modulePath) return false;
+  return canonicalExecutablePath(argvPath) === canonicalExecutablePath(modulePath);
+}
+
 function launchDetachedRunWorker({ runId, resumeRun = false }) {
   const childArgs = [thisFilePath, DETACHED_WORKER_FLAG, DETACHED_WORKER_RUN_ID_FLAG, String(runId)];
   if (resumeRun) {
@@ -3473,6 +3487,7 @@ export const __testables = {
   createToolsSchema,
   getConfiguredMcpToolset,
   normalizeMcpToolset,
+  isMainModulePath,
   handleRequest,
   runDetachedWorkerForTests(options = {}) {
     return runDetachedWorker(options);
@@ -3534,7 +3549,7 @@ export const __testables = {
 };
 
 const thisFilePath = fileURLToPath(import.meta.url);
-if (process.argv[1] && path.resolve(process.argv[1]) === thisFilePath) {
+if (isMainModulePath(process.argv[1], thisFilePath)) {
   const detachedWorkerOptions = parseDetachedWorkerOptions(process.argv.slice(2));
   if (detachedWorkerOptions) {
     installDetachedWorkerFailureHandlers(detachedWorkerOptions.runId);

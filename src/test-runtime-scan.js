@@ -12,11 +12,15 @@ const scannerSource = fs.readFileSync(scannerPath, "utf8");
 
 for (const patternId of [
   "page-dollar-eval",
+  "page-evaluate-on-new-document",
+  "playwright-add-init-script",
   "page-add-script-to-evaluate",
   "global-eval",
   "function-constructor",
   "script-element-injection",
+  "script-markup-injection",
   "javascript-navigation-call",
+  "javascript-browser-navigation",
   "javascript-location-assignment",
   "page-js-file"
 ]) {
@@ -43,7 +47,7 @@ assert.equal(
   report.summary.legacy_quarantined_findings
 );
 assert.ok(report.summary.raw_active_findings > 0);
-assert.ok(report.summary.allowed_findings > 0);
+assert.equal(report.summary.allowed_findings, 0);
 assert.ok(report.findings.every((finding) => finding.status !== "active"));
 assert.ok(report.findings.some((finding) => finding.status === "legacy-quarantined"));
 
@@ -61,6 +65,7 @@ assert.equal(packageSurfaceReport.summary.reachable_findings, 0);
 assert.equal(packageSurfaceReport.summary.active_findings, 0);
 assert.equal(packageSurfaceReport.summary.raw_active_findings, 0);
 assert.equal(packageSurfaceReport.summary.legacy_quarantined_findings, 0);
+assert.equal(packageSurfaceReport.summary.allowed_findings, 0);
 assert.equal(packageSurfaceReport.summary.strict_gate, "pass");
 
 const packageStrictRun = runScanner(["--package-surface", "--fail-on-legacy"]);

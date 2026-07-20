@@ -339,10 +339,18 @@ function compactCdpMethodTimestamp(value) {
 function compactMethodLogForStatus(methodLog = []) {
   if (!Array.isArray(methodLog)) return [];
   return methodLog
-    .map((entry) => ({
-      method: compactCdpMethodName(entry?.method || entry || ""),
-      at: compactCdpMethodTimestamp(entry?.at || "")
-    }))
+    .map((entry) => {
+      const compact = {
+        method: compactCdpMethodName(entry?.method || entry || ""),
+        at: compactCdpMethodTimestamp(entry?.at || "")
+      };
+      for (const key of ["connection_epoch", "replay_of_connection_epoch"]) {
+        if (Number.isInteger(entry?.[key]) && entry[key] >= 0) compact[key] = entry[key];
+      }
+      const replayPolicy = normalizeText(entry?.replay_policy || "");
+      if (replayPolicy) compact.replay_policy = replayPolicy.slice(0, 100);
+      return compact;
+    })
     .filter((entry) => Boolean(entry.method))
     .slice(-STATUS_METHOD_LOG_TAIL_LIMIT);
 }
@@ -674,6 +682,16 @@ function normalizeLegacyProgress(progress = {}, summary = null) {
       normalized.list_read_stale_diagnostics
     );
   }
+  if (Object.prototype.hasOwnProperty.call(normalized, "dom_stale_forensic")) {
+    normalized.dom_stale_forensic = compactDomStaleForensicForStatus(
+      normalized.dom_stale_forensic
+    );
+  }
+  if (Object.prototype.hasOwnProperty.call(normalized, "dom_stale_forensics")) {
+    normalized.dom_stale_forensics = compactDomStaleForensicsForStatus(
+      normalized.dom_stale_forensics
+    );
+  }
   return normalized;
 }
 
@@ -713,14 +731,38 @@ function compactListReadStaleDiagnosticForStatus(value) {
   const source = plainRecord(value);
   if (!Object.keys(source).length) return null;
   const compact = {};
-  for (const key of ["code", "message", "phase", "cdp_method", "cdp_at", "recovery_mode"]) {
+  for (const key of [
+    "name",
+    "code",
+    "message",
+    "phase",
+    "cdp_method",
+    "cdp_at",
+    "cdp_search_id",
+    "cdp_replay_policy",
+    "recovery_mode"
+  ]) {
     const text = normalizeText(source[key] || "");
     if (text) compact[key] = text.slice(0, key === "message" ? 500 : 200);
   }
-  for (const key of ["cdp_node_id", "cdp_backend_node_id", "attempt"]) {
+  for (const key of [
+    "cdp_node_id",
+    "cdp_backend_node_id",
+    "cdp_connection_epoch",
+    "cdp_reconnected_epoch",
+    "attempt"
+  ]) {
     if (Number.isInteger(source[key]) && source[key] >= 0) compact[key] = source[key];
   }
-  for (const key of ["exhausted", "recovery_applied", "recovered"]) {
+  for (const key of [
+    "exhausted",
+    "recovery_applied",
+    "recovered",
+    "cdp_replay_suppressed",
+    "cdp_outcome_unknown",
+    "cdp_reconnected",
+    "cdp_replayed_after_reconnect"
+  ]) {
     if (typeof source[key] === "boolean") compact[key] = source[key];
   }
   for (const key of ["at", "recovery_applied_at", "recovered_at"]) {
@@ -733,7 +775,146 @@ function compactListReadStaleDiagnosticForStatus(value) {
       .filter((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key))
       .slice(0, 20);
   }
+  if (source.cdp_reconnect_error !== undefined && source.cdp_reconnect_error !== null) {
+    const reconnectError = plainRecord(source.cdp_reconnect_error);
+    if (Object.keys(reconnectError).length) {
+      const safeReconnectError = {};
+      for (const key of ["name", "code", "message"]) {
+        const text = normalizeText(reconnectError[key] || "");
+        if (text) safeReconnectError[key] = text.slice(0, key === "message" ? 500 : 200);
+      }
+      if (Object.keys(safeReconnectError).length) compact.cdp_reconnect_error = safeReconnectError;
+    } else {
+      const reconnectErrorText = normalizeText(source.cdp_reconnect_error);
+      if (reconnectErrorText) compact.cdp_reconnect_error = reconnectErrorText.slice(0, 500);
+    }
+  }
   return Object.keys(compact).length ? compact : null;
+}
+
+function compactDomStaleRootIdentityForStatus(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  for (const key of [
+    "connection_epoch",
+    "top_document_node_id",
+    "iframe_owner_node_id",
+    "iframe_document_node_id"
+  ]) {
+    if (Number.isInteger(source[key]) && source[key] >= 0) compact[key] = source[key];
+  }
+  const iframeSelector = normalizeText(source.iframe_selector || "");
+  if (iframeSelector) compact.iframe_selector = iframeSelector.slice(0, 300);
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactDomStaleNumericRecordForStatus(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  for (const [key, rawValue] of Object.entries(source)) {
+    if (!/^[a-z][a-z0-9_]*$/i.test(key)) continue;
+    if (!Number.isInteger(rawValue) || rawValue < 0) continue;
+    compact[key] = rawValue;
+    if (Object.keys(compact).length >= 30) break;
+  }
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactDomStaleLifecycleTimelineForStatus(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((rawEntry) => {
+      const entry = plainRecord(rawEntry);
+      const compact = {};
+      const at = compactCdpMethodTimestamp(entry.at || "");
+      if (at) compact.at = at;
+      for (const key of ["type", "operation", "frame_id", "parent_frame_id", "loader_id"]) {
+        const text = normalizeText(entry[key] || "");
+        if (text) compact[key] = text.slice(0, 300);
+      }
+      if (Number.isInteger(entry.connection_epoch) && entry.connection_epoch >= 0) {
+        compact.connection_epoch = entry.connection_epoch;
+      }
+      const url = compactChromeEvidenceUrl(entry.url);
+      if (url) compact.url = url;
+      return Object.keys(compact).length ? compact : null;
+    })
+    .filter(Boolean)
+    .slice(-20);
+}
+
+function compactDomStaleCandidateForStatus(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  for (const key of ["index", "card_node_id", "visible_index", "failing_list_node_id"]) {
+    if (Number.isInteger(source[key]) && source[key] >= 0) compact[key] = source[key];
+  }
+  const candidateKey = normalizeText(source.key || "");
+  if (candidateKey) compact.key = candidateKey.slice(0, 300);
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactDomStaleRecoveryForStatus(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  for (const key of ["status", "mode", "escalated_from", "method"]) {
+    const text = normalizeText(source[key] || "");
+    if (text) compact[key] = text.slice(0, 200);
+  }
+  const at = compactCdpMethodTimestamp(source.at || "");
+  if (at) compact.at = at;
+  if (typeof source.ok === "boolean") compact.ok = source.ok;
+  if (Number.isInteger(source.card_count) && source.card_count >= 0) {
+    compact.card_count = source.card_count;
+  }
+  const error = compactListReadStaleDiagnosticForStatus(source.error);
+  if (error) compact.error = error;
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactDomStaleForensicForStatus(value) {
+  const source = plainRecord(value);
+  if (!Object.keys(source).length) return null;
+  const compact = {};
+  if (Number.isInteger(source.schema_version) && source.schema_version >= 0) {
+    compact.schema_version = source.schema_version;
+  }
+  for (const key of ["event_id", "event_type", "phase", "operation", "detail_step"]) {
+    const text = normalizeText(source[key] || "");
+    if (text) compact[key] = text.slice(0, key === "event_id" ? 300 : 200);
+  }
+  const at = compactCdpMethodTimestamp(source.at || "");
+  if (at) compact.at = at;
+
+  const candidate = compactDomStaleCandidateForStatus(source.candidate);
+  if (candidate) compact.candidate = candidate;
+  const error = compactListReadStaleDiagnosticForStatus(source.error);
+  if (error) compact.error = error;
+  const preRecoveryRoots = compactDomStaleRootIdentityForStatus(source.pre_recovery_roots);
+  if (preRecoveryRoots) compact.pre_recovery_roots = preRecoveryRoots;
+  const postRecoveryRoots = compactDomStaleRootIdentityForStatus(source.post_recovery_roots);
+  if (postRecoveryRoots) compact.post_recovery_roots = postRecoveryRoots;
+  const candidateList = compactDomStaleNumericRecordForStatus(source.candidate_list);
+  if (candidateList) compact.candidate_list = candidateList;
+  const counters = compactDomStaleNumericRecordForStatus(source.counters);
+  if (counters) compact.counters = counters;
+  const lifecycleTimeline = compactDomStaleLifecycleTimelineForStatus(source.lifecycle_timeline);
+  if (lifecycleTimeline.length) compact.lifecycle_timeline = lifecycleTimeline;
+  const recovery = compactDomStaleRecoveryForStatus(source.recovery);
+  if (recovery) compact.recovery = recovery;
+  return Object.keys(compact).length ? compact : null;
+}
+
+function compactDomStaleForensicsForStatus(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => compactDomStaleForensicForStatus(item))
+    .filter(Boolean)
+    .slice(-12);
 }
 
 function compactListReadStaleDiagnosticsForStatus(value) {
@@ -842,6 +1023,10 @@ function compactRecommendSummaryForStatus(summary) {
   if (lastStaleDiagnostic) compact.last_list_read_stale_diagnostic = lastStaleDiagnostic;
   const staleDiagnostics = compactListReadStaleDiagnosticsForStatus(summary.list_read_stale_diagnostics);
   if (staleDiagnostics.length) compact.list_read_stale_diagnostics = staleDiagnostics;
+  const domStaleForensic = compactDomStaleForensicForStatus(summary.dom_stale_forensic);
+  if (domStaleForensic) compact.dom_stale_forensic = domStaleForensic;
+  const domStaleForensics = compactDomStaleForensicsForStatus(summary.dom_stale_forensics);
+  if (domStaleForensics.length) compact.dom_stale_forensics = domStaleForensics;
   return compact;
 }
 
@@ -869,6 +1054,10 @@ function compactRecommendCheckpointForStatus(checkpoint) {
     const event = compactListReadStaleCheckpointEvent(checkpoint[key]);
     if (event) compact[key] = event;
   }
+  const domStaleForensic = compactDomStaleForensicForStatus(checkpoint.dom_stale_forensic);
+  if (domStaleForensic) compact.dom_stale_forensic = domStaleForensic;
+  const domStaleForensics = compactDomStaleForensicsForStatus(checkpoint.dom_stale_forensics);
+  if (domStaleForensics.length) compact.dom_stale_forensics = domStaleForensics;
   return compact;
 }
 

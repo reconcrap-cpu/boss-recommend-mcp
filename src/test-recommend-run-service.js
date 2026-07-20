@@ -14,6 +14,8 @@ import {
 } from "./domains/recommend/index.js";
 import {
   acquireRecommendListReadWithStaleRecovery,
+  compactRecommendDomRootIdentity,
+  createRecommendDomStaleForensicEvent,
   createRecommendDebugBoundaryController,
   createRecommendRefreshFailureError,
   normalizeRecommendDebugBoundaryOptions,
@@ -25,6 +27,10 @@ function createListReadStaleError(nodeId = 101) {
   error.cdp_method = "DOM.querySelectorAll";
   error.cdp_at = "2026-07-17T10:00:00.000Z";
   error.cdp_node_id = nodeId;
+  error.cdp_connection_epoch = 2;
+  error.cdp_reconnected_epoch = 3;
+  error.cdp_replay_policy = "safe_read_only";
+  error.cdp_replayed_after_reconnect = true;
   error.cdp_param_keys = ["nodeId", "selector", "unsafe-key!"];
   return error;
 }
@@ -181,6 +187,7 @@ async function testListReadStaleRecoveryThenSuccess() {
   let acquireCount = 0;
   let recoverCount = 0;
   const recoveredDiagnostics = [];
+  const order = [];
   const acquisition = await acquireRecommendListReadWithStaleRecovery({
     maxRetries: 2,
     acquire: async () => {
@@ -188,11 +195,19 @@ async function testListReadStaleRecoveryThenSuccess() {
       if (acquireCount === 1) throw createListReadStaleError(111);
       return { ok: true, item: { key: "candidate:new" } };
     },
+    onStale: async () => {
+      order.push("stale_checkpoint");
+    },
     recover: async () => {
+      order.push("recover");
       recoverCount += 1;
       return { recovery_mode: "root_reacquire" };
     },
+    onRecoveryApplied: async () => {
+      order.push("recovery_applied");
+    },
     onRecovered: async ({ diagnostic }) => {
+      order.push("recovered");
       recoveredDiagnostics.push(diagnostic);
     }
   });
@@ -203,10 +218,77 @@ async function testListReadStaleRecoveryThenSuccess() {
   assert.equal(acquisition.stale_diagnostics[0].recovered, true);
   assert.equal(acquisition.stale_diagnostics[0].cdp_method, "DOM.querySelectorAll");
   assert.equal(acquisition.stale_diagnostics[0].cdp_node_id, 111);
+  assert.equal(acquisition.stale_diagnostics[0].cdp_connection_epoch, 2);
+  assert.equal(acquisition.stale_diagnostics[0].cdp_reconnected_epoch, 3);
+  assert.equal(acquisition.stale_diagnostics[0].cdp_replay_policy, "safe_read_only");
+  assert.equal(acquisition.stale_diagnostics[0].cdp_replayed_after_reconnect, true);
   assert.equal(acquisition.stale_diagnostics[0].cdp_at, "2026-07-17T10:00:00.000Z");
   assert.deepEqual(acquisition.stale_diagnostics[0].cdp_param_keys, ["nodeId", "selector"]);
   assert.equal(acquisition.stale_diagnostics[0].recovery_mode, "root_reacquire");
   assert.equal(recoveredDiagnostics.length, 1);
+  assert.deepEqual(order, ["stale_checkpoint", "recover", "recovery_applied", "recovered"]);
+}
+
+function testDomStaleForensicEventIsSafeAndCorrelatable() {
+  const error = createListReadStaleError(771);
+  error.cdp_search_id = "search-7";
+  error.cdp_replay_suppressed = true;
+  error.cdp_outcome_unknown = true;
+  const listState = {
+    domain: "recommend",
+    list_name: "recommend-candidates",
+    seen_keys: new Set(["candidate:done"]),
+    queued_keys: new Set(),
+    processed_keys: new Set(["candidate:done"]),
+    ledger: [{
+      at: "2026-07-17T10:00:00.000Z",
+      event: "candidate_read_error",
+      node_id: 771,
+      visible_index: 4,
+      error: error.message
+    }]
+  };
+  const rootState = {
+    topRoot: { nodeId: 10 },
+    iframe: {
+      nodeId: 20,
+      documentNodeId: 30,
+      selector: "#recommendFrame"
+    },
+    rootNodes: { top: 10, frameOwner: 20, frame: 30 }
+  };
+  assert.deepEqual(compactRecommendDomRootIdentity(rootState, 2), {
+    connection_epoch: 2,
+    top_document_node_id: 10,
+    iframe_owner_node_id: 20,
+    iframe_document_node_id: 30,
+    iframe_selector: "#recommendFrame"
+  });
+  const event = createRecommendDomStaleForensicEvent(error, {
+    eventId: "dom-stale-test",
+    phase: "recommend:list-read",
+    operation: "candidate:list-read-card",
+    candidateIndex: 10,
+    rootState,
+    connectionEpoch: 2,
+    listState,
+    counters: { processed: 10, passed: 1 },
+    timeline: Array.from({ length: 25 }, (_, index) => ({
+      at: `2026-07-17T10:00:${String(index).padStart(2, "0")}.000Z`,
+      type: "DOM.documentUpdated"
+    }))
+  });
+  assert.equal(event.event_id, "dom-stale-test");
+  assert.equal(event.candidate.index, 10);
+  assert.equal(event.candidate.failing_list_node_id, 771);
+  assert.equal(event.candidate.visible_index, 4);
+  assert.equal(event.error.cdp_connection_epoch, 2);
+  assert.equal(event.error.cdp_reconnected_epoch, 3);
+  assert.equal(event.error.cdp_search_id, "search-7");
+  assert.equal(event.error.cdp_replay_suppressed, true);
+  assert.equal(event.error.cdp_outcome_unknown, true);
+  assert.equal(event.lifecycle_timeline.length, 20);
+  assert.equal(JSON.stringify(event).includes("unsafe-key!"), false);
 }
 
 async function testListReadRepeatedStaleIsBounded() {
@@ -798,6 +880,7 @@ function testRecommendStatusCountersPreserveProgressAfterRecovery() {
 await testLifecycleDelegation();
 testDebugBoundaryValidationAndOnceOnlyController();
 await testListReadStaleRecoveryThenSuccess();
+testDomStaleForensicEventIsSafeAndCorrelatable();
 await testListReadRepeatedStaleIsBounded();
 await testListReadRecoveryDoesNotDuplicateResultsOrActions();
 await testTieredListReadRecoverySelection();

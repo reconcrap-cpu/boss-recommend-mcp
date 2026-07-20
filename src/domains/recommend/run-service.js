@@ -17,14 +17,23 @@ import {
 } from "../../core/browser/index.js";
 import { GREET_CREDITS_EXHAUSTED_CODE } from "../../core/greet-quota/index.js";
 import {
+  attemptImageCaptureCheckpointResume,
   compactCvAcquisitionState,
+  createImageCaptureWorkflowRetryTracker,
+  createRequiredImageEvidenceFailure,
+  imageCaptureResumeCheckpoint,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
   DEFAULT_MAX_IMAGE_PAGES,
   getCvNetworkWaitPlan,
+  isFailedClosedImageAcquisition,
+  isIncompleteImageEvidence,
+  isRecoverableImageCaptureWorkflowError,
   recordCvImageFallback,
   recordCvNetworkHit,
   recordCvNetworkMiss,
+  reacquireImageCaptureResumeTarget,
+  requireCompleteImageEvidence,
   summarizeImageEvidence,
   waitForCvNetworkEvents
 } from "../../core/cv-acquisition/index.js";
@@ -56,6 +65,7 @@ import {
   isRecommendDetailOpenMissError,
   isStaleRecommendNodeError,
   openRecommendCardDetailWithFreshRetry,
+  waitForRecommendDetail,
   waitForRecommendDetailNetworkEvents
 } from "./detail.js";
 import {
@@ -201,26 +211,152 @@ export function createRecommendDebugBoundaryController(source = {}) {
   };
 }
 
+function readErrorChainField(error, key) {
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    if ((typeof current === "object" || typeof current === "function") && seen.has(current)) break;
+    if (typeof current === "object" || typeof current === "function") seen.add(current);
+    if (current?.[key] !== undefined && current?.[key] !== null) return current[key];
+    current = current?.cause || null;
+  }
+  return undefined;
+}
+
+function compactCdpFailureDiagnostic(error, {
+  fallbackCode = "RECOMMEND_DOM_STALE",
+  fallbackPhase = ""
+} = {}) {
+  const message = String(readErrorChainField(error, "message") || error || "DOM node became stale");
+  const diagnostic = {
+    name: String(readErrorChainField(error, "name") || "Error").slice(0, 100),
+    code: String(readErrorChainField(error, "code") || fallbackCode).slice(0, 160),
+    message: message.slice(0, 500),
+    phase: String(readErrorChainField(error, "phase") || fallbackPhase || "").slice(0, 200) || null,
+    cdp_method: String(readErrorChainField(error, "cdp_method") || "").slice(0, 200) || null,
+    cdp_at: String(readErrorChainField(error, "cdp_at") || "").slice(0, 100) || null,
+    cdp_search_id: String(readErrorChainField(error, "cdp_search_id") || "").slice(0, 200) || null,
+    cdp_replay_policy: String(readErrorChainField(error, "cdp_replay_policy") || "").slice(0, 100) || null,
+    cdp_reconnect_error: String(readErrorChainField(error, "cdp_reconnect_error") || "").slice(0, 300) || null
+  };
+  for (const key of [
+    "cdp_node_id",
+    "cdp_backend_node_id",
+    "cdp_connection_epoch",
+    "cdp_reconnected_epoch"
+  ]) {
+    const value = Number(readErrorChainField(error, key));
+    diagnostic[key] = Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  for (const key of [
+    "cdp_reconnected",
+    "cdp_replayed_after_reconnect",
+    "cdp_replay_suppressed",
+    "cdp_outcome_unknown"
+  ]) {
+    const value = readErrorChainField(error, key);
+    diagnostic[key] = typeof value === "boolean" ? value : null;
+  }
+  const paramKeys = readErrorChainField(error, "cdp_param_keys");
+  diagnostic.cdp_param_keys = Array.isArray(paramKeys)
+    ? paramKeys
+      .map((key) => String(key || "").trim())
+      .filter((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key))
+      .slice(0, 20)
+    : [];
+  return diagnostic;
+}
+
+export function compactRecommendDomRootIdentity(rootState = null, connectionEpoch = null) {
+  const epoch = Number(connectionEpoch);
+  const topNodeId = Number(rootState?.rootNodes?.top || rootState?.topRoot?.nodeId || 0);
+  const frameOwnerNodeId = Number(rootState?.rootNodes?.frameOwner || rootState?.iframe?.nodeId || 0);
+  const frameDocumentNodeId = Number(
+    rootState?.rootNodes?.frame || rootState?.iframe?.documentNodeId || 0
+  );
+  return {
+    connection_epoch: Number.isInteger(epoch) && epoch > 0 ? epoch : null,
+    top_document_node_id: Number.isInteger(topNodeId) && topNodeId > 0 ? topNodeId : null,
+    iframe_owner_node_id: Number.isInteger(frameOwnerNodeId) && frameOwnerNodeId > 0
+      ? frameOwnerNodeId
+      : null,
+    iframe_document_node_id: Number.isInteger(frameDocumentNodeId) && frameDocumentNodeId > 0
+      ? frameDocumentNodeId
+      : null,
+    iframe_selector: String(rootState?.iframe?.selector || "").slice(0, 300) || null
+  };
+}
+
+function latestInfiniteListReadError(listState = null) {
+  const ledger = Array.isArray(listState?.ledger) ? listState.ledger : [];
+  for (let index = ledger.length - 1; index >= 0; index -= 1) {
+    const item = ledger[index];
+    if (item?.event !== "candidate_read_error") continue;
+    return {
+      at: item.at || null,
+      node_id: Number.isInteger(item.node_id) ? item.node_id : null,
+      visible_index: Number.isInteger(item.visible_index) ? item.visible_index : null,
+      error: String(item.error || "").slice(0, 500) || null
+    };
+  }
+  return null;
+}
+
+export function createRecommendDomStaleForensicEvent(error, {
+  eventId = "",
+  phase = "",
+  operation = "",
+  detailStep = "",
+  candidateIndex = null,
+  candidateKey = "",
+  cardNodeId = null,
+  rootState = null,
+  connectionEpoch = null,
+  listState = null,
+  counters = null,
+  timeline = []
+} = {}) {
+  const at = new Date().toISOString();
+  const listReadError = latestInfiniteListReadError(listState);
+  return {
+    schema_version: 1,
+    event_id: String(eventId || `recommend_dom_stale_${Date.now()}`).slice(0, 160),
+    event_type: "dom_stale",
+    at,
+    phase: String(phase || "").slice(0, 200) || null,
+    operation: String(operation || "").slice(0, 200) || null,
+    detail_step: String(detailStep || "").slice(0, 200) || null,
+    candidate: {
+      index: Number.isInteger(candidateIndex) && candidateIndex >= 0 ? candidateIndex : null,
+      key: String(candidateKey || "").slice(0, 300) || null,
+      card_node_id: Number.isInteger(cardNodeId) && cardNodeId > 0 ? cardNodeId : null,
+      visible_index: listReadError?.visible_index ?? null,
+      failing_list_node_id: listReadError?.node_id ?? null
+    },
+    error: compactCdpFailureDiagnostic(error, {
+      fallbackCode: "RECOMMEND_DOM_STALE",
+      fallbackPhase: phase
+    }),
+    pre_recovery_roots: compactRecommendDomRootIdentity(rootState, connectionEpoch),
+    candidate_list: compactInfiniteListState(listState || {}),
+    counters: counters && typeof counters === "object" ? counters : null,
+    lifecycle_timeline: Array.isArray(timeline) ? timeline.slice(-20) : []
+  };
+}
+
 function compactListReadStaleDiagnostic(error, {
   attempt = 0,
   exhausted = false
 } = {}) {
+  const cdp = compactCdpFailureDiagnostic(error, {
+    fallbackCode: "RECOMMEND_LIST_READ_STALE_NODE",
+    fallbackPhase: "recommend:list-read"
+  });
   return {
-    code: error?.code || "RECOMMEND_LIST_READ_STALE_NODE",
-    message: String(error?.message || error || "Stale recommend list node").slice(0, 500),
+    ...cdp,
+    code: error?.code || cdp.code || "RECOMMEND_LIST_READ_STALE_NODE",
+    message: String(error?.message || cdp.message || error || "Stale recommend list node").slice(0, 500),
     phase: "recommend:list-read",
-    cdp_method: error?.cdp_method || null,
-    cdp_at: error?.cdp_at ? String(error.cdp_at).slice(0, 100) : null,
-    cdp_node_id: Number.isInteger(error?.cdp_node_id) ? error.cdp_node_id : null,
-    cdp_backend_node_id: Number.isInteger(error?.cdp_backend_node_id)
-      ? error.cdp_backend_node_id
-      : null,
-    cdp_param_keys: Array.isArray(error?.cdp_param_keys)
-      ? error.cdp_param_keys
-        .map((key) => String(key || "").trim())
-        .filter((key) => /^[A-Za-z][A-Za-z0-9_]*$/.test(key))
-        .slice(0, 20)
-      : [],
     attempt,
     exhausted: Boolean(exhausted),
     at: new Date().toISOString()
@@ -876,6 +1012,10 @@ function compactCloseResult(closeResult) {
 
 function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   if (!error) return null;
+  const cdpDiagnostic = compactCdpFailureDiagnostic(error, {
+    fallbackCode,
+    fallbackPhase: error?.phase || ""
+  });
   const result = {
     code: error.code || fallbackCode,
     message: error.message || String(error)
@@ -891,6 +1031,12 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   }
   if (error.error_diagnostic) {
     result.error_diagnostic = error.error_diagnostic;
+  } else if (
+    cdpDiagnostic.cdp_method
+    || cdpDiagnostic.cdp_connection_epoch !== null
+    || cdpDiagnostic.cdp_node_id !== null
+  ) {
+    result.error_diagnostic = cdpDiagnostic;
   }
   if (error.list_end_reason) {
     result.list_end_reason = error.list_end_reason;
@@ -987,10 +1133,16 @@ export function createRecommendRefreshFailureError(refreshAttempt, {
 }
 
 export function isRecoverableImageCaptureError(error) {
-  const code = String(error?.code || "");
-  if (code === "IMAGE_CAPTURE_TIMEOUT" || code === "IMAGE_CAPTURE_TOTAL_TIMEOUT") return true;
+  if (isRecoverableImageCaptureWorkflowError(error)) return true;
   if (isStaleRecommendNodeError(error)) return true;
   return /Image fallback capture timed out/i.test(String(error?.message || error || ""));
+}
+
+export function shouldFailClosedRecommendImageAcquisition(detailResult = null) {
+  return isFailedClosedImageAcquisition({
+    source: detailResult?.cv_acquisition?.source,
+    imageEvidence: detailResult?.image_evidence
+  });
 }
 
 function collectPartialImageEvidencePaths(basePath = "", extension = "jpg", maxCount = 12) {
@@ -1192,6 +1344,7 @@ export async function runRecommendWorkflow({
   let contextRecoveryAttempts = 0;
   let greetCount = 0;
   const candidateRecoveryCounts = new Map();
+  const imageCaptureWorkflowRetries = createImageCaptureWorkflowRetryTracker();
   let jobSelection = null;
   let pageScopeSelection = null;
   let currentCityOnlyResult = null;
@@ -1207,6 +1360,10 @@ export async function runRecommendWorkflow({
   let lastListReadStaleDiagnostic = null;
   let lastListReadRecoveryMode = null;
   const listReadStaleDiagnostics = [];
+  let domStaleEventCount = 0;
+  let currentDomOperation = "recommend:initialize";
+  const domLifecycleTimeline = [];
+  const domStaleForensics = [];
   const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
     rootNodeId: rootState?.iframe?.documentNodeId,
     containerSelectors: RECOMMEND_LIST_CONTAINER_SELECTORS,
@@ -1215,6 +1372,133 @@ export async function runRecommendWorkflow({
     viewportPoint: { xRatio: 0.28, yRatio: 0.5 },
     validateViewportPoint: true
   }));
+
+  function currentConnectionEpoch() {
+    const epoch = Number(client?.__connectionEpoch);
+    return Number.isInteger(epoch) && epoch > 0 ? epoch : null;
+  }
+
+  function compactLifecycleUrl(value = "") {
+    const text = String(value || "").trim();
+    if (!text) return null;
+    try {
+      const parsed = new URL(text);
+      return `${parsed.origin}${parsed.pathname}`.slice(0, 500);
+    } catch {
+      return text.split(/[?#]/, 1)[0].slice(0, 500) || null;
+    }
+  }
+
+  function recordDomLifecycleEvent(type, payload = {}) {
+    const frame = payload?.frame || payload || {};
+    const event = {
+      at: new Date().toISOString(),
+      type: String(type || "unknown").slice(0, 100),
+      operation: currentDomOperation,
+      connection_epoch: currentConnectionEpoch(),
+      frame_id: String(frame?.id || payload?.frameId || "").slice(0, 200) || null,
+      parent_frame_id: String(frame?.parentId || "").slice(0, 200) || null,
+      loader_id: String(frame?.loaderId || "").slice(0, 200) || null,
+      url: compactLifecycleUrl(frame?.url || "")
+    };
+    domLifecycleTimeline.push(event);
+    if (domLifecycleTimeline.length > 40) domLifecycleTimeline.splice(0, domLifecycleTimeline.length - 40);
+    return event;
+  }
+
+  function subscribeDomLifecycleEvents() {
+    const subscriptions = [
+      [client?.DOM, "documentUpdated", "DOM.documentUpdated"],
+      [client?.Page, "frameNavigated", "Page.frameNavigated"],
+      [client?.Page, "frameDetached", "Page.frameDetached"],
+      [client?.Page, "frameStartedLoading", "Page.frameStartedLoading"],
+      [client?.Page, "frameStoppedLoading", "Page.frameStoppedLoading"]
+    ];
+    for (const [domain, eventName, label] of subscriptions) {
+      if (typeof domain?.[eventName] !== "function") continue;
+      try {
+        domain[eventName]((payload = {}) => recordDomLifecycleEvent(label, payload));
+      } catch {
+        // Lifecycle observation is diagnostic-only and must not alter the run.
+      }
+    }
+  }
+
+  function checkpointDomStaleForensic(error, {
+    phase = "",
+    operation = currentDomOperation,
+    detailStep = "",
+    candidateIndex = null,
+    candidateKey = "",
+    cardNodeId = null
+  } = {}) {
+    if (!isStaleRecommendNodeError(error)) return null;
+    domStaleEventCount += 1;
+    const event = createRecommendDomStaleForensicEvent(error, {
+      eventId: `recommend_dom_stale_${runControl?.runId || "run"}_${domStaleEventCount}`,
+      phase,
+      operation,
+      detailStep,
+      candidateIndex,
+      candidateKey,
+      cardNodeId,
+      rootState,
+      connectionEpoch: currentConnectionEpoch(),
+      listState,
+      counters: countRecommendResultStatuses(results, { greetCount }),
+      timeline: domLifecycleTimeline
+    });
+    domStaleForensics.push(event);
+    if (domStaleForensics.length > 12) domStaleForensics.splice(0, domStaleForensics.length - 12);
+    runControl.checkpoint({
+      dom_stale_forensic: event,
+      dom_stale_forensics: domStaleForensics.slice(),
+      candidate_list: compactInfiniteListState(listState)
+    });
+    updateRecommendProgress({
+      dom_stale_events: domStaleEventCount,
+      last_dom_stale_phase: phase || null,
+      last_dom_stale_operation: operation || null
+    });
+    return event;
+  }
+
+  function checkpointDomStaleRecovery(event, {
+    status = "unknown",
+    recoveryResult = null,
+    recoveryError = null
+  } = {}) {
+    if (!event) return null;
+    event.recovery = {
+      status: String(status || "unknown").slice(0, 100),
+      at: new Date().toISOString(),
+      mode: String(recoveryResult?.recovery_mode || recoveryResult?.method || "").slice(0, 100) || null,
+      escalated_from: String(recoveryResult?.escalated_from || "").slice(0, 100) || null,
+      ok: recoveryResult?.ok === undefined ? null : Boolean(recoveryResult.ok),
+      method: String(recoveryResult?.method || recoveryResult?.context_reapply?.method || "").slice(0, 100) || null,
+      card_count: Number.isInteger(recoveryResult?.card_count)
+        ? recoveryResult.card_count
+        : Number.isInteger(recoveryResult?.root_reacquire?.card_count)
+        ? recoveryResult.root_reacquire.card_count
+        : Number.isInteger(recoveryResult?.context_reapply?.card_count)
+        ? recoveryResult.context_reapply.card_count
+        : null,
+      error: recoveryError ? compactCdpFailureDiagnostic(recoveryError, {
+        fallbackCode: "RECOMMEND_DOM_STALE_RECOVERY_FAILED",
+        fallbackPhase: "recommend:recover-context"
+      }) : null
+    };
+    event.post_recovery_roots = compactRecommendDomRootIdentity(rootState, currentConnectionEpoch());
+    event.lifecycle_timeline = domLifecycleTimeline.slice(-20);
+    runControl.checkpoint({
+      dom_stale_forensic: event,
+      dom_stale_forensics: domStaleForensics.slice(),
+      candidate_list: compactInfiniteListState(listState)
+    });
+    return event;
+  }
+
+  subscribeDomLifecycleEvents();
 
   function recordHumanEvent(event = null) {
     if (!event) return lastHumanEvent;
@@ -1530,6 +1814,7 @@ export async function runRecommendWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recommend:list-read");
+    currentDomOperation = "candidate:list-read";
     const debugBoundaryAction = debugBoundary.take(results.length);
     let debugForcedListEnd = false;
     if (debugBoundaryAction) {
@@ -1593,6 +1878,7 @@ export async function runRecommendWorkflow({
           listScrollJitterEnabled: effectiveHumanBehavior.listScrollJitter,
           fallbackPoint: listFallbackResolver,
           findNodeIds: async () => {
+            currentDomOperation = "candidate:list-find-nodes";
             let currentRootState = await getRecommendRoots(client);
             currentRootState = await ensureRecommendViewport(currentRootState, "candidate_find_nodes");
             rootState = currentRootState;
@@ -1632,26 +1918,42 @@ export async function runRecommendWorkflow({
             cardNodeIds = currentCardNodeIds;
             return currentCardNodeIds;
           },
-          readCandidate: async (nodeId, { visibleIndex }) => readRecommendCardCandidate(client, nodeId, {
-            targetUrl,
-            source: "recommend-run-card",
-            metadata: {
-              run_candidate_index: results.length,
-              visible_index: visibleIndex
-            }
-          }),
+          readCandidate: async (nodeId, { visibleIndex }) => {
+            currentDomOperation = "candidate:list-read-card";
+            return readRecommendCardCandidate(client, nodeId, {
+              targetUrl,
+              source: "recommend-run-card",
+              metadata: {
+                run_candidate_index: results.length,
+                visible_index: visibleIndex
+              }
+            });
+          },
           shouldRethrowReadError: isStaleRecommendNodeError,
-          detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => detectInfiniteListBottomMarker(client, {
-            rootNodeId: rootState?.iframe?.documentNodeId,
-            markerSelectors: RECOMMEND_BOTTOM_MARKER_SELECTORS,
-            refreshSelectors: [RECOMMEND_END_REFRESH_SELECTOR],
-            textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
-            maxTextScanNodes: 500
-          })
+          detectBottomMarker: async ({ scrollAttempt = 0, signature = {} } = {}) => {
+            currentDomOperation = "candidate:list-bottom-probe";
+            return detectInfiniteListBottomMarker(client, {
+              rootNodeId: rootState?.iframe?.documentNodeId,
+              markerSelectors: RECOMMEND_BOTTOM_MARKER_SELECTORS,
+              refreshSelectors: [RECOMMEND_END_REFRESH_SELECTOR],
+              textScanSelectors: scrollAttempt > 0 || (signature?.stable_signature_count || 0) >= 2 ? undefined : [],
+              maxTextScanNodes: 500
+            });
+          }
         }));
       },
-      onStale: async ({ diagnostic }) => {
+      onStale: async ({ error, diagnostic }) => {
         listReadStaleRecoveryAttempts += 1;
+        const forensic = checkpointDomStaleForensic(error, {
+          phase: "recommend:list-read",
+          operation: currentDomOperation,
+          candidateIndex: results.length
+        });
+        if (forensic) {
+          diagnostic.forensic_event_id = forensic.event_id;
+          diagnostic.pre_recovery_roots = forensic.pre_recovery_roots;
+          diagnostic.failing_candidate = forensic.candidate;
+        }
         lastListReadStaleDiagnostic = diagnostic;
         listReadStaleDiagnostics.push(diagnostic);
         runControl.checkpoint({
@@ -1690,7 +1992,11 @@ export async function runRecommendWorkflow({
               cardNodeIds = freshCardNodeIds;
               return {
                 card_count: freshCardNodeIds.length,
-                iframe_document_node_id: freshRootState.iframe.documentNodeId
+                iframe_document_node_id: freshRootState.iframe.documentNodeId,
+                root_identity: compactRecommendDomRootIdentity(
+                  freshRootState,
+                  currentConnectionEpoch()
+                )
               };
             },
             contextReapply: async ({ rootReacquireError }) => {
@@ -1704,11 +2010,22 @@ export async function runRecommendWorkflow({
               return {
                 ok: Boolean(recovery?.ok),
                 method: recovery?.method || null,
-                card_count: recovery?.card_count || 0
+                card_count: recovery?.card_count || 0,
+                root_identity: compactRecommendDomRootIdentity(
+                  rootState,
+                  currentConnectionEpoch()
+                )
               };
             }
           });
         } catch (recoveryError) {
+          const forensic = domStaleForensics.find((item) => (
+            item.event_id === diagnostic.forensic_event_id
+          ));
+          checkpointDomStaleRecovery(forensic, {
+            status: "recovery_failed",
+            recoveryError
+          });
           updateRecommendProgress({
             list_read_stale_recovery_failed: true
           });
@@ -1723,10 +2040,17 @@ export async function runRecommendWorkflow({
           throw recoveryError;
         }
       },
-      onRecoveryApplied: async ({ diagnostic }) => {
+      onRecoveryApplied: async ({ diagnostic, recoveryResult }) => {
         listReadStaleRecoveryApplied += 1;
         lastListReadStaleDiagnostic = diagnostic;
         lastListReadRecoveryMode = diagnostic.recovery_mode || null;
+        const forensic = domStaleForensics.find((item) => (
+          item.event_id === diagnostic.forensic_event_id
+        ));
+        checkpointDomStaleRecovery(forensic, {
+          status: "recovery_applied",
+          recoveryResult
+        });
         updateRecommendProgress();
         runControl.checkpoint({
           list_read_stale_recovery_applied: {
@@ -1739,6 +2063,16 @@ export async function runRecommendWorkflow({
       onRecovered: async ({ diagnostic }) => {
         listReadStaleRecoveries += 1;
         lastListReadStaleDiagnostic = diagnostic;
+        const forensic = domStaleForensics.find((item) => (
+          item.event_id === diagnostic.forensic_event_id
+        ));
+        checkpointDomStaleRecovery(forensic, {
+          status: "recovered",
+          recoveryResult: {
+            recovery_mode: diagnostic.recovery_mode,
+            ok: true
+          }
+        });
         updateRecommendProgress();
         runControl.checkpoint({
           list_read_stale_recovered: {
@@ -1748,8 +2082,19 @@ export async function runRecommendWorkflow({
           }
         });
       },
-      onExhausted: async ({ diagnostic }) => {
+      onExhausted: async ({ error, diagnostic }) => {
         listReadStaleRecoveryAttempts += 1;
+        const forensic = checkpointDomStaleForensic(error, {
+          phase: "recommend:list-read",
+          operation: currentDomOperation,
+          candidateIndex: results.length
+        });
+        if (forensic) {
+          diagnostic.forensic_event_id = forensic.event_id;
+          diagnostic.pre_recovery_roots = forensic.pre_recovery_roots;
+          diagnostic.failing_candidate = forensic.candidate;
+          checkpointDomStaleRecovery(forensic, { status: "exhausted" });
+        }
         lastListReadStaleDiagnostic = diagnostic;
         listReadStaleDiagnostics.push(diagnostic);
         updateRecommendProgress({
@@ -1776,19 +2121,30 @@ export async function runRecommendWorkflow({
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
         runControl.setPhase("recommend:refresh");
+        currentDomOperation = "candidate:list-end-refresh";
         refreshRounds += 1;
-        const refreshResult = await refreshRecommendListAtEnd(client, {
-          rootState,
-          jobLabel,
-          pageScope: pageScopeSelection?.effective_scope || requestedPageScope,
-          fallbackPageScope: normalizedFallbackPageScope,
-          filter: normalizedFilter,
-          preferEndRefreshButton: debugForcedListEnd ? false : undefined,
-          forceRecentNotView: normalizedFilter.enabled,
-          cardTimeoutMs,
-          buttonSettleMs: refreshButtonSettleMs,
-          reloadSettleMs: refreshReloadSettleMs
-        });
+        let refreshResult;
+        try {
+          refreshResult = await refreshRecommendListAtEnd(client, {
+            rootState,
+            jobLabel,
+            pageScope: pageScopeSelection?.effective_scope || requestedPageScope,
+            fallbackPageScope: normalizedFallbackPageScope,
+            filter: normalizedFilter,
+            preferEndRefreshButton: debugForcedListEnd ? false : undefined,
+            forceRecentNotView: normalizedFilter.enabled,
+            cardTimeoutMs,
+            buttonSettleMs: refreshButtonSettleMs,
+            reloadSettleMs: refreshReloadSettleMs
+          });
+        } catch (error) {
+          checkpointDomStaleForensic(error, {
+            phase: "recommend:refresh",
+            operation: currentDomOperation,
+            candidateIndex: results.length
+          });
+          throw error;
+        }
         const compactRefresh = compactRefreshAttempt(refreshResult);
         refreshAttempts.push(compactRefresh);
         runControl.checkpoint({
@@ -1808,12 +2164,22 @@ export async function runRecommendWorkflow({
           if (refreshResult.filter) {
             filterResult = refreshResult.filter;
           }
-          rootState = refreshResult.root_state || await getRecommendRoots(client);
-          rootState = await ensureRecommendViewport(rootState, "refresh_after");
-          cardNodeIds = await waitForRecommendCardNodeIds(client, rootState.iframe.documentNodeId, {
-            timeoutMs: cardTimeoutMs,
-            intervalMs: 300
-          });
+          try {
+            currentDomOperation = "candidate:list-end-refresh-reacquire";
+            rootState = refreshResult.root_state || await getRecommendRoots(client);
+            rootState = await ensureRecommendViewport(rootState, "refresh_after");
+            cardNodeIds = await waitForRecommendCardNodeIds(client, rootState.iframe.documentNodeId, {
+              timeoutMs: cardTimeoutMs,
+              intervalMs: 300
+            });
+          } catch (error) {
+            checkpointDomStaleForensic(error, {
+              phase: "recommend:refresh",
+              operation: currentDomOperation,
+              candidateIndex: results.length
+            });
+            throw error;
+          }
           resetInfiniteListForRefreshRound(listState, {
             reason: listEndReason,
             round: refreshRounds,
@@ -1853,7 +2219,9 @@ export async function runRecommendWorkflow({
         runControl.throwIfCanceled();
         runControl.setPhase("recommend:detail");
         detailStep = "ensure_viewport";
+        currentDomOperation = "candidate:detail-ensure-viewport";
         rootState = await ensureRecommendViewport(rootState, "detail");
+        currentDomOperation = "candidate:detail-close-blocking-panels";
         const blockingPanelClose = await closeRecommendBlockingPanels(client, {
           attemptsLimit: 2,
           rootState
@@ -1875,6 +2243,8 @@ export async function runRecommendWorkflow({
         }
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailStep = "open_detail";
+        currentDomOperation = "candidate:detail-open";
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         networkRecorder.clear();
         await maybeHumanActionCooldown("before_detail_open", timings);
         const openedDetail = await openRecommendCardDetailWithFreshRetry(client, {
@@ -1893,6 +2263,8 @@ export async function runRecommendWorkflow({
         screeningCandidate = cardCandidate;
         if (shouldSkipRecentColleagueContacted) {
           detailStep = "check_colleague_contact";
+          currentDomOperation = "candidate:detail-colleague-contact";
+          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
           try {
             colleagueContact = await measureTiming(timings, "colleague_contact_check_ms", () => inspectRecentColleagueContact(
               client,
@@ -1933,6 +2305,8 @@ export async function runRecommendWorkflow({
         if (!skipRecentColleagueContact) {
           const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
         detailStep = "wait_network";
+        currentDomOperation = "candidate:detail-network-wait";
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
           waitForRecommendDetailNetworkEvents,
           networkRecorder,
@@ -1947,6 +2321,8 @@ export async function runRecommendWorkflow({
           timings.network_cv_wait_ms = Math.round(Number(networkWait.elapsed_ms) || 0);
         }
         detailStep = "extract_detail";
+        currentDomOperation = "candidate:detail-extract";
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailResult = await extractRecommendDetailCandidate(client, {
           cardCandidate,
           cardNodeId,
@@ -1972,6 +2348,8 @@ export async function runRecommendWorkflow({
           });
         } else {
           detailStep = "wait_capture_target";
+          currentDomOperation = "candidate:detail-wait-capture-target";
+          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
           captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
             domain: "recommend",
             timeoutMs: 6000,
@@ -1987,15 +2365,17 @@ export async function runRecommendWorkflow({
               index,
               extension: "jpg"
             });
-            try {
-              detailStep = "capture_image";
-              imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
+            const captureImageForTarget = (target, targetWait, resumeCheckpoint = null) => captureScrolledNodeScreenshots(
+              client,
+              target.node_id,
+              {
                 filePath: imageEvidencePath,
                 format: "jpeg",
                 quality: 72,
                 optimize: true,
                 resizeMaxWidth: 1100,
                 captureViewport: false,
+                iframeOwnerNodeId: target?.iframe_node_id || null,
                 padding: 0,
                 maxScreenshots: maxImagePages,
                 wheelDeltaY: imageWheelDeltaY,
@@ -2004,45 +2384,179 @@ export async function runRecommendWorkflow({
                 scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
                 stepTimeoutMs: 45000,
                 totalTimeoutMs: 90000,
-                duplicateStopCount: 1,
+                duplicateStopCount: 2,
                 skipDuplicateScreenshots: true,
+                requireTerminalProof: true,
                 composeForLlm: true,
                 llmPagesPerImage: 3,
                 llmResizeMaxWidth: 1100,
                 llmQuality: 72,
+                resumeCheckpoint,
                 metadata: {
                   domain: "recommend",
                   capture_mode: "scroll_sequence",
                   acquisition_reason: "network_miss_image_fallback",
                   run_candidate_index: index,
                   candidate_key: candidateKey,
-                  capture_target: captureTarget,
-                  capture_target_wait: captureTargetWait
+                  capture_target: target,
+                  capture_target_wait: targetWait,
+                  resumed_from_checkpoint: Boolean(resumeCheckpoint)
                 }
-              }));
-              source = "image";
+              }
+            );
+            try {
+              detailStep = "capture_image";
+              currentDomOperation = "candidate:detail-capture-image";
+              checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+              imageEvidence = await measureTiming(
+                timings,
+                "screenshot_capture_ms",
+                () => captureImageForTarget(captureTarget, captureTargetWait)
+              );
+              imageEvidence = requireCompleteImageEvidence(imageEvidence, {
+                code: "IMAGE_CAPTURE_EVIDENCE_MISSING",
+                message: "Recommend CV capture returned no complete persisted evidence",
+                metadata: { domain: "recommend", candidate_key: candidateKey }
+              });
+              source = isIncompleteImageEvidence(imageEvidence) ? "image_capture_failed" : "image";
             } catch (error) {
               if (!isRecoverableImageCaptureError(error)) throw error;
-              const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
-              if (recoveryCount < 1) {
-                candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
+              const retryReservation = imageCaptureWorkflowRetries.consume(candidateKey);
+              if (retryReservation.allowed) {
                 timings.image_capture_recovery_trigger = compactError(error, "IMAGE_CAPTURE_FAILED");
+                timings.image_capture_workflow_retry = retryReservation;
                 checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
-                await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
-                await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
-                await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
-                await recoverAndReapplyRecommendContext(`image_capture:${detailStep}`, error, {
-                  forceRecentNotView: true
-                });
-                continue;
+                const resumeCheckpoint = imageCaptureResumeCheckpoint(error);
+                if (resumeCheckpoint) {
+                  detailStep = "resume_image_capture_reacquire";
+                  const resumeAttempt = await attemptImageCaptureCheckpointResume({
+                    checkpoint: resumeCheckpoint,
+                    reacquire: () => reacquireImageCaptureResumeTarget({
+                      domain: "recommend",
+                      getRoots: () => getRecommendRoots(client),
+                      ensureViewport: (freshRoots) => ensureRecommendViewport(
+                        freshRoots,
+                        "image_capture_resume_reacquire"
+                      ),
+                      getDetailState: () => waitForRecommendDetail(client, {
+                        timeoutMs: 4000,
+                        intervalMs: 200
+                      }),
+                      isDetailAvailable: (state) => Boolean(state?.popup || state?.resumeIframe),
+                      waitForTarget: (detailState) => waitForCvCaptureTarget(client, detailState, {
+                        domain: "recommend",
+                        timeoutMs: 4000,
+                        intervalMs: 200
+                      })
+                    }),
+                    capture: (reacquired) => {
+                      rootState = reacquired.root_state;
+                      captureTarget = reacquired.target;
+                      captureTargetWait = reacquired.target_wait;
+                      detailStep = "resume_image_capture";
+                      return measureTiming(
+                        timings,
+                        "screenshot_capture_ms",
+                        () => captureImageForTarget(captureTarget, captureTargetWait, resumeCheckpoint)
+                      );
+                    }
+                  });
+                  if (resumeAttempt.outcome === "reacquire_failed") {
+                    const reacquireError = resumeAttempt.error;
+                    imageEvidence = {
+                      ...createRecoverableImageCaptureEvidence(reacquireError, {
+                        elapsedMs: timings.screenshot_capture_ms,
+                        filePath: imageEvidencePath,
+                        extension: "jpg",
+                        maxScreenshots: maxImagePages
+                      }),
+                      coverage_complete: false,
+                      resumed_from_checkpoint: true,
+                      resume_checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      coverage_checkpoint: resumeCheckpoint
+                    };
+                    source = "image_capture_failed";
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: false,
+                      phase: "reacquire",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error: compactError(reacquireError, "IMAGE_CAPTURE_RESUME_REACQUIRE_FAILED")
+                    };
+                  }
+                  if (resumeAttempt.outcome === "completed") {
+                    imageEvidence = requireCompleteImageEvidence(resumeAttempt.evidence, {
+                      code: "IMAGE_CAPTURE_RESUME_EVIDENCE_MISSING",
+                      message: "Recommend resumed CV capture returned no complete persisted evidence",
+                      metadata: { domain: "recommend", candidate_key: candidateKey }
+                    });
+                    source = isIncompleteImageEvidence(imageEvidence) ? "image_capture_failed" : "image";
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: !isIncompleteImageEvidence(imageEvidence),
+                      phase: "capture",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      confirmed_screenshot_count: resumeCheckpoint.unique_screenshot_count || 0
+                    };
+                  } else if (resumeAttempt.outcome === "capture_failed") {
+                    const resumeError = resumeAttempt.error;
+                    imageEvidence = {
+                      ...createRecoverableImageCaptureEvidence(resumeError, {
+                        elapsedMs: timings.screenshot_capture_ms,
+                        filePath: imageEvidencePath,
+                        extension: "jpg",
+                        maxScreenshots: maxImagePages
+                      }),
+                      coverage_complete: false,
+                      resumed_from_checkpoint: true,
+                      resume_checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      coverage_checkpoint: resumeError.capture_checkpoint || resumeCheckpoint
+                    };
+                    source = "image_capture_failed";
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: false,
+                      phase: "capture",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error: compactError(resumeError, "IMAGE_CAPTURE_RESUME_FAILED")
+                    };
+                  }
+                } else {
+                  imageEvidence = {
+                    ...createRecoverableImageCaptureEvidence(error, {
+                      elapsedMs: timings.screenshot_capture_ms,
+                      filePath: imageEvidencePath,
+                      extension: "jpg",
+                      maxScreenshots: maxImagePages
+                    }),
+                    coverage_complete: false
+                  };
+                  source = "image_capture_failed";
+                  timings.image_capture_resume = {
+                    attempted: false,
+                    ok: false,
+                    phase: "checkpoint",
+                    error: {
+                      code: "IMAGE_CAPTURE_CHECKPOINT_UNAVAILABLE",
+                      message: "Capture failed without a resumable checkpoint"
+                    }
+                  };
+                }
+              } else {
+                imageEvidence = {
+                  ...createRecoverableImageCaptureEvidence(error, {
+                    elapsedMs: timings.screenshot_capture_ms,
+                    filePath: imageEvidencePath,
+                    extension: "jpg",
+                    maxScreenshots: maxImagePages
+                  }),
+                  coverage_complete: false,
+                  metadata: {
+                    image_capture_workflow_retry: retryReservation
+                  }
+                };
+                source = "image_capture_failed";
               }
-              imageEvidence = createRecoverableImageCaptureEvidence(error, {
-                elapsedMs: timings.screenshot_capture_ms,
-                filePath: imageEvidencePath,
-                extension: "jpg",
-                maxScreenshots: maxImagePages
-              });
-              source = "image_capture_failed";
             }
             recordCvImageFallback(cvAcquisitionState, {
               reason: source === "image_capture_failed"
@@ -2054,6 +2568,15 @@ export async function runRecommendWorkflow({
             });
           } else {
             source = "missing_capture_node";
+            imageEvidence = createRequiredImageEvidenceFailure({
+              code: "IMAGE_CAPTURE_TARGET_UNAVAILABLE",
+              message: "Recommend CV capture target was unavailable after the network fallback missed",
+              metadata: {
+                domain: "recommend",
+                candidate_key: candidateKey,
+                capture_target_wait: captureTargetWait || null
+              }
+            });
             recordCvNetworkMiss(cvAcquisitionState, {
               reason: "network_miss_no_capture_node",
               parsedNetworkProfileCount,
@@ -2077,6 +2600,14 @@ export async function runRecommendWorkflow({
         }
       } catch (error) {
         if (!isRecoverableRecommendDetailError(error)) throw error;
+        const staleForensic = checkpointDomStaleForensic(error, {
+          phase: "recommend:detail",
+          operation: currentDomOperation,
+          detailStep,
+          candidateIndex: index,
+          candidateKey,
+          cardNodeId
+        });
         const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
         if (recoveryCount < 1) {
           candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
@@ -2085,11 +2616,24 @@ export async function runRecommendWorkflow({
           await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
           await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
           await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
-          await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
-            forceRecentNotView: true
-          });
+          try {
+            const recovery = await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
+              forceRecentNotView: true
+            });
+            checkpointDomStaleRecovery(staleForensic, {
+              status: "recovered",
+              recoveryResult: recovery
+            });
+          } catch (recoveryError) {
+            checkpointDomStaleRecovery(staleForensic, {
+              status: "recovery_failed",
+              recoveryError
+            });
+            throw recoveryError;
+          }
           continue;
         }
+        checkpointDomStaleRecovery(staleForensic, { status: "candidate_failed_closed" });
         recoverableDetailError = error;
         detailResult = null;
         timings.detail_recovered_error = compactRecoverableDetailError(error);
@@ -2103,8 +2647,9 @@ export async function runRecommendWorkflow({
     runControl.throwIfCanceled();
     runControl.setPhase("recommend:screening");
     let llmResult = null;
+    const imageAcquisitionFailed = shouldFailClosedRecommendImageAcquisition(detailResult);
     if (useLlmScreening) {
-      if (skipRecentColleagueContact || recoverableDetailError || detailResult?.image_evidence?.ok === false) {
+      if (skipRecentColleagueContact || recoverableDetailError || imageAcquisitionFailed) {
         llmResult = null;
       } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
@@ -2138,10 +2683,10 @@ export async function runRecommendWorkflow({
       ? createRecentColleagueContactSkipScreening(screeningCandidate, colleagueContact)
       : recoverableDetailError
       ? createRecoverableDetailFailureScreening(screeningCandidate, recoverableDetailError)
-      : detailResult?.image_evidence?.ok === false
+      : imageAcquisitionFailed
       ? createImageCaptureFailureScreening(screeningCandidate, {
-        code: detailResult.image_evidence.error_code,
-        message: detailResult.image_evidence.error
+        code: detailResult?.image_evidence?.error_code || "IMAGE_CAPTURE_EVIDENCE_MISSING",
+        message: detailResult?.image_evidence?.error || "Required CV image evidence is unavailable"
       })
       : useLlmScreening
         ? llmResultToScreening(llmResult, screeningCandidate)
@@ -2151,34 +2696,71 @@ export async function runRecommendWorkflow({
     let closeFailureError = null;
     let closeRecoveryFailure = null;
     if (postActionEnabled && detailResult && !skipRecentColleagueContact) {
-      const postActionStarted = Date.now();
-      await runControl.waitIfPaused();
-      runControl.throwIfCanceled();
-      runControl.setPhase("recommend:post-action");
-      await maybeHumanActionCooldown("before_post_action", timings);
-      actionDiscovery = await waitForRecommendDetailActionControls(client, {
-        timeoutMs: actionTimeoutMs,
-        intervalMs: actionIntervalMs,
-        requireAny: true
-      });
-      postActionResult = await runRecommendPostAction({
-        client,
-        screening,
-        actionDiscovery,
-        postAction: normalizedPostAction,
-        greetCount,
-        maxGreetCount: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
-        executePostAction,
-        afterClickDelayMs: actionAfterClickDelayMs
-      });
-      if (postActionResult.counted_as_greet && postActionResult.action_clicked) {
-        greetCount += 1;
+      try {
+        const postActionStarted = Date.now();
+        await runControl.waitIfPaused();
+        runControl.throwIfCanceled();
+        runControl.setPhase("recommend:post-action");
+        detailStep = "post_action_discovery";
+        currentDomOperation = "candidate:post-action-discovery";
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+        await maybeHumanActionCooldown("before_post_action", timings);
+        actionDiscovery = await waitForRecommendDetailActionControls(client, {
+          timeoutMs: actionTimeoutMs,
+          intervalMs: actionIntervalMs,
+          requireAny: true
+        });
+        detailStep = "post_action_execute";
+        currentDomOperation = "candidate:post-action-execute";
+        checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+        postActionResult = await runRecommendPostAction({
+          client,
+          screening,
+          actionDiscovery,
+          postAction: normalizedPostAction,
+          greetCount,
+          maxGreetCount: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
+          executePostAction,
+          afterClickDelayMs: actionAfterClickDelayMs
+        });
+        if (postActionResult.counted_as_greet && postActionResult.action_clicked) {
+          greetCount += 1;
+        }
+        addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
+      } catch (error) {
+        checkpointDomStaleForensic(error, {
+          phase: "recommend:post-action",
+          operation: currentDomOperation,
+          detailStep,
+          candidateIndex: index,
+          candidateKey,
+          cardNodeId
+        });
+        throw error;
       }
-      addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
     }
     if (detailResult && closeDetail && !detailResult.close_result?.closed) {
       runControl.setPhase("recommend:close-detail");
-      detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
+      detailStep = "close_detail";
+      currentDomOperation = "candidate:close-detail";
+      checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+      try {
+        detailResult.close_result = await measureTiming(
+          timings,
+          "close_detail_ms",
+          () => closeRecommendDetail(client)
+        );
+      } catch (error) {
+        checkpointDomStaleForensic(error, {
+          phase: "recommend:close-detail",
+          operation: currentDomOperation,
+          detailStep,
+          candidateIndex: index,
+          candidateKey,
+          cardNodeId
+        });
+        throw error;
+      }
       await maybeHumanActionCooldown("after_detail_close", timings);
       if (!detailResult.close_result?.closed) {
         closeFailureError = createRecommendCloseFailureError(detailResult.close_result);
@@ -2247,6 +2829,7 @@ export async function runRecommendWorkflow({
     });
     const checkpointStarted = Date.now();
     runControl.checkpoint({
+      in_progress_candidate: null,
       results,
       last_candidate: {
         id: screeningCandidate.id || null,
@@ -2331,6 +2914,9 @@ export async function runRecommendWorkflow({
     last_list_read_recovery_mode: lastListReadRecoveryMode,
     last_list_read_stale_diagnostic: lastListReadStaleDiagnostic,
     list_read_stale_diagnostics: listReadStaleDiagnostics.slice(-12),
+    dom_stale_events: domStaleEventCount,
+    dom_stale_forensics: domStaleForensics.slice(-12),
+    dom_lifecycle_timeline: domLifecycleTimeline.slice(-20),
     ...countRecommendResultStatuses(results, { greetCount }),
     transient_recovered: countRecommendResultStatuses(results, { greetCount }).transient_recovered
       + listReadStaleRecoveries,

@@ -192,10 +192,11 @@ function mergeSelectorGroups(rules, scope, names = [], fallback = []) {
 }
 
 function rootNodeId(roots = {}, name) {
-  const root = roots[name];
-  if (typeof root === "number") return root;
-  if (root?.nodeId) return root.nodeId;
-  if (root?.documentNodeId) return root.documentNodeId;
+  for (const root of [roots?.[name], roots?.rootNodes?.[name], roots?.roots?.[name]]) {
+    if (typeof root === "number" && root > 0) return root;
+    if (root?.nodeId) return root.nodeId;
+    if (root?.documentNodeId) return root.documentNodeId;
+  }
   return 0;
 }
 
@@ -378,7 +379,9 @@ export function runNetworkProbe(networkEvents = [], probe) {
   };
 }
 
-export async function runViewportCollapseProbe(client, roots, probe) {
+export async function runViewportCollapseProbe(client, roots, probe, {
+  reacquireRoots = null
+} = {}) {
   const nodeId = rootNodeId(roots, probe.root);
   if (!nodeId) {
     return {
@@ -398,7 +401,8 @@ export async function runViewportCollapseProbe(client, roots, probe) {
       root: probe.root,
       frameOwnerRoot: probe.frameOwnerRoot,
       reason: probe.id,
-      repair: probe.repair
+      repair: probe.repair,
+      reacquireRoots
     });
     const ok = Boolean(health.ok);
     return {
@@ -469,7 +473,8 @@ export async function runSelfHealCheck({
   accessibilityProbes = [],
   viewportProbes = [],
   networkProbes = [],
-  networkEvents = []
+  networkEvents = [],
+  reacquireRoots = null
 } = {}) {
   const selectorResults = [];
   for (const probe of selectorProbes) {
@@ -482,8 +487,19 @@ export async function runSelfHealCheck({
   }
 
   const viewportResults = [];
+  const resolveViewportRoots = typeof reacquireRoots === "function"
+    ? reacquireRoots
+    : domain === "recommend"
+      ? async () => (await resolveRecommendSelfHealRoots(client)).roots
+      : domain === "recruit"
+        ? async () => (await resolveRecruitSelfHealRoots(client)).roots
+        : domain === "chat"
+          ? async () => (await resolveChatSelfHealRoots(client)).roots
+          : null;
   for (const probe of viewportProbes) {
-    viewportResults.push(await runViewportCollapseProbe(client, roots, probe));
+    viewportResults.push(await runViewportCollapseProbe(client, roots, probe, {
+      reacquireRoots: resolveViewportRoots
+    }));
   }
 
   const networkResults = networkProbes.map((probe) => runNetworkProbe(networkEvents, probe));

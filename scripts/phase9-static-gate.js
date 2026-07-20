@@ -18,6 +18,10 @@ const GATES = [
   {
     name: "package boundary",
     script: "scan:package-boundary"
+  },
+  {
+    name: "screenshot safety",
+    script: "scan:screenshot-safety"
   }
 ];
 

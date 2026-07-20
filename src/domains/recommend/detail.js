@@ -388,7 +388,7 @@ export async function readRecommendDetailHtml(client, detailState) {
 }
 
 export function isStaleRecommendNodeError(error) {
-  const pattern = /Could not find node with given id|No node with given id|Node is detached|Cannot find node|Could not compute box model/i;
+  const pattern = /Could not find node with given id|No node with given id|Node with given id does not exist|No node found for given backend id|Invalid (?:backend )?Node\s*Id|Node is detached|Cannot find node|Could not compute box model/i;
   const seen = new Set();
   let current = error;
   for (let depth = 0; current && depth < 5; depth += 1) {

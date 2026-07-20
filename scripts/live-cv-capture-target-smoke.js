@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
+  assertNoForbiddenCdpCalls,
   bringPageToFront,
   clickPoint,
   connectToChromeTargetOrOpen,
@@ -12,6 +13,10 @@ import {
 import { captureScrolledNodeScreenshots } from "../src/core/capture/index.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "../src/core/cv-acquisition/index.js";
 import { waitForCvCaptureTarget } from "../src/core/cv-capture-target/index.js";
+import {
+  verifyCaptureEvidenceSafety,
+  verifyScreenshotMethodSafety
+} from "./live-helpers/capture-safety-proof.js";
 import { candidateKeyFromProfile } from "../src/core/infinite-list/index.js";
 import {
   closeRecommendDetail,
@@ -358,6 +363,9 @@ async function captureDomainCv(client, domain, detailState, options) {
     optimize: true,
     resizeMaxWidth: 1100,
     captureViewport: config.captureViewport,
+    captureBeyondViewport: false,
+    fromSurface: true,
+    iframeOwnerNodeId: captureTarget.iframe_node_id || null,
     padding: config.padding,
     maxScreenshots: options.maxScreenshots,
     wheelDeltaY: 650,
@@ -365,8 +373,9 @@ async function captureDomainCv(client, domain, detailState, options) {
     scrollMethod: "dom-anchor-fallback-input",
     stepTimeoutMs: 45000,
     totalTimeoutMs: 180000,
-    duplicateStopCount: 1,
+    duplicateStopCount: 2,
     skipDuplicateScreenshots: true,
+    requireTerminalProof: true,
     composeForLlm: false,
     stopBoundarySelector: domain === "chat" ? CHAT_RESUME_IMAGE_STOP_BOUNDARY_SELECTOR : "",
     stopBoundaryTextPatterns: domain === "chat" ? CHAT_RESUME_IMAGE_STOP_BOUNDARY_TEXT : [],
@@ -381,8 +390,20 @@ async function captureDomainCv(client, domain, detailState, options) {
       capture_target_wait: captureTargetWait
     }
   });
+  const safetyProof = verifyCaptureEvidenceSafety(evidence);
+  if (!safetyProof.ok) {
+    throw new Error(`${domain} capture safety proof failed: ${JSON.stringify(safetyProof.issues)}`);
+  }
+  if (evidence.optimization?.browser_clip_used) {
+    throw new Error(`${domain} capture used a browser-side clip`);
+  }
+  if (evidence.optimization?.capture_beyond_viewport) {
+    throw new Error(`${domain} capture enabled captureBeyondViewport`);
+  }
   const fullScrollDetected = Boolean(
-    evidence.screenshot_count > 0
+    evidence.ok === true
+    && evidence.coverage_complete === true
+    && evidence.screenshot_count > 0
     && (
       (evidence.capture_count || 0) < options.maxScreenshots
       || (evidence.dropped_duplicate_count || 0) > 0
@@ -393,6 +414,7 @@ async function captureDomainCv(client, domain, detailState, options) {
   return {
     captureTarget,
     evidence,
+    safetyProof,
     fullScrollDetected,
     captureTargetWait
   };
@@ -429,7 +451,8 @@ function summarizeResult(domain, data = {}) {
         (data.capture?.evidence?.screenshots || []).map((item) => Boolean(item.capture_viewport))
       )),
       first_clip: data.capture?.evidence?.screenshots?.[0]?.clip || null,
-      file_paths: data.capture?.evidence?.file_paths || []
+      file_paths: data.capture?.evidence?.file_paths || [],
+      safety_proof: data.capture?.safetyProof || null
     },
     chat_attempts: data.detail?.attempts || undefined,
     chat_content_wait: data.detail?.contentWait
@@ -446,6 +469,14 @@ async function runDomain(domain, options) {
   const session = await connectDomain(domain, options);
   try {
     const client = session.client;
+    const frameResizeEvents = [];
+    client.Page.frameResized(() => {
+      frameResizeEvents.push({
+        at: new Date().toISOString(),
+        at_ms: Date.now(),
+        connection_epoch: client.__connectionEpoch ?? null
+      });
+    });
     let detail = null;
     if (domain === "recommend") {
       detail = await ensureRecommendDetail(client);
@@ -456,12 +487,45 @@ async function runDomain(domain, options) {
     } else {
       throw new Error(`Unsupported domain: ${domain}`);
     }
+    const captureStartedAt = Date.now();
     const capture = await captureDomainCv(client, domain, detail.detailState, options);
+    const captureEndedAt = Date.now();
+    const screenshotCorrelatedFrameResizeEvents = frameResizeEvents.filter((event) => (
+      event.at_ms >= captureStartedAt && event.at_ms <= captureEndedAt
+    ));
+    if (screenshotCorrelatedFrameResizeEvents.length > 0) {
+      throw new Error(`${domain} emitted Page.frameResized during CV screenshot capture`);
+    }
     const url = await getMainFrameUrl(client).catch(() => "");
     if (!capture.fullScrollDetected) {
       throw new Error(`${domain} capture reached max screenshots without end-of-CV detection`);
     }
-    return summarizeResult(domain, { url, detail, capture });
+    const methodProof = assertNoForbiddenCdpCalls(session.methodLog || []);
+    const screenshotMethodSafety = verifyScreenshotMethodSafety(session.methodLog || []);
+    if (!screenshotMethodSafety.ok) {
+      throw new Error(`${domain} screenshot replay safety failed: ${JSON.stringify(screenshotMethodSafety.issues)}`);
+    }
+    const methodLogPath = path.join(options.outputDir, `${domain}-cdp-method-log.json`);
+    fs.writeFileSync(methodLogPath, `${JSON.stringify(session.methodLog || [], null, 2)}\n`);
+    return {
+      ...summarizeResult(domain, { url, detail, capture }),
+      safety: {
+        ...methodProof,
+        screenshot_method_count: (session.methodLog || []).filter((entry) => (
+          String(entry?.method || "").replace(/:retry_after_reconnect$/, "") === "Page.captureScreenshot"
+        )).length,
+        screenshot_retry_count: (session.methodLog || []).filter((entry) => (
+          entry?.method === "Page.captureScreenshot:retry_after_reconnect"
+        )).length,
+        browser_clip_used: Boolean(capture.evidence?.optimization?.browser_clip_used),
+        capture_beyond_viewport: Boolean(capture.evidence?.optimization?.capture_beyond_viewport),
+        frame_resize_event_count: frameResizeEvents.length,
+        screenshot_correlated_frame_resize_event_count: screenshotCorrelatedFrameResizeEvents.length,
+        screenshot_correlated_frame_resize_events: screenshotCorrelatedFrameResizeEvents,
+        screenshot_method_safety: screenshotMethodSafety,
+        method_log_path: methodLogPath
+      }
+    };
   } finally {
     if (domain === "recommend") {
       await closeRecommendDetail(session.client, { attemptsLimit: 2 }).catch(() => null);
@@ -501,6 +565,12 @@ async function main() {
     ok: results.every((item) => item.ok),
     output_dir: options.outputDir,
     max_screenshots: options.maxScreenshots,
+    model_boundary: {
+      live_evaluated: false,
+      status: "not_live_evaluated",
+      fail_closed_unit_tested: true,
+      unit_test_command: "npm run test:core-cv-acquisition"
+    },
     results
   };
   const summaryPath = path.join(options.outputDir, "summary.json");

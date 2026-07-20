@@ -14,14 +14,22 @@ import {
   sleep
 } from "../../core/browser/index.js";
 import {
+  attemptImageCaptureCheckpointResume,
   compactCvAcquisitionState,
+  createImageCaptureWorkflowRetryTracker,
+  createRequiredImageEvidenceFailure,
+  imageCaptureResumeCheckpoint,
   countParsedNetworkProfiles,
   createCvAcquisitionState,
   DEFAULT_MAX_IMAGE_PAGES,
   getCvNetworkWaitPlan,
+  isIncompleteImageEvidence,
+  isRecoverableImageCaptureWorkflowError,
   recordCvImageFallback,
   recordCvNetworkHit,
   recordCvNetworkMiss,
+  reacquireImageCaptureResumeTarget,
+  requireCompleteImageEvidence,
   summarizeImageEvidence,
   waitForCvNetworkEvents
 } from "../../core/cv-acquisition/index.js";
@@ -63,6 +71,7 @@ import {
   readChatCardCandidate,
   waitForChatCandidateNodeIds
 } from "./cards.js";
+import { createChatActionJournal } from "./action-journal.js";
 import {
   closeChatBlockingPanels,
   closeChatResumeModal,
@@ -74,16 +83,20 @@ import {
   quickChatResumeModalOpenProbe,
   readChatActiveCandidateState,
   readChatConversationReadyState,
+  readChatRequestVerificationEvidence,
+  getChatGreetingMessageState,
   requestChatResumeForPassedCandidate,
   selectChatMessageFilter,
   selectChatPrimaryLabel,
   waitForChatOnlineResumeButton,
   waitForChatProfileNetworkEvents,
+  waitForChatResumeModal,
   waitForChatResumeContent
 } from "./detail.js";
 import { selectChatJob } from "./jobs.js";
 import {
   getChatTopLevelState,
+  makeBossSecurityVerificationRequiredError,
   isForbiddenChatResumeNavigationError,
   makeForbiddenChatResumeNavigationError,
   recoverChatShell
@@ -91,8 +104,260 @@ import {
 import { getChatRoots } from "./roots.js";
 
 const DETAIL_SOURCES = new Set(["cascade", "network", "dom", "image"]);
-const CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS = 5000;
-const CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS = 8000;
+export const CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS = 10000;
+export const CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS = 15000;
+export const CHAT_EDITOR_PRE_ACTION_RETRY_LIMIT = 1;
+export const CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS = 1500;
+
+export function shouldRetryChatEditorPreAction(error, journalRecord, retryCount = 0, {
+  retryLimit = CHAT_EDITOR_PRE_ACTION_RETRY_LIMIT
+} = {}) {
+  const code = String(error?.code || error?.message || "").trim();
+  const state = String(journalRecord?.state || "").trim();
+  const count = Math.max(0, Math.floor(Number(retryCount) || 0));
+  const limit = Math.max(0, Math.floor(Number(retryLimit) || 0));
+  return code === "CHAT_EDITOR_MESSAGE_MISMATCH"
+    && state === "pre_action"
+    && count < limit;
+}
+
+export function sampleChatCollectCvProcessingFloorMs({
+  minMs = CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS,
+  maxMs = CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS,
+  random = Math.random
+} = {}) {
+  const lower = Math.max(0, Math.round(Number(minMs) || 0));
+  const upper = Math.max(lower, Math.round(Number(maxMs) || lower));
+  const raw = typeof random === "function" ? Number(random()) : Number.NaN;
+  const unit = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0.5;
+  return Math.round(lower + (upper - lower) * unit);
+}
+
+export async function enforceChatCollectCvProcessingFloor({
+  enabled = true,
+  candidateStartedAt,
+  targetMs = null,
+  minMs = CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS,
+  maxMs = CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS,
+  random = Math.random,
+  nowFn = Date.now,
+  sleepFn = sleep
+} = {}) {
+  if (!enabled) {
+    return {
+      enabled: false,
+      target_ms: 0,
+      elapsed_before_ms: 0,
+      delay_requested_ms: 0,
+      delay_elapsed_ms: 0,
+      elapsed_after_ms: 0,
+      verified: true
+    };
+  }
+  const readNow = typeof nowFn === "function" ? nowFn : Date.now;
+  const sleeper = typeof sleepFn === "function" ? sleepFn : sleep;
+  const startedAt = Number(candidateStartedAt);
+  if (!Number.isFinite(startedAt)) {
+    throw new Error("enforceChatCollectCvProcessingFloor requires candidateStartedAt");
+  }
+  const sampledTarget = targetMs == null
+    ? sampleChatCollectCvProcessingFloorMs({ minMs, maxMs, random })
+    : sampleChatCollectCvProcessingFloorMs({ minMs: targetMs, maxMs: targetMs, random });
+  const elapsedBefore = Math.max(0, Number(readNow()) - startedAt);
+  const delayStartedAt = Number(readNow());
+  let delayRequestedMs = 0;
+  let elapsedAfter = elapsedBefore;
+  let stagnantReads = 0;
+  while (elapsedAfter < sampledTarget) {
+    const remainingMs = Math.max(1, Math.ceil(sampledTarget - elapsedAfter));
+    delayRequestedMs += remainingMs;
+    await sleeper(remainingMs);
+    const nextElapsed = Math.max(0, Number(readNow()) - startedAt);
+    stagnantReads = nextElapsed > elapsedAfter ? 0 : stagnantReads + 1;
+    elapsedAfter = nextElapsed;
+    if (stagnantReads >= 3) {
+      const error = new Error("Chat collect-CV processing-floor clock did not advance after sleep");
+      error.code = "CHAT_COLLECT_CV_PROCESSING_FLOOR_CLOCK_STALLED";
+      error.target_ms = sampledTarget;
+      error.elapsed_ms = elapsedAfter;
+      throw error;
+    }
+  }
+  const delayElapsedMs = Math.max(0, Number(readNow()) - delayStartedAt);
+  return {
+    enabled: true,
+    target_ms: sampledTarget,
+    elapsed_before_ms: Math.round(elapsedBefore),
+    delay_requested_ms: Math.round(delayRequestedMs),
+    delay_elapsed_ms: Math.round(delayElapsedMs),
+    elapsed_after_ms: Math.round(elapsedAfter),
+    verified: elapsedAfter >= sampledTarget
+  };
+}
+
+function compactChatActionJournalRecord(record = null, filePath = null) {
+  if (!record) return null;
+  return {
+    schema_version: record.schema_version || 1,
+    action_key: record.action_key || null,
+    candidate_id: record.candidate_id || null,
+    state: record.state || null,
+    evidence: record.evidence || {},
+    created_at: record.created_at || null,
+    updated_at: record.updated_at || null,
+    first_run_id: record.first_run_id || null,
+    last_run_id: record.last_run_id || null,
+    file_path: filePath || null
+  };
+}
+
+function chatActionUnknownOrigin(record = null) {
+  const history = Array.isArray(record?.history) ? record.history : [];
+  const last = history[history.length - 1];
+  return record?.state === "outcome_unknown" ? last?.from_state || null : null;
+}
+
+export function reconcileChatRequestJournalFromExactExistingState({
+  actionJournal = null,
+  actionJournalScope = "",
+  actionJournalRecord = null,
+  candidateId = "",
+  selectionReadyState = null,
+  readyState = null,
+  runId = "",
+  greeting = "",
+  checkpointCritical = null
+} = {}) {
+  const normalizedCandidateId = normalizeText(candidateId);
+  const expectedCandidateId = normalizeText(selectionReadyState?.expected_candidate_id || "");
+  const activeCandidateId = normalizeText(selectionReadyState?.active_candidate_id || "");
+  const exactCandidateBound = Boolean(
+    normalizedCandidateId
+    && selectionReadyState?.candidate_selection_verified === true
+    && expectedCandidateId === normalizedCandidateId
+    && activeCandidateId === normalizedCandidateId
+  );
+  const exactExistingRequestState = Boolean(
+    readyState?.already_requested_resume
+    || readyState?.attachment_resume_enabled
+  );
+  const recoverableRequestJournal = Boolean(
+    actionJournalRecord?.state === "request_in_flight"
+    || (
+      actionJournalRecord?.state === "outcome_unknown"
+      && chatActionUnknownOrigin(actionJournalRecord) === "request_in_flight"
+    )
+  );
+  if (
+    !exactCandidateBound
+    || !exactExistingRequestState
+    || !recoverableRequestJournal
+    || actionJournalRecord?.candidate_id !== normalizedCandidateId
+    || typeof actionJournal?.transition !== "function"
+    || typeof checkpointCritical !== "function"
+  ) {
+    return null;
+  }
+
+  const confirmationSource = readyState.already_requested_resume
+    ? "exact_requested_resume_state"
+    : "attachment_resume_available";
+  const transitioned = actionJournal.transition({
+    scope: actionJournalScope,
+    candidateId: normalizedCandidateId,
+    state: "request_confirmed",
+    runId,
+    greeting,
+    evidence: {
+      active_candidate_id: activeCandidateId,
+      reason: "recovered_from_exact_existing_request_state_before_screening",
+      message_observed: Boolean(readyState.already_requested_resume),
+      request_ready_state_observed: true,
+      request_confirmation_source: confirmationSource
+    }
+  });
+  const actionTransaction = compactChatActionJournalRecord(
+    transitioned.record,
+    transitioned.file_path
+  );
+  checkpointCritical({ action_transaction: actionTransaction });
+  return {
+    requested: false,
+    skipped: true,
+    satisfied: true,
+    reason: "request_confirmed_from_exact_existing_state",
+    initial_state: readyState,
+    journal_reconciled_existing_state: true,
+    action_transaction: actionTransaction
+  };
+}
+
+export function preserveChatRequestOutcomeUnknownWithoutReplay({
+  actionJournalRecord = null,
+  candidateId = "",
+  activeCandidateId = "",
+  readyEvidence = null,
+  messageEvidence = null
+} = {}) {
+  const normalizedCandidateId = normalizeText(candidateId);
+  const normalizedActiveCandidateId = normalizeText(activeCandidateId);
+  const exactCandidateBound = Boolean(
+    normalizedCandidateId
+    && normalizedActiveCandidateId === normalizedCandidateId
+    && normalizeText(actionJournalRecord?.candidate_id || "") === normalizedCandidateId
+  );
+  if (
+    !exactCandidateBound
+    || actionJournalRecord?.state !== "outcome_unknown"
+    || chatActionUnknownOrigin(actionJournalRecord) !== "request_in_flight"
+  ) {
+    return null;
+  }
+
+  const requestMessageCount = Number(messageEvidence?.count);
+  const resumeAttachmentCount = Number(messageEvidence?.resume_attachment_count);
+  return {
+    requested: false,
+    skipped: true,
+    satisfied: false,
+    reason: "outcome_unknown_preserved_no_replay",
+    initial_state: readyEvidence || null,
+    journal_preserved_outcome_unknown: true,
+    no_replay: true,
+    action_unknown_origin: "request_in_flight",
+    request_verification: {
+      ready_state_readable: Boolean(readyEvidence),
+      message_state_readable: messageEvidence?.ok === true,
+      request_message_count: Number.isFinite(requestMessageCount) ? requestMessageCount : null,
+      resume_attachment_count: Number.isFinite(resumeAttachmentCount) ? resumeAttachmentCount : null,
+      request_marker_observed: Boolean(readyEvidence?.already_requested_resume),
+      attachment_resume_observed: Boolean(readyEvidence?.attachment_resume_enabled)
+    },
+    action_transaction: compactChatActionJournalRecord(actionJournalRecord)
+  };
+}
+
+export function applyChatProtectedOutcomeSkip(screening = null, postAction = null, candidate = null) {
+  if (postAction?.journal_preserved_outcome_unknown !== true) return screening;
+  return {
+    status: "skip",
+    passed: false,
+    score: 0,
+    reasons: [postAction.reason || "outcome_unknown_preserved_no_replay"],
+    candidate: candidate || screening?.candidate || null
+  };
+}
+
+function makeChatPostActionOutcomeUnknownError(candidateId, record, evidence = {}) {
+  const error = new Error(`POST_ACTION_OUTCOME_UNKNOWN: candidate=${candidateId || "unknown"}; state=${record?.state || "unknown"}`);
+  error.code = "POST_ACTION_OUTCOME_UNKNOWN";
+  error.retryable = false;
+  error.candidate_id = candidateId || null;
+  error.action_state = record?.state || null;
+  error.action_unknown_origin = chatActionUnknownOrigin(record);
+  error.action_evidence = evidence;
+  return error;
+}
 
 function normalizeDetailSource(value) {
   const normalized = String(value || "").trim().toLowerCase();
@@ -218,6 +483,57 @@ export function isChatResumeModalCloseFailureError(error) {
     || /CHAT_RESUME_MODAL_OPEN_BEFORE_CANDIDATE_CLICK/i.test(String(error?.message || error || ""));
 }
 
+export function consumeChatDetailRecoveryBudget(recoveryCounts, candidateKey, {
+  retryLimit = 1
+} = {}) {
+  if (!(recoveryCounts instanceof Map)) {
+    throw new TypeError("consumeChatDetailRecoveryBudget requires a recovery-count Map");
+  }
+  const key = String(candidateKey || "").trim() || "__unknown_candidate__";
+  const limit = Math.max(0, Math.floor(Number(retryLimit) || 0));
+  const previousCount = Math.max(0, Math.floor(Number(recoveryCounts.get(key)) || 0));
+  if (previousCount >= limit) {
+    return {
+      allowed: false,
+      previous_count: previousCount,
+      count: previousCount,
+      retry_limit: limit
+    };
+  }
+  const count = previousCount + 1;
+  recoveryCounts.set(key, count);
+  return {
+    allowed: true,
+    previous_count: previousCount,
+    count,
+    retry_limit: limit
+  };
+}
+
+export function compactChatCandidateSelectionReadyState(selectionReadyState = null) {
+  if (!selectionReadyState) return null;
+  const activeCandidate = selectionReadyState.activeCandidate || selectionReadyState.active_candidate || null;
+  return {
+    ok: selectionReadyState.ok === true,
+    reason: selectionReadyState.reason || null,
+    elapsed_ms: Number.isFinite(Number(selectionReadyState.elapsed_ms))
+      ? Number(selectionReadyState.elapsed_ms)
+      : null,
+    expected_candidate_id: normalizeText(selectionReadyState.expected_candidate_id || "") || null,
+    active_candidate_id: normalizeText(selectionReadyState.active_candidate_id || "") || null,
+    candidate_selection_verified: selectionReadyState.candidate_selection_verified === true,
+    active_candidate: activeCandidate
+      ? {
+          node_id: activeCandidate.node_id || null,
+          selector: activeCandidate.selector || null,
+          candidate_id: normalizeText(activeCandidate.candidate_id || "") || null,
+          label: normalizeText(activeCandidate.label || "") || null,
+          outer_html_length: activeCandidate.outer_html_length || 0
+        }
+      : null
+  };
+}
+
 export function makeChatCandidateSelectionMismatchError(selected = null, candidate = null) {
   const expectedId = candidate?.id || selected?.ready?.expected_candidate_id || "";
   const activeId = selected?.ready?.active_candidate_id || "";
@@ -232,6 +548,23 @@ export function makeChatCandidateSelectionMismatchError(selected = null, candida
 export function isChatCandidateSelectionMismatchError(error) {
   return error?.code === "CHAT_ACTIVE_CANDIDATE_MISMATCH"
     || /CHAT_ACTIVE_CANDIDATE_MISMATCH/i.test(String(error?.message || error || ""));
+}
+
+export function requireExactChatCandidateSelection(selected = null, candidate = null) {
+  const candidateId = normalizeText(candidate?.id || "");
+  const selectionReadyState = selected?.ready || null;
+  const expectedCandidateId = normalizeText(selectionReadyState?.expected_candidate_id || "");
+  const activeCandidateId = normalizeText(selectionReadyState?.active_candidate_id || "");
+  const exactCandidateBound = Boolean(
+    candidateId
+    && selectionReadyState?.candidate_selection_verified === true
+    && expectedCandidateId === candidateId
+    && activeCandidateId === candidateId
+  );
+  if (!exactCandidateBound) {
+    throw makeChatCandidateSelectionMismatchError(selected, candidate);
+  }
+  return selectionReadyState;
 }
 
 export async function ensureNoOpenChatResumeModalBeforeCandidateClick(client, {
@@ -381,6 +714,10 @@ function createFailedLlmResult(error) {
     error: error?.message || String(error || "unknown"),
     screened_at: new Date().toISOString()
   };
+}
+
+export function isRecoverableChatImageCaptureError(error) {
+  return isRecoverableImageCaptureWorkflowError(error);
 }
 
 function normalizeScreeningMode(value) {
@@ -553,13 +890,6 @@ async function captureChatFinalFailureArtifact(client, {
   }
   try {
     artifact.screenshot = await captureViewportScreenshot(client, {
-      filePath: imageEvidenceFilePath({
-        imageOutputDir,
-        domain: "chat-final-failure",
-        runId: runControl.runId,
-        index: 0,
-        extension: "jpg"
-      }),
       format: "jpeg",
       quality: 72,
       metadata: {
@@ -678,7 +1008,12 @@ function isFullCvNetworkProfile(profileResult = {}) {
 }
 
 function hasUsableImageEvidence(imageEvidence = null) {
-  if (!imageEvidence || imageEvidence.ok === false) return false;
+  if (
+    !imageEvidence
+    || imageEvidence.ok === false
+    || imageEvidence.coverage_complete !== true
+    || isIncompleteImageEvidence(imageEvidence)
+  ) return false;
   return Boolean(
     (Array.isArray(imageEvidence.llm_file_paths) && imageEvidence.llm_file_paths.length)
     || (Array.isArray(imageEvidence.file_paths) && imageEvidence.file_paths.length)
@@ -768,7 +1103,7 @@ async function selectFreshChatCandidate(client, {
             expectedCandidateId: candidate?.id || ""
           })
         : await readSelectedChatCandidateState(client, candidate);
-      return {
+      const selected = {
         card_box: box,
         ready,
         card_node_id: freshNodeId,
@@ -776,6 +1111,10 @@ async function selectFreshChatCandidate(client, {
         modal_guard: modalGuard,
         attempt: attempt + 1
       };
+      if (!ready?.forbidden_top_level_navigation) {
+        requireExactChatCandidateSelection(selected, candidate);
+      }
+      return selected;
     } catch (error) {
       lastError = error;
       if (!isRecoverableCdpNodeError(error)) throw error;
@@ -787,6 +1126,12 @@ async function selectFreshChatCandidate(client, {
 
 async function readSelectedChatCandidateState(client, candidate = null) {
   const topLevelState = await getChatTopLevelState(client);
+  if (topLevelState.is_security_verification) {
+    throw makeBossSecurityVerificationRequiredError(
+      topLevelState,
+      "chat_candidate_selection"
+    );
+  }
   if (topLevelState.is_forbidden_resume_top_level) {
     return {
       forbidden_top_level_navigation: true,
@@ -810,6 +1155,16 @@ async function readSelectedChatCandidateState(client, candidate = null) {
     active_candidate_id: activeCandidateId || null,
     candidate_selection_verified: candidateSelectionVerified
   };
+}
+
+export function hasScreenableChatFullCvEvidence(fullCvEvidence = null, imageEvidence = null) {
+  if (fullCvEvidence?.source === "image") {
+    return Boolean(fullCvEvidence.full_cv_acquired && hasUsableImageEvidence(imageEvidence));
+  }
+  return Boolean(
+    fullCvEvidence?.full_cv_acquired
+    && !isIncompleteImageEvidence(imageEvidence)
+  );
 }
 
 function selectedDetailNetworkEvents(detailSource, selectionEvents, resumeEvents) {
@@ -938,7 +1293,9 @@ export async function runChatWorkflow({
   listFallbackPoint = null,
   imageOutputDir = "",
   humanRestEnabled = false,
-  humanBehavior = null
+  humanBehavior = null,
+  actionJournal = null,
+  actionJournalScope = "boss-chat:default"
 } = {}, runControl) {
   if (!client) throw new Error("runChatWorkflow requires a guarded CDP client");
   const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
@@ -948,8 +1305,12 @@ export async function runChatWorkflow({
   const normalizedScreeningMode = normalizeText(criteria) ? normalizeScreeningMode(screeningMode) : "collect_cv";
   const collectCvOnly = normalizedScreeningMode === "collect_cv" || !normalizeText(criteria);
   const useLlmScreening = normalizedScreeningMode === "llm" && !collectCvOnly;
-  const collectCvPerCandidateRestEnabled = collectCvOnly && effectiveHumanBehavior.enabled;
-  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled || collectCvPerCandidateRestEnabled;
+  const collectCvProcessingFloorEnabled = collectCvOnly;
+  const collectCvPerCandidateRestEnabled = false;
+  const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
+  const effectiveActionJournal = requestResumeForPassed
+    ? actionJournal || createChatActionJournal()
+    : actionJournal;
   configureHumanInteraction(client, {
     enabled: effectiveHumanBehavior.enabled,
     clickMovementEnabled: effectiveHumanBehavior.clickMovement,
@@ -961,10 +1322,22 @@ export async function runChatWorkflow({
     enabled: effectiveHumanRestEnabled,
     shortRestEnabled: effectiveHumanBehavior.shortRest,
     batchRestEnabled: effectiveHumanBehavior.batchRest,
-    restLevel: effectiveHumanBehavior.restLevel,
-    perCandidateRestEnabled: collectCvPerCandidateRestEnabled,
-    perCandidateRestMinMs: CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS,
-    perCandidateRestMaxMs: CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS
+    restLevel: effectiveHumanBehavior.restLevel
+  });
+  const collectCvProcessingFloorState = {
+    enabled: collectCvProcessingFloorEnabled,
+    min_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS : null,
+    max_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS : null,
+    count: 0,
+    total_delay_requested_ms: 0,
+    total_delay_elapsed_ms: 0,
+    last: null
+  };
+  const collectCvProcessingFloorSnapshot = () => ({
+    ...collectCvProcessingFloorState,
+    last: collectCvProcessingFloorState.last
+      ? { ...collectCvProcessingFloorState.last }
+      : null
   });
   const processedLimit = Math.max(1, Number(maxCandidates) || 1);
   const passTarget = Number.isFinite(Number(targetPassCount)) && Number(targetPassCount) > 0
@@ -1009,6 +1382,7 @@ export async function runChatWorkflow({
   let contextSetup = {};
   let contextRecoveryAttempts = 0;
   const candidateRecoveryCounts = new Map();
+  const imageCaptureWorkflowRetries = createImageCaptureWorkflowRetryTracker();
   let lastHumanEvent = null;
 
   function recordHumanEvent(event = null) {
@@ -1039,6 +1413,12 @@ export async function runChatWorkflow({
 
   runControl.setPhase("chat:cleanup");
   let initialTopLevelState = await getChatTopLevelState(client);
+  if (initialTopLevelState.is_security_verification) {
+    throw makeBossSecurityVerificationRequiredError(
+      initialTopLevelState,
+      "chat_run_setup"
+    );
+  }
   if (!initialTopLevelState.is_chat_shell) {
     const recovery = await recoverChatShell(client, {
       targetUrl,
@@ -1187,8 +1567,14 @@ export async function runChatWorkflow({
       human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
       human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
-      human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
-      human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
+      human_rest_per_candidate_min_ms: null,
+      human_rest_per_candidate_max_ms: null,
+      collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+      collect_cv_processing_floor_min_ms: collectCvProcessingFloorState.min_ms,
+      collect_cv_processing_floor_max_ms: collectCvProcessingFloorState.max_ms,
+      collect_cv_processing_floor_count: collectCvProcessingFloorState.count,
+      collect_cv_processing_floor_delay_requested_ms: collectCvProcessingFloorState.total_delay_requested_ms,
+      collect_cv_processing_floor_delay_ms: collectCvProcessingFloorState.total_delay_elapsed_ms,
       human_rest_count: humanRestController.getState().rest_count,
       human_rest_ms: humanRestController.getState().total_rest_ms,
       last_human_event: lastHumanEvent
@@ -1211,6 +1597,7 @@ export async function runChatWorkflow({
       },
       human_behavior: effectiveHumanBehavior,
       human_rest: humanRestController.getState(),
+      collect_cv_processing_floor: collectCvProcessingFloorSnapshot(),
       last_human_event: lastHumanEvent,
       list_end_reason: listEndReason,
       target_pass_count: passTarget,
@@ -1256,8 +1643,15 @@ export async function runChatWorkflow({
     human_rest_level: effectiveHumanBehavior.restLevel,
     human_rest_enabled: effectiveHumanRestEnabled,
     human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
-    human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
-    human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
+    human_rest_per_candidate_min_ms: null,
+    human_rest_per_candidate_max_ms: null,
+    collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+    collect_cv_processing_floor_min_ms: collectCvProcessingFloorState.min_ms,
+    collect_cv_processing_floor_max_ms: collectCvProcessingFloorState.max_ms,
+    collect_cv_processing_floor_count: collectCvProcessingFloorState.count,
+    collect_cv_processing_floor_delay_requested_ms: collectCvProcessingFloorState.total_delay_requested_ms,
+    collect_cv_processing_floor_delay_ms: collectCvProcessingFloorState.total_delay_elapsed_ms,
+    collect_cv_processing_floor_current: null,
     human_rest_count: humanRestController.getState().rest_count,
     human_rest_ms: humanRestController.getState().total_rest_ms,
     last_human_event: lastHumanEvent
@@ -1275,8 +1669,14 @@ export async function runChatWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("chat:candidate");
-    rootState = await ensureChatViewport(rootState, "candidate_loop");
+    rootState = await ensureChatViewport(await getChatRoots(client), "candidate_loop");
     const loopTopLevelState = await getChatTopLevelState(client);
+    if (loopTopLevelState.is_security_verification) {
+      throw makeBossSecurityVerificationRequiredError(
+        loopTopLevelState,
+        "chat_candidate_loop"
+      );
+    }
     if (!loopTopLevelState.is_chat_shell) {
       await recoverAndReapplyChatContext("candidate_loop_non_chat_shell", {
         message: `Unexpected chat top-level URL: ${loopTopLevelState.url}`
@@ -1372,6 +1772,12 @@ export async function runChatWorkflow({
     }));
     if (!nextCandidateResult.ok) {
       const endTopLevelState = await getChatTopLevelState(client);
+      if (endTopLevelState.is_security_verification) {
+        throw makeBossSecurityVerificationRequiredError(
+          endTopLevelState,
+          "chat_candidate_list_end"
+        );
+      }
       if (!endTopLevelState.is_chat_shell) {
         await recoverAndReapplyChatContext("candidate_list_end_non_chat_shell", {
           message: `Unexpected chat top-level URL at list end: ${endTopLevelState.url}`
@@ -1396,10 +1802,16 @@ export async function runChatWorkflow({
     let effectiveCardNodeId = cardNodeId;
     const candidateKey = nextCandidateResult.item.key;
     const cardCandidate = nextCandidateResult.item.candidate;
+    const candidateProcessingStarted = Date.now();
+    const candidateProcessingFloorTargetMs = collectCvProcessingFloorEnabled
+      ? sampleChatCollectCvProcessingFloorMs()
+      : 0;
 
     let screeningCandidate = cardCandidate;
     let detailResult = null;
     let preActionState = null;
+    let selectionReadyState = null;
+    let preScreeningActionReconciliation = null;
     let detailUnavailableReason = "";
     if (index < detailCountLimit) {
       let detailStep = "start";
@@ -1418,8 +1830,8 @@ export async function runChatWorkflow({
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
         runControl.setPhase("chat:detail");
-        rootState = await ensureChatViewport(rootState, "detail");
         checkpointInProgressCandidate({ event: "detail_start" });
+        rootState = await ensureChatViewport(rootState, "detail");
 
         detailStep = "select_candidate";
         networkRecorder.clear();
@@ -1433,7 +1845,12 @@ export async function runChatWorkflow({
         if (selected.ready?.forbidden_top_level_navigation) {
           throw makeForbiddenChatResumeNavigationError(selected.ready.top_level_state);
         }
+        selectionReadyState = selected.ready || null;
         effectiveCardNodeId = selected.card_node_id || cardNodeId;
+        checkpointInProgressCandidate({
+          event: "candidate_selection_verified",
+          selection_ready_state: compactChatCandidateSelectionReadyState(selectionReadyState)
+        });
         const selectionNetworkEvents = networkRecorder.events.slice();
         try {
           preActionState = await readChatConversationReadyState(client);
@@ -1441,6 +1858,31 @@ export async function runChatWorkflow({
           preActionState = {
             error: error?.message || String(error)
           };
+        }
+        if (
+          requestResumeForPassed
+          && !dryRunRequestCv
+          && effectiveActionJournal
+          && (preActionState?.already_requested_resume || preActionState?.attachment_resume_enabled)
+        ) {
+          const candidateId = normalizeText(cardCandidate.id || "");
+          const actionJournalRecord = candidateId
+            ? effectiveActionJournal.read({
+                scope: actionJournalScope,
+                candidateId
+              })
+            : null;
+          preScreeningActionReconciliation = reconcileChatRequestJournalFromExactExistingState({
+            actionJournal: effectiveActionJournal,
+            actionJournalScope,
+            actionJournalRecord,
+            candidateId,
+            selectionReadyState: selected.ready,
+            readyState: preActionState,
+            runId: runControl.runId,
+            greeting: greetingText,
+            checkpointCritical: (patch) => runControl.checkpointCritical(patch)
+          });
         }
         const preDetailSkipReason = chatDetailSkipReasonFromReadyState(preActionState);
         if (preDetailSkipReason) {
@@ -1668,53 +2110,208 @@ export async function runChatWorkflow({
             captureTarget = captureTargetWait.target || null;
             const captureNodeId = captureTarget?.node_id || null;
             if (captureNodeId) {
-              detailStep = "capture_image_fallback";
-              imageEvidence = await measureTiming(timings, "screenshot_capture_ms", () => captureScrolledNodeScreenshots(client, captureNodeId, {
-                filePath: imageEvidenceFilePath({
-                  imageOutputDir,
-                  domain: "chat",
-                  runId: runControl?.runId,
-                  index,
-                  extension: "jpg"
-                }),
-                format: "jpeg",
-                quality: 72,
-                optimize: true,
-                resizeMaxWidth: 1100,
-                captureViewport: false,
-                padding: 0,
-                maxScreenshots: maxImagePages,
-                wheelDeltaY: imageWheelDeltaY,
-                settleMs: 350,
-                scrollMethod: "dom-anchor-fallback-input",
-                scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
-                stepTimeoutMs: 45000,
-                totalTimeoutMs: 90000,
-                duplicateStopCount: 1,
-                skipDuplicateScreenshots: true,
-                composeForLlm: true,
-                llmPagesPerImage: 3,
-                llmResizeMaxWidth: 1100,
-                llmQuality: 72,
-                stopBoundarySelector: CHAT_RESUME_IMAGE_STOP_BOUNDARY_SELECTOR,
-                stopBoundaryTextPatterns: CHAT_RESUME_IMAGE_STOP_BOUNDARY_TEXT,
-                stopBoundaryMaxProbeNodes: 360,
-                stopBoundaryTopPadding: 10,
-                stopBoundaryMinCaptureHeight: 180,
-                metadata: {
-                  domain: "chat",
-                  capture_mode: "scroll_sequence",
-                  capture_scope: "resume_modal_clip",
-                  acquisition_reason: normalizedDetailSource === "image"
-                    ? "forced_image"
-                    : "network_miss_image_fallback",
-                  run_candidate_index: index,
-                  candidate_key: candidateKey,
-                  capture_target: captureTarget,
-                  capture_target_wait: captureTargetWait
+              const imageEvidencePath = imageEvidenceFilePath({
+                imageOutputDir,
+                domain: "chat",
+                runId: runControl?.runId,
+                index,
+                extension: "jpg"
+              });
+              const captureImageForTarget = (target, targetWait, resumeCheckpoint = null) => captureScrolledNodeScreenshots(
+                client,
+                target.node_id,
+                {
+                  filePath: imageEvidencePath,
+                  format: "jpeg",
+                  quality: 72,
+                  optimize: true,
+                  resizeMaxWidth: 1100,
+                  captureViewport: false,
+                  iframeOwnerNodeId: target?.iframe_node_id || null,
+                  padding: 0,
+                  maxScreenshots: maxImagePages,
+                  wheelDeltaY: imageWheelDeltaY,
+                  settleMs: 350,
+                  scrollMethod: "dom-anchor-fallback-input",
+                  scrollDeltaJitterEnabled: effectiveHumanBehavior.listScrollJitter,
+                  stepTimeoutMs: 45000,
+                  totalTimeoutMs: 90000,
+                  duplicateStopCount: 2,
+                  skipDuplicateScreenshots: true,
+                  requireTerminalProof: true,
+                  composeForLlm: true,
+                  llmPagesPerImage: 3,
+                  llmResizeMaxWidth: 1100,
+                  llmQuality: 72,
+                  stopBoundarySelector: CHAT_RESUME_IMAGE_STOP_BOUNDARY_SELECTOR,
+                  stopBoundaryTextPatterns: CHAT_RESUME_IMAGE_STOP_BOUNDARY_TEXT,
+                  stopBoundaryMaxProbeNodes: 360,
+                  stopBoundaryTopPadding: 10,
+                  stopBoundaryMinCaptureHeight: 180,
+                  resumeCheckpoint,
+                  metadata: {
+                    domain: "chat",
+                    capture_mode: "scroll_sequence",
+                    capture_scope: "resume_modal_clip",
+                    acquisition_reason: normalizedDetailSource === "image"
+                      ? "forced_image"
+                      : "network_miss_image_fallback",
+                    run_candidate_index: index,
+                    candidate_key: candidateKey,
+                    capture_target: target,
+                    capture_target_wait: targetWait,
+                    resumed_from_checkpoint: Boolean(resumeCheckpoint)
+                  }
                 }
-              }));
-              source = "image";
+              );
+              detailStep = "capture_image_fallback";
+              try {
+                imageEvidence = await measureTiming(
+                  timings,
+                  "screenshot_capture_ms",
+                  () => captureImageForTarget(captureTarget, captureTargetWait)
+                );
+                imageEvidence = requireCompleteImageEvidence(imageEvidence, {
+                  code: "IMAGE_CAPTURE_EVIDENCE_MISSING",
+                  message: "Chat CV capture returned no complete persisted evidence",
+                  metadata: { domain: "chat", candidate_key: candidateKey }
+                });
+              } catch (error) {
+                if (!isRecoverableChatImageCaptureError(error)) throw error;
+                const retryReservation = imageCaptureWorkflowRetries.consume(candidateKey);
+                const resumeCheckpoint = retryReservation.allowed
+                  ? imageCaptureResumeCheckpoint(error)
+                  : null;
+                timings.image_capture_workflow_retry = retryReservation;
+                if (!resumeCheckpoint) {
+                  imageEvidence = createRequiredImageEvidenceFailure({
+                    code: error?.code || "IMAGE_CAPTURE_CHECKPOINT_UNAVAILABLE",
+                    message: error?.message || "Chat CV capture failed without a resumable checkpoint",
+                    metadata: {
+                      domain: "chat",
+                      candidate_key: candidateKey,
+                      image_capture_workflow_retry: retryReservation
+                    }
+                  });
+                  timings.image_capture_resume = {
+                    attempted: false,
+                    ok: false,
+                    phase: "checkpoint",
+                    error: compactChatRuntimeError(error)
+                  };
+                } else {
+                  checkpointInProgressCandidate({
+                    event: "resume_image_capture_reacquire",
+                    error: compactChatRuntimeError(error),
+                    checkpoint_id: resumeCheckpoint.checkpoint_id || null
+                  });
+                  detailStep = "resume_image_capture_reacquire";
+                  const resumeAttempt = await attemptImageCaptureCheckpointResume({
+                  checkpoint: resumeCheckpoint,
+                  reacquire: () => reacquireImageCaptureResumeTarget({
+                    domain: "chat",
+                    getRoots: () => getChatRoots(client),
+                    ensureViewport: (freshRoots) => ensureChatViewport(
+                      freshRoots,
+                      "image_capture_resume_reacquire"
+                    ),
+                    getDetailState: () => waitForChatResumeModal(client, {
+                      timeoutMs: 4000,
+                      intervalMs: 200
+                    }),
+                    isDetailAvailable: (state) => Boolean(
+                      !state?.forbidden_top_level_navigation
+                      && (state?.popup || state?.content || state?.resumeIframe)
+                    ),
+                    waitForTarget: (detailState) => waitForCvCaptureTarget(client, detailState, {
+                      domain: "chat",
+                      timeoutMs: 4000,
+                      intervalMs: 200
+                    })
+                  }),
+                  capture: (reacquired) => {
+                    rootState = reacquired.root_state;
+                    resumeState = reacquired.detail_state;
+                    captureTarget = reacquired.target;
+                    captureTargetWait = reacquired.target_wait;
+                    detailStep = "resume_image_capture";
+                    return measureTiming(
+                      timings,
+                      "screenshot_capture_ms",
+                      () => captureImageForTarget(captureTarget, captureTargetWait, resumeCheckpoint)
+                    );
+                  }
+                  });
+                  if (resumeAttempt.outcome === "reacquire_failed") {
+                    const reacquireError = resumeAttempt.error;
+                    imageEvidence = createRequiredImageEvidenceFailure({
+                      code: reacquireError?.code || "IMAGE_CAPTURE_RESUME_REACQUIRE_FAILED",
+                      message: reacquireError?.message || "Chat CV target reacquisition failed",
+                      metadata: {
+                        domain: "chat",
+                        candidate_key: candidateKey,
+                        resumed_from_checkpoint: true,
+                        resume_checkpoint_id: resumeCheckpoint.checkpoint_id || null
+                      }
+                    });
+                    imageEvidence.resumed_from_checkpoint = true;
+                    imageEvidence.resume_checkpoint_id = resumeCheckpoint.checkpoint_id || null;
+                    imageEvidence.coverage_checkpoint = resumeCheckpoint;
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: false,
+                      phase: "reacquire",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error: compactChatRuntimeError(reacquireError)
+                    };
+                  }
+                  if (resumeAttempt.outcome === "completed") {
+                    imageEvidence = requireCompleteImageEvidence(resumeAttempt.evidence, {
+                      code: "IMAGE_CAPTURE_RESUME_EVIDENCE_MISSING",
+                      message: "Chat resumed CV capture returned no complete persisted evidence",
+                      metadata: { domain: "chat", candidate_key: candidateKey }
+                    });
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: !isIncompleteImageEvidence(imageEvidence),
+                      phase: "capture",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      confirmed_screenshot_count: resumeCheckpoint.unique_screenshot_count || 0
+                    };
+                  } else if (resumeAttempt.outcome === "capture_failed") {
+                    const resumeError = resumeAttempt.error;
+                    const failedCheckpoint = resumeError.capture_checkpoint || resumeCheckpoint;
+                    const failedScreenshots = Array.isArray(failedCheckpoint?.screenshots)
+                      ? failedCheckpoint.screenshots
+                      : [];
+                    imageEvidence = {
+                      schema_version: 1,
+                      ok: false,
+                      source: "image-scroll-sequence",
+                      elapsed_ms: timings.screenshot_capture_ms || 0,
+                      capture_count: failedCheckpoint?.confirmed_capture_count || failedScreenshots.length,
+                      screenshot_count: failedScreenshots.length,
+                      unique_screenshot_count: failedCheckpoint?.unique_screenshot_count || 0,
+                      coverage_complete: false,
+                      resumed_from_checkpoint: true,
+                      resume_checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error_code: resumeError?.code || "IMAGE_CAPTURE_RESUME_FAILED",
+                      error: resumeError?.message || String(resumeError),
+                      file_paths: failedScreenshots.map((item) => item?.file_path).filter(Boolean),
+                      llm_file_paths: [],
+                      coverage_checkpoint: failedCheckpoint
+                    };
+                    timings.image_capture_resume = {
+                      attempted: true,
+                      ok: false,
+                      phase: "capture",
+                      checkpoint_id: resumeCheckpoint.checkpoint_id || null,
+                      error: compactChatRuntimeError(resumeError)
+                    };
+                  }
+                }
+              }
+              source = isIncompleteImageEvidence(imageEvidence) ? "image_capture_failed" : "image";
               fullCvEvidence = summarizeChatFullCvEvidence({
                 detailResult,
                 contentWait,
@@ -1728,7 +2325,10 @@ export async function runChatWorkflow({
                 waitResult: networkWait,
                 imageEvidence
               });
-              if (callLlmOnImage && fullCvEvidence.full_cv_acquired) {
+              if (
+                callLlmOnImage
+                && hasScreenableChatFullCvEvidence(fullCvEvidence, imageEvidence)
+              ) {
                 detailStep = "llm_image_screening";
                 if (!llmConfig) {
                   llmResult = createMissingLlmConfigResult();
@@ -1756,6 +2356,15 @@ export async function runChatWorkflow({
               }
             } else {
               source = "missing_capture_node";
+              imageEvidence = createRequiredImageEvidenceFailure({
+                code: "IMAGE_CAPTURE_TARGET_UNAVAILABLE",
+                message: "Chat CV capture target was unavailable after the network fallback missed",
+                metadata: {
+                  domain: "chat",
+                  candidate_key: candidateKey,
+                  capture_target_wait: captureTargetWait || null
+                }
+              });
               fullCvEvidence = summarizeChatFullCvEvidence({
                 detailResult,
                 contentWait,
@@ -1802,8 +2411,14 @@ export async function runChatWorkflow({
           }
 
           if (useLlmScreening && !llmResult) {
-            if (!fullCvEvidence.full_cv_acquired) {
-              detailUnavailableReason = "full_cv_not_acquired";
+            if (!hasScreenableChatFullCvEvidence(fullCvEvidence, imageEvidence)) {
+              if (isIncompleteImageEvidence(imageEvidence)) {
+              detailUnavailableReason = `image_capture_failed:${String(
+                imageEvidence?.error_code || "coverage_incomplete"
+              ).toLowerCase()}`;
+              } else {
+                detailUnavailableReason = "full_cv_not_acquired";
+              }
             } else {
               detailStep = "llm_screening";
               if (!llmConfig) {
@@ -1897,13 +2512,25 @@ export async function runChatWorkflow({
           detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
           detailResult.cv_acquisition.recovery = recovery;
         } else if (isChatResumeModalCloseFailureError(error)) {
-          const recoveryReason = `resume_modal_close_failed:${detailStep}`;
-          const recovery = await recoverAndReapplyChatContext(recoveryReason, error, { forceRefresh: true });
-          checkpointInProgressCandidate({
-            event: "retry_after_modal_recovery",
-            recovery
-          });
-          continue;
+          const retryReservation = consumeChatDetailRecoveryBudget(
+            candidateRecoveryCounts,
+            candidateKey
+          );
+          if (retryReservation.allowed) {
+            const recoveryReason = `resume_modal_close_failed:${detailStep}`;
+            const recovery = await recoverAndReapplyChatContext(recoveryReason, error, { forceRefresh: true });
+            checkpointInProgressCandidate({
+              event: "retry_after_modal_recovery",
+              recovery,
+              retry: retryReservation
+            });
+            continue;
+          }
+          detailUnavailableReason = "resume_modal_close_failed";
+          detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
+          detailResult.cv_acquisition.recovery_attempted = true;
+          detailResult.cv_acquisition.recovery_attempt_count = retryReservation.count;
+          detailResult.cv_acquisition.recovery_retry_limit = retryReservation.retry_limit;
         } else if (isChatCandidateSelectionMismatchError(error)) {
           const retryCount = candidateRecoveryCounts.get(candidateKey) || 0;
           if (retryCount < 1) {
@@ -1919,11 +2546,14 @@ export async function runChatWorkflow({
             });
             continue;
           }
-          detailUnavailableReason = "active_candidate_mismatch";
-          detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
-          detailResult.cv_acquisition.selection_ready_state = error.selection_ready_state || null;
-          detailResult.cv_acquisition.recovery_attempted = true;
-          detailResult.cv_acquisition.recovery_attempt_count = retryCount;
+          error.retryable = false;
+          checkpointInProgressCandidate({
+            event: "active_candidate_mismatch_exhausted",
+            selection_ready_state: compactChatCandidateSelectionReadyState(error.selection_ready_state),
+            recovery_attempted: true,
+            recovery_attempt_count: retryCount
+          });
+          throw error;
         } else if (isChatOnlineResumeModalOpenFailureError(error)) {
           const retryCount = candidateRecoveryCounts.get(candidateKey) || 0;
           if (retryCount < 1) {
@@ -1951,6 +2581,16 @@ export async function runChatWorkflow({
           detailResult.cv_acquisition.button_href = error.href || null;
           detailResult.cv_acquisition.button_selector = error.button_selector || null;
           detailResult.cv_acquisition.attempts = error.attempts || null;
+        } else if (isRecoverableChatImageCaptureError(error)) {
+          detailUnavailableReason = `image_capture_failed:${String(error?.code || "unknown").toLowerCase()}`;
+          detailResult = createSkippedDetailResult(cardCandidate, detailUnavailableReason, error);
+          detailResult.cv_acquisition.recovery_attempted = true;
+          detailResult.cv_acquisition.recovery_attempt_count = imageCaptureWorkflowRetries.count(candidateKey);
+          detailResult.image_evidence = createRequiredImageEvidenceFailure({
+            code: error?.code || "IMAGE_CAPTURE_FAILED",
+            message: error?.message || "Chat CV image capture failed",
+            metadata: { domain: "chat", candidate_key: candidateKey }
+          });
         } else {
           if (!isRecoverableCdpNodeError(error)) throw error;
           detailUnavailableReason = `recoverable_cdp_node_stale:${detailStep}`;
@@ -1972,7 +2612,7 @@ export async function runChatWorkflow({
         : "detail_not_opened_full_cv_required";
     }
     const effectiveLlmResult = detailResult?.llm_result || cardOnlyLlmResult;
-    const screening = collectCvOnly
+    let screening = collectCvOnly
       ? createCvCollectionScreening(screeningCandidate, {
           detailResult,
           detailUnavailableReason,
@@ -1989,31 +2629,406 @@ export async function runChatWorkflow({
         : useLlmScreening
           ? llmToScreening(effectiveLlmResult, screeningCandidate)
           : screenCandidate(screeningCandidate, { criteria });
-    let postAction = null;
+    let postAction = preScreeningActionReconciliation;
     if (requestResumeForPassed && screening.passed) {
       await maybeHumanActionCooldown("before_post_action", timings);
-      postAction = await measureTiming(timings, "post_action_ms", () => requestChatResumeForPassedCandidate(client, {
-        greetingText,
-        dryRun: dryRunRequestCv
-      }));
+      postAction = await measureTiming(timings, "post_action_ms", async () => {
+        if (dryRunRequestCv) {
+          return requestChatResumeForPassedCandidate(client, {
+            greetingText,
+            dryRun: true
+          });
+        }
+
+        const candidateId = normalizeText(screeningCandidate.id || cardCandidate.id || "");
+        if (!candidateId) {
+          const error = new Error("CHAT_ACTION_CANDIDATE_ID_REQUIRED: refusing outbound action without a stable Boss candidate ID");
+          error.code = "CHAT_ACTION_CANDIDATE_ID_REQUIRED";
+          error.retryable = false;
+          throw error;
+        }
+        if (!effectiveActionJournal) {
+          const error = new Error("CHAT_ACTION_JOURNAL_REQUIRED: durable outbound action journal is unavailable");
+          error.code = "CHAT_ACTION_JOURNAL_REQUIRED";
+          error.retryable = false;
+          throw error;
+        }
+        if (typeof runControl.checkpointCritical !== "function") {
+          const error = new Error("CHAT_CRITICAL_CHECKPOINT_UNAVAILABLE: refusing outbound action without required checkpoint persistence");
+          error.code = "CHAT_CRITICAL_CHECKPOINT_UNAVAILABLE";
+          error.retryable = false;
+          throw error;
+        }
+
+        const activeState = await readChatActiveCandidateState(client);
+        const activeCandidateId = normalizeText(activeState?.active_candidate?.candidate_id || "");
+        if (!activeCandidateId || activeCandidateId !== candidateId) {
+          const error = new Error(`CHAT_ACTIVE_CANDIDATE_MISMATCH: expected=${candidateId}; active=${activeCandidateId || "unknown"}`);
+          error.code = "CHAT_ACTIVE_CANDIDATE_MISMATCH";
+          error.retryable = false;
+          throw error;
+        }
+
+        let journalRecord = effectiveActionJournal.read({
+          scope: actionJournalScope,
+          candidateId
+        });
+        const transitionAction = async (state, evidence = {}) => {
+          const transitioned = effectiveActionJournal.transition({
+            scope: actionJournalScope,
+            candidateId,
+            state,
+            runId: runControl.runId,
+            greeting: greetingText,
+            evidence: {
+              ...evidence,
+              active_candidate_id: activeCandidateId
+            }
+          });
+          journalRecord = transitioned.record;
+          runControl.checkpointCritical({
+            action_transaction: compactChatActionJournalRecord(
+              transitioned.record,
+              transitioned.file_path
+            )
+          });
+          return transitioned.record;
+        };
+
+        const currentReadyState = await readChatConversationReadyState(client);
+        if (!journalRecord && (
+          currentReadyState.attachment_resume_enabled
+          || currentReadyState.already_requested_resume
+        )) {
+          return {
+            requested: false,
+            skipped: true,
+            reason: currentReadyState.attachment_resume_enabled
+              ? "attachment_resume_already_available"
+              : "resume_request_already_pending",
+            initial_state: currentReadyState,
+            journal_bypassed_existing_state: true
+          };
+        }
+
+        if (!journalRecord) {
+          journalRecord = await transitionAction("pre_action", {
+            active_candidate_id: activeCandidateId
+          });
+          const existingGreeting = await getChatGreetingMessageState(client, greetingText);
+          if (existingGreeting.ok && existingGreeting.exact_count > 0) {
+            journalRecord = await transitionAction("greeting_send_in_flight", {
+              greeting_baseline_count: Math.max(0, existingGreeting.exact_count - 1),
+              greeting_evidence_readable: true,
+              reason: "preexisting_exact_greeting_detected"
+            });
+            journalRecord = await transitionAction("greeting_confirmed", {
+              greeting_baseline_count: Math.max(0, existingGreeting.exact_count - 1),
+              greeting_evidence_readable: true,
+              reason: "preexisting_exact_greeting_detected"
+            });
+          }
+        }
+
+        if (journalRecord.state === "request_confirmed") {
+          return {
+            requested: false,
+            skipped: true,
+            satisfied: true,
+            reason: "request_confirmed_by_durable_journal",
+            action_transaction: compactChatActionJournalRecord(journalRecord)
+          };
+        }
+
+        if (
+          journalRecord.state === "greeting_confirmed"
+          && (currentReadyState.attachment_resume_enabled || currentReadyState.already_requested_resume)
+        ) {
+          await transitionAction("request_in_flight", {
+            request_baseline_count: 0,
+            resume_attachment_baseline_count: 0,
+            reason: "existing_request_state_before_input"
+          });
+          journalRecord = await transitionAction("request_confirmed", {
+            reason: currentReadyState.attachment_resume_enabled
+              ? "attachment_resume_already_available"
+              : "resume_request_already_pending"
+          });
+          return {
+            requested: false,
+            skipped: true,
+            satisfied: true,
+            reason: "request_confirmed_from_existing_state",
+            action_transaction: compactChatActionJournalRecord(journalRecord)
+          };
+        }
+
+        const unknownOrigin = chatActionUnknownOrigin(journalRecord);
+        if (
+          journalRecord.state === "request_in_flight"
+          || (journalRecord.state === "outcome_unknown" && unknownOrigin === "request_in_flight")
+        ) {
+          const {
+            ready_state: readyEvidence,
+            message_state: messageEvidence
+          } = await readChatRequestVerificationEvidence(client);
+          const baselineCount = Number(journalRecord.evidence?.request_baseline_count) || 0;
+          const baselineAttachmentCount = Number(journalRecord.evidence?.resume_attachment_baseline_count) || 0;
+          const requestConfirmed = Boolean(
+            readyEvidence.attachment_resume_enabled
+            || readyEvidence.already_requested_resume
+            || messageEvidence.count > baselineCount
+            || messageEvidence.resume_attachment_count > baselineAttachmentCount
+          );
+          if (requestConfirmed) {
+            journalRecord = await transitionAction("request_confirmed", {
+              reason: "recovered_from_exact_request_evidence",
+              message_observed: messageEvidence.count > baselineCount,
+              request_after_count: messageEvidence.count,
+              resume_attachment_after_count: messageEvidence.resume_attachment_count
+            });
+            return {
+              requested: false,
+              skipped: true,
+              satisfied: true,
+              reason: "request_confirmed_after_in_flight_recovery",
+              action_transaction: compactChatActionJournalRecord(journalRecord)
+            };
+          }
+          const preservedUnknown = preserveChatRequestOutcomeUnknownWithoutReplay({
+            actionJournalRecord: journalRecord,
+            candidateId,
+            activeCandidateId,
+            readyEvidence,
+            messageEvidence
+          });
+          if (preservedUnknown) return preservedUnknown;
+          if (journalRecord.state !== "outcome_unknown") {
+            journalRecord = await transitionAction("outcome_unknown", {
+              action: "request_resume",
+              reason: "in_flight_request_not_provable"
+            });
+          }
+          throw makeChatPostActionOutcomeUnknownError(candidateId, journalRecord, {
+            ready_state_readable: Boolean(readyEvidence),
+            message_state_readable: Boolean(messageEvidence.ok)
+          });
+        }
+
+        let skipGreeting = journalRecord.state === "greeting_confirmed";
+        if (
+          journalRecord.state === "greeting_send_in_flight"
+          || (journalRecord.state === "outcome_unknown" && unknownOrigin === "greeting_send_in_flight")
+        ) {
+          const greetingEvidence = await getChatGreetingMessageState(client, greetingText);
+          const baselineCount = Number(journalRecord.evidence?.greeting_baseline_count) || 0;
+          if (greetingEvidence.ok && greetingEvidence.exact_count > baselineCount) {
+            journalRecord = await transitionAction("greeting_confirmed", {
+              reason: "recovered_from_exact_greeting_delta",
+              greeting_baseline_count: baselineCount,
+              greeting_evidence_readable: true
+            });
+            skipGreeting = true;
+          } else {
+            if (journalRecord.state !== "outcome_unknown") {
+              journalRecord = await transitionAction("outcome_unknown", {
+                action: "greeting_send",
+                reason: greetingEvidence.ok
+                  ? "in_flight_greeting_delta_absent"
+                  : "in_flight_greeting_evidence_unreadable",
+                greeting_baseline_count: baselineCount,
+                greeting_evidence_readable: greetingEvidence.ok
+              });
+            }
+            throw makeChatPostActionOutcomeUnknownError(candidateId, journalRecord, {
+              greeting_evidence_readable: greetingEvidence.ok,
+              greeting_exact_count: greetingEvidence.exact_count,
+              greeting_baseline_count: baselineCount
+            });
+          }
+        }
+
+        if (journalRecord.state === "outcome_unknown") {
+          throw makeChatPostActionOutcomeUnknownError(candidateId, journalRecord);
+        }
+        let editorPreActionRetryCount = 0;
+        while (true) {
+          try {
+            const result = await requestChatResumeForPassedCandidate(client, {
+              greetingText,
+              dryRun: false,
+              skipGreeting,
+              actionTransition: transitionAction
+            });
+            if (editorPreActionRetryCount > 0) {
+              return {
+                ...result,
+                editor_pre_action_recovery: {
+                  recovered: true,
+                  retry_count: editorPreActionRetryCount,
+                  settle_ms: CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS
+                }
+              };
+            }
+            return result;
+          } catch (error) {
+            if (!shouldRetryChatEditorPreAction(
+              error,
+              journalRecord,
+              editorPreActionRetryCount
+            )) {
+              throw error;
+            }
+
+            editorPreActionRetryCount += 1;
+            runControl.checkpoint({
+              chat_editor_pre_action_recovery: {
+                candidate_id: candidateId,
+                retry_count: editorPreActionRetryCount,
+                settle_ms: CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS,
+                reason: error?.code || error?.message || "CHAT_EDITOR_MESSAGE_MISMATCH",
+                action_state: journalRecord.state,
+                attempts: Array.isArray(error?.attempts) ? error.attempts : []
+              }
+            });
+            await runControl.sleep(CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS);
+            runControl.throwIfCanceled();
+
+            const topLevelState = await getChatTopLevelState(client);
+            if (topLevelState.is_security_verification) {
+              throw makeBossSecurityVerificationRequiredError(
+                topLevelState,
+                "chat_editor_pre_action_recovery"
+              );
+            }
+            const latestJournalRecord = effectiveActionJournal.read({
+              scope: actionJournalScope,
+              candidateId
+            });
+            if (latestJournalRecord?.state !== "pre_action") {
+              throw error;
+            }
+            journalRecord = latestJournalRecord;
+
+            const retryActiveState = await readChatActiveCandidateState(client);
+            const retryActiveCandidateId = normalizeText(
+              retryActiveState?.active_candidate?.candidate_id || ""
+            );
+            if (!retryActiveCandidateId || retryActiveCandidateId !== candidateId) {
+              const mismatchError = new Error(
+                `CHAT_ACTIVE_CANDIDATE_MISMATCH: expected=${candidateId}; active=${retryActiveCandidateId || "unknown"}`
+              );
+              mismatchError.code = "CHAT_ACTIVE_CANDIDATE_MISMATCH";
+              mismatchError.retryable = false;
+              throw mismatchError;
+            }
+
+            const retryReadyState = await readChatConversationReadyState(client);
+            if (
+              retryReadyState.attachment_resume_enabled
+              || retryReadyState.already_requested_resume
+            ) {
+              return {
+                requested: false,
+                skipped: true,
+                reason: retryReadyState.attachment_resume_enabled
+                  ? "attachment_resume_already_available"
+                  : "resume_request_already_pending",
+                initial_state: retryReadyState,
+                editor_pre_action_recovery: {
+                  recovered: true,
+                  retry_count: editorPreActionRetryCount,
+                  settle_ms: CHAT_EDITOR_PRE_ACTION_RETRY_SETTLE_MS,
+                  converged_to_existing_state: true
+                }
+              };
+            }
+          }
+        }
+      });
+      screening = applyChatProtectedOutcomeSkip(screening, postAction, screeningCandidate);
       if (postAction?.requested) requestSatisfiedCount += 1;
+      if (postAction?.satisfied && !postAction?.requested) requestSatisfiedCount += 1;
       if (postAction?.skipped) requestSkippedCount += 1;
       if (postAction?.requested && !postAction?.skipped) requestedCount += 1;
       if (!postAction?.requested && !postAction?.skipped && !dryRunRequestCv) {
-        throw new Error(`REQUEST_CV_NOT_VERIFIED:${postAction?.reason || "unknown"}`);
+        const verificationError = new Error(
+          `REQUEST_CV_NOT_VERIFIED:${postAction?.reason || "unknown"}`
+        );
+        verificationError.code = "REQUEST_CV_NOT_VERIFIED";
+        verificationError.retryable = false;
+        verificationError.attempts = Array.isArray(postAction?.attempts)
+          ? postAction.attempts
+          : [];
+        throw verificationError;
       }
     }
+    // Every committed collect-CV outcome converges here: existing attachment/online CV,
+    // an already-pending request, or a newly requested CV. Human-rest and delayMs remain later layers.
+    let processingFloor = null;
+    if (collectCvProcessingFloorEnabled) {
+      const elapsedBeforeFloor = Math.max(0, Date.now() - candidateProcessingStarted);
+      const floorCurrent = {
+        candidate_id: screeningCandidate.id || null,
+        candidate_key: candidateKey,
+        target_ms: candidateProcessingFloorTargetMs,
+        elapsed_before_ms: elapsedBeforeFloor,
+        remaining_ms: Math.max(0, candidateProcessingFloorTargetMs - elapsedBeforeFloor)
+      };
+      runControl.setPhase("chat:collect_cv_processing_floor");
+      runControl.updateProgress({
+        collect_cv_processing_floor_current: floorCurrent
+      });
+      runControl.checkpoint({
+        collect_cv_processing_floor_current: floorCurrent
+      });
+      processingFloor = await enforceChatCollectCvProcessingFloor({
+        candidateStartedAt: candidateProcessingStarted,
+        targetMs: candidateProcessingFloorTargetMs,
+        sleepFn: (ms) => runControl.sleep(ms)
+      });
+      collectCvProcessingFloorState.count += 1;
+      collectCvProcessingFloorState.total_delay_requested_ms += processingFloor.delay_requested_ms;
+      collectCvProcessingFloorState.total_delay_elapsed_ms += processingFloor.delay_elapsed_ms;
+      collectCvProcessingFloorState.last = {
+        candidate_id: screeningCandidate.id || null,
+        candidate_key: candidateKey,
+        ...processingFloor
+      };
+      timings.collect_cv_processing_target_ms = processingFloor.target_ms;
+      timings.collect_cv_processing_elapsed_before_floor_ms = processingFloor.elapsed_before_ms;
+      timings.collect_cv_processing_floor_delay_requested_ms = processingFloor.delay_requested_ms;
+      timings.collect_cv_processing_floor_delay_ms = processingFloor.delay_elapsed_ms;
+      timings.collect_cv_processing_elapsed_after_floor_ms = processingFloor.elapsed_after_ms;
+      runControl.updateProgress({
+        collect_cv_processing_floor_count: collectCvProcessingFloorState.count,
+        collect_cv_processing_floor_delay_requested_ms: collectCvProcessingFloorState.total_delay_requested_ms,
+        collect_cv_processing_floor_delay_ms: collectCvProcessingFloorState.total_delay_elapsed_ms,
+        collect_cv_processing_floor_last: collectCvProcessingFloorState.last,
+        collect_cv_processing_floor_current: null
+      });
+      runControl.checkpoint({
+        collect_cv_processing_floor_current: null,
+        collect_cv_processing_floor_last: collectCvProcessingFloorState.last,
+        collect_cv_processing_floor: collectCvProcessingFloorSnapshot()
+      });
+    }
     timings.total_ms = Date.now() - candidateStarted;
+    if (index < detailCountLimit && preActionState) {
+      requireExactChatCandidateSelection({ ready: selectionReadyState }, cardCandidate);
+    }
     const compactResult = {
       index,
       candidate_key: candidateKey,
       card_node_id: effectiveCardNodeId,
       candidate: compactCandidate(screeningCandidate),
+      selection_ready_state: compactChatCandidateSelectionReadyState(selectionReadyState),
       detail: compactDetail(detailResult),
       llm_screening: detailResult ? null : compactLlmResult(cardOnlyLlmResult),
       screening: compactScreening(screening),
       post_action: postAction,
       pre_action_state: preActionState,
+      collect_cv_processing_floor: processingFloor,
       timings
     };
     results.push(compactResult);
@@ -2050,8 +3065,16 @@ export async function runChatWorkflow({
       human_rest_level: effectiveHumanBehavior.restLevel,
       human_rest_enabled: effectiveHumanRestEnabled,
       human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
-      human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
-      human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
+      human_rest_per_candidate_min_ms: null,
+      human_rest_per_candidate_max_ms: null,
+      collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+      collect_cv_processing_floor_min_ms: collectCvProcessingFloorState.min_ms,
+      collect_cv_processing_floor_max_ms: collectCvProcessingFloorState.max_ms,
+      collect_cv_processing_floor_count: collectCvProcessingFloorState.count,
+      collect_cv_processing_floor_delay_requested_ms: collectCvProcessingFloorState.total_delay_requested_ms,
+      collect_cv_processing_floor_delay_ms: collectCvProcessingFloorState.total_delay_elapsed_ms,
+      collect_cv_processing_floor_last: collectCvProcessingFloorState.last,
+      collect_cv_processing_floor_current: null,
       human_rest_count: humanRestController.getState().rest_count,
       human_rest_ms: humanRestController.getState().total_rest_ms,
       last_human_event: lastHumanEvent,
@@ -2127,6 +3150,7 @@ export async function runChatWorkflow({
     },
     human_behavior: effectiveHumanBehavior,
     human_rest: humanRestController.getState(),
+    collect_cv_processing_floor: collectCvProcessingFloorSnapshot(),
     last_human_event: lastHumanEvent,
     list_end_reason: listEndReason || null,
     target_pass_count: passTarget,
@@ -2151,9 +3175,11 @@ export function createChatRunService({
   lifecycle,
   idPrefix = "chat",
   workflow = runChatWorkflow,
-  onSnapshot = null
+  onSnapshot = null,
+  actionJournal = null
 } = {}) {
   const manager = lifecycle || createRunLifecycleManager({ idPrefix, onSnapshot });
+  const configuredActionJournal = actionJournal || null;
 
   function startChatRun({
     runId = "",
@@ -2193,6 +3219,7 @@ export function createChatRunService({
     imageOutputDir = "",
     humanRestEnabled = false,
     humanBehavior = null,
+    actionJournalScope = "boss-chat:default",
     name = "chat-domain-run"
   } = {}) {
     if (!client) throw new Error("startChatRun requires a guarded CDP client");
@@ -2204,8 +3231,9 @@ export function createChatRunService({
     const effectiveHumanBehavior = normalizeHumanBehaviorOptions(humanBehavior, {
       legacyEnabled: humanRestEnabled === true || llmConfig?.humanRestEnabled === true
     });
-    const collectCvPerCandidateRestEnabled = collectCvOnly && effectiveHumanBehavior.enabled;
-    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled || collectCvPerCandidateRestEnabled;
+    const collectCvProcessingFloorEnabled = collectCvOnly;
+    const collectCvPerCandidateRestEnabled = false;
+    const effectiveHumanRestEnabled = effectiveHumanBehavior.restEnabled;
     return manager.startRun({
       runId,
       name,
@@ -2222,6 +3250,7 @@ export function createChatRunService({
         detail_source: normalizedDetailSource,
         close_resume: closeResume,
         request_resume_for_passed: Boolean(requestResumeForPassed),
+        action_journal_enabled: Boolean(requestResumeForPassed),
         dry_run_request_cv: Boolean(dryRunRequestCv),
         greeting_text: greetingText,
         cv_acquisition_mode: cvAcquisitionMode,
@@ -2247,8 +3276,11 @@ export function createChatRunService({
         human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
         human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
-        human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
-        human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null
+        human_rest_per_candidate_min_ms: null,
+        human_rest_per_candidate_max_ms: null,
+        collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+        collect_cv_processing_floor_min_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS : null,
+        collect_cv_processing_floor_max_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS : null
       },
       progress: {
         card_count: 0,
@@ -2270,8 +3302,15 @@ export function createChatRunService({
         human_rest_level: effectiveHumanBehavior.restLevel,
         human_rest_enabled: effectiveHumanRestEnabled,
         human_rest_per_candidate_enabled: collectCvPerCandidateRestEnabled,
-        human_rest_per_candidate_min_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MIN_MS : null,
-        human_rest_per_candidate_max_ms: collectCvPerCandidateRestEnabled ? CHAT_COLLECT_CV_PER_CANDIDATE_REST_MAX_MS : null,
+        human_rest_per_candidate_min_ms: null,
+        human_rest_per_candidate_max_ms: null,
+        collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+        collect_cv_processing_floor_min_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS : null,
+        collect_cv_processing_floor_max_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS : null,
+        collect_cv_processing_floor_count: 0,
+        collect_cv_processing_floor_delay_requested_ms: 0,
+        collect_cv_processing_floor_delay_ms: 0,
+        collect_cv_processing_floor_current: null,
         human_rest_count: 0,
         human_rest_ms: 0,
         last_human_event: null
@@ -2315,7 +3354,9 @@ export function createChatRunService({
             listFallbackPoint,
             imageOutputDir,
             humanRestEnabled: effectiveHumanRestEnabled,
-            humanBehavior: effectiveHumanBehavior
+            humanBehavior: effectiveHumanBehavior,
+            actionJournal: configuredActionJournal || createChatActionJournal(),
+            actionJournalScope
           }, runControl);
         } catch (error) {
           if (error instanceof RunCanceledError) throw error;

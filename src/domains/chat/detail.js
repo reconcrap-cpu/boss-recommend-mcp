@@ -48,6 +48,7 @@ import {
   assertChatShellNotResumeTopLevel,
   getChatTopLevelState,
   isForbiddenChatResumeTopLevelUrl,
+  makeBossSecurityVerificationRequiredError,
   makeForbiddenChatResumeNavigationError
 } from "./page-guard.js";
 
@@ -80,6 +81,16 @@ const CHAT_REQUESTED_RESUME_SCOPE_SELECTORS = Object.freeze([
   ".boss-dialog",
   ".dialog-wrap.active"
 ]);
+
+const CHAT_REQUEST_RESUME_CONFIRM_PROMPT = "确定向牛人索取简历吗？";
+const CHAT_REQUEST_RESUME_CONFIRM_SCOPE_SELECTORS = Object.freeze([
+  ".exchange-tooltip",
+  ".boss-popup__wrapper",
+  ".boss-dialog",
+  ".dialog-wrap.active"
+]);
+const CHAT_REQUEST_RESUME_CONFIRM_DEFAULT_TIMEOUT_MS = 20000;
+const CHAT_REQUEST_RESUME_CONFIRM_POLL_INTERVAL_MS = 250;
 
 export function matchesChatProfileNetwork(url) {
   return CHAT_PROFILE_NETWORK_PATTERNS.some((pattern) => pattern.test(String(url || "")));
@@ -396,7 +407,6 @@ function isResumeRequestSentMessageText(text = "") {
     || normalized.includes("已发送简历")
     || normalized.includes("已求简历")
     || normalized.includes("已索要简历")
-    || normalized.includes("已发送")
   );
 }
 
@@ -414,7 +424,7 @@ function countTextOccurrences(text = "", needle = "") {
 }
 
 function countResumeRequestSentMessageMarkers(lines = []) {
-  const markers = ["简历请求已发送", "已发送简历", "已求简历", "已索要简历", "已发送"];
+  const markers = ["简历请求已发送", "已发送简历", "已求简历", "已索要简历"];
   return lines.reduce((total, line) => (
     total + markers.reduce((lineTotal, marker) => (
       lineTotal + countTextOccurrences(line, marker)
@@ -463,16 +473,13 @@ function isAttachmentResumeTarget(target = {}) {
     || /resume-btn-file/i.test(String(target.attributes?.class || target.selector || ""));
 }
 
-function isConfirmText(text = "") {
+function isRequestResumeConfirmPrompt(text = "") {
+  return normalizeDetailText(text).includes(CHAT_REQUEST_RESUME_CONFIRM_PROMPT);
+}
+
+function isExactRequestResumeConfirmText(text = "") {
   const normalized = normalizeDetailText(text);
-  return Boolean(
-    normalized === "确定"
-    || normalized === "确认"
-    || normalized === "提交"
-    || normalized === "继续"
-    || normalized.includes("确定")
-    || normalized.includes("确认")
-  );
+  return normalized === "确定" || normalized === "确认";
 }
 
 function isSendText(text = "") {
@@ -561,6 +568,53 @@ async function resolveScopedRoots(client, roots = [], selectors = [], {
   }
   if (scoped.length || !fallbackToRoots) return scoped;
   return roots;
+}
+
+async function findAnchoredChatRequestResumeConfirmTarget(client, roots = []) {
+  const promptRoots = await resolveScopedRoots(
+    client,
+    roots,
+    CHAT_REQUEST_RESUME_CONFIRM_SCOPE_SELECTORS,
+    { fallbackToRoots: false }
+  );
+  let lastPrompt = null;
+  let lastPromptCandidate = null;
+  let lastTargetCandidate = null;
+  for (const promptRoot of promptRoots) {
+    const prompt = await readTarget(
+      client,
+      promptRoot,
+      "request-resume-confirm-prompt",
+      promptRoot.nodeId
+    );
+    lastPromptCandidate = prompt;
+    if (!prompt.visible || !isRequestResumeConfirmPrompt(prompt.label)) continue;
+    lastPrompt = prompt;
+    for (const selector of CHAT_CONFIRM_REQUEST_RESUME_SELECTORS) {
+      const nodeIds = await querySelectorAll(client, promptRoot.nodeId, selector);
+      for (const nodeId of nodeIds) {
+        const target = await readTarget(client, promptRoot, selector, nodeId);
+        lastTargetCandidate = target;
+        if (!target.visible || target.disabled || !isExactRequestResumeConfirmText(target.label)) {
+          continue;
+        }
+        return {
+          prompt,
+          prompt_candidate: lastPromptCandidate,
+          target,
+          target_candidate: lastTargetCandidate,
+          discovery_mode: "exact_request_prompt"
+        };
+      }
+    }
+  }
+  return {
+    prompt: lastPrompt,
+    prompt_candidate: lastPromptCandidate,
+    target: null,
+    target_candidate: lastTargetCandidate,
+    discovery_mode: lastPrompt ? "exact_request_prompt" : null
+  };
 }
 
 export async function selectChatPrimaryLabel(client, {
@@ -1085,42 +1139,768 @@ export async function readChatConversationReadyState(client) {
   };
 }
 
+function readAccessibilityBooleanProperty(node, propertyName) {
+  for (const property of node?.properties || []) {
+    if (property?.name !== propertyName) continue;
+    if (typeof property?.value?.value === "boolean") return property.value.value;
+  }
+  return null;
+}
+
+async function readFreshChatEditorTarget(client) {
+  const rootState = await getChatRoots(client);
+  const scopedControlRoots = await resolveScopedRoots(
+    client,
+    rootState.roots,
+    CHAT_CONVERSATION_CONTROL_SCOPE_SELECTORS,
+    { fallbackToRoots: false }
+  );
+  const controlRoots = scopedControlRoots.length ? scopedControlRoots : rootState.roots;
+  return findVisibleMatchingTarget(
+    client,
+    controlRoots,
+    CHAT_EDITOR_SELECTORS,
+    () => true
+  );
+}
+
+async function readChatEditorFocusState(client, editor) {
+  if (!editor?.node_id) {
+    return {
+      available: false,
+      focused: false,
+      reason: "editor_node_missing"
+    };
+  }
+  if (typeof client?.Accessibility?.getPartialAXTree !== "function") {
+    return {
+      available: false,
+      focused: false,
+      reason: "accessibility_unavailable",
+      editor_node_id: editor.node_id
+    };
+  }
+  try {
+    const result = await client.Accessibility.getPartialAXTree({
+      nodeId: editor.node_id,
+      fetchRelatives: false
+    });
+    const node = result?.nodes?.[0] || null;
+    if (!node) {
+      return {
+        available: false,
+        focused: false,
+        reason: "accessibility_node_missing",
+        editor_node_id: editor.node_id
+      };
+    }
+    return {
+      available: true,
+      focused: readAccessibilityBooleanProperty(node, "focused") === true,
+      focusable: readAccessibilityBooleanProperty(node, "focusable"),
+      role: node?.role?.value || "",
+      backend_dom_node_id: node?.backendDOMNodeId || null,
+      editor_node_id: editor.node_id
+    };
+  } catch (error) {
+    return {
+      available: false,
+      focused: false,
+      reason: "accessibility_read_failed",
+      read_error: error?.message || String(error),
+      editor_node_id: editor.node_id
+    };
+  }
+}
+
+const CHAT_EDITOR_FOCUS_SETTLE_LIMIT_MS = 600;
+const CHAT_EDITOR_FOCUS_POLL_INTERVAL_MS = 100;
+
+function canChatEditorFocusStillSettle(focus) {
+  if (focus?.focused) return false;
+  if (focus?.available && focus?.focusable === true && !focus?.read_error) return true;
+  if (focus?.reason === "editor_node_missing" || focus?.reason === "accessibility_node_missing") {
+    return true;
+  }
+  return Boolean(focus?.read_error && isRecoverableNodeError(focus.read_error));
+}
+
+async function waitForFreshChatEditorFocus(client, {
+  initialDelayMs = 0,
+  settleLimitMs = CHAT_EDITOR_FOCUS_SETTLE_LIMIT_MS,
+  pollIntervalMs = CHAT_EDITOR_FOCUS_POLL_INTERVAL_MS
+} = {}) {
+  const startedAt = Date.now();
+  const observations = [];
+  let editor = null;
+  let focus = {
+    available: false,
+    focused: false,
+    reason: "focus_not_read"
+  };
+  let firstRead = true;
+  while (true) {
+    try {
+      editor = await readFreshChatEditorTarget(client);
+      focus = await readChatEditorFocusState(client, editor);
+    } catch (error) {
+      if (!isRecoverableNodeError(error)) throw error;
+      editor = null;
+      focus = {
+        available: false,
+        focused: false,
+        reason: "recoverable_node_error",
+        read_error: error?.message || String(error)
+      };
+    }
+    observations.push({
+      elapsed_ms: Math.max(0, Date.now() - startedAt),
+      editor_node_id: editor?.node_id || null,
+      available: focus.available,
+      focused: focus.focused,
+      focusable: focus.focusable ?? null,
+      role: focus.role || null,
+      backend_dom_node_id: focus.backend_dom_node_id || null,
+      reason: focus.reason || null,
+      read_error: focus.read_error || null
+    });
+    const elapsedMs = Date.now() - startedAt;
+    if (
+      focus.focused
+      || !canChatEditorFocusStillSettle(focus)
+      || elapsedMs >= settleLimitMs
+    ) {
+      break;
+    }
+    const delayMs = firstRead && initialDelayMs > 0
+      ? initialDelayMs
+      : pollIntervalMs;
+    firstRead = false;
+    await sleep(Math.min(delayMs, Math.max(1, settleLimitMs - elapsedMs)));
+  }
+  return {
+    editor,
+    focus,
+    observations,
+    poll_count: Math.max(0, observations.length - 1),
+    elapsed_ms: observations.at(-1)?.elapsed_ms || 0,
+    settled_after_poll: Boolean(focus.focused && observations.length > 1)
+  };
+}
+
+async function recoverChatEditorFocusWithDomFocus(client, editor, focus) {
+  const backendNodeId = Number(focus?.backend_dom_node_id);
+  const editorNodeId = Number(editor?.node_id);
+  if (
+    typeof client?.DOM?.focus !== "function"
+    || typeof client?.DOM?.describeNode !== "function"
+    || !Number.isInteger(editorNodeId)
+    || editorNodeId <= 0
+    || focus?.focused
+    || focus?.available !== true
+    || focus?.focusable !== true
+    || focus?.read_error
+    || !Number.isInteger(backendNodeId)
+    || backendNodeId <= 0
+  ) {
+    return {
+      attempted: false,
+      dispatched: false,
+      editor,
+      focus,
+      settle: null
+    };
+  }
+
+  let focusCallAttempted = false;
+  try {
+    const freshEditor = await readFreshChatEditorTarget(client);
+    const freshEditorNodeId = Number(freshEditor?.node_id);
+    const axEditorNodeId = Number(focus?.editor_node_id);
+    if (
+      !Number.isInteger(freshEditorNodeId)
+      || freshEditorNodeId <= 0
+      || freshEditorNodeId !== editorNodeId
+      || axEditorNodeId !== editorNodeId
+    ) {
+      return {
+        attempted: true,
+        dispatched: false,
+        target_kind: "backend_node_id",
+        target_id: backendNodeId,
+        editor: freshEditor || editor,
+        focus,
+        settle: null,
+        pre_focus_editor_node_id: editorNodeId,
+        fresh_editor_node_id: Number.isInteger(freshEditorNodeId) ? freshEditorNodeId : null,
+        ax_editor_node_id: Number.isInteger(axEditorNodeId) ? axEditorNodeId : null,
+        focus_call_attempted: false,
+        binding_failed: true,
+        pre_focus_binding_verified: false,
+        post_focus_binding_verified: false,
+        error: "fresh_editor_node_binding_mismatch"
+      };
+    }
+
+    const described = await client.DOM.describeNode({ nodeId: freshEditorNodeId });
+    const describedBackendNodeId = Number(described?.node?.backendNodeId);
+    if (
+      !Number.isInteger(describedBackendNodeId)
+      || describedBackendNodeId <= 0
+      || describedBackendNodeId !== backendNodeId
+    ) {
+      return {
+        attempted: true,
+        dispatched: false,
+        target_kind: "backend_node_id",
+        target_id: backendNodeId,
+        editor: freshEditor,
+        focus,
+        settle: null,
+        pre_focus_editor_node_id: editorNodeId,
+        fresh_editor_node_id: freshEditorNodeId,
+        ax_editor_node_id: axEditorNodeId,
+        described_backend_dom_node_id: Number.isInteger(describedBackendNodeId)
+          ? describedBackendNodeId
+          : null,
+        focus_call_attempted: false,
+        binding_failed: true,
+        pre_focus_binding_verified: false,
+        post_focus_binding_verified: false,
+        error: "editor_backend_node_binding_mismatch"
+      };
+    }
+
+    focusCallAttempted = true;
+    await client.DOM.focus({ backendNodeId });
+    const settle = await waitForFreshChatEditorFocus(client, {
+      initialDelayMs: 80
+    });
+    const postFocusEditorNodeId = Number(settle.editor?.node_id);
+    const postFocusAxEditorNodeId = Number(settle.focus?.editor_node_id);
+    const postFocusBackendNodeId = Number(settle.focus?.backend_dom_node_id);
+    const postFocusBindingVerified = Boolean(
+      Number.isInteger(postFocusEditorNodeId)
+      && postFocusEditorNodeId > 0
+      && postFocusAxEditorNodeId === postFocusEditorNodeId
+      && postFocusBackendNodeId === backendNodeId
+    );
+    const postFocusVerified = postFocusBindingVerified && settle.focus?.focused === true;
+    const verifiedFocus = postFocusVerified
+      ? settle.focus
+      : {
+          ...settle.focus,
+          focused: false,
+          reason: postFocusBindingVerified
+            ? "native_focus_not_verified"
+            : "native_focus_post_binding_mismatch"
+        };
+    return {
+      attempted: true,
+      dispatched: true,
+      target_kind: "backend_node_id",
+      target_id: backendNodeId,
+      editor: settle.editor || editor,
+      focus: verifiedFocus,
+      settle: {
+        ...settle,
+        focus: verifiedFocus
+      },
+      pre_focus_editor_node_id: editorNodeId,
+      fresh_editor_node_id: freshEditorNodeId,
+      ax_editor_node_id: axEditorNodeId,
+      described_backend_dom_node_id: describedBackendNodeId,
+      focus_call_attempted: true,
+      binding_failed: !postFocusVerified,
+      pre_focus_binding_verified: true,
+      post_focus_editor_node_id: Number.isInteger(postFocusEditorNodeId)
+        ? postFocusEditorNodeId
+        : null,
+      post_focus_ax_editor_node_id: Number.isInteger(postFocusAxEditorNodeId)
+        ? postFocusAxEditorNodeId
+        : null,
+      post_focus_backend_dom_node_id: Number.isInteger(postFocusBackendNodeId)
+        ? postFocusBackendNodeId
+        : null,
+      post_focus_binding_verified: postFocusBindingVerified,
+      post_focus_verified: postFocusVerified,
+      error: postFocusVerified
+        ? null
+        : postFocusBindingVerified
+          ? "native_focus_not_verified"
+          : "post_focus_backend_node_binding_mismatch"
+    };
+  } catch (error) {
+    if (!focusCallAttempted && !isRecoverableNodeError(error)) throw error;
+    return {
+      attempted: true,
+      dispatched: false,
+      target_kind: "backend_node_id",
+      target_id: backendNodeId,
+      editor,
+      focus,
+      settle: null,
+      focus_call_attempted: focusCallAttempted,
+      binding_failed: focusCallAttempted,
+      error: error?.message || String(error)
+    };
+  }
+}
+
+async function focusChatEditorForInput(client, initialEditor, {
+  deterministic = false,
+  attemptsLimit = 3
+} = {}) {
+  let editor = initialEditor || null;
+  let lastState = null;
+  const attempts = [];
+  let nativeFocusAttempted = false;
+  const limit = Math.max(1, Number(attemptsLimit) || 1);
+  for (let attempt = 1; attempt <= limit; attempt += 1) {
+    if (!editor?.node_id) {
+      editor = await readFreshChatEditorTarget(client);
+      lastState = { editor };
+    }
+    if (!editor?.node_id) {
+      attempts.push({
+        attempt,
+        editor_node_id: null,
+        focused: false,
+        reason: "editor_not_found"
+      });
+      if (attempt < limit) await sleep(160);
+      continue;
+    }
+
+    let clickResult = null;
+    try {
+      const useDeterministicClick = deterministic || attempt > 1;
+      if (editor.center) {
+        clickResult = await clickPoint(
+          client,
+          editor.center.x,
+          editor.center.y,
+          useDeterministicClick ? DETERMINISTIC_CLICK_OPTIONS : undefined
+        );
+      } else {
+        clickResult = await clickNodeCenter(client, editor.node_id, {
+          scrollIntoView: true,
+          ...(useDeterministicClick ? DETERMINISTIC_CLICK_OPTIONS : {})
+        });
+      }
+      const clickedEditor = editor;
+      // Boss can remount the contenteditable as a direct consequence of focus.
+      // Frontend DOM node ids are session/document-epoch scoped, so never ask
+      // Accessibility about the pre-click id. Reacquire the editor first.
+      const clickFocusSettle = await waitForFreshChatEditorFocus(client, {
+        initialDelayMs: attempt === 1 ? 120 : 180
+      });
+      let verificationEditor = clickFocusSettle.editor;
+      lastState = { editor: verificationEditor };
+      let focus = clickFocusSettle.focus;
+      let focusSettle = clickFocusSettle;
+      const nativeFocusRecovery = nativeFocusAttempted
+        ? {
+            attempted: false,
+            dispatched: false,
+            editor: verificationEditor,
+            focus,
+            settle: null
+          }
+        : await recoverChatEditorFocusWithDomFocus(
+            client,
+            verificationEditor,
+            focus
+          );
+      nativeFocusAttempted = nativeFocusAttempted || nativeFocusRecovery.attempted;
+      if (nativeFocusRecovery.attempted) {
+        verificationEditor = nativeFocusRecovery.editor || verificationEditor;
+        focus = nativeFocusRecovery.focus || focus;
+        focusSettle = nativeFocusRecovery.settle || focusSettle;
+        lastState = { editor: verificationEditor };
+      }
+      attempts.push({
+        attempt,
+        clicked_editor_node_id: clickedEditor.node_id,
+        editor_node_id: verificationEditor?.node_id || null,
+        editor_reacquired: Boolean(verificationEditor?.node_id),
+        editor_node_changed: Boolean(
+          verificationEditor?.node_id
+          && verificationEditor.node_id !== clickedEditor.node_id
+        ),
+        editor_selector: verificationEditor?.selector || clickedEditor.selector || null,
+        editor_trace_id: verificationEditor?.attributes?.traceid || clickedEditor.attributes?.traceid || null,
+        click_mode: clickResult?.mode || clickResult?.click_result?.mode || null,
+        focus_available: focus.available,
+        focused: focus.focused,
+        focusable: focus.focusable ?? null,
+        focus_role: focus.role || null,
+        focus_backend_dom_node_id: focus.backend_dom_node_id || null,
+        focus_reason: focus.reason || null,
+        focus_read_error: focus.read_error || null,
+        focus_poll_count: focusSettle.poll_count,
+        focus_settle_elapsed_ms: focusSettle.elapsed_ms,
+        focus_settled_after_poll: focusSettle.settled_after_poll,
+        focus_observations: focusSettle.observations,
+        click_focus_poll_count: clickFocusSettle.poll_count,
+        click_focus_settle_elapsed_ms: clickFocusSettle.elapsed_ms,
+        click_focus_settled_after_poll: clickFocusSettle.settled_after_poll,
+        click_focus_observations: clickFocusSettle.observations,
+        native_focus_attempted: nativeFocusRecovery.attempted,
+        native_focus_dispatched: nativeFocusRecovery.dispatched,
+        native_focus_target_kind: nativeFocusRecovery.target_kind || null,
+        native_focus_target_id: nativeFocusRecovery.target_id || null,
+        native_focus_error: nativeFocusRecovery.error || null,
+        native_focus_call_attempted: nativeFocusRecovery.focus_call_attempted === true,
+        native_focus_binding_failed: nativeFocusRecovery.binding_failed === true,
+        native_focus_pre_editor_node_id: nativeFocusRecovery.pre_focus_editor_node_id || null,
+        native_focus_fresh_editor_node_id: nativeFocusRecovery.fresh_editor_node_id || null,
+        native_focus_ax_editor_node_id: nativeFocusRecovery.ax_editor_node_id || null,
+        native_focus_described_backend_dom_node_id: nativeFocusRecovery.described_backend_dom_node_id || null,
+        native_focus_pre_binding_verified: nativeFocusRecovery.pre_focus_binding_verified === true,
+        native_focus_post_editor_node_id: nativeFocusRecovery.post_focus_editor_node_id || null,
+        native_focus_post_ax_editor_node_id: nativeFocusRecovery.post_focus_ax_editor_node_id || null,
+        native_focus_post_backend_dom_node_id: nativeFocusRecovery.post_focus_backend_dom_node_id || null,
+        native_focus_post_binding_verified: nativeFocusRecovery.post_focus_binding_verified === true,
+        native_focus_post_verified: nativeFocusRecovery.post_focus_verified === true,
+        native_focus_poll_count: nativeFocusRecovery.settle?.poll_count ?? null,
+        native_focus_settle_elapsed_ms: nativeFocusRecovery.settle?.elapsed_ms ?? null,
+        native_focus_settled_after_poll: nativeFocusRecovery.settle?.settled_after_poll ?? null,
+        native_focus_observations: nativeFocusRecovery.settle?.observations || []
+      });
+      if (nativeFocusRecovery.binding_failed) {
+        return {
+          ok: false,
+          terminal_binding_failure: true,
+          editor: verificationEditor,
+          focus,
+          attempts,
+          state: lastState,
+          terminal_focus_binding_failure: nativeFocusRecovery.focus_call_attempted === true,
+          focus_binding_error: nativeFocusRecovery.error || null
+        };
+      }
+      if (focus.focused) {
+        return {
+          ok: true,
+          editor: verificationEditor,
+          focus,
+          native_focus_backend_node_id: nativeFocusRecovery.dispatched
+            && nativeFocusRecovery.pre_focus_binding_verified
+            && nativeFocusRecovery.post_focus_binding_verified
+            ? nativeFocusRecovery.target_id
+            : null,
+          attempts,
+          state: lastState
+        };
+      }
+      editor = focus.read_error && isRecoverableNodeError(focus.read_error)
+        ? null
+        : verificationEditor;
+    } catch (error) {
+      if (!isRecoverableNodeError(error)) throw error;
+      attempts.push({
+        attempt,
+        editor_node_id: editor.node_id,
+        editor_selector: editor.selector || null,
+        editor_trace_id: editor.attributes?.traceid || null,
+        focused: false,
+        recoverable_error: error?.message || String(error)
+      });
+      editor = null;
+    }
+
+    if (attempt < limit) await sleep(160);
+  }
+  return {
+    ok: false,
+    editor,
+    focus: attempts[attempts.length - 1] || null,
+    attempts,
+    state: lastState
+  };
+}
+
+async function verifyChatEditorBackendBinding(client, editor, focus, expectedBackendNodeId) {
+  const expected = Number(expectedBackendNodeId);
+  if (!Number.isInteger(expected) || expected <= 0) {
+    return {
+      required: false,
+      verified: true
+    };
+  }
+  const editorNodeId = Number(editor?.node_id);
+  const axEditorNodeId = Number(focus?.editor_node_id);
+  const axBackendNodeId = Number(focus?.backend_dom_node_id);
+  const base = {
+    required: true,
+    expected_backend_dom_node_id: expected,
+    editor_node_id: Number.isInteger(editorNodeId) ? editorNodeId : null,
+    ax_editor_node_id: Number.isInteger(axEditorNodeId) ? axEditorNodeId : null,
+    ax_backend_dom_node_id: Number.isInteger(axBackendNodeId) ? axBackendNodeId : null
+  };
+  if (
+    focus?.focused !== true
+    || !Number.isInteger(editorNodeId)
+    || editorNodeId <= 0
+    || axEditorNodeId !== editorNodeId
+    || axBackendNodeId !== expected
+    || typeof client?.DOM?.describeNode !== "function"
+  ) {
+    return {
+      ...base,
+      verified: false,
+      error: "editor_backend_node_binding_mismatch"
+    };
+  }
+  try {
+    const described = await client.DOM.describeNode({ nodeId: editorNodeId });
+    const describedBackendNodeId = Number(described?.node?.backendNodeId);
+    const verified = Number.isInteger(describedBackendNodeId)
+      && describedBackendNodeId > 0
+      && describedBackendNodeId === expected;
+    return {
+      ...base,
+      described_backend_dom_node_id: Number.isInteger(describedBackendNodeId)
+        ? describedBackendNodeId
+        : null,
+      verified,
+      error: verified ? null : "editor_backend_node_binding_mismatch"
+    };
+  } catch (error) {
+    return {
+      ...base,
+      verified: false,
+      error: error?.message || String(error)
+    };
+  }
+}
+
 export async function setChatEditorMessage(client, message, {
   timeoutMs = 8000
 } = {}) {
+  const expectedText = normalizeDetailText(message);
   const started = Date.now();
   let lastState = null;
+  let editorFound = false;
+  const attempts = [];
   while (Date.now() - started <= timeoutMs) {
     const state = await readChatConversationReadyState(client);
     lastState = state;
     if (state.editor?.node_id) {
+      editorFound = true;
       try {
-        if (state.editor.center) {
-          await clickPoint(client, state.editor.center.x, state.editor.center.y);
-        } else {
-          await clickNodeCenter(client, state.editor.node_id, { scrollIntoView: true });
+        const focusResult = await focusChatEditorForInput(client, state.editor, {
+          deterministic: false,
+          attemptsLimit: 3
+        });
+        const focusedEditor = focusResult.editor || state.editor;
+        if (!focusResult.ok) {
+          const observedText = normalizeDetailText(focusedEditor?.label || "");
+          attempts.push({
+            stage: "normal",
+            editor_node_id: focusedEditor?.node_id || state.editor.node_id,
+            editor_selector: focusedEditor?.selector || state.editor.selector || null,
+            editor_trace_id: focusedEditor?.attributes?.traceid || state.editor.attributes?.traceid || null,
+            input_mode: null,
+            chunk_count: 0,
+            expected_length: expectedText.length,
+            observed_length: observedText.length,
+            exact_match: false,
+            focus_verified: false,
+            focus_attempts: focusResult.attempts,
+            terminal_focus_binding_failure: focusResult.terminal_focus_binding_failure === true,
+            focus_binding_error: focusResult.focus_binding_error || null
+          });
+          lastState = {
+            ...(focusResult.state || state),
+            editor_focus_unverified: true,
+            terminal_focus_binding_failure: focusResult.terminal_focus_binding_failure === true,
+            focus_binding_error: focusResult.focus_binding_error || null,
+            editor_text_length: observedText.length
+          };
+          if (focusResult.terminal_focus_binding_failure) {
+            return {
+              ok: false,
+              error: "CHAT_EDITOR_MESSAGE_MISMATCH",
+              editor_found: true,
+              attempts,
+              deterministic_fallback_attempted: false,
+              state: lastState
+            };
+          }
+          break;
         }
-        await sleep(120);
-        await clearFocusedInput(client);
-        await sleep(80);
-        await insertText(client, message);
+        const clearSkipped = normalizeDetailText(focusedEditor.label || "") === "";
+        const nativeFocusBackendNodeId = Number(focusResult.native_focus_backend_node_id);
+        let preClearFocusSettle = null;
+        let preClearBinding = {
+          required: false,
+          verified: true
+        };
+        if (Number.isInteger(nativeFocusBackendNodeId) && nativeFocusBackendNodeId > 0) {
+          preClearFocusSettle = await waitForFreshChatEditorFocus(client, {
+            initialDelayMs: 80
+          });
+          preClearBinding = await verifyChatEditorBackendBinding(
+            client,
+            preClearFocusSettle.editor,
+            preClearFocusSettle.focus,
+            nativeFocusBackendNodeId
+          );
+          if (!preClearBinding.verified) {
+            attempts.push({
+              stage: "normal",
+              editor_node_id: preClearFocusSettle.editor?.node_id || null,
+              editor_selector: preClearFocusSettle.editor?.selector || focusedEditor.selector || null,
+              editor_trace_id: preClearFocusSettle.editor?.attributes?.traceid || focusedEditor.attributes?.traceid || null,
+              input_mode: null,
+              chunk_count: 0,
+              expected_length: expectedText.length,
+              observed_length: normalizeDetailText(focusedEditor.label || "").length,
+              exact_match: false,
+              focus_verified: false,
+              terminal_focus_binding_failure: true,
+              focus_binding_error: preClearBinding.error || null,
+              focus_attempts: focusResult.attempts,
+              pre_clear_focus: preClearFocusSettle.focus,
+              pre_clear_focus_observations: preClearFocusSettle.observations,
+              pre_clear_binding: preClearBinding,
+              clear_skipped: true
+            });
+            lastState = {
+              editor: preClearFocusSettle.editor,
+              terminal_focus_binding_failure: true,
+              focus_binding_error: preClearBinding.error || null,
+              editor_focus_unverified: true
+            };
+            return {
+              ok: false,
+              error: "CHAT_EDITOR_MESSAGE_MISMATCH",
+              editor_found: true,
+              attempts,
+              deterministic_fallback_attempted: false,
+              state: lastState
+            };
+          }
+        }
+        if (!clearSkipped) await clearFocusedInput(client);
+        const preInsertFocusSettle = clearSkipped && preClearFocusSettle
+          ? preClearFocusSettle
+          : await waitForFreshChatEditorFocus(client, {
+              initialDelayMs: 80
+            });
+        const preInsertEditor = preInsertFocusSettle.editor;
+        const preInsertState = { editor: preInsertEditor };
+        const preInsertFocus = preInsertFocusSettle.focus;
+        const preInsertBinding = clearSkipped && preClearFocusSettle
+          ? preClearBinding
+          : await verifyChatEditorBackendBinding(
+              client,
+              preInsertEditor,
+              preInsertFocus,
+              nativeFocusBackendNodeId
+            );
+        if (!preInsertFocus.focused || !preInsertBinding.verified) {
+          attempts.push({
+            stage: "normal",
+            editor_node_id: preInsertEditor?.node_id || null,
+            editor_node_changed_before_insert: Boolean(
+              preInsertEditor?.node_id
+              && preInsertEditor.node_id !== focusedEditor.node_id
+            ),
+            editor_selector: preInsertEditor?.selector || focusedEditor.selector || null,
+            editor_trace_id: preInsertEditor?.attributes?.traceid || focusedEditor.attributes?.traceid || null,
+            input_mode: null,
+            chunk_count: 0,
+            expected_length: expectedText.length,
+            observed_length: normalizeDetailText(focusedEditor.label || "").length,
+            exact_match: false,
+            focus_verified: false,
+            focus_lost_before_insert: true,
+            terminal_focus_binding_failure: preInsertBinding.required && !preInsertBinding.verified,
+            focus_binding_error: preInsertBinding.error || null,
+            focus_attempts: focusResult.attempts,
+            pre_insert_focus: preInsertFocus,
+            pre_insert_binding: preInsertBinding,
+            pre_insert_focus_poll_count: preInsertFocusSettle.poll_count,
+            pre_insert_focus_settle_elapsed_ms: preInsertFocusSettle.elapsed_ms,
+            pre_insert_focus_observations: preInsertFocusSettle.observations,
+            clear_skipped: clearSkipped
+          });
+          lastState = {
+            ...preInsertState,
+            editor_focus_lost_before_insert: true,
+            terminal_focus_binding_failure: preInsertBinding.required && !preInsertBinding.verified,
+            focus_binding_error: preInsertBinding.error || null
+          };
+          if (preInsertBinding.required && !preInsertBinding.verified) {
+            return {
+              ok: false,
+              error: "CHAT_EDITOR_MESSAGE_MISMATCH",
+              editor_found: true,
+              attempts,
+              deterministic_fallback_attempted: false,
+              state: lastState
+            };
+          }
+          break;
+        }
+        const inputResult = await insertText(client, message);
         await sleep(250);
         const afterState = await readChatConversationReadyState(client);
         const editorText = normalizeDetailText(afterState.editor?.label || "");
-        if (editorText.includes(normalizeDetailText(message))) {
+        const exactMatch = editorText === expectedText;
+        attempts.push({
+          stage: "normal",
+          editor_node_id: preInsertEditor?.node_id || focusedEditor.node_id,
+          editor_node_changed_before_insert: Boolean(
+            preInsertEditor?.node_id
+            && preInsertEditor.node_id !== focusedEditor.node_id
+          ),
+          editor_selector: preInsertEditor?.selector || focusedEditor.selector || null,
+          editor_trace_id: preInsertEditor?.attributes?.traceid || focusedEditor.attributes?.traceid || null,
+          input_mode: inputResult?.mode || null,
+          chunk_count: Number(inputResult?.chunk_count || 0),
+          expected_length: expectedText.length,
+          observed_length: editorText.length,
+          exact_match: exactMatch,
+          focus_verified: true,
+          focus_attempts: focusResult.attempts,
+          pre_insert_focus: preInsertFocus,
+          pre_insert_binding: preInsertBinding,
+          pre_insert_focus_poll_count: preInsertFocusSettle.poll_count,
+          pre_insert_focus_settle_elapsed_ms: preInsertFocusSettle.elapsed_ms,
+          pre_insert_focus_observations: preInsertFocusSettle.observations,
+          clear_skipped: clearSkipped,
+          read_error: afterState.editor?.read_error || null
+        });
+        if (exactMatch) {
           return {
             ok: true,
             value: editorText,
-            editor: afterState.editor || state.editor
+            editor: afterState.editor || state.editor,
+            attempts,
+            deterministic_fallback_attempted: false
           };
         }
         lastState = {
           ...afterState,
           editor_message_mismatch: true,
-          editor_text: editorText
+          editor_text_length: editorText.length
         };
+        break;
       } catch (error) {
         if (!isRecoverableNodeError(error)) throw error;
+        attempts.push({
+          stage: "normal",
+          editor_node_id: state.editor.node_id,
+          editor_selector: state.editor.selector || null,
+          editor_trace_id: state.editor.attributes?.traceid || null,
+          expected_length: expectedText.length,
+          exact_match: false,
+          recoverable_error: error?.message || String(error)
+        });
         lastState = {
           ...state,
           recoverable_error: error?.message || String(error),
@@ -1130,9 +1910,223 @@ export async function setChatEditorMessage(client, message, {
     }
     await sleep(250);
   }
+
+  // A chat transition can briefly steal focus or remount the contenteditable
+  // while human-style chunked input is in progress. No outbound action has
+  // started yet, so one freshly reacquired, deterministic editor-only retry is
+  // safe. The message still must be read back exactly before callers may send.
+  let deterministicFallbackAttempted = false;
+  const fallbackState = await readChatConversationReadyState(client);
+  lastState = fallbackState || lastState;
+  if (fallbackState?.editor?.node_id) {
+    editorFound = true;
+    deterministicFallbackAttempted = true;
+    try {
+      const focusResult = await focusChatEditorForInput(client, fallbackState.editor, {
+        deterministic: true,
+        attemptsLimit: 3
+      });
+      const focusedEditor = focusResult.editor || fallbackState.editor;
+      if (!focusResult.ok) {
+        const observedText = normalizeDetailText(focusedEditor?.label || "");
+        attempts.push({
+          stage: "deterministic_fallback",
+          editor_node_id: focusedEditor?.node_id || fallbackState.editor.node_id,
+          editor_selector: focusedEditor?.selector || fallbackState.editor.selector || null,
+          editor_trace_id: focusedEditor?.attributes?.traceid || fallbackState.editor.attributes?.traceid || null,
+          input_mode: null,
+          chunk_count: 0,
+          expected_length: expectedText.length,
+          observed_length: observedText.length,
+          exact_match: false,
+          focus_verified: false,
+          focus_attempts: focusResult.attempts
+        });
+        lastState = {
+          ...(focusResult.state || fallbackState),
+          editor_focus_unverified: true,
+          editor_text_length: observedText.length
+        };
+      } else {
+        const clearSkipped = normalizeDetailText(focusedEditor.label || "") === "";
+        const nativeFocusBackendNodeId = Number(focusResult.native_focus_backend_node_id);
+        let preClearFocusSettle = null;
+        let preClearBinding = {
+          required: false,
+          verified: true
+        };
+        if (Number.isInteger(nativeFocusBackendNodeId) && nativeFocusBackendNodeId > 0) {
+          preClearFocusSettle = await waitForFreshChatEditorFocus(client, {
+            initialDelayMs: 80
+          });
+          preClearBinding = await verifyChatEditorBackendBinding(
+            client,
+            preClearFocusSettle.editor,
+            preClearFocusSettle.focus,
+            nativeFocusBackendNodeId
+          );
+          if (!preClearBinding.verified) {
+            attempts.push({
+              stage: "deterministic_fallback",
+              editor_node_id: preClearFocusSettle.editor?.node_id || null,
+              editor_selector: preClearFocusSettle.editor?.selector || focusedEditor.selector || null,
+              editor_trace_id: preClearFocusSettle.editor?.attributes?.traceid || focusedEditor.attributes?.traceid || null,
+              input_mode: null,
+              chunk_count: 0,
+              expected_length: expectedText.length,
+              observed_length: normalizeDetailText(focusedEditor.label || "").length,
+              exact_match: false,
+              focus_verified: false,
+              terminal_focus_binding_failure: true,
+              focus_binding_error: preClearBinding.error || null,
+              focus_attempts: focusResult.attempts,
+              pre_clear_focus: preClearFocusSettle.focus,
+              pre_clear_focus_observations: preClearFocusSettle.observations,
+              pre_clear_binding: preClearBinding,
+              clear_skipped: true
+            });
+            lastState = {
+              editor: preClearFocusSettle.editor,
+              terminal_focus_binding_failure: true,
+              focus_binding_error: preClearBinding.error || null,
+              editor_focus_unverified: true
+            };
+            return {
+              ok: false,
+              error: "CHAT_EDITOR_MESSAGE_MISMATCH",
+              editor_found: true,
+              attempts,
+              deterministic_fallback_attempted: true,
+              state: lastState
+            };
+          }
+        }
+        if (!clearSkipped) await clearFocusedInput(client);
+        const preInsertFocusSettle = clearSkipped && preClearFocusSettle
+          ? preClearFocusSettle
+          : await waitForFreshChatEditorFocus(client, {
+              initialDelayMs: 80
+            });
+        const preInsertEditor = preInsertFocusSettle.editor;
+        const preInsertState = { editor: preInsertEditor };
+        const preInsertFocus = preInsertFocusSettle.focus;
+        const preInsertBinding = clearSkipped && preClearFocusSettle
+          ? preClearBinding
+          : await verifyChatEditorBackendBinding(
+              client,
+              preInsertEditor,
+              preInsertFocus,
+              nativeFocusBackendNodeId
+            );
+        if (!preInsertFocus.focused || !preInsertBinding.verified) {
+          attempts.push({
+            stage: "deterministic_fallback",
+            editor_node_id: preInsertEditor?.node_id || null,
+            editor_node_changed_before_insert: Boolean(
+              preInsertEditor?.node_id
+              && preInsertEditor.node_id !== focusedEditor.node_id
+            ),
+            editor_selector: preInsertEditor?.selector || focusedEditor.selector || null,
+            editor_trace_id: preInsertEditor?.attributes?.traceid || focusedEditor.attributes?.traceid || null,
+            input_mode: null,
+            chunk_count: 0,
+            expected_length: expectedText.length,
+            observed_length: normalizeDetailText(focusedEditor.label || "").length,
+            exact_match: false,
+            focus_verified: false,
+            focus_lost_before_insert: true,
+            terminal_focus_binding_failure: preInsertBinding.required && !preInsertBinding.verified,
+            focus_binding_error: preInsertBinding.error || null,
+            focus_attempts: focusResult.attempts,
+            pre_insert_focus: preInsertFocus,
+            pre_insert_binding: preInsertBinding,
+            pre_insert_focus_poll_count: preInsertFocusSettle.poll_count,
+            pre_insert_focus_settle_elapsed_ms: preInsertFocusSettle.elapsed_ms,
+            pre_insert_focus_observations: preInsertFocusSettle.observations,
+            clear_skipped: clearSkipped
+          });
+          lastState = {
+            ...preInsertState,
+            editor_focus_lost_before_insert: true,
+            terminal_focus_binding_failure: preInsertBinding.required && !preInsertBinding.verified,
+            focus_binding_error: preInsertBinding.error || null
+          };
+        } else {
+          const inputResult = await insertText(client, message, {
+            humanTextEntryEnabled: false
+          });
+          await sleep(350);
+          const afterState = await readChatConversationReadyState(client);
+          const editorText = normalizeDetailText(afterState.editor?.label || "");
+          const exactMatch = editorText === expectedText;
+          attempts.push({
+            stage: "deterministic_fallback",
+            editor_node_id: preInsertEditor?.node_id || focusedEditor.node_id,
+            editor_node_changed_before_insert: Boolean(
+              preInsertEditor?.node_id
+              && preInsertEditor.node_id !== focusedEditor.node_id
+            ),
+            editor_selector: preInsertEditor?.selector || focusedEditor.selector || null,
+            editor_trace_id: preInsertEditor?.attributes?.traceid || focusedEditor.attributes?.traceid || null,
+            input_mode: inputResult?.mode || null,
+            chunk_count: Number(inputResult?.chunk_count || 0),
+            expected_length: expectedText.length,
+            observed_length: editorText.length,
+            exact_match: exactMatch,
+            focus_verified: true,
+            focus_attempts: focusResult.attempts,
+            pre_insert_focus: preInsertFocus,
+            pre_insert_binding: preInsertBinding,
+            pre_insert_focus_poll_count: preInsertFocusSettle.poll_count,
+            pre_insert_focus_settle_elapsed_ms: preInsertFocusSettle.elapsed_ms,
+            pre_insert_focus_observations: preInsertFocusSettle.observations,
+            clear_skipped: clearSkipped,
+            read_error: afterState.editor?.read_error || null
+          });
+          if (exactMatch) {
+            return {
+              ok: true,
+              value: editorText,
+              editor: afterState.editor || preInsertEditor || focusedEditor,
+              attempts,
+              deterministic_fallback_attempted: true,
+              recovery: {
+                mode: "deterministic_reacquired_editor"
+              }
+            };
+          }
+          lastState = {
+            ...afterState,
+            editor_message_mismatch: true,
+            editor_text_length: editorText.length
+          };
+        }
+      }
+    } catch (error) {
+      if (!isRecoverableNodeError(error)) throw error;
+      attempts.push({
+        stage: "deterministic_fallback",
+        editor_node_id: fallbackState.editor.node_id,
+        editor_selector: fallbackState.editor.selector || null,
+        editor_trace_id: fallbackState.editor.attributes?.traceid || null,
+        expected_length: expectedText.length,
+        exact_match: false,
+        recoverable_error: error?.message || String(error)
+      });
+      lastState = {
+        ...fallbackState,
+        recoverable_error: error?.message || String(error),
+        recoverable_phase: "set_editor_message_deterministic_fallback"
+      };
+    }
+  }
+
   return {
     ok: false,
-    error: "CHAT_EDITOR_NOT_FOUND",
+    error: editorFound ? "CHAT_EDITOR_MESSAGE_MISMATCH" : "CHAT_EDITOR_NOT_FOUND",
+    editor_found: editorFound,
+    attempts,
+    deterministic_fallback_attempted: deterministicFallbackAttempted,
     state: lastState
   };
 }
@@ -1250,8 +2244,8 @@ export async function clickChatAskResume(client, {
   if (lastDisabledAskResume) {
     return {
       ok: false,
-      already_requested: true,
-      request_pending: true,
+      already_requested: false,
+      request_pending: false,
       error: "ASK_RESUME_BUTTON_DISABLED",
       control: lastDisabledAskResume,
       state: lastState
@@ -1264,59 +2258,157 @@ export async function clickChatAskResume(client, {
   };
 }
 
+export function resolveChatConfirmResumeTimeoutMs(value) {
+  const hasExplicitValue = value !== null
+    && value !== undefined
+    && !(typeof value === "string" && value.trim() === "");
+  if (!hasExplicitValue) return CHAT_REQUEST_RESUME_CONFIRM_DEFAULT_TIMEOUT_MS;
+  const parsedValue = Number(value);
+  return Number.isFinite(parsedValue)
+    ? Math.max(0, parsedValue)
+    : CHAT_REQUEST_RESUME_CONFIRM_DEFAULT_TIMEOUT_MS;
+}
+
 export async function clickChatConfirmRequestResume(client, {
-  timeoutMs = 8000,
-  settleMs = 900
+  timeoutMs = null,
+  settleMs = 900,
+  pollIntervalMs = CHAT_REQUEST_RESUME_CONFIRM_POLL_INTERVAL_MS
 } = {}) {
+  const effectiveTimeoutMs = resolveChatConfirmResumeTimeoutMs(timeoutMs);
+  const parsedPollIntervalMs = Number(pollIntervalMs);
+  const effectivePollIntervalMs = Number.isFinite(parsedPollIntervalMs)
+    ? Math.max(1, parsedPollIntervalMs)
+    : CHAT_REQUEST_RESUME_CONFIRM_POLL_INTERVAL_MS;
   const started = Date.now();
+  let lastPrompt = null;
   let lastTarget = null;
   let lastState = null;
-  while (Date.now() - started <= timeoutMs) {
+  let discoveryMode = null;
+  let pollCount = 0;
+  let firstPromptObservedElapsedMs = null;
+  let firstTargetObservedElapsedMs = null;
+  let lastPromptReadError = null;
+  let lastTargetReadError = null;
+  let clickAttempted = false;
+  let clickDispatched = false;
+  const diagnostics = () => ({
+    timeout_ms: effectiveTimeoutMs,
+    poll_interval_ms: effectivePollIntervalMs,
+    poll_count: pollCount,
+    elapsed_ms: Math.max(0, Date.now() - started),
+    discovery_mode: discoveryMode,
+    prompt_observed: Boolean(lastPrompt),
+    first_prompt_observed_elapsed_ms: firstPromptObservedElapsedMs,
+    last_prompt_read_error: lastPromptReadError,
+    target_observed: Boolean(lastTarget),
+    first_target_observed_elapsed_ms: firstTargetObservedElapsedMs,
+    last_target_read_error: lastTargetReadError,
+    click_attempted: clickAttempted,
+    click_dispatched: clickDispatched
+  });
+
+  while (true) {
+    pollCount += 1;
     lastState = await readChatConversationReadyState(client);
+    if (lastState.already_requested_resume || lastState.attachment_resume_enabled) {
+      return {
+        confirmed: true,
+        assumed_requested: true,
+        reason: lastState.attachment_resume_enabled
+          ? "attachment_resume_available"
+          : "request_state_observed",
+        control: lastState.requested_resume || lastState.attachment_resume || null,
+        prompt: lastPrompt,
+        state: lastState,
+        ...diagnostics()
+      };
+    }
     const rootState = await getChatRoots(client);
-    const confirmRoots = await resolveScopedRoots(
-      client,
-      rootState.roots,
-      CHAT_CONVERSATION_CONTROL_SCOPE_SELECTORS
-    );
-    const target = await findVisibleMatchingTarget(
-      client,
-      confirmRoots,
-      CHAT_CONFIRM_REQUEST_RESUME_SELECTORS,
-      (item) => isConfirmText(item.label) && !item.disabled
-    );
-    lastTarget = target;
-    if (target?.node_id) {
+    let discovered;
+    try {
+      discovered = await findAnchoredChatRequestResumeConfirmTarget(
+        client,
+        rootState.roots
+      );
+    } catch (error) {
+      if (!isRecoverableNodeError(error)) throw error;
+      lastTargetReadError = error?.message || String(error);
+      discovered = {
+        prompt: null,
+        prompt_candidate: null,
+        target: null,
+        target_candidate: null,
+        discovery_mode: null
+      };
+    }
+    lastPromptReadError = discovered.prompt_candidate?.read_error || lastPromptReadError;
+    lastTargetReadError = discovered.target_candidate?.read_error || lastTargetReadError;
+    if (discovered.prompt) {
+      lastPrompt = discovered.prompt;
+      discoveryMode = discovered.discovery_mode;
+      if (firstPromptObservedElapsedMs === null) {
+        firstPromptObservedElapsedMs = Math.max(0, Date.now() - started);
+      }
+    }
+    lastTarget = discovered.target;
+    if (lastTarget && firstTargetObservedElapsedMs === null) {
+      firstTargetObservedElapsedMs = Math.max(0, Date.now() - started);
+    }
+    if (lastTarget?.node_id) {
+      clickAttempted = true;
       try {
-        if (target.center) {
-          await clickPoint(client, target.center.x, target.center.y);
+        if (lastTarget.center) {
+          await clickPoint(client, lastTarget.center.x, lastTarget.center.y);
         } else {
-          await clickNodeCenter(client, target.node_id, { scrollIntoView: true });
+          await clickNodeCenter(client, lastTarget.node_id, { scrollIntoView: true });
         }
+        clickDispatched = true;
         if (settleMs > 0) await sleep(settleMs);
         const afterState = await readChatConversationReadyState(client);
         return {
           confirmed: true,
           assumed_requested: Boolean(afterState.already_requested_resume),
-          control: target,
-          state: afterState
+          control: lastTarget,
+          prompt: lastPrompt,
+          state: afterState,
+          ...diagnostics()
         };
       } catch (error) {
         if (!isRecoverableNodeError(error)) throw error;
-        lastTarget = {
-          ...target,
+        const control = {
+          ...lastTarget,
           recoverable_error: error?.message || String(error),
-          recoverable_phase: "confirm_request_resume_click"
+          recoverable_phase: clickDispatched
+            ? "confirm_request_resume_post_click_state"
+            : "confirm_request_resume_click"
+        };
+        return {
+          confirmed: false,
+          outcome_unknown: true,
+          error: clickDispatched
+            ? "CONFIRM_CLICK_OUTCOME_UNKNOWN"
+            : "CONFIRM_CLICK_FAILED",
+          control,
+          prompt: lastPrompt,
+          state: lastState,
+          ...diagnostics()
         };
       }
     }
-    await sleep(250);
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs >= effectiveTimeoutMs) break;
+    await sleep(Math.min(
+      effectivePollIntervalMs,
+      Math.max(1, effectiveTimeoutMs - elapsedMs)
+    ));
   }
   return {
     confirmed: false,
     error: "CONFIRM_BUTTON_NOT_FOUND",
-    control: lastTarget,
-    state: lastState
+    control: null,
+    prompt: lastPrompt,
+    state: lastState,
+    ...diagnostics()
   };
 }
 
@@ -1360,6 +2452,69 @@ export async function getChatResumeRequestMessageState(client) {
   };
 }
 
+export async function readChatRequestVerificationEvidence(client) {
+  // Both readers reacquire the document root. Running them concurrently can
+  // invalidate the first reader's frontend node IDs when the second
+  // DOM.getDocument call refreshes Chrome's node-id namespace.
+  const messageState = await getChatResumeRequestMessageState(client);
+  const readyState = await readChatConversationReadyState(client);
+  return {
+    message_state: messageState,
+    ready_state: readyState
+  };
+}
+
+const CHAT_GREETING_DELIVERY_PREFIX_PATTERN = /^(?:送达|已送达|已读|未读)\s*/u;
+
+export function isExactChatGreetingMessageText(value = "", expectedValue = "") {
+  const line = normalizeDetailText(value);
+  const expected = normalizeDetailText(expectedValue);
+  if (!line || !expected) return false;
+  if (line === expected) return true;
+  return normalizeDetailText(line.replace(CHAT_GREETING_DELIVERY_PREFIX_PATTERN, "")) === expected;
+}
+
+export async function getChatGreetingMessageState(client, greetingText = "") {
+  const expected = normalizeDetailText(greetingText);
+  const rootState = await getChatRoots(client);
+  let messageRoot = null;
+  for (const root of rootState.roots) {
+    for (const selector of CHAT_MESSAGE_LIST_SELECTORS) {
+      const nodeIds = await querySelectorAll(client, root.nodeId, selector);
+      if (nodeIds.length) {
+        messageRoot = {
+          root,
+          selector,
+          node_id: nodeIds[0]
+        };
+        break;
+      }
+    }
+    if (messageRoot) break;
+  }
+  if (!messageRoot?.node_id || !expected) {
+    return {
+      ok: false,
+      selector: messageRoot?.selector || null,
+      expected_text: expected,
+      exact_count: 0,
+      recent: []
+    };
+  }
+  let text = "";
+  try {
+    text = htmlToText(await getOuterHTML(client, messageRoot.node_id));
+  } catch {}
+  const lines = text.split(/\r?\n/).map(normalizeDetailText).filter(Boolean);
+  return {
+    ok: Boolean(text),
+    selector: messageRoot.selector,
+    expected_text: expected,
+    exact_count: lines.filter((line) => isExactChatGreetingMessageText(line, expected)).length,
+    recent: lines.slice(-12)
+  };
+}
+
 export async function waitForChatResumeRequestMessage(client, {
   baselineCount = 0,
   baselineResumeAttachmentCount = 0,
@@ -1368,7 +2523,7 @@ export async function waitForChatResumeRequestMessage(client, {
 } = {}) {
   const started = Date.now();
   let state = null;
-  while (Date.now() - started <= timeoutMs) {
+  while (true) {
     state = await getChatResumeRequestMessageState(client);
     const observed = (
       state.count > baselineCount
@@ -1381,7 +2536,9 @@ export async function waitForChatResumeRequestMessage(client, {
         state
       };
     }
-    await sleep(intervalMs);
+    const elapsedMs = Date.now() - started;
+    if (elapsedMs >= timeoutMs) break;
+    await sleep(Math.min(intervalMs, Math.max(0, timeoutMs - elapsedMs)));
   }
   return {
     observed: false,
@@ -1390,12 +2547,34 @@ export async function waitForChatResumeRequestMessage(client, {
   };
 }
 
+export function resolveChatRequestVerificationTimeoutMs(value, maxAttempts = 3) {
+  const parsedAttempts = Number(maxAttempts);
+  const effectiveAttempts = Number.isFinite(parsedAttempts)
+    ? Math.max(0, parsedAttempts)
+    : 3;
+  const fallbackMs = Math.max(6500, Math.min(20000, effectiveAttempts * 3250));
+  const hasExplicitValue = value !== null
+    && value !== undefined
+    && !(typeof value === "string" && value.trim() === "");
+  if (!hasExplicitValue) return fallbackMs;
+  const parsedValue = Number(value);
+  return Number.isFinite(parsedValue)
+    ? Math.max(0, parsedValue)
+    : fallbackMs;
+}
+
 export async function requestChatResumeForPassedCandidate(client, {
   greetingText = "Hi同学，能麻烦发下简历吗？",
   maxAttempts = 3,
   askResumeTimeoutMs = 8000,
+  confirmResumeTimeoutMs = null,
+  confirmResumePollIntervalMs = CHAT_REQUEST_RESUME_CONFIRM_POLL_INTERVAL_MS,
+  requestVerificationTimeoutMs = null,
+  requestFinalVerificationSettleMs = 260,
   dryRun = false,
-  skipWhenAttachmentResumeAvailable = true
+  skipWhenAttachmentResumeAvailable = true,
+  skipGreeting = false,
+  actionTransition = null
 } = {}) {
   const effectiveGreetingText = normalizeDetailText(greetingText) || "Hi同学，能麻烦发下简历吗？";
   const initialState = await readChatConversationReadyState(client);
@@ -1436,119 +2615,223 @@ export async function requestChatResumeForPassedCandidate(client, {
       close_before_greeting: closeBeforeGreeting
     };
   }
-  const editorState = await setChatEditorMessage(client, effectiveGreetingText);
-  if (!editorState.ok) {
-    throw new Error("CHAT_EDITOR_MESSAGE_MISMATCH");
-  }
-  const sendResult = await sendChatMessage(client, effectiveGreetingText);
-  if (!sendResult.sent) {
-    throw new Error(`CHAT_GREETING_SEND_FAILED:${sendResult.error || sendResult.method || "unknown"}`);
+  let greetingBaseline = null;
+  let editorState = null;
+  let sendResult = null;
+  if (!skipGreeting) {
+    greetingBaseline = await getChatGreetingMessageState(client, effectiveGreetingText);
+    editorState = await setChatEditorMessage(client, effectiveGreetingText);
+    if (!editorState.ok) {
+      const error = new Error(editorState.error || "CHAT_EDITOR_MESSAGE_MISMATCH");
+      error.code = editorState.error || "CHAT_EDITOR_MESSAGE_MISMATCH";
+      error.retryable = true;
+      error.attempts = Array.isArray(editorState.attempts)
+        ? editorState.attempts
+        : [];
+      throw error;
+    }
+    if (typeof actionTransition === "function") {
+      await actionTransition("greeting_send_in_flight", {
+        greeting_baseline_count: greetingBaseline.exact_count,
+        greeting_evidence_readable: greetingBaseline.ok
+      });
+    }
+    sendResult = await sendChatMessage(client, effectiveGreetingText);
+    if (!sendResult.sent) {
+      if (typeof actionTransition === "function") {
+        await actionTransition("outcome_unknown", {
+          action: "greeting_send",
+          reason: sendResult.error || sendResult.method || "unknown"
+        });
+      }
+      throw new Error(`CHAT_GREETING_SEND_FAILED:${sendResult.error || sendResult.method || "unknown"}`);
+    }
+    const postGreetingPageState = await getChatTopLevelState(client);
+    if (postGreetingPageState.is_security_verification) {
+      if (typeof actionTransition === "function") {
+        await actionTransition("outcome_unknown", {
+          action: "greeting_send",
+          reason: "boss_security_verification_required"
+        });
+      }
+      throw makeBossSecurityVerificationRequiredError(
+        postGreetingPageState,
+        "chat_greeting_confirmation"
+      );
+    }
+    if (typeof actionTransition === "function") {
+      await actionTransition("greeting_confirmed", {
+        greeting_baseline_count: greetingBaseline.exact_count,
+        send_method: sendResult.method || null
+      });
+    }
   }
 
   const attempts = [];
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const before = await getChatResumeRequestMessageState(client);
-    const askResult = await clickChatAskResume(client, {
-      timeoutMs: askResumeTimeoutMs,
-      skipWhenAttachmentResumeAvailable
+  const before = await getChatResumeRequestMessageState(client);
+  if (typeof actionTransition === "function") {
+    await actionTransition("request_in_flight", {
+      request_baseline_count: before.count,
+      resume_attachment_baseline_count: before.resume_attachment_count || 0
     });
-    let confirmResult = {
-      confirmed: false,
-      assumed_requested: Boolean(askResult.already_requested),
-      skipped: true,
-      reason: askResult.attachment_resume_available
-        ? "attachment_resume_already_available"
-        : askResult.request_pending
-          ? "resume_request_already_pending"
+  }
+  const askResult = await clickChatAskResume(client, {
+    timeoutMs: askResumeTimeoutMs,
+    skipWhenAttachmentResumeAvailable
+  });
+  let confirmResult = {
+    confirmed: false,
+    assumed_requested: Boolean(askResult.already_requested),
+    skipped: true,
+    reason: askResult.attachment_resume_available
+      ? "attachment_resume_already_available"
+      : askResult.request_pending
+        ? "resume_request_already_pending"
         : askResult.ok
           ? "already_requested"
           : (askResult.error || "ask_resume_not_clicked")
+  };
+  if (askResult.ok && !askResult.already_requested) {
+    confirmResult = await clickChatConfirmRequestResume(client, {
+      timeoutMs: confirmResumeTimeoutMs,
+      pollIntervalMs: confirmResumePollIntervalMs
+    });
+  }
+  let messageCheck = (askResult.attachment_resume_available || askResult.request_pending || askResult.already_requested)
+    ? { observed: false, state: before, elapsed_ms: 0 }
+    : await waitForChatResumeRequestMessage(client, {
+        baselineCount: before.count,
+        baselineResumeAttachmentCount: before.resume_attachment_count,
+        timeoutMs: resolveChatRequestVerificationTimeoutMs(
+          requestVerificationTimeoutMs,
+          maxAttempts
+        )
+      });
+  let finalReadyState = confirmResult?.assumed_requested
+    ? (confirmResult.state || null)
+    : null;
+  let passiveVerificationAttempted = false;
+  if (!messageCheck.observed && !finalReadyState) {
+    passiveVerificationAttempted = true;
+    const settleMs = Math.max(0, Number(requestFinalVerificationSettleMs) || 0);
+    if (settleMs > 0) await sleep(settleMs);
+    const {
+      message_state: freshMessageState,
+      ready_state: freshReadyState
+    } = await readChatRequestVerificationEvidence(client);
+    messageCheck = {
+      observed: Boolean(
+        freshMessageState.count > before.count
+        || freshMessageState.resume_attachment_count > before.resume_attachment_count
+      ),
+      elapsed_ms: messageCheck.elapsed_ms + settleMs,
+      state: freshMessageState,
+      passive_final_read: true
     };
-    if (askResult.attachment_resume_available) {
-      attempts.push({
-        attempt: attempt + 1,
-        ask_result: askResult,
-        confirm_result: confirmResult,
-        message_before_count: before.count,
-        message_after_count: before.count,
-        message_observed: false,
-        message_last_text: before.last_text || ""
+    finalReadyState = freshReadyState;
+  }
+  const postRequestPageState = await getChatTopLevelState(client);
+  if (postRequestPageState.is_security_verification) {
+    if (typeof actionTransition === "function") {
+      await actionTransition("outcome_unknown", {
+        action: "request_resume",
+        reason: "boss_security_verification_required"
       });
-      return {
-        requested: false,
-        skipped: true,
-        reason: "attachment_resume_already_available",
-        initial_state: initialState,
-        close_before_greeting: closeBeforeGreeting,
-        greeting_sent: true,
-        greeting_send_result: sendResult,
-        attempts
-      };
     }
-    if (askResult.request_pending || askResult.already_requested) {
-      attempts.push({
-        attempt: attempt + 1,
-        ask_result: askResult,
-        confirm_result: confirmResult,
-        message_before_count: before.count,
-        message_after_count: before.count,
-        resume_attachment_before_count: before.resume_attachment_count || 0,
-        resume_attachment_after_count: before.resume_attachment_count || 0,
-        message_observed: false,
-        message_last_text: before.last_success_text || before.last_text || ""
+    throw makeBossSecurityVerificationRequiredError(
+      postRequestPageState,
+      "chat_resume_request_confirmation"
+    );
+  }
+  const messageObserved = Boolean(
+    (messageCheck.state?.count || 0) > (before.count || 0)
+  );
+  const attachmentObserved = Boolean(
+    (messageCheck.state?.resume_attachment_count || 0) > (before.resume_attachment_count || 0)
+  );
+  const readyStateObserved = Boolean(
+    finalReadyState?.already_requested_resume
+    || finalReadyState?.attachment_resume_enabled
+  );
+  const requestObserved = messageObserved || attachmentObserved || readyStateObserved;
+  const confirmationSource = messageObserved
+    ? "message_delta"
+    : attachmentObserved
+      ? "attachment_resume_delta"
+      : finalReadyState?.already_requested_resume
+        ? "exact_requested_resume_state"
+        : finalReadyState?.attachment_resume_enabled
+          ? "attachment_resume_available"
+          : null;
+  attempts.push({
+    attempt: 1,
+    ask_result: askResult,
+    confirm_result: confirmResult,
+    message_before_count: before.count,
+    message_after_count: messageCheck.state?.count || 0,
+    resume_attachment_before_count: before.resume_attachment_count || 0,
+    resume_attachment_after_count: messageCheck.state?.resume_attachment_count || 0,
+    message_observed: messageObserved,
+    message_last_text: messageCheck.state?.last_success_text || messageCheck.state?.last_text || "",
+    ready_state_observed: readyStateObserved,
+    confirmation_source: confirmationSource,
+    passive_verification_attempted: passiveVerificationAttempted
+  });
+
+  const satisfiedReason = askResult.attachment_resume_available
+    ? "attachment_resume_already_available"
+    : (askResult.request_pending || askResult.already_requested)
+      ? "resume_request_already_pending"
+      : requestObserved
+        ? "requested"
+        : "";
+  if (satisfiedReason) {
+    if (typeof actionTransition === "function") {
+      await actionTransition("request_confirmed", {
+        reason: satisfiedReason,
+        message_observed: messageObserved,
+        request_ready_state_observed: readyStateObserved,
+        request_confirmation_source: confirmationSource,
+        request_after_count: messageCheck.state?.count || before.count,
+        resume_attachment_after_count: messageCheck.state?.resume_attachment_count || before.resume_attachment_count || 0
       });
-      return {
-        requested: false,
-        skipped: true,
-        reason: "resume_request_already_pending",
-        initial_state: initialState,
-        close_before_greeting: closeBeforeGreeting,
-        greeting_sent: true,
-        greeting_send_result: sendResult,
-        attempts
-      };
     }
-    if (askResult.ok && !askResult.already_requested) {
-      confirmResult = await clickChatConfirmRequestResume(client);
-    }
-    const messageCheck = await waitForChatResumeRequestMessage(client, {
-      baselineCount: before.count,
-      baselineResumeAttachmentCount: before.resume_attachment_count
-    });
-    const messageObserved = Boolean(messageCheck.observed);
-    attempts.push({
-      attempt: attempt + 1,
-      ask_result: askResult,
-      confirm_result: confirmResult,
-      message_before_count: before.count,
-      message_after_count: messageCheck.state?.count || 0,
-      resume_attachment_before_count: before.resume_attachment_count || 0,
-      resume_attachment_after_count: messageCheck.state?.resume_attachment_count || 0,
-      message_observed: messageObserved,
-      message_last_text: messageCheck.state?.last_success_text || messageCheck.state?.last_text || ""
-    });
-    if (messageObserved) {
-      return {
-        requested: true,
-        skipped: false,
-        reason: "requested",
-        initial_state: initialState,
-        close_before_greeting: closeBeforeGreeting,
-        greeting_sent: true,
-        greeting_send_result: sendResult,
-        attempts
-      };
-    }
-    await sleep(900);
+    return {
+      requested: satisfiedReason === "requested",
+      skipped: satisfiedReason !== "requested",
+      reason: satisfiedReason,
+      initial_state: initialState,
+      close_before_greeting: closeBeforeGreeting,
+      greeting_sent: !skipGreeting,
+      greeting_skipped_from_journal: Boolean(skipGreeting),
+      greeting_send_result: sendResult,
+      attempts
+    };
   }
 
+  if (typeof actionTransition === "function") {
+    await actionTransition("outcome_unknown", {
+      action: "request_resume",
+      reason: "resume_request_message_not_observed",
+      ask_result: {
+        ok: Boolean(askResult.ok),
+        error: askResult.error || null
+      },
+      confirm_result: {
+        confirmed: Boolean(confirmResult.confirmed),
+        error: confirmResult.error || null
+      }
+    });
+  }
   return {
     requested: false,
     skipped: false,
     reason: "resume_request_message_not_observed",
+    outcome_unknown: true,
     initial_state: initialState,
     close_before_greeting: closeBeforeGreeting,
-    greeting_sent: true,
+    greeting_sent: !skipGreeting,
+    greeting_skipped_from_journal: Boolean(skipGreeting),
     greeting_send_result: sendResult,
     attempts
   };

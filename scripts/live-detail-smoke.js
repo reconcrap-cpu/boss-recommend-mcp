@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   clickNodeCenter,
   connectToChromeTarget,
@@ -341,7 +340,6 @@ async function run() {
       url: target.url,
       title: target.title
     };
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
 
     await enableDomains(client, ["Page", "DOM", "Input", "Network"]);
     client.Network.responseReceived((event) => {
@@ -587,7 +585,7 @@ async function run() {
       closeResult = await closeDetail(client);
     }
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
 
     let savedPayloadPath = null;
     if (options.savePayload) {

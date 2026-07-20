@@ -5,7 +5,6 @@ import path from "node:path";
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
@@ -424,7 +423,6 @@ async function run() {
       title: target.title
     };
 
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
     await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
     await bringPageToFront(client);
     result.navigation = await ensureTargetPage(client, target, config, options);
@@ -438,7 +436,7 @@ async function run() {
     });
     result.saved_image_path = writeBase64File(options.saveImage, screenshot.data || "");
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
     result.runtime_evaluate_used = false;
     result.method_summary = methodSummary(methodLog);
     result.method_log_count = methodLog.length;

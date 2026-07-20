@@ -9,6 +9,7 @@ import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 const {
   createToolsSchema,
   handleRequest,
+  isMainModulePath,
   normalizeMcpToolset,
   resetRecommendMcpStateForTests,
   runDetachedWorkerForTests,
@@ -34,6 +35,17 @@ const TOOL_CANCEL = "cancel_recommend_pipeline_run";
 const TOOL_CHAT_START = "start_boss_chat_run";
 const TOOL_CHAT_LIST_JOBS = "list_boss_chat_jobs";
 const TOOL_RECRUIT_START = "start_recruit_pipeline_run";
+
+function testMainModulePathAcceptsWindowsJunction(tempHome) {
+  const targetDir = path.join(tempHome, "worker-real");
+  const linkDir = path.join(tempHome, "worker-link");
+  fs.mkdirSync(targetDir, { recursive: true });
+  const targetFile = path.join(targetDir, "index.js");
+  fs.writeFileSync(targetFile, "// worker fixture\n", "utf8");
+  fs.symlinkSync(targetDir, linkDir, process.platform === "win32" ? "junction" : "dir");
+  assert.equal(isMainModulePath(path.join(linkDir, "index.js"), targetFile), true);
+  assert.equal(isMainModulePath(path.join(linkDir, "missing.js"), targetFile), false);
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1510,6 +1522,7 @@ async function testRecommendActiveRunPersistsProgressToDisk() {
 
 async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
   installFakeConnector();
+  const privateMarker = "must-not-persist";
   const diagnostics = Array.from({ length: 15 }, (_, index) => ({
     code: "RECOMMEND_LIST_READ_STALE_NODE",
     message: "Could not find node with given id",
@@ -1517,11 +1530,96 @@ async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
     cdp_method: "DOM.querySelectorAll:retry_after_reconnect",
     cdp_at: `2026-07-17T10:00:${String(index).padStart(2, "0")}.000Z`,
     cdp_node_id: 1000 + index,
+    cdp_backend_node_id: 2000 + index,
+    cdp_search_id: `search-${index}`,
+    cdp_connection_epoch: index,
+    cdp_reconnected_epoch: index + 1,
+    cdp_replay_policy: "safe_read_only",
+    cdp_replay_suppressed: index % 2 === 0,
+    cdp_outcome_unknown: index % 2 === 1,
+    cdp_reconnected: true,
+    cdp_replayed_after_reconnect: true,
+    cdp_reconnect_error: {
+      code: "ECONNRESET",
+      message: "connection reset",
+      candidate_name: privateMarker
+    },
     cdp_param_keys: ["nodeId", "selector", "unsafe-key!"],
     attempt: index + 1,
     exhausted: index === 14,
     recovery_mode: index === 0 ? "root_reacquire" : "context_reapply",
-    candidate_name: "must-not-persist"
+    candidate_name: privateMarker
+  }));
+  const forensicEvents = Array.from({ length: 15 }, (_, index) => ({
+    schema_version: 1,
+    event_id: `dom-stale-${index}`,
+    event_type: "dom_stale",
+    at: `2026-07-17T10:01:${String(index).padStart(2, "0")}.000Z`,
+    phase: "recommend:detail",
+    operation: "capture_candidate_detail",
+    detail_step: "open_detail",
+    candidate: {
+      index,
+      key: `recommend:id:${index}`,
+      card_node_id: 3000 + index,
+      visible_index: index % 4,
+      failing_list_node_id: 4000 + index,
+      name: privateMarker,
+      resume_content: privateMarker
+    },
+    error: {
+      ...diagnostics[index],
+      name: "ProtocolError"
+    },
+    pre_recovery_roots: {
+      connection_epoch: index,
+      top_document_node_id: 5000 + index,
+      iframe_owner_node_id: 6000 + index,
+      iframe_document_node_id: 7000 + index,
+      iframe_selector: "iframe[name=recommendFrame]",
+      candidate_name: privateMarker
+    },
+    candidate_list: {
+      seen_count: index + 1,
+      queued_count: 2,
+      processed_count: index,
+      resume_content: privateMarker
+    },
+    counters: {
+      processed: index,
+      screened: index,
+      candidate_name: privateMarker
+    },
+    lifecycle_timeline: Array.from({ length: 25 }, (_, timelineIndex) => ({
+      at: new Date(Date.UTC(2026, 6, 17, 10, 2, timelineIndex)).toISOString(),
+      type: timelineIndex % 2 === 0 ? "frameNavigated" : "documentUpdated",
+      operation: "capture_candidate_detail",
+      connection_epoch: index,
+      frame_id: `frame-${timelineIndex}`,
+      parent_frame_id: "main-frame",
+      loader_id: `loader-${timelineIndex}`,
+      url: `https://www.zhipin.com/web/chat/recommend?candidate=${privateMarker}`,
+      resume_content: privateMarker
+    })),
+    recovery: {
+      status: "recovered",
+      at: `2026-07-17T10:03:${String(index).padStart(2, "0")}.000Z`,
+      mode: "context_reapply",
+      escalated_from: "root_reacquire",
+      ok: true,
+      method: "Page.reload",
+      card_count: 12,
+      candidate_name: privateMarker
+    },
+    post_recovery_roots: {
+      connection_epoch: index + 1,
+      top_document_node_id: 8000 + index,
+      iframe_owner_node_id: 9000 + index,
+      iframe_document_node_id: 10000 + index,
+      iframe_selector: "iframe[name=recommendFrame]"
+    },
+    candidate_name: privateMarker,
+    resume: { content: privateMarker }
   }));
   setRecommendMcpWorkflowForTests(async (options, runControl) => {
     runControl.setPhase("recommend:list-read");
@@ -1533,7 +1631,9 @@ async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
       list_read_stale_recovery_applied: 2,
       list_read_stale_recoveries: 1,
       last_list_read_recovery_mode: "context_reapply",
-      last_list_read_stale_diagnostic: diagnostics.at(-1)
+      last_list_read_stale_diagnostic: diagnostics.at(-1),
+      dom_stale_forensic: forensicEvents.at(-1),
+      dom_stale_forensics: forensicEvents
     });
     runControl.checkpoint({
       list_read_stale_recovery_exhausted: {
@@ -1544,8 +1644,10 @@ async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
           queued_count: 0,
           processed_count: 10
         },
-        candidate_name: "must-not-persist"
-      }
+        candidate_name: privateMarker
+      },
+      dom_stale_forensic: forensicEvents.at(-1),
+      dom_stale_forensics: forensicEvents
     });
     return {
       domain: "recommend",
@@ -1558,6 +1660,8 @@ async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
       last_list_read_recovery_mode: "context_reapply",
       last_list_read_stale_diagnostic: diagnostics.at(-1),
       list_read_stale_diagnostics: diagnostics,
+      dom_stale_forensic: forensicEvents.at(-1),
+      dom_stale_forensics: forensicEvents,
       results: []
     };
   });
@@ -1576,11 +1680,41 @@ async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
     status.run.summary.last_list_read_stale_diagnostic.cdp_param_keys,
     ["nodeId", "selector"]
   );
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_search_id, "search-14");
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_connection_epoch, 14);
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_reconnected_epoch, 15);
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_replay_policy, "safe_read_only");
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_replay_suppressed, true);
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_outcome_unknown, false);
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_reconnected, true);
+  assert.equal(status.run.summary.last_list_read_stale_diagnostic.cdp_replayed_after_reconnect, true);
+  assert.equal(
+    status.run.summary.last_list_read_stale_diagnostic.cdp_reconnect_error.code,
+    "ECONNRESET"
+  );
   assert.equal(
     status.run.checkpoint.list_read_stale_recovery_exhausted.recent_diagnostics.length,
     12
   );
-  assert.equal(JSON.stringify(status.run).includes("must-not-persist"), false);
+  assert.equal(status.run.progress.dom_stale_forensics.length, 12);
+  assert.equal(status.run.summary.dom_stale_forensics.length, 12);
+  assert.equal(status.run.checkpoint.dom_stale_forensics.length, 12);
+  assert.equal(status.run.summary.dom_stale_forensics[0].event_id, "dom-stale-3");
+  const latestForensic = status.run.summary.dom_stale_forensic;
+  assert.equal(latestForensic.candidate.index, 14);
+  assert.equal(latestForensic.candidate.key, "recommend:id:14");
+  assert.equal(latestForensic.candidate.failing_list_node_id, 4014);
+  assert.equal(latestForensic.pre_recovery_roots.top_document_node_id, 5014);
+  assert.equal(latestForensic.post_recovery_roots.connection_epoch, 15);
+  assert.equal(latestForensic.recovery.status, "recovered");
+  assert.equal(latestForensic.recovery.ok, true);
+  assert.equal(latestForensic.lifecycle_timeline.length, 20);
+  assert.equal(latestForensic.lifecycle_timeline[0].frame_id, "frame-5");
+  assert.equal(
+    latestForensic.lifecycle_timeline.at(-1).url,
+    "https://www.zhipin.com/web/chat/recommend"
+  );
+  assert.equal(JSON.stringify(status.run).includes(privateMarker), false);
 
   const persisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(persisted.summary.list_read_stale_diagnostics.length, 12);
@@ -1588,7 +1722,9 @@ async function testRecommendStaleDiagnosticsSurviveStatusAndDiskCompaction() {
     persisted.checkpoint.list_read_stale_recovery_exhausted.diagnostic.cdp_node_id,
     1014
   );
-  assert.equal(JSON.stringify(persisted).includes("must-not-persist"), false);
+  assert.equal(persisted.summary.dom_stale_forensics.length, 12);
+  assert.equal(persisted.checkpoint.dom_stale_forensic.candidate.card_node_id, 3014);
+  assert.equal(JSON.stringify(persisted).includes(privateMarker), false);
 }
 
 async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
@@ -2210,6 +2346,9 @@ async function testRecommendDetachedDiskFallbackPreservesSafeCdpEvidence() {
   const methodLog = Array.from({ length: 31 }, (_, index) => ({
     method: index % 2 === 0 ? "DOM.getDocument" : "Input.dispatchMouseEvent",
     at: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    connection_epoch: Math.floor(index / 10),
+    replay_of_connection_epoch: index === 30 ? 1 : undefined,
+    replay_policy: index % 2 === 0 ? "safe_read_only" : "non_replayable",
     params: {
       candidate_name: privateMarker,
       nodeId: index + 1
@@ -2300,7 +2439,17 @@ async function testRecommendDetachedDiskFallbackPreservesSafeCdpEvidence() {
     assert.equal(diskPayload.method_log_total, 31);
     assert.equal(diskPayload.method_log.length, 25);
     assert.equal(diskPayload.method_log[0].at, methodLog[6].at);
-    assert.deepEqual(Object.keys(diskPayload.method_log[0]).sort(), ["at", "method"]);
+    assert.deepEqual(Object.keys(diskPayload.method_log[0]).sort(), [
+      "at",
+      "connection_epoch",
+      "method",
+      "replay_policy"
+    ]);
+    assert.equal(diskPayload.method_log[0].connection_epoch, 0);
+    assert.equal(diskPayload.method_log[0].replay_policy, "safe_read_only");
+    assert.equal(diskPayload.method_log.at(-1).connection_epoch, 3);
+    assert.equal(diskPayload.method_log.at(-1).replay_of_connection_epoch, 1);
+    assert.equal(diskPayload.method_log.at(-1).replay_policy, "safe_read_only");
     assert.equal(diskPayload.method_summary["DOM.getDocument"], 16);
     assert.equal(diskPayload.method_summary["Input.dispatchMouseEvent"], 15);
     assert.equal(diskPayload.runtime_evaluate_used, false);
@@ -2563,6 +2712,7 @@ async function main() {
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
+    testMainModulePathAcceptsWindowsJunction(tempHome);
     await testMcpToolsetFilteringKeepsRecommendSmallAndFirst();
     await testRecommendDebugBoundaryInputGate();
     await testToolListIncludesRecommendTools();

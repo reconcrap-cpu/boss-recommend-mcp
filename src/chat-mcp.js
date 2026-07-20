@@ -1,7 +1,7 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import process from "node:process";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   assertNoForbiddenCdpCalls,
@@ -35,6 +35,8 @@ import {
   runSelfHealCheck
 } from "./core/self-heal/index.js";
 import {
+  CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS,
+  CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS,
   CHAT_TARGET_URL,
   closeChatResumeModal,
   closeChatJobDropdown,
@@ -55,6 +57,7 @@ import {
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import { launchDetachedWorker } from "./core/run/detached-launcher.js";
 
 const DEFAULT_CHAT_HOST = "127.0.0.1";
 const DEFAULT_CHAT_PORT = 9222;
@@ -91,6 +94,10 @@ const STALE_PROCESS_STATUSES = new Set([
   RUN_STATUS_CANCELING
 ]);
 
+const CHAT_ATOMIC_RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const CHAT_ATOMIC_RENAME_RETRY_DELAYS_MS = Object.freeze([25, 50, 100, 200, 400, 500]);
+const CHAT_ATOMIC_RENAME_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+
 const CHAT_REQUEST_RESUME_ACTIONS = new Set([
   "request_cv",
   "ask_cv",
@@ -118,6 +125,7 @@ const CHAT_DISABLE_REQUEST_RESUME_ACTIONS = new Set([
 let chatWorkflowImpl = runChatWorkflow;
 let chatConnectorImpl = connectChatChromeSession;
 let chatJobReaderImpl = readChatJobOptionsFromSession;
+let chatDetachedWorkerLauncherImpl = launchDetachedWorker;
 let chatRunService = createChatRunService({
   idPrefix: "mcp_chat",
   workflow: (...args) => chatWorkflowImpl(...args),
@@ -187,11 +195,59 @@ function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function writeJsonAtomic(filePath, payload) {
+function sleepSync(milliseconds) {
+  const delayMs = Math.max(0, Math.floor(Number(milliseconds) || 0));
+  if (delayMs <= 0) return;
+  Atomics.wait(CHAT_ATOMIC_RENAME_SLEEP_CELL, 0, 0, delayMs);
+}
+
+function writeJsonAtomic(filePath, payload, {
+  renameSyncImpl = fs.renameSync,
+  sleepSyncImpl = sleepSync,
+  randomUUIDImpl = randomUUID
+} = {}) {
   ensureDirectory(path.dirname(filePath));
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tempPath, filePath);
+  const tempPath = `${filePath}.${process.pid}.${randomUUIDImpl()}.tmp`;
+  let renameAttempts = 0;
+  const retryDelays = [];
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    while (true) {
+      renameAttempts += 1;
+      try {
+        renameSyncImpl(tempPath, filePath);
+        return;
+      } catch (error) {
+        const retryDelayMs = CHAT_ATOMIC_RENAME_RETRY_DELAYS_MS[renameAttempts - 1];
+        if (
+          !CHAT_ATOMIC_RENAME_RETRY_CODES.has(error?.code)
+          || retryDelayMs === undefined
+        ) {
+          try {
+            error.atomic_rename_attempts = renameAttempts;
+            error.atomic_rename_retry_delays_ms = [...retryDelays];
+            error.atomic_rename_source = tempPath;
+            error.atomic_rename_target = filePath;
+          } catch {
+            // Preserve the original filesystem error when it is not extensible.
+          }
+          throw error;
+        }
+        retryDelays.push(retryDelayMs);
+        sleepSyncImpl(retryDelayMs);
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup only; never hide the original persistence outcome.
+    }
+  }
 }
 
 function readJsonFile(filePath) {
@@ -221,6 +277,7 @@ function selectedChatJobForCsv(meta = {}, snapshot = {}) {
 function buildChatCsvInputRows(snapshot = {}, meta = {}) {
   const normalized = meta.normalized || {};
   const context = snapshot.context || {};
+  const processingFloor = snapshot.summary?.collect_cv_processing_floor || {};
   const postAction = shouldRequestChatResume(meta.args, context)
     ? "request_cv"
     : normalizeText(meta.args?.post_action || meta.args?.action || "") || "none";
@@ -245,7 +302,13 @@ function buildChatCsvInputRows(snapshot = {}, meta = {}) {
     followUp: meta.args?.follow_up || null,
     extraRows: [
       ["chat_params.greeting_text", normalized.greetingText || meta.args?.greeting_text || meta.args?.greetingText || context.greeting_text || DEFAULT_CHAT_GREETING_TEXT],
-      ["chat_params.profile", normalized.profile || meta.args?.profile || context.profile || "default"]
+      ["chat_params.profile", normalized.profile || meta.args?.profile || context.profile || "default"],
+      ["chat_params.collect_cv_processing_floor_enabled", context.collect_cv_processing_floor_enabled === true],
+      ["chat_params.collect_cv_processing_floor_min_ms", context.collect_cv_processing_floor_min_ms ?? ""],
+      ["chat_params.collect_cv_processing_floor_max_ms", context.collect_cv_processing_floor_max_ms ?? ""],
+      ["chat_params.collect_cv_processing_floor_count", processingFloor.count ?? snapshot.progress?.collect_cv_processing_floor_count ?? 0],
+      ["chat_params.collect_cv_processing_floor_delay_requested_ms", processingFloor.total_delay_requested_ms ?? snapshot.progress?.collect_cv_processing_floor_delay_requested_ms ?? 0],
+      ["chat_params.collect_cv_processing_floor_delay_ms", processingFloor.total_delay_elapsed_ms ?? snapshot.progress?.collect_cv_processing_floor_delay_ms ?? 0]
     ]
   });
 }
@@ -261,6 +324,32 @@ function readChatRunState(runId) {
   const artifacts = getChatRunArtifacts(runId);
   if (!artifacts) return null;
   return readJsonFile(artifacts.run_state_path);
+}
+
+function hasChatCheckpointPayload(value) {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value).length > 0
+  );
+}
+
+function readHydratedChatCheckpoint(persisted = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  const artifacts = getChatRunArtifacts(runId);
+  const checkpointPaths = [
+    persisted.resume?.checkpoint_path,
+    persisted.artifacts?.checkpoint_path,
+    artifacts?.checkpoint_path
+  ].map((value) => normalizeText(value)).filter(Boolean);
+  for (const checkpointPath of new Set(checkpointPaths)) {
+    const checkpoint = readJsonFile(checkpointPath);
+    if (checkpoint) return checkpoint;
+  }
+  return persisted.checkpoint && typeof persisted.checkpoint === "object"
+    ? persisted.checkpoint
+    : {};
 }
 
 function writeChatRunState(runId, payload) {
@@ -284,6 +373,9 @@ function buildInitialChatDetachedState(runId, {
   const now = new Date().toISOString();
   const isAllTarget = normalized.publicTargetCount === "all";
   const processedLimit = isAllTarget ? CHAT_ALL_MAX_CANDIDATES : Math.max(1, Number(normalized.targetCount) || 1);
+  const criteria = normalizeText(normalized.criteria || args.criteria || "");
+  const screeningMode = normalizeScreeningModeArg(args, { ...normalized, criteria });
+  const collectCvProcessingFloorEnabled = screeningMode === "collect_cv";
   return {
     run_id: runId,
     mode: RUN_MODE_ASYNC,
@@ -308,7 +400,14 @@ function buildInitialChatDetachedState(runId, {
       requested: 0,
       request_satisfied: 0,
       request_skipped: 0,
-      greet_count: 0
+      greet_count: 0,
+      collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+      collect_cv_processing_floor_min_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS : null,
+      collect_cv_processing_floor_max_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS : null,
+      collect_cv_processing_floor_count: 0,
+      collect_cv_processing_floor_delay_requested_ms: 0,
+      collect_cv_processing_floor_delay_ms: 0,
+      collect_cv_processing_floor_current: null
     },
     last_message: "Boss chat detached worker is queued.",
     context: {
@@ -318,7 +417,13 @@ function buildInitialChatDetachedState(runId, {
       profile: normalized.profile || args.profile || "default",
       job: normalized.job || args.job || "",
       start_from: normalized.startFrom || args.start_from || "",
-      criteria: normalized.criteria || args.criteria || "",
+      criteria,
+      criteria_present: Boolean(criteria),
+      screening_mode: screeningMode,
+      cv_collection_mode: collectCvProcessingFloorEnabled,
+      collect_cv_processing_floor_enabled: collectCvProcessingFloorEnabled,
+      collect_cv_processing_floor_min_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MIN_MS : null,
+      collect_cv_processing_floor_max_ms: collectCvProcessingFloorEnabled ? CHAT_COLLECT_CV_PROCESSING_FLOOR_MAX_MS : null,
       greeting_text: normalized.greetingText || args.greeting_text || args.greetingText || DEFAULT_CHAT_GREETING_TEXT,
       target_count: normalized.publicTargetCount ?? normalized.targetCount ?? null,
       target_count_semantics: TARGET_COUNT_SEMANTICS,
@@ -385,29 +490,38 @@ function patchPersistedChatControl(runId, controlPatch = {}, {
   };
 }
 
-function launchDetachedChatWorker(runId) {
+function launchDetachedChatWorker(runId, { screenConfigPath = "" } = {}) {
   const artifacts = getChatRunArtifacts(runId);
   if (!artifacts) throw new Error("Invalid chat run_id");
-  fs.mkdirSync(path.dirname(artifacts.worker_stdout_path), { recursive: true });
-  const stdoutFd = fs.openSync(artifacts.worker_stdout_path, "a");
-  const stderrFd = fs.openSync(artifacts.worker_stderr_path, "a");
-  let child;
-  try {
-    child = spawn(process.execPath, [
-      DETACHED_WORKER_SCRIPT,
-      "--domain",
-      "chat",
-      "--run-id",
-      runId
-    ], {
-      detached: true,
-      stdio: ["ignore", stdoutFd, stderrFd],
-      windowsHide: true,
-      env: process.env
+  const child = chatDetachedWorkerLauncherImpl({
+    nodePath: process.execPath,
+    workerScriptPath: DETACHED_WORKER_SCRIPT,
+    domain: "chat",
+    runId,
+    stdoutPath: artifacts.worker_stdout_path,
+    stderrPath: artifacts.worker_stderr_path,
+    chatRuntimeHomePath: getBossChatDataDir(),
+    screenConfigPath,
+    environment: process.env
+  });
+  if (typeof child?.once === "function") {
+    child.once("error", (error) => {
+      markBossChatDetachedWorkerFailed(runId, error, {
+        code: "CHAT_WORKER_PROCESS_ERROR",
+        message: "Boss chat detached worker process emitted an asynchronous error."
+      });
     });
-  } finally {
-    fs.closeSync(stdoutFd);
-    fs.closeSync(stderrFd);
+    child.once("exit", (exitCode, signal) => {
+      const normalizedSignal = normalizeText(signal);
+      const exitLabel = Number.isInteger(exitCode) ? `code=${exitCode}` : "code=unknown";
+      const signalLabel = normalizedSignal ? `, signal=${normalizedSignal}` : "";
+      const error = new Error(`Boss chat detached worker exited before writing a terminal state (${exitLabel}${signalLabel}).`);
+      markBossChatDetachedWorkerFailed(runId, error, {
+        code: "CHAT_WORKER_EXITED_EARLY",
+        workerExitCode: Number.isInteger(exitCode) ? exitCode : null,
+        workerSignal: normalizedSignal || null
+      });
+    });
   }
   if (typeof child?.unref === "function") child.unref();
   return child;
@@ -505,10 +619,16 @@ function ensureChatRunArtifacts(snapshot) {
   if (!artifacts) return null;
 
   const meta = getChatRunMeta(snapshot?.runId || snapshot?.run_id);
-  const checkpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
+  const snapshotCheckpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
     ? snapshot.checkpoint
     : {};
-  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  const existingCheckpoint = readJsonFile(artifacts.checkpoint_path);
+  const checkpoint = hasChatCheckpointPayload(snapshotCheckpoint)
+    ? snapshotCheckpoint
+    : existingCheckpoint || snapshotCheckpoint;
+  if (hasChatCheckpointPayload(snapshotCheckpoint) || !existingCheckpoint) {
+    writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
+  }
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
@@ -550,11 +670,16 @@ function ensureChatRunArtifacts(snapshot) {
 function persistChatCheckpointSnapshot(normalized) {
   const artifacts = getChatRunArtifacts(normalized?.run_id || normalized?.runId);
   if (!artifacts) return;
+  const meta = getChatRunMeta(normalized?.run_id || normalized?.runId);
   const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
     ? normalized.checkpoint
     : {};
+  const existingCheckpoint = readJsonFile(artifacts.checkpoint_path);
+  if (!hasChatCheckpointPayload(checkpoint) && existingCheckpoint) {
+    if (meta) meta.checkpointPath = artifacts.checkpoint_path;
+    return;
+  }
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
-  const meta = getChatRunMeta(normalized?.run_id || normalized?.runId);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 }
 
@@ -578,7 +703,7 @@ function snapshotFromPersistedChatRun(persisted = {}) {
     phase: persisted.stage || persisted.phase,
     progress: persisted.progress || {},
     context: persisted.context || {},
-    checkpoint: persisted.checkpoint || {},
+    checkpoint: readHydratedChatCheckpoint(persisted),
     startedAt: persisted.started_at || persisted.startedAt,
     updatedAt: persisted.updated_at || persisted.updatedAt,
     completedAt: persisted.completed_at || persisted.completedAt || null,
@@ -628,6 +753,21 @@ function finalizePersistedChatRun(persisted = {}, {
         message: error?.message || message || "Boss chat run process exited before it wrote a terminal state."
       }
     : null;
+  if (normalizedError) {
+    for (const field of ["worker_error_code", "worker_exit_code", "worker_signal"]) {
+      if (error?.[field] !== undefined && error?.[field] !== null && error?.[field] !== "") {
+        normalizedError[field] = error[field];
+      }
+    }
+    if (normalizeText(error?.stack || "")) {
+      normalizedError.stack = String(error.stack).slice(0, 8000);
+    }
+  }
+  const workerLastHeartbeatAt = normalizeText(
+    persisted.recovery?.worker_last_heartbeat_at
+    || persisted.heartbeat_at
+    || ""
+  ) || null;
   const next = {
     ...persisted,
     run_id: runId,
@@ -635,7 +775,7 @@ function finalizePersistedChatRun(persisted = {}, {
     status,
     stage: persisted.stage || persisted.phase || "chat:stale",
     updated_at: now,
-    heartbeat_at: now,
+    heartbeat_at: persisted.heartbeat_at || now,
     completed_at: persisted.completed_at || now,
     last_message: normalizedError?.message || message || status,
     control: {
@@ -643,7 +783,13 @@ function finalizePersistedChatRun(persisted = {}, {
       cancel_requested: false
     },
     error: normalizedError,
-    summary: persisted.summary || null
+    summary: persisted.summary || null,
+    recovery: {
+      ...(persisted.recovery && typeof persisted.recovery === "object" ? persisted.recovery : {}),
+      worker_last_heartbeat_at: workerLastHeartbeatAt,
+      reconciled_at: now,
+      reconciliation_reason: normalizedError?.code || status
+    }
   };
   return attachLegacyArtifactsToPersistedChatRun(next);
 }
@@ -659,6 +805,16 @@ export function markBossChatDetachedWorkerFailed(runId, error, options = {}) {
     code: options.code || error?.code || "CHAT_WORKER_UNHANDLED_EXCEPTION",
     message: normalizeText(error?.message || error || options.message) || "Boss chat detached worker exited unexpectedly."
   };
+  const workerErrorCode = normalizeText(error?.code || "");
+  if (workerErrorCode && workerErrorCode !== errorPayload.code) {
+    errorPayload.worker_error_code = workerErrorCode;
+  }
+  if (Number.isInteger(options.workerExitCode)) {
+    errorPayload.worker_exit_code = options.workerExitCode;
+  }
+  if (normalizeText(options.workerSignal || "")) {
+    errorPayload.worker_signal = normalizeText(options.workerSignal);
+  }
   if (normalizeText(error?.stack || "")) {
     errorPayload.stack = String(error.stack).slice(0, 8000);
   }
@@ -1348,6 +1504,7 @@ function getRunOptions(args, normalized, session, { workspaceRoot = "", configRe
     imageOutputDir: resolveBossConfiguredOutputDir("", getChatRunsDir()),
     humanRestEnabled: humanBehavior.restEnabled,
     humanBehavior,
+    actionJournalScope: `boss-chat-cdp:${normalized.host}:${normalized.port}`,
     name: "mcp-boss-chat-run"
   };
 }
@@ -1816,7 +1973,9 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
 
   let child;
   try {
-    child = launchDetachedChatWorker(runId);
+    child = launchDetachedChatWorker(runId, {
+      screenConfigPath: defaultConfigResolution?.config_path || ""
+    });
     const now = new Date().toISOString();
     const latest = readChatRunState(runId) || initial;
     const latestState = normalizeText(latest.state || latest.status);
@@ -2185,6 +2344,10 @@ export function __setChatMcpConnectorForTests(nextConnector) {
   chatConnectorImpl = typeof nextConnector === "function" ? nextConnector : connectChatChromeSession;
 }
 
+export function __writeChatJsonAtomicForTests(filePath, payload, options = {}) {
+  return writeJsonAtomic(filePath, payload, options);
+}
+
 export function __setChatMcpJobReaderForTests(nextReader) {
   chatJobReaderImpl = typeof nextReader === "function" ? nextReader : readChatJobOptionsFromSession;
 }
@@ -2196,6 +2359,16 @@ export function __setChatMcpWorkflowForTests(nextWorkflow) {
     workflow: (...args) => chatWorkflowImpl(...args),
     onSnapshot: persistChatLifecycleSnapshot
   });
+}
+
+export function __setChatMcpSpawnForTests(nextSpawn) {
+  chatDetachedWorkerLauncherImpl = typeof nextSpawn === "function"
+    ? (options) => launchDetachedWorker({
+        ...options,
+        platform: "test-posix",
+        spawnImpl: nextSpawn
+      })
+    : launchDetachedWorker;
 }
 
 export function __resetChatMcpStateForTests() {
@@ -2210,4 +2383,5 @@ export function __resetChatMcpStateForTests() {
   __setChatMcpConnectorForTests(null);
   __setChatMcpJobReaderForTests(null);
   __setChatMcpWorkflowForTests(null);
+  __setChatMcpSpawnForTests(null);
 }

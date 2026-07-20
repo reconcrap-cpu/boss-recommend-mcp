@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
@@ -434,7 +433,6 @@ async function run() {
       url: target.url,
       title: target.title
     };
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
 
     await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
     await client.Network.setCacheDisabled({ cacheDisabled: true });
@@ -485,7 +483,7 @@ async function run() {
     }
 
     if (options.searchOnly) {
-      assertNoForbiddenCdpCalls(methodLog);
+      result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
       result.status = "PASS";
       result.runtime_evaluate_used = false;
       result.method_summary = methodSummary(methodLog);
@@ -674,7 +672,7 @@ async function run() {
       });
     }
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
 
     let savedPayloadPath = null;
     if (options.savePayload) {

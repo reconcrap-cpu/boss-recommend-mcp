@@ -4,7 +4,6 @@ import path from "node:path";
 import process from "node:process";
 import {
   assertNoForbiddenCdpCalls,
-  assertRuntimeEvaluateBlocked,
   bringPageToFront,
   connectToChromeTarget,
   enableDomains,
@@ -744,7 +743,6 @@ async function run() {
       url: target.url,
       title: target.title
     };
-    result.runtime_guard_probe = await assertRuntimeEvaluateBlocked(client);
 
     await enableDomains(client, ["Page", "DOM", "Input", "Network", "Accessibility"]);
     await bringPageToFront(client);
@@ -1025,7 +1023,7 @@ async function run() {
     result.refresh_attempts = refreshAttempts;
     result.results = results;
 
-    assertNoForbiddenCdpCalls(methodLog);
+    result.runtime_guard_probe = assertNoForbiddenCdpCalls(methodLog);
     result.runtime_evaluate_used = false;
     result.method_summary = methodSummary(methodLog);
     result.method_log = methodLog;

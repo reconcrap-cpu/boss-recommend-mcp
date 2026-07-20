@@ -434,28 +434,71 @@ export async function waitForRecommendDetailActionControls(client, {
 export async function clickRecommendActionControl(client, control, {
   allowDisabled = false
 } = {}) {
+  const greetQuota = control?.kind === "greet"
+    ? assertGreetQuotaAvailable(control.greet_quota || control.label || "")
+    : null;
+  if (control?.disabled && !allowDisabled) {
+    throw new Error(`Action control is disabled: ${control.kind}`);
+  }
+
   let clickCenter = control?.center || null;
   let clickRect = control?.rect || null;
   if (control?.node_id) {
+    let refreshStep = "scroll_into_view";
     try {
       await scrollNodeIntoView(client, control.node_id);
       await sleep(150);
+      refreshStep = "read_box_model";
       const box = await getNodeBox(client, control.node_id);
+      const centerX = Number(box?.center?.x);
+      const centerY = Number(box?.center?.y);
+      const width = Number(box?.rect?.width);
+      const height = Number(box?.rect?.height);
+      if (
+        !Number.isFinite(centerX)
+        || !Number.isFinite(centerY)
+        || !Number.isFinite(width)
+        || !Number.isFinite(height)
+        || width <= 2
+        || height <= 2
+      ) {
+        const error = new Error(
+          `Could not compute box model for recommend action control nodeId=${control.node_id}`
+        );
+        error.code = "RECOMMEND_ACTION_CONTROL_GEOMETRY_UNREADABLE";
+        throw error;
+      }
       clickCenter = box.center;
       clickRect = box.rect;
-    } catch {
-      // Fall back to the discovered center below; callers still get a clear
-      // error if no usable click point exists.
+    } catch (error) {
+      const failure = error instanceof Error
+        ? error
+        : new Error(String(error || "Recommend action control refresh failed"));
+      failure.code = failure.code || "RECOMMEND_ACTION_CONTROL_REFRESH_FAILED";
+      failure.phase = failure.phase || "recommend:post-action-control-refresh";
+      failure.action_control_refresh_step = failure.action_control_refresh_step || refreshStep;
+      failure.action_control = failure.action_control || {
+        kind: control?.kind || null,
+        label: control?.label || null,
+        selector: control?.selector || null,
+        root: control?.root || null,
+        node_id: control?.node_id || null
+      };
+      failure.cached_center_ignored = Boolean(control?.center);
+      failure.cdp_method = failure.cdp_method || (
+        refreshStep === "scroll_into_view"
+          ? "DOM.scrollIntoViewIfNeeded"
+          : "DOM.getBoxModel"
+      );
+      failure.cdp_node_id = failure.cdp_node_id || control.node_id;
+      failure.cdp_param_keys = Array.isArray(failure.cdp_param_keys)
+        ? failure.cdp_param_keys
+        : ["nodeId"];
+      throw failure;
     }
   }
   if (!clickCenter) {
     throw new Error("Action control has no clickable center");
-  }
-  const greetQuota = control.kind === "greet"
-    ? assertGreetQuotaAvailable(control.greet_quota || control.label || "")
-    : null;
-  if (control.disabled && !allowDisabled) {
-    throw new Error(`Action control is disabled: ${control.kind}`);
   }
   await clickPoint(client, clickCenter.x, clickCenter.y);
   return {

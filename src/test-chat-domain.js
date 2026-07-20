@@ -12,6 +12,9 @@ import {
   closeChatBlockingPanels,
   getChatTopLevelState,
   findChatBlockingPanel,
+  isBossSecurityVerificationRequiredError,
+  isBossSecurityVerificationUrl,
+  isExactChatGreetingMessageText,
   isChatShellUrl,
   isForbiddenChatResumeTopLevelUrl,
   isUnsafeChatOnlineResumeLinkError,
@@ -23,8 +26,11 @@ import {
   readChatCardCandidate,
   closeChatJobDropdown,
   recoverChatShell,
+  resolveChatConfirmResumeTimeoutMs,
+  resolveChatRequestVerificationTimeoutMs,
   requestChatResumeForPassedCandidate,
   selectChatJob,
+  setChatEditorMessage,
   waitForChatResumeRequestMessage,
   waitForChatOnlineResumeButton
 } from "./domains/chat/index.js";
@@ -204,8 +210,40 @@ async function testEmptyChatListVisualInspection() {
   assert.equal(inspection.verified_empty, true);
   assert.equal(inspection.selector_counts_after.total, 0);
   assert.equal(inspection.empty_hint_found, true);
-  assert.equal(fs.existsSync(inspection.screenshot.file_path), true);
+  assert.equal(inspection.screenshot.file_path, null);
+  assert.equal(inspection.screenshot.persistence, "forbidden_uncropped_viewport");
+  assert.equal(inspection.screenshot.byte_length > 0, true);
+  assert.deepEqual(fs.readdirSync(dir), []);
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+function testChatRequestVerificationTimeoutResolution() {
+  assert.equal(resolveChatConfirmResumeTimeoutMs(null), 20000);
+  assert.equal(resolveChatConfirmResumeTimeoutMs(undefined), 20000);
+  assert.equal(resolveChatConfirmResumeTimeoutMs(""), 20000);
+  assert.equal(resolveChatConfirmResumeTimeoutMs("not-a-number"), 20000);
+  assert.equal(resolveChatConfirmResumeTimeoutMs(0), 0);
+  assert.equal(resolveChatConfirmResumeTimeoutMs("0"), 0);
+  assert.equal(resolveChatConfirmResumeTimeoutMs(1200), 1200);
+  assert.equal(resolveChatRequestVerificationTimeoutMs(null, 3), 9750);
+  assert.equal(resolveChatRequestVerificationTimeoutMs(undefined, 3), 9750);
+  assert.equal(resolveChatRequestVerificationTimeoutMs("", 3), 9750);
+  assert.equal(resolveChatRequestVerificationTimeoutMs("not-a-number", 3), 9750);
+  assert.equal(resolveChatRequestVerificationTimeoutMs(0, 3), 0);
+  assert.equal(resolveChatRequestVerificationTimeoutMs("0", 3), 0);
+  assert.equal(resolveChatRequestVerificationTimeoutMs(1200, 3), 1200);
+}
+
+function testExactChatGreetingMessageText() {
+  const greeting = "Hi同学，能麻烦发下简历吗？";
+  assert.equal(isExactChatGreetingMessageText(greeting, greeting), true);
+  assert.equal(isExactChatGreetingMessageText(`送达 ${greeting}`, greeting), true);
+  assert.equal(isExactChatGreetingMessageText(`已送达${greeting}`, greeting), true);
+  assert.equal(isExactChatGreetingMessageText(`已读 ${greeting}`, greeting), true);
+  assert.equal(isExactChatGreetingMessageText(`未读 ${greeting}`, greeting), true);
+  assert.equal(isExactChatGreetingMessageText(`发送失败 ${greeting}`, greeting), false);
+  assert.equal(isExactChatGreetingMessageText(`候选人回复：${greeting}`, greeting), false);
+  assert.equal(isExactChatGreetingMessageText("", greeting), false);
 }
 
 async function testChatTopLevelPageGuard() {
@@ -213,6 +251,13 @@ async function testChatTopLevelPageGuard() {
   assert.equal(isChatShellUrl("https://www.zhipin.com/web/frame/c-resume/?source=chat-resume-online"), false);
   assert.equal(isForbiddenChatResumeTopLevelUrl("https://www.zhipin.com/web/frame/c-resume/?source=chat-resume-online"), true);
   assert.equal(isForbiddenChatResumeTopLevelUrl("https://www.zhipin.com/web/chat/index"), false);
+  assert.equal(
+    isBossSecurityVerificationUrl(
+      "https://www.zhipin.com/web/passport/zp/verify.html?callbackUrl=https%3A%2F%2Fwww.zhipin.com%2Fweb%2Fchat%2Findex&code=36"
+    ),
+    true
+  );
+  assert.equal(isBossSecurityVerificationUrl("https://www.zhipin.com/web/chat/index"), false);
 
   let url = "https://www.zhipin.com/web/frame/c-resume/?source=chat-resume-online";
   const navigations = [];
@@ -265,6 +310,24 @@ async function testChatTopLevelPageGuard() {
     "https://www.zhipin.com/web/chat/index",
     "https://www.zhipin.com/web/chat/index"
   ]);
+
+  url = "https://www.zhipin.com/web/passport/zp/verify.html?code=36";
+  const verificationState = await getChatTopLevelState(client);
+  assert.equal(verificationState.is_security_verification, true);
+  await assert.rejects(
+    () => recoverChatShell(client, {
+      targetUrl: "https://www.zhipin.com/web/chat/index",
+      timeoutMs: 200,
+      intervalMs: 10
+    }),
+    (error) => {
+      assert.equal(error.code, "BOSS_SECURITY_VERIFICATION_REQUIRED");
+      assert.equal(error.requires_user_verification, true);
+      assert.equal(isBossSecurityVerificationRequiredError(error), true);
+      return true;
+    }
+  );
+  assert.equal(navigations.length, 2, "security verification must not be navigated away");
 }
 
 async function testUnsafeOnlineResumeLinkIsBlockedBeforeClick() {
@@ -867,13 +930,750 @@ async function testActiveAttachmentResumeSkipsRequest() {
   assert.equal(clicked, false);
 }
 
+function createFocusedChatEditorAccessibility(isFocused) {
+  return {
+    async getPartialAXTree() {
+      return {
+        nodes: [{
+          role: { type: "role", value: "textbox" },
+          properties: [
+            {
+              name: "focusable",
+              value: { type: "booleanOrUndefined", value: true }
+            },
+            {
+              name: "focused",
+              value: { type: "booleanOrUndefined", value: Boolean(isFocused()) }
+            },
+            {
+              name: "editable",
+              value: { type: "token", value: "richtext" }
+            }
+          ]
+        }]
+      };
+    }
+  };
+}
+
+function createChatEditorInputClient({
+  editorPresent = true,
+  acceptInsertFromCall = 1,
+  decorateInsertedText = false,
+  focusAfterEditorClick = 1,
+  focusAfterAccessibilityRead = Number.POSITIVE_INFINITY,
+  initialEditorText = "",
+  loseFocusAfterClear = false,
+  remountEditorAfterClick = false,
+  remountEditorAfterClear = false,
+  restoreFocusAfterClearAccessibilityReads = Number.POSITIVE_INFINITY,
+  transientAccessibilityErrorsAfterClick = 0,
+  domFocusSupported = false,
+  focusAfterDomFocus = 1,
+  domFocusError = null,
+  editorBackendNodeIdOffset = 1000,
+  describedBackendNodeIdOverride = null,
+  postFocusAxBackendNodeIdOverride = null,
+  postFocusAxBackendOverrideAfterReads = 1
+} = {}) {
+  const state = {
+    editorText: initialEditorText,
+    currentEditorNodeId: 40,
+    editorNodeIds: [40],
+    clickedEditorNodeIds: [],
+    postClickEditorNodeIds: [],
+    postClearEditorNodeIds: [],
+    accessibilityNodeIds: [],
+    staleAccessibilityNodeIds: [],
+    insertedEditorNodeIds: [],
+    lastAccessibilityFocusedNodeId: null,
+    insertCalls: 0,
+    mouseReleases: 0,
+    editorClicks: 0,
+    domFocusCalls: 0,
+    domFocusTargets: [],
+    describeNodeCalls: 0,
+    describeNodeTargets: [],
+    sendClicks: 0,
+    enterKeyDowns: 0,
+    clearedCount: 0,
+    focused: false,
+    accessibilityFocusReads: 0,
+    postDomFocusAccessibilityReads: 0,
+    clearAccessibilityFocusReads: 0,
+    clearOccurred: false,
+    transientAccessibilityErrorsRemaining: transientAccessibilityErrorsAfterClick,
+    editorDiscoveryReads: 0,
+    operations: []
+  };
+  const backendNodeIdForEditor = (nodeId) => Number(nodeId) + editorBackendNodeIdOffset;
+  const remountEditor = (reason) => {
+    state.currentEditorNodeId += 100;
+    state.editorNodeIds.push(state.currentEditorNodeId);
+    if (reason === "click") state.postClickEditorNodeIds.push(state.currentEditorNodeId);
+    if (reason === "clear") state.postClearEditorNodeIds.push(state.currentEditorNodeId);
+    state.operations.push(`editor-remount:${reason}:${state.currentEditorNodeId}`);
+  };
+  const accessibilityNode = (nodeId) => {
+    state.accessibilityFocusReads += 1;
+    if (state.domFocusCalls > 0) state.postDomFocusAccessibilityReads += 1;
+    if (state.clearOccurred) {
+      state.clearAccessibilityFocusReads += 1;
+      if (state.clearAccessibilityFocusReads >= restoreFocusAfterClearAccessibilityReads) {
+        state.focused = true;
+      }
+    } else if (
+      !state.focused
+      && state.editorClicks > 0
+      && state.accessibilityFocusReads >= focusAfterAccessibilityRead
+    ) {
+      state.focused = true;
+    }
+    state.accessibilityNodeIds.push(nodeId);
+    if (nodeId !== state.currentEditorNodeId) {
+      state.staleAccessibilityNodeIds.push(nodeId);
+      throw new Error("Could not find node with given id");
+    }
+    if (state.editorClicks > 0 && state.transientAccessibilityErrorsRemaining > 0) {
+      state.transientAccessibilityErrorsRemaining -= 1;
+      state.operations.push("ax-transient-node-error");
+      throw new Error("Could not find node with given id");
+    }
+    state.lastAccessibilityFocusedNodeId = state.focused ? nodeId : null;
+    state.operations.push(`ax-focused:${state.focused}`);
+    const backendDOMNodeId = state.postDomFocusAccessibilityReads >= postFocusAxBackendOverrideAfterReads
+      && Number.isInteger(postFocusAxBackendNodeIdOverride)
+      ? postFocusAxBackendNodeIdOverride
+      : backendNodeIdForEditor(nodeId);
+    return {
+      nodeId: "chat-editor-ax-node",
+      backendDOMNodeId,
+      role: { type: "role", value: "textbox" },
+      properties: [
+        {
+          name: "focusable",
+          value: { type: "booleanOrUndefined", value: true }
+        },
+        {
+          name: "focused",
+          value: { type: "booleanOrUndefined", value: state.focused }
+        },
+        {
+          name: "editable",
+          value: { type: "token", value: "richtext" }
+        }
+      ]
+    };
+  };
+  const client = {
+    Page: {
+      async getFrameTree() {
+        return {
+          frameTree: {
+            frame: {
+              url: "https://www.zhipin.com/web/chat/index"
+            }
+          }
+        };
+      }
+    },
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        if (editorPresent && (selector.includes("boss-chat-editor-input") || selector === '[contenteditable="true"]')) {
+          state.editorDiscoveryReads += 1;
+          return { nodeIds: [state.currentEditorNodeId] };
+        }
+        if (selector.includes("submit")) return { nodeIds: [41] };
+        return { nodeIds: [] };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === state.currentEditorNodeId) {
+          return {
+            attributes: [
+              "id", "boss-chat-editor-input",
+              "contenteditable", "true",
+              "class", "boss-chat-editor-input",
+              "traceid", `editor-test-trace-${state.currentEditorNodeId}`
+            ]
+          };
+        }
+        if (params.nodeId === 41) return { attributes: ["class", "submit"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        if (params.nodeId === state.currentEditorNodeId) {
+          return {
+            outerHTML: `<div id="boss-chat-editor-input" contenteditable="true" class="boss-chat-editor-input">${state.editorText}</div>`
+          };
+        }
+        if (params.nodeId === 41) return { outerHTML: '<button class="submit">发送</button>' };
+        return { outerHTML: "" };
+      },
+      async getBoxModel(params) {
+        const left = params.nodeId === state.currentEditorNodeId ? 100 : 400;
+        return {
+          model: {
+            border: [left, 100, left + 200, 100, left + 200, 160, left, 160]
+          }
+        };
+      },
+      async scrollIntoViewIfNeeded() {},
+      ...(domFocusSupported ? {
+        async describeNode(params) {
+          state.describeNodeCalls += 1;
+          state.describeNodeTargets.push({ ...params });
+          state.operations.push(`dom-describe:${params.nodeId}`);
+          if (params.nodeId !== state.currentEditorNodeId) {
+            throw new Error("Could not find node with given id");
+          }
+          return {
+            node: {
+              nodeId: params.nodeId,
+              backendNodeId: Number.isInteger(describedBackendNodeIdOverride)
+                ? describedBackendNodeIdOverride
+                : backendNodeIdForEditor(params.nodeId)
+            }
+          };
+        },
+        async focus(params) {
+          state.domFocusCalls += 1;
+          const targetId = Number(params.backendNodeId || params.nodeId || 0);
+          state.domFocusTargets.push({ ...params });
+          state.operations.push(`dom-focus:${targetId}`);
+          if (domFocusError) throw new Error(domFocusError);
+          if (targetId !== backendNodeIdForEditor(state.currentEditorNodeId)) {
+            throw new Error("Could not find node with given id");
+          }
+          if (state.domFocusCalls >= focusAfterDomFocus) state.focused = true;
+          return {};
+        }
+      } : {})
+    },
+    Accessibility: {
+      async getPartialAXTree(params) {
+        return { nodes: [accessibilityNode(params.nodeId)] };
+      },
+      async getFullAXTree() {
+        return { nodes: [accessibilityNode(state.currentEditorNodeId)] };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(params) {
+        if (params.type === "mouseReleased") {
+          state.mouseReleases += 1;
+          if (params.x >= 100 && params.x <= 300) {
+            state.clickedEditorNodeIds.push(state.currentEditorNodeId);
+            state.editorClicks += 1;
+            if (state.editorClicks >= focusAfterEditorClick) state.focused = true;
+            state.operations.push(`editor-click:${state.editorClicks}`);
+            if (remountEditorAfterClick) remountEditor("click");
+          } else if (params.x >= 400 && params.x <= 600) {
+            state.sendClicks += 1;
+            state.operations.push("send-click");
+          }
+        }
+        return {};
+      },
+      async dispatchKeyEvent(params) {
+        if (params.type === "keyDown" && params.key === "Enter") {
+          state.enterKeyDowns += 1;
+          state.operations.push("enter");
+        }
+        if (params.type === "keyDown" && params.key === "a" && params.modifiers === 2) {
+          state.operations.push("select-all");
+        }
+        if (params.type === "keyDown" && params.key === "Backspace") {
+          state.editorText = "";
+          state.clearedCount += 1;
+          state.clearOccurred = true;
+          state.clearAccessibilityFocusReads = 0;
+          if (loseFocusAfterClear) state.focused = false;
+          state.operations.push("backspace");
+          if (remountEditorAfterClear) remountEditor("clear");
+        }
+        return {};
+      },
+      async insertText(params) {
+        state.insertCalls += 1;
+        state.insertedEditorNodeIds.push(state.currentEditorNodeId);
+        state.operations.push(`insert:${params.text}`);
+        if (
+          state.focused
+          && state.lastAccessibilityFocusedNodeId === state.currentEditorNodeId
+          && state.insertCalls >= acceptInsertFromCall
+        ) {
+          state.editorText = decorateInsertedText
+            ? `prefix-${params.text}-suffix`
+            : `${state.editorText}${params.text}`;
+        }
+        return {};
+      }
+    }
+  };
+  return { client, state };
+}
+
+async function testChatEditorUsesDeterministicFallbackAfterTransientMismatch() {
+  const { client, state } = createChatEditorInputClient({
+    acceptInsertFromCall: 2
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.value, "Hi同学，能麻烦发下简历吗？");
+  assert.equal(result.deterministic_fallback_attempted, true);
+  assert.equal(result.recovery.mode, "deterministic_reacquired_editor");
+  assert.deepEqual(result.attempts.map((attempt) => attempt.stage), [
+    "normal",
+    "deterministic_fallback"
+  ]);
+  assert.equal(result.attempts[0].exact_match, false);
+  assert.equal(result.attempts[1].exact_match, true);
+  assert.equal(result.attempts[1].input_mode, "direct");
+  assert.equal(state.insertCalls, 2);
+  assert.equal(state.clearedCount, 0, "an already-empty editor does not need a destructive clear");
+}
+
+async function testChatEditorPersistentMismatchReturnsBoundedDiagnostics() {
+  const { client, state } = createChatEditorInputClient({
+    acceptInsertFromCall: Number.POSITIVE_INFINITY
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(result.editor_found, true);
+  assert.equal(result.deterministic_fallback_attempted, true);
+  assert.deepEqual(result.attempts.map((attempt) => attempt.stage), [
+    "normal",
+    "deterministic_fallback"
+  ]);
+  assert.equal(result.attempts.every((attempt) => attempt.exact_match === false), true);
+  assert.equal(state.insertCalls, 2);
+}
+
+async function testChatEditorRejectsContainingButNonExactText() {
+  const { client } = createChatEditorInputClient({
+    acceptInsertFromCall: 1,
+    decorateInsertedText: true
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(result.attempts.length, 2);
+  assert.equal(result.attempts.every((attempt) => attempt.exact_match === false), true);
+}
+
+async function testChatEditorAbsentRemainsDistinctFromMismatch() {
+  const { client, state } = createChatEditorInputClient({
+    editorPresent: false
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_NOT_FOUND");
+  assert.equal(result.editor_found, false);
+  assert.equal(result.deterministic_fallback_attempted, false);
+  assert.equal(result.attempts.length, 0);
+  assert.equal(state.insertCalls, 0);
+}
+
+async function testChatEditorRequiresAccessibilityFocusBeforeClearingOrTyping() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: 2,
+    initialEditorText: "stale draft",
+    remountEditorAfterClick: true,
+    remountEditorAfterClear: true
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.value, "Hi同学，能麻烦发下简历吗？");
+  assert.equal(state.editorClicks, 2, "a failed first focus click must be followed by a fresh physical click");
+  assert.deepEqual(state.clickedEditorNodeIds, [40, 140]);
+  assert.deepEqual(state.postClickEditorNodeIds, [140, 240]);
+  assert.deepEqual(state.postClearEditorNodeIds, [340]);
+  assert.ok(state.editorDiscoveryReads >= 4, "the editor must be reacquired after every click and clear");
+  assert.ok(state.accessibilityFocusReads >= 3, "each click and the post-clear editor must be AX-verified");
+  assert.equal(state.accessibilityNodeIds[0], 140);
+  assert.ok(state.accessibilityNodeIds.includes(240));
+  assert.equal(
+    state.accessibilityNodeIds.at(-1),
+    340,
+    "AX must receive the fresh post-click/post-clear node rather than a node that triggered a remount"
+  );
+  assert.deepEqual(state.staleAccessibilityNodeIds, [], "no AX probe may use a pre-remount editor id");
+  assert.equal(state.insertCalls, 1, "the unfocused first attempt must not insert any text");
+  assert.equal(state.clearedCount, 1, "the unfocused first attempt must not clear page selection");
+  assert.deepEqual(state.insertedEditorNodeIds, [340], "typing must target the fresh post-clear editor");
+  assert.equal(result.attempts[0].editor_node_changed_before_insert, true);
+  assert.equal(result.attempts[0].pre_insert_focus.editor_node_id, 340);
+
+  const firstFocusedVerification = state.operations.indexOf("ax-focused:true");
+  const firstSelectAll = state.operations.indexOf("select-all");
+  const firstInsert = state.operations.findIndex((operation) => operation.startsWith("insert:"));
+  assert.ok(firstFocusedVerification >= 0);
+  assert.ok(firstSelectAll > firstFocusedVerification, "Ctrl+A must occur only after AX focused=true");
+  assert.ok(firstInsert > firstFocusedVerification, "Input.insertText must occur only after AX focused=true");
+  assert.equal(
+    state.operations.slice(0, firstFocusedVerification).some((operation) => (
+      operation === "select-all"
+      || operation === "backspace"
+      || operation.startsWith("insert:")
+    )),
+    false,
+    "an unfocused editor must not trigger clear or insertion operations"
+  );
+}
+
+async function testChatEditorWaitsForRemountedEditorFocusWithoutReclicking() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    focusAfterAccessibilityRead: 2,
+    remountEditorAfterClick: true
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.value, "Hi同学，能麻烦发下简历吗？");
+  assert.equal(state.editorClicks, 1, "delayed AX focus must settle before another click remounts the editor");
+  assert.deepEqual(state.clickedEditorNodeIds, [40]);
+  assert.deepEqual(state.postClickEditorNodeIds, [140]);
+  assert.deepEqual(state.staleAccessibilityNodeIds, []);
+  assert.equal(state.insertCalls, 1);
+  assert.equal(result.attempts[0].focus_attempts.length, 1);
+  assert.equal(result.attempts[0].focus_attempts[0].focus_poll_count, 1);
+  assert.equal(result.attempts[0].focus_attempts[0].focus_settled_after_poll, true);
+  assert.deepEqual(
+    result.attempts[0].focus_attempts[0].focus_observations.map((observation) => observation.focused),
+    [false, true]
+  );
+}
+
+async function testChatEditorSamplesFreshFocusImmediatelyAfterClick() {
+  const { client } = createChatEditorInputClient({
+    remountEditorAfterClick: true
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, true);
+  const focusAttempt = result.attempts[0].focus_attempts[0];
+  assert.equal(focusAttempt.focus_observations[0].focused, true);
+  assert.equal(focusAttempt.focus_poll_count, 0);
+  assert.equal(focusAttempt.focus_backend_dom_node_id, 1140);
+  assert.equal(focusAttempt.focus_observations[0].backend_dom_node_id, 1140);
+  assert.ok(
+    focusAttempt.focus_observations[0].elapsed_ms < 100,
+    "the first fresh AX read must happen before the former 120 ms blind delay"
+  );
+}
+
+async function testChatEditorWaitsThroughTransientAxNodeErrorWithoutReclicking() {
+  const { client, state } = createChatEditorInputClient({
+    remountEditorAfterClick: true,
+    transientAccessibilityErrorsAfterClick: 1
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(state.editorClicks, 1);
+  assert.equal(state.insertCalls, 1);
+  assert.equal(result.attempts[0].focus_attempts[0].focus_poll_count, 1);
+  assert.match(
+    result.attempts[0].focus_attempts[0].focus_observations[0].read_error,
+    /Could not find node with given id/
+  );
+  assert.equal(result.attempts[0].focus_attempts[0].focus_observations[1].focused, true);
+}
+
+async function testChatEditorWaitsForFocusAfterClearRemountWithoutReclicking() {
+  const { client, state } = createChatEditorInputClient({
+    initialEditorText: "stale draft",
+    loseFocusAfterClear: true,
+    remountEditorAfterClear: true,
+    restoreFocusAfterClearAccessibilityReads: 2
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(state.editorClicks, 1);
+  assert.equal(state.clearedCount, 1);
+  assert.equal(state.insertCalls, 1);
+  assert.equal(result.attempts[0].pre_insert_focus_poll_count, 1);
+  assert.deepEqual(
+    result.attempts[0].pre_insert_focus_observations.map((observation) => observation.focused),
+    [false, true]
+  );
+}
+
+async function testChatEditorPersistentAccessibilityFocusFailureFailsClosed() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(result.editor_found, true);
+  assert.ok(state.editorClicks >= 2, "focus failure should receive the one bounded reacquire/reclick recovery");
+  assert.ok(state.accessibilityFocusReads >= 2);
+  assert.equal(state.focused, false);
+  assert.equal(state.clearedCount, 0, "Ctrl+A/Backspace must not run against an unfocused editor");
+  assert.equal(state.insertCalls, 0, "an unfocused editor must never receive Input.insertText");
+  assert.equal(state.sendClicks, 0, "focus failure must not reach the send button path");
+  assert.equal(state.enterKeyDowns, 0, "focus failure must not reach the Enter send fallback");
+  assert.equal(
+    state.operations.some((operation) => (
+      operation === "select-all"
+      || operation === "backspace"
+      || operation.startsWith("insert:")
+      || operation === "send-click"
+      || operation === "enter"
+    )),
+    false
+  );
+}
+
+async function testChatEditorRecoversStableFocusableEditorWithNativeDomFocus() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    domFocusSupported: true,
+    focusAfterDomFocus: 1
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(state.editorClicks, 1, "native focus recovery should avoid another physical click");
+  assert.equal(state.describeNodeCalls, 2);
+  assert.deepEqual(state.describeNodeTargets, [{ nodeId: 40 }, { nodeId: 40 }]);
+  assert.equal(state.domFocusCalls, 1);
+  assert.deepEqual(state.domFocusTargets, [{ backendNodeId: 1040 }]);
+  assert.equal(state.insertCalls, 1);
+  const focusAttempt = result.attempts[0].focus_attempts[0];
+  assert.equal(focusAttempt.click_focus_observations.every((item) => item.focused === false), true);
+  assert.equal(focusAttempt.native_focus_attempted, true);
+  assert.equal(focusAttempt.native_focus_call_attempted, true);
+  assert.equal(focusAttempt.native_focus_dispatched, true);
+  assert.equal(focusAttempt.native_focus_target_kind, "backend_node_id");
+  assert.equal(focusAttempt.native_focus_target_id, 1040);
+  assert.equal(focusAttempt.native_focus_pre_editor_node_id, 40);
+  assert.equal(focusAttempt.native_focus_fresh_editor_node_id, 40);
+  assert.equal(focusAttempt.native_focus_ax_editor_node_id, 40);
+  assert.equal(focusAttempt.native_focus_described_backend_dom_node_id, 1040);
+  assert.equal(focusAttempt.native_focus_pre_binding_verified, true);
+  assert.equal(focusAttempt.native_focus_post_editor_node_id, 40);
+  assert.equal(focusAttempt.native_focus_post_ax_editor_node_id, 40);
+  assert.equal(focusAttempt.native_focus_post_backend_dom_node_id, 1040);
+  assert.equal(focusAttempt.native_focus_post_binding_verified, true);
+  assert.equal(focusAttempt.native_focus_post_verified, true);
+  assert.equal(focusAttempt.native_focus_observations.at(-1).focused, true);
+  const describeNode = state.operations.indexOf("dom-describe:40");
+  const nativeFocus = state.operations.indexOf("dom-focus:1040");
+  const focusedVerification = state.operations.indexOf("ax-focused:true");
+  const insert = state.operations.findIndex((operation) => operation.startsWith("insert:"));
+  assert.ok(describeNode >= 0);
+  assert.ok(nativeFocus > describeNode);
+  assert.ok(focusedVerification > nativeFocus);
+  assert.ok(insert > focusedVerification, "Input.insertText must remain gated on fresh AX focus proof");
+}
+
+async function testChatEditorNativeDomFocusRejectsBackendBindingMismatch() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    domFocusSupported: true,
+    describedBackendNodeIdOverride: 9040
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.ok(state.describeNodeCalls >= 2);
+  assert.equal(state.domFocusCalls, 0, "a mismatched DOM-to-AX binding must block DOM.focus");
+  assert.equal(state.clearedCount, 0);
+  assert.equal(state.insertCalls, 0);
+  assert.equal(state.sendClicks, 0);
+  assert.equal(state.enterKeyDowns, 0);
+  assert.equal(
+    result.attempts.every((attempt) => (
+      attempt.focus_verified === false
+      && attempt.chunk_count === 0
+      && attempt.input_mode === null
+      && attempt.focus_attempts.some((focusAttempt) => (
+        focusAttempt.native_focus_error === "editor_backend_node_binding_mismatch"
+        && focusAttempt.native_focus_pre_binding_verified === false
+        && focusAttempt.native_focus_dispatched === false
+      ))
+    )),
+    true
+  );
+}
+
+async function testChatEditorNativeDomFocusRejectsPostFocusBackendMismatch() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    domFocusSupported: true,
+    postFocusAxBackendNodeIdOverride: 9040
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(state.domFocusCalls, 1);
+  assert.equal(result.deterministic_fallback_attempted, false);
+  assert.equal(state.clearedCount, 0);
+  assert.equal(state.insertCalls, 0, "a post-focus AX backend mismatch must block Input.insertText");
+  assert.equal(state.sendClicks, 0);
+  assert.equal(state.enterKeyDowns, 0);
+  assert.equal(
+    result.attempts.every((attempt) => (
+      attempt.focus_verified === false
+      && attempt.chunk_count === 0
+      && attempt.input_mode === null
+      && attempt.focus_attempts.some((focusAttempt) => (
+        focusAttempt.native_focus_error === "post_focus_backend_node_binding_mismatch"
+        && focusAttempt.native_focus_pre_binding_verified === true
+        && focusAttempt.native_focus_post_binding_verified === false
+      ))
+    )),
+    true
+  );
+}
+
+async function testChatEditorNativeDomFocusRejectsBindingChangeBeforeInput() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    domFocusSupported: true,
+    postFocusAxBackendNodeIdOverride: 9040,
+    postFocusAxBackendOverrideAfterReads: 2
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(result.deterministic_fallback_attempted, false);
+  assert.equal(state.domFocusCalls, 1);
+  assert.equal(state.clearedCount, 0);
+  assert.equal(state.insertCalls, 0, "a binding change after native focus must block Input.insertText");
+  assert.equal(state.sendClicks, 0);
+  assert.equal(state.enterKeyDowns, 0);
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.attempts[0].chunk_count, 0);
+  assert.equal(result.attempts[0].input_mode, null);
+  assert.equal(result.attempts[0].focus_verified, false);
+  assert.equal(result.attempts[0].terminal_focus_binding_failure, true);
+  assert.equal(result.attempts[0].pre_clear_binding.required, true);
+  assert.equal(result.attempts[0].pre_clear_binding.verified, false);
+  assert.equal(result.attempts[0].pre_clear_binding.ax_backend_dom_node_id, 9040);
+}
+
+async function testChatEditorNativeDomFocusFailureStillFailsClosed() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    domFocusSupported: true,
+    focusAfterDomFocus: Number.POSITIVE_INFINITY
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(result.deterministic_fallback_attempted, false);
+  assert.equal(state.editorClicks, 1);
+  assert.equal(state.domFocusCalls, 1);
+  assert.equal(state.focused, false);
+  assert.equal(state.clearedCount, 0);
+  assert.equal(state.insertCalls, 0);
+  assert.equal(state.sendClicks, 0);
+  assert.equal(state.enterKeyDowns, 0);
+  assert.equal(
+    result.attempts.every((attempt) => (
+      attempt.focus_verified === false
+      && attempt.chunk_count === 0
+      && attempt.input_mode === null
+      && attempt.terminal_focus_binding_failure === true
+      && attempt.focus_binding_error === "native_focus_not_verified"
+    )),
+    true
+  );
+}
+
+async function testChatEditorNativeDomFocusCallErrorIsTerminal() {
+  const { client, state } = createChatEditorInputClient({
+    focusAfterEditorClick: Number.POSITIVE_INFINITY,
+    domFocusSupported: true,
+    domFocusError: "WebSocket transport closed"
+  });
+  const result = await setChatEditorMessage(client, "Hi同学，能麻烦发下简历吗？", {
+    timeoutMs: 1
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "CHAT_EDITOR_MESSAGE_MISMATCH");
+  assert.equal(result.deterministic_fallback_attempted, false);
+  assert.equal(state.editorClicks, 1);
+  assert.equal(state.domFocusCalls, 1);
+  assert.equal(state.clearedCount, 0);
+  assert.equal(state.insertCalls, 0);
+  assert.equal(state.sendClicks, 0);
+  assert.equal(state.enterKeyDowns, 0);
+  assert.equal(result.attempts.length, 1);
+  assert.equal(result.attempts[0].chunk_count, 0);
+  assert.equal(result.attempts[0].input_mode, null);
+  assert.equal(result.attempts[0].terminal_focus_binding_failure, true);
+  assert.equal(result.attempts[0].focus_binding_error, "WebSocket transport closed");
+  assert.equal(result.attempts[0].focus_attempts[0].native_focus_call_attempted, true);
+  assert.equal(result.attempts[0].focus_attempts[0].native_focus_dispatched, false);
+}
+
 async function testChatResumeRequestSendsMessageBeforeAskResume() {
+  const transitions = [];
   const state = {
     editorText: "",
+    editorFocused: false,
     messageSent: false,
     askClicked: false,
+    confirmPending: false,
     confirmVisible: false,
+    confirmDiscoveryReads: 0,
+    confirmVisibleAfterReads: 0,
+    confirmClicks: 0,
+    suppressConfirm: false,
     requestSent: false,
+    lateRequestMode: false,
+    lateRequestVisibleAt: 3,
+    messageListReads: 0,
+    documentEpoch: 0,
+    activeDocumentRootId: 0,
     lastBoxNodeId: 0,
     clicks: [],
     boxCenters: {}
@@ -883,15 +1683,26 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
     if (nodeId === 21) return '<a class="btn resume-btn-file disabled">附件简历</a>';
     if (nodeId === 30) {
       const className = state.messageSent ? "operate-btn" : "operate-btn disabled";
-      const label = state.requestSent ? "已求简历" : "求简历";
-      return `<span class="${state.requestSent ? "operate-btn disabled" : className}">${label}</span>`;
+      const requestVisible = state.requestSent
+        || (state.lateRequestMode && state.messageListReads >= state.lateRequestVisibleAt);
+      const label = requestVisible ? "已求简历" : "求简历";
+      return `<span class="${requestVisible ? "operate-btn disabled" : className}">${label}</span>`;
     }
     if (nodeId === 40) return `<div id="boss-chat-editor-input" contenteditable="true">${state.editorText}</div>`;
     if (nodeId === 41) return '<button class="submit active">发送</button>';
     if (nodeId === 50) {
+      if (state.lateRequestMode) {
+        state.messageListReads += 1;
+        return state.messageListReads >= state.lateRequestVisibleAt
+          ? '<div class="chat-message-list"><div>简历请求已发送</div></div>'
+          : '<div class="chat-message-list"></div>';
+      }
       return state.requestSent
         ? '<div class="chat-message-list"><div>简历请求已发送</div></div>'
         : '<div class="chat-message-list"></div>';
+    }
+    if (nodeId === 59) {
+      return '<div class="exchange-tooltip"><span class="text">确定向牛人索取简历吗？</span><div class="btn-box"><span class="boss-btn-outline boss-btn">取消</span><span class="boss-btn-primary boss-btn">确定</span></div></div>';
     }
     if (nodeId === 60) return '<span class="boss-btn-primary boss-btn">确定</span>';
     return "";
@@ -899,9 +1710,17 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
   const client = {
     DOM: {
       async getDocument() {
-        return { root: { nodeId: 1 } };
+        state.documentEpoch += 1;
+        state.activeDocumentRootId = 1000 + state.documentEpoch;
+        return { root: { nodeId: state.activeDocumentRootId } };
       },
       async querySelectorAll(params) {
+        if (
+          params.nodeId >= 1000
+          && params.nodeId !== state.activeDocumentRootId
+        ) {
+          throw new Error("Could not find node with given id");
+        }
         const selector = String(params.selector || "");
         if (selector.includes("resume-btn-online")) return { nodeIds: [20] };
         if (selector.includes("resume-btn-file")) return { nodeIds: [21] };
@@ -909,14 +1728,31 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
         if (selector.includes("boss-chat-editor-input")) return { nodeIds: [40] };
         if (selector.includes("submit")) return { nodeIds: [41] };
         if (selector.includes("chat-message-list")) return { nodeIds: [50] };
-        if (state.confirmVisible && selector.includes("boss-btn-primary")) return { nodeIds: [60] };
+        if (params.nodeId === state.activeDocumentRootId && selector === ".exchange-tooltip") {
+          if (state.confirmPending && !state.suppressConfirm) {
+            state.confirmDiscoveryReads += 1;
+            if (state.confirmDiscoveryReads >= state.confirmVisibleAfterReads) {
+              state.confirmVisible = true;
+            }
+          }
+          return { nodeIds: state.confirmVisible ? [59] : [] };
+        }
+        if (
+          params.nodeId === 59
+          && state.confirmVisible
+          && selector.includes("boss-btn-primary")
+        ) {
+          return { nodeIds: [60] };
+        }
         return { nodeIds: [] };
       },
       async getAttributes(params) {
         if (params.nodeId === 20) return { attributes: ["class", "btn resume-btn-online"] };
         if (params.nodeId === 21) return { attributes: ["class", "btn resume-btn-file disabled"] };
         if (params.nodeId === 30) {
-          const className = state.requestSent
+          const requestVisible = state.requestSent
+            || (state.lateRequestMode && state.messageListReads >= state.lateRequestVisibleAt);
+          const className = requestVisible
             ? "operate-btn disabled"
             : state.messageSent
               ? "operate-btn"
@@ -926,6 +1762,7 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
         if (params.nodeId === 40) return { attributes: ["id", "boss-chat-editor-input", "contenteditable", "true"] };
         if (params.nodeId === 41) return { attributes: ["class", "submit active"] };
         if (params.nodeId === 50) return { attributes: ["class", "chat-message-list"] };
+        if (params.nodeId === 59) return { attributes: ["class", "exchange-tooltip"] };
         if (params.nodeId === 60) return { attributes: ["class", "boss-btn-primary boss-btn"] };
         return { attributes: [] };
       },
@@ -946,17 +1783,24 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
       },
       async scrollIntoViewIfNeeded() {}
     },
+    Accessibility: createFocusedChatEditorAccessibility(() => state.editorFocused),
     Input: {
       async dispatchMouseEvent(params) {
         if (params.type !== "mouseReleased") return {};
         const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
         state.clicks.push(clickedNodeId);
+        if (clickedNodeId === 40) state.editorFocused = true;
         if (clickedNodeId === 41) state.messageSent = true;
         if (clickedNodeId === 30 && state.messageSent) {
           state.askClicked = true;
-          state.confirmVisible = true;
+          state.confirmPending = !state.lateRequestMode;
+          state.confirmVisible = state.confirmPending
+            && !state.suppressConfirm
+            && state.confirmVisibleAfterReads <= 0;
         }
         if (clickedNodeId === 60 && state.confirmVisible) {
+          state.confirmClicks += 1;
+          state.confirmPending = false;
           state.confirmVisible = false;
           state.requestSent = true;
         }
@@ -974,18 +1818,270 @@ async function testChatResumeRequestSendsMessageBeforeAskResume() {
 
   const result = await requestChatResumeForPassedCandidate(client, {
     greetingText: "",
-    maxAttempts: 1
+    maxAttempts: 1,
+    async actionTransition(stateName, evidence) {
+      transitions.push({ state: stateName, evidence });
+    }
   });
   assert.equal(result.requested, true);
   assert.equal(result.skipped, false);
   assert.equal(result.greeting_sent, true);
   assert.equal(result.greeting_send_result.expected_text, "Hi同学，能麻烦发下简历吗？");
   assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [41, 30, 60]);
+  assert.deepEqual(transitions.map((item) => item.state), [
+    "greeting_send_in_flight",
+    "greeting_confirmed",
+    "request_in_flight",
+    "request_confirmed"
+  ]);
+  assert.equal(transitions[2].evidence.request_baseline_count, 0);
+  assert.equal(transitions[3].evidence.message_observed, true);
+
+  state.requestSent = false;
+  state.confirmVisible = false;
+  state.clicks = [];
+  const resumedTransitions = [];
+  const resumed = await requestChatResumeForPassedCandidate(client, {
+    skipGreeting: true,
+    maxAttempts: 1,
+    async actionTransition(stateName) {
+      resumedTransitions.push(stateName);
+    }
+  });
+  assert.equal(resumed.requested, true);
+  assert.equal(resumed.greeting_sent, false);
+  assert.equal(resumed.greeting_skipped_from_journal, true);
+  assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [30, 60]);
+  assert.deepEqual(resumedTransitions, ["request_in_flight", "request_confirmed"]);
+
+  state.requestSent = false;
+  state.confirmVisible = false;
+  state.lateRequestMode = true;
+  state.messageListReads = 0;
+  state.clicks = [];
+  const lateTransitions = [];
+  const lateObserved = await requestChatResumeForPassedCandidate(client, {
+    skipGreeting: true,
+    maxAttempts: 1,
+    confirmResumeTimeoutMs: 0,
+    requestVerificationTimeoutMs: 0,
+    requestFinalVerificationSettleMs: 0,
+    async actionTransition(stateName, evidence) {
+      lateTransitions.push({ state: stateName, evidence });
+    }
+  });
+  assert.equal(lateObserved.requested, true);
+  assert.equal(lateObserved.skipped, false);
+  assert.equal(lateObserved.outcome_unknown, undefined);
+  assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [30]);
+  assert.deepEqual(lateTransitions.map((item) => item.state), [
+    "request_in_flight",
+    "request_confirmed"
+  ]);
+  assert.equal(lateTransitions[1].evidence.message_observed, true);
+  assert.equal(lateObserved.attempts[0].passive_verification_attempted, true);
+  assert.equal(lateObserved.attempts[0].confirmation_source, "message_delta");
+
+  state.requestSent = false;
+  state.confirmVisible = false;
+  state.lateRequestVisibleAt = 12;
+  state.messageListReads = 0;
+  state.clicks = [];
+  const defaultWindowTransitions = [];
+  const observedWithinDefaultWindow = await requestChatResumeForPassedCandidate(client, {
+    skipGreeting: true,
+    maxAttempts: 1,
+    confirmResumeTimeoutMs: 0,
+    requestFinalVerificationSettleMs: 0,
+    async actionTransition(stateName, evidence) {
+      defaultWindowTransitions.push({ state: stateName, evidence });
+    }
+  });
+  assert.equal(observedWithinDefaultWindow.requested, true);
+  assert.equal(observedWithinDefaultWindow.outcome_unknown, undefined);
+  assert.deepEqual(
+    state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)),
+    [30],
+    "default verification polling must observe passively without replaying the request click"
+  );
+  assert.deepEqual(defaultWindowTransitions.map((item) => item.state), [
+    "request_in_flight",
+    "request_confirmed"
+  ]);
+  assert.equal(observedWithinDefaultWindow.attempts[0].message_observed, true);
+  assert.equal(observedWithinDefaultWindow.attempts[0].passive_verification_attempted, false);
+
+  state.requestSent = false;
+  state.lateRequestMode = false;
+  state.confirmPending = false;
+  state.confirmVisible = false;
+  state.confirmDiscoveryReads = 0;
+  state.confirmVisibleAfterReads = 5;
+  state.confirmClicks = 0;
+  state.suppressConfirm = false;
+  state.clicks = [];
+  const delayedConfirm = await requestChatResumeForPassedCandidate(client, {
+    skipGreeting: true,
+    maxAttempts: 1,
+    confirmResumeTimeoutMs: 1000,
+    confirmResumePollIntervalMs: 1,
+    requestVerificationTimeoutMs: 1,
+    requestFinalVerificationSettleMs: 0
+  });
+  assert.equal(delayedConfirm.requested, true);
+  assert.deepEqual(
+    state.clicks.filter((nodeId) => [30, 60].includes(nodeId)),
+    [30, 60],
+    "a delayed exact-prompt modal must receive one ask click and one confirm click"
+  );
+  assert.equal(state.confirmClicks, 1);
+  assert.equal(delayedConfirm.attempts[0].confirm_result.discovery_mode, "exact_request_prompt");
+  assert.equal(delayedConfirm.attempts[0].confirm_result.prompt_observed, true);
+  assert.equal(delayedConfirm.attempts[0].confirm_result.target_observed, true);
+  assert.equal(delayedConfirm.attempts[0].confirm_result.click_attempted, true);
+  assert.equal(delayedConfirm.attempts[0].confirm_result.click_dispatched, true);
+  assert.ok(delayedConfirm.attempts[0].confirm_result.poll_count >= 2);
+
+  state.requestSent = false;
+  state.confirmPending = false;
+  state.confirmVisible = false;
+  state.confirmDiscoveryReads = 0;
+  state.confirmVisibleAfterReads = 0;
+  state.confirmClicks = 0;
+  state.suppressConfirm = true;
+  state.clicks = [];
+  const noConfirm = await requestChatResumeForPassedCandidate(client, {
+    skipGreeting: true,
+    maxAttempts: 1,
+    confirmResumeTimeoutMs: 5,
+    confirmResumePollIntervalMs: 1,
+    requestVerificationTimeoutMs: 0,
+    requestFinalVerificationSettleMs: 0
+  });
+  assert.equal(noConfirm.requested, false);
+  assert.equal(noConfirm.outcome_unknown, true);
+  assert.equal(noConfirm.attempts[0].confirm_result.error, "CONFIRM_BUTTON_NOT_FOUND");
+  assert.equal(noConfirm.attempts[0].confirm_result.prompt_observed, false);
+  assert.equal(noConfirm.attempts[0].confirm_result.target_observed, false);
+  assert.equal(noConfirm.attempts[0].confirm_result.click_attempted, false);
+  assert.equal(noConfirm.attempts[0].confirm_result.click_dispatched, false);
+  assert.deepEqual(
+    state.clicks.filter((nodeId) => [30, 60].includes(nodeId)),
+    [30],
+    "an absent confirmation surface must fail closed without a second ask or any confirm click"
+  );
+  assert.equal(state.confirmClicks, 0);
+}
+
+async function testSecurityVerificationAfterRequestFailsClosed() {
+  const transitions = [];
+  const state = {
+    confirmVisible: false,
+    securityVerification: false,
+    lastBoxNodeId: 0,
+    boxCenters: {}
+  };
+  const nodeHtml = (nodeId) => {
+    if (nodeId === 20) return '<a class="btn resume-btn-online">在线简历</a>';
+    if (nodeId === 21) return '<a class="btn resume-btn-file disabled">附件简历</a>';
+    if (nodeId === 30) return '<span class="operate-btn">求简历</span>';
+    if (nodeId === 50) return '<div class="chat-message-list"></div>';
+    if (nodeId === 59) return '<div class="exchange-tooltip"><span class="text">确定向牛人索取简历吗？</span><span class="boss-btn-primary boss-btn">确定</span></div>';
+    if (nodeId === 60) return '<span class="boss-btn-primary boss-btn">确定</span>';
+    return "";
+  };
+  const client = {
+    Page: {
+      async getFrameTree() {
+        return {
+          frameTree: {
+            frame: {
+              url: state.securityVerification
+                ? "https://www.zhipin.com/web/passport/zp/verify.html?code=36"
+                : "https://www.zhipin.com/web/chat/index"
+            }
+          }
+        };
+      }
+    },
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        const selector = String(params.selector || "");
+        if (selector.includes("resume-btn-online")) return { nodeIds: [20] };
+        if (selector.includes("resume-btn-file")) return { nodeIds: [21] };
+        if (selector === "span.operate-btn" || selector === ".operate-btn") return { nodeIds: [30] };
+        if (selector.includes("chat-message-list")) return { nodeIds: [50] };
+        if (selector === ".exchange-tooltip") return { nodeIds: state.confirmVisible ? [59] : [] };
+        if (params.nodeId === 59 && state.confirmVisible && selector.includes("boss-btn-primary")) {
+          return { nodeIds: [60] };
+        }
+        return { nodeIds: [] };
+      },
+      async getAttributes(params) {
+        if (params.nodeId === 20) return { attributes: ["class", "btn resume-btn-online"] };
+        if (params.nodeId === 21) return { attributes: ["class", "btn resume-btn-file disabled"] };
+        if (params.nodeId === 30) return { attributes: ["class", "operate-btn"] };
+        if (params.nodeId === 50) return { attributes: ["class", "chat-message-list"] };
+        if (params.nodeId === 59) return { attributes: ["class", "exchange-tooltip"] };
+        if (params.nodeId === 60) return { attributes: ["class", "boss-btn-primary boss-btn"] };
+        return { attributes: [] };
+      },
+      async getOuterHTML(params) {
+        return { outerHTML: nodeHtml(params.nodeId) };
+      },
+      async getBoxModel(params) {
+        state.lastBoxNodeId = params.nodeId;
+        const left = params.nodeId * 10;
+        const right = left + 100;
+        state.boxCenters[left + 50] = params.nodeId;
+        return { model: { border: [left, 0, right, 0, right, 30, left, 30] } };
+      },
+      async scrollIntoViewIfNeeded() {}
+    },
+    Input: {
+      async dispatchMouseEvent(params) {
+        if (params.type !== "mouseReleased") return {};
+        const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
+        if (clickedNodeId === 30) state.confirmVisible = true;
+        if (clickedNodeId === 60 && state.confirmVisible) {
+          state.confirmVisible = false;
+          state.securityVerification = true;
+        }
+        return {};
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => requestChatResumeForPassedCandidate(client, {
+      skipGreeting: true,
+      maxAttempts: 1,
+      requestVerificationTimeoutMs: 1,
+      async actionTransition(stateName, evidence) {
+        transitions.push({ state: stateName, evidence });
+      }
+    }),
+    (error) => {
+      assert.equal(error.code, "BOSS_SECURITY_VERIFICATION_REQUIRED");
+      assert.equal(error.requires_user_verification, true);
+      return true;
+    }
+  );
+  assert.deepEqual(transitions.map((item) => item.state), [
+    "request_in_flight",
+    "outcome_unknown"
+  ]);
+  assert.equal(transitions[1].evidence.action, "request_resume");
+  assert.equal(transitions[1].evidence.reason, "boss_security_verification_required");
 }
 
 async function testDisabledAskResumeAfterGreetingSkipsAsPendingRequest() {
   const state = {
     editorText: "",
+    editorFocused: false,
     messageSent: false,
     lastBoxNodeId: 0,
     clicks: [],
@@ -1069,11 +2165,13 @@ async function testDisabledAskResumeAfterGreetingSkipsAsPendingRequest() {
       },
       async scrollIntoViewIfNeeded() {}
     },
+    Accessibility: createFocusedChatEditorAccessibility(() => state.editorFocused),
     Input: {
       async dispatchMouseEvent(params) {
         if (params.type !== "mouseReleased") return {};
         const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
         state.clicks.push(clickedNodeId);
+        if (clickedNodeId === 104) state.editorFocused = true;
         if (clickedNodeId === 105) state.messageSent = true;
         return {};
       },
@@ -1089,19 +2187,23 @@ async function testDisabledAskResumeAfterGreetingSkipsAsPendingRequest() {
 
   const result = await requestChatResumeForPassedCandidate(client, {
     maxAttempts: 1,
-    askResumeTimeoutMs: 1
+    askResumeTimeoutMs: 1,
+    requestVerificationTimeoutMs: 1
   });
   assert.equal(result.requested, false);
-  assert.equal(result.skipped, true);
-  assert.equal(result.reason, "resume_request_already_pending");
+  assert.equal(result.skipped, false);
+  assert.equal(result.outcome_unknown, true);
+  assert.equal(result.reason, "resume_request_message_not_observed");
   assert.equal(result.greeting_sent, true);
   assert.equal(result.attempts[0].ask_result.error, "ASK_RESUME_BUTTON_DISABLED");
   assert.deepEqual(state.clicks.filter((nodeId) => [105, 103].includes(nodeId)), [105]);
 }
 
-async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserved() {
+async function testExistingSentMessageDoesNotReplayAskResumeWhenOutcomeIsUnknown() {
+  const transitions = [];
   const state = {
     editorText: "",
+    editorFocused: false,
     messageSent: false,
     askClicks: 0,
     confirmClicks: 0,
@@ -1126,6 +2228,7 @@ async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserve
         '</div>'
       ].join("");
     }
+    if (nodeId === 59) return '<div class="exchange-tooltip"><span class="text">确定向牛人索取简历吗？</span><span class="boss-btn-primary boss-btn">确定</span></div>';
     if (nodeId === 60) return '<span class="boss-btn-primary boss-btn">确定</span>';
     return "";
   };
@@ -1143,7 +2246,10 @@ async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserve
         if (selector.includes("boss-chat-editor-input")) return { nodeIds: [40] };
         if (selector.includes("submit")) return { nodeIds: [41] };
         if (selector.includes("chat-message-list")) return { nodeIds: [50] };
-        if (state.confirmVisible && selector.includes("boss-btn-primary")) return { nodeIds: [60] };
+        if (selector === ".exchange-tooltip") return { nodeIds: state.confirmVisible ? [59] : [] };
+        if (params.nodeId === 59 && state.confirmVisible && selector.includes("boss-btn-primary")) {
+          return { nodeIds: [60] };
+        }
         return { nodeIds: [] };
       },
       async getAttributes(params) {
@@ -1154,6 +2260,7 @@ async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserve
         if (params.nodeId === 40) return { attributes: ["id", "boss-chat-editor-input", "contenteditable", "true"] };
         if (params.nodeId === 41) return { attributes: ["class", "submit active"] };
         if (params.nodeId === 50) return { attributes: ["class", "chat-message-list"] };
+        if (params.nodeId === 59) return { attributes: ["class", "exchange-tooltip"] };
         if (params.nodeId === 60) return { attributes: ["class", "boss-btn-primary boss-btn"] };
         return { attributes: [] };
       },
@@ -1174,11 +2281,13 @@ async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserve
       },
       async scrollIntoViewIfNeeded() {}
     },
+    Accessibility: createFocusedChatEditorAccessibility(() => state.editorFocused),
     Input: {
       async dispatchMouseEvent(params) {
         if (params.type !== "mouseReleased") return {};
         const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
         state.clicks.push(clickedNodeId);
+        if (clickedNodeId === 40) state.editorFocused = true;
         if (clickedNodeId === 41) state.messageSent = true;
         if (clickedNodeId === 30) {
           state.askClicks += 1;
@@ -1202,19 +2311,32 @@ async function testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserve
   };
 
   const result = await requestChatResumeForPassedCandidate(client, {
-    maxAttempts: 2
+    maxAttempts: 2,
+    requestVerificationTimeoutMs: 1,
+    async actionTransition(stateName) {
+      transitions.push(stateName);
+    }
   });
-  assert.equal(result.requested, true);
+  assert.equal(result.requested, false);
   assert.equal(result.skipped, false);
-  assert.equal(state.askClicks, 2);
-  assert.equal(state.confirmClicks, 2);
-  assert.equal(result.attempts.length, 2);
-  assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [41, 30, 60, 30, 60]);
+  assert.equal(result.outcome_unknown, true);
+  assert.equal(state.askClicks, 1);
+  assert.equal(state.confirmClicks, 1);
+  assert.equal(result.attempts.length, 1);
+  assert.deepEqual(state.clicks.filter((nodeId) => [41, 30, 60].includes(nodeId)), [41, 30, 60]);
+  assert.deepEqual(transitions, [
+    "greeting_send_in_flight",
+    "greeting_confirmed",
+    "request_in_flight",
+    "outcome_unknown"
+  ]);
 }
 
 async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageVerifiesRequest() {
+  const transitions = [];
   const state = {
     editorText: "",
+    editorFocused: false,
     messageSent: false,
     askClicked: false,
     confirmVisible: false,
@@ -1243,7 +2365,7 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
         '<div class="operate-icon-item">',
         '<span class="operate-btn">求简历</span>',
         state.confirmVisible
-          ? '<div class="exchange-tooltip"><span class="boss-btn-primary boss-btn">确定</span></div>'
+          ? '<div class="exchange-tooltip"><span class="text">确定向牛人索取简历吗？</span><span class="boss-btn-primary boss-btn">确定</span></div>'
           : '',
         '</div>',
         '</div>'
@@ -1253,6 +2375,7 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
     if (nodeId === 104) return `<div id="boss-chat-editor-input" contenteditable="true">${state.editorText}</div>`;
     if (nodeId === 105) return '<button class="submit active">发送</button>';
     if (nodeId === 106) return '<span class="boss-btn-primary boss-btn">确定</span>';
+    if (nodeId === 107) return '<div class="exchange-tooltip"><span class="text">确定向牛人索取简历吗？</span><span class="boss-btn-primary boss-btn">确定</span></div>';
     return "";
   };
   const client = {
@@ -1268,6 +2391,7 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
           if (selector === ".conversation-editor") return { nodeIds: [130] };
           if (selector === ".chat-message-list") return { nodeIds: [140] };
           if (selector === ".toolbar-box-right") return { nodeIds: [150] };
+          if (selector === ".exchange-tooltip") return { nodeIds: state.confirmVisible ? [107] : [] };
           if (selector === "span") return { nodeIds: [31] };
           return { nodeIds: [] };
         }
@@ -1293,6 +2417,10 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
           if (selector === "span") return { nodeIds: state.confirmVisible ? [103, 106] : [103] };
           return { nodeIds: [] };
         }
+        if (nodeId === 107) {
+          if (state.confirmVisible && selector.includes("boss-btn-primary")) return { nodeIds: [106] };
+          return { nodeIds: [] };
+        }
         return { nodeIds: [] };
       },
       async getAttributes(params) {
@@ -1307,6 +2435,7 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
         if (params.nodeId === 104) return { attributes: ["id", "boss-chat-editor-input", "contenteditable", "true"] };
         if (params.nodeId === 105) return { attributes: ["class", "submit active"] };
         if (params.nodeId === 106) return { attributes: ["class", "boss-btn-primary boss-btn"] };
+        if (params.nodeId === 107) return { attributes: ["class", "exchange-tooltip"] };
         return { attributes: [] };
       },
       async getOuterHTML(params) {
@@ -1326,11 +2455,13 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
       },
       async scrollIntoViewIfNeeded() {}
     },
+    Accessibility: createFocusedChatEditorAccessibility(() => state.editorFocused),
     Input: {
       async dispatchMouseEvent(params) {
         if (params.type !== "mouseReleased") return {};
         const clickedNodeId = state.boxCenters[Math.round(params.x)] || state.lastBoxNodeId;
         state.clicks.push(clickedNodeId);
+        if (clickedNodeId === 104) state.editorFocused = true;
         if (clickedNodeId === 105) state.messageSent = true;
         if (clickedNodeId === 103 && state.messageSent) {
           state.askClicked = true;
@@ -1357,7 +2488,10 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
   assert.equal(preState.has_ask_resume, true);
 
   const result = await requestChatResumeForPassedCandidate(client, {
-    maxAttempts: 1
+    maxAttempts: 1,
+    actionTransition: async (transitionState, evidence) => {
+      transitions.push({ state: transitionState, evidence });
+    }
   });
   assert.equal(result.requested, true);
   assert.equal(result.skipped, false);
@@ -1365,7 +2499,23 @@ async function testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageV
   assert.deepEqual(state.clicks.filter((nodeId) => [105, 103, 106].includes(nodeId)), [105, 103, 106]);
   assert.equal(result.attempts[0].resume_attachment_before_count, 0);
   assert.equal(result.attempts[0].resume_attachment_after_count, 2);
+  assert.equal(result.attempts[0].message_before_count, 0);
+  assert.equal(result.attempts[0].message_after_count, 0);
+  assert.equal(result.attempts[0].message_observed, false);
+  assert.equal(result.attempts[0].ready_state_observed, false);
+  assert.equal(result.attempts[0].confirmation_source, "attachment_resume_delta");
   assert.equal(result.attempts[0].message_last_text, "点击预览附件简历");
+  assert.deepEqual(transitions.map((item) => item.state), [
+    "greeting_send_in_flight",
+    "greeting_confirmed",
+    "request_in_flight",
+    "request_confirmed"
+  ]);
+  assert.equal(transitions[3].evidence.message_observed, false);
+  assert.equal(transitions[3].evidence.request_ready_state_observed, false);
+  assert.equal(transitions[3].evidence.request_confirmation_source, "attachment_resume_delta");
+  assert.equal(transitions[3].evidence.request_after_count, 0);
+  assert.equal(transitions[3].evidence.resume_attachment_after_count, 2);
 }
 
 async function testLegacyResumeRequestSentMarkerStillVerifiesRequest() {
@@ -1401,7 +2551,41 @@ async function testLegacyResumeRequestSentMarkerStillVerifiesRequest() {
   assert.equal(result.state.last_success_text, "简历请求已发送");
 }
 
+async function testGenericSentMessageDoesNotVerifyResumeRequest() {
+  const client = {
+    DOM: {
+      async getDocument() {
+        return { root: { nodeId: 1 } };
+      },
+      async querySelectorAll(params) {
+        if (String(params.selector || "") === ".chat-message-list") {
+          return { nodeIds: [50] };
+        }
+        return { nodeIds: [] };
+      },
+      async getOuterHTML(params) {
+        if (params.nodeId === 50) {
+          return { outerHTML: '<div class="chat-message-list"><div>您好，已发送</div></div>' };
+        }
+        return { outerHTML: "" };
+      }
+    }
+  };
+
+  const result = await waitForChatResumeRequestMessage(client, {
+    baselineCount: 0,
+    baselineResumeAttachmentCount: 0,
+    timeoutMs: 0,
+    intervalMs: 1
+  });
+  assert.equal(result.observed, false);
+  assert.equal(result.state.count, 0);
+  assert.equal(result.state.last_success_text, "");
+}
+
 testNetworkPatterns();
+testChatRequestVerificationTimeoutResolution();
+testExactChatGreetingMessageText();
 await testQuickChatResumeModalOpenProbe();
 testNetworkRecorder();
 await testCardCandidateReader();
@@ -1419,10 +2603,28 @@ await testDisabledAskResumeIsNotAlreadyRequested();
 await testGenericSentMessageIsNotAlreadyRequestedResume();
 await testPlainAttachmentResumeIsNotAskResumeControl();
 await testActiveAttachmentResumeSkipsRequest();
+await testChatEditorUsesDeterministicFallbackAfterTransientMismatch();
+await testChatEditorPersistentMismatchReturnsBoundedDiagnostics();
+await testChatEditorRejectsContainingButNonExactText();
+await testChatEditorAbsentRemainsDistinctFromMismatch();
+await testChatEditorRequiresAccessibilityFocusBeforeClearingOrTyping();
+await testChatEditorWaitsForRemountedEditorFocusWithoutReclicking();
+await testChatEditorSamplesFreshFocusImmediatelyAfterClick();
+await testChatEditorWaitsThroughTransientAxNodeErrorWithoutReclicking();
+await testChatEditorWaitsForFocusAfterClearRemountWithoutReclicking();
+await testChatEditorPersistentAccessibilityFocusFailureFailsClosed();
+await testChatEditorRecoversStableFocusableEditorWithNativeDomFocus();
+await testChatEditorNativeDomFocusRejectsBackendBindingMismatch();
+await testChatEditorNativeDomFocusRejectsPostFocusBackendMismatch();
+await testChatEditorNativeDomFocusRejectsBindingChangeBeforeInput();
+await testChatEditorNativeDomFocusFailureStillFailsClosed();
+await testChatEditorNativeDomFocusCallErrorIsTerminal();
 await testChatResumeRequestSendsMessageBeforeAskResume();
+await testSecurityVerificationAfterRequestFailsClosed();
 await testDisabledAskResumeAfterGreetingSkipsAsPendingRequest();
-await testExistingSentMessageDoesNotSkipAskResumeAndRetriesUntilObserved();
+await testExistingSentMessageDoesNotReplayAskResumeWhenOutcomeIsUnknown();
 await testLeftListRequestPreviewDoesNotSkipConfirmAndAttachmentMessageVerifiesRequest();
 await testLegacyResumeRequestSentMarkerStillVerifiesRequest();
+await testGenericSentMessageDoesNotVerifyResumeRequest();
 
 console.log("chat domain tests passed");

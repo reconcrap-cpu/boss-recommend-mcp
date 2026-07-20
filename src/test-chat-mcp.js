@@ -1,9 +1,16 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
+import {
+  __setChatMcpSpawnForTests,
+  __writeChatJsonAtomicForTests,
+  runBossChatDetachedWorker,
+  startBossChatDetachedRunTool
+} from "./chat-mcp.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 
 const {
@@ -321,11 +328,23 @@ async function testChatBlankCriteriaStartsCvCollectionWithoutLlmConfig() {
     assert.equal(started.run.context.cv_collection_mode, true);
     assert.equal(started.run.context.llm_configured, false);
     assert.equal(started.run.context.human_rest_enabled, true);
-    assert.equal(started.run.context.human_rest_per_candidate_enabled, true);
-    assert.equal(started.run.context.human_rest_per_candidate_min_ms, 5000);
-    assert.equal(started.run.context.human_rest_per_candidate_max_ms, 8000);
+    assert.equal(started.run.context.human_rest_per_candidate_enabled, false);
+    assert.equal(started.run.context.human_rest_per_candidate_min_ms, null);
+    assert.equal(started.run.context.human_rest_per_candidate_max_ms, null);
+    assert.equal(started.run.context.collect_cv_processing_floor_enabled, true);
+    assert.equal(started.run.context.collect_cv_processing_floor_min_ms, 10000);
+    assert.equal(started.run.context.collect_cv_processing_floor_max_ms, 15000);
     const completed = await waitForChatRun(started.run_id, (run) => run?.status === "completed");
     assert.equal(completed.result.requested_count, 1);
+    const csv = fs.readFileSync(completed.result.output_csv, "utf8");
+    assert.equal(csv.includes("chat_params.collect_cv_processing_floor_enabled"), true);
+    assert.equal(csv.includes("chat_params.collect_cv_processing_floor_min_ms"), true);
+    assert.equal(csv.includes("10000"), true);
+    assert.equal(csv.includes("chat_params.collect_cv_processing_floor_max_ms"), true);
+    assert.equal(csv.includes("15000"), true);
+    assert.equal(csv.includes("chat_params.collect_cv_processing_floor_count"), true);
+    assert.equal(csv.includes("chat_params.collect_cv_processing_floor_delay_requested_ms"), true);
+    assert.equal(csv.includes("chat_params.collect_cv_processing_floor_delay_ms"), true);
   } finally {
     if (previousConfig === undefined) {
       delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
@@ -721,6 +740,32 @@ async function testChatStaleDiskRunIsFinalizedWithArtifacts() {
   const runId = "mcp_chat_stale_disk_test";
   const runsDir = path.join(process.env.BOSS_CHAT_HOME, "runs");
   fs.mkdirSync(runsDir, { recursive: true });
+  const checkpointPath = path.join(runsDir, `${runId}.checkpoint.json`);
+  const workerHeartbeatAt = "2026-01-01T00:00:01.000Z";
+  const checkpoint = {
+    updatedAt: "2026-01-01T00:00:02.000Z",
+    in_progress_candidate: {
+      index: 1,
+      key: "chat:test:pending",
+      detail_step: "select_candidate"
+    },
+    results: [
+      {
+        index: 0,
+        candidate: {
+          identity: { name: "checkpoint-test-candidate" },
+          profile: { headline: "算法工程师" }
+        },
+        screening: {
+          status: "pass",
+          passed: true,
+          score: 90,
+          reasons: ["checkpoint hydration test"]
+        }
+      }
+    ]
+  };
+  fs.writeFileSync(checkpointPath, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8");
   fs.writeFileSync(path.join(runsDir, `${runId}.json`), JSON.stringify({
     run_id: runId,
     mode: "async",
@@ -729,13 +774,13 @@ async function testChatStaleDiskRunIsFinalizedWithArtifacts() {
     stage: "chat:cleanup",
     started_at: "2026-01-01T00:00:00.000Z",
     updated_at: "2026-01-01T00:00:01.000Z",
-    heartbeat_at: "2026-01-01T00:00:01.000Z",
+    heartbeat_at: workerHeartbeatAt,
     completed_at: null,
     pid: -1,
     progress: {
-      processed: 0,
-      screened: 0,
-      passed: 0,
+      processed: 1,
+      screened: 1,
+      passed: 1,
       requested: 0,
       target_count: "all"
     },
@@ -750,7 +795,9 @@ async function testChatStaleDiskRunIsFinalizedWithArtifacts() {
     control: {
       cancel_requested: false
     },
-    resume: {},
+    resume: {
+      checkpoint_path: checkpointPath
+    },
     error: null,
     result: null,
     artifacts: null
@@ -760,13 +807,294 @@ async function testChatStaleDiskRunIsFinalizedWithArtifacts() {
   assert.equal(payload.status, "RUN_STATUS");
   assert.equal(payload.run.status, "failed");
   assert.equal(payload.run.error.code, "STALE_RUN_PROCESS_EXITED");
+  assert.equal(payload.run.heartbeat_at, workerHeartbeatAt);
+  assert.equal(payload.run.recovery.worker_last_heartbeat_at, workerHeartbeatAt);
+  assert.equal(payload.run.recovery.reconciled_at !== workerHeartbeatAt, true);
+  assert.equal(payload.run.recovery.reconciliation_reason, "STALE_RUN_PROCESS_EXITED");
   assert.equal(payload.persistence.source, "disk");
   assert.equal(payload.persistence.stale_finalized, true);
+  assert.equal(payload.run.result.processed_count, 1);
+  assert.equal(payload.run.result.passed_count, 1);
   assert.equal(fs.existsSync(payload.run.result.output_csv), true);
   assert.equal(fs.existsSync(payload.run.result.report_json), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(checkpointPath, "utf8")), checkpoint);
+  const report = JSON.parse(fs.readFileSync(payload.run.result.report_json, "utf8"));
+  assert.deepEqual(report.checkpoint, checkpoint);
+  assert.equal(report.summary.results.length, 1);
   const csv = fs.readFileSync(payload.run.result.output_csv, "utf8");
   assert.equal(csv.includes("screen_params.post_action"), true);
   assert.equal(csv.includes("request_cv"), true);
+}
+
+function makeFilesystemError(code, message = code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function testChatAtomicJsonRenameRetriesTransientWindowsDenial() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-atomic-retry-"));
+  const targetPath = path.join(directory, "checkpoint.json");
+  fs.writeFileSync(targetPath, `${JSON.stringify({ generation: "old" })}\n`, "utf8");
+  const waits = [];
+  const sources = [];
+  let renameCalls = 0;
+  try {
+    __writeChatJsonAtomicForTests(targetPath, { generation: "new" }, {
+      randomUUIDImpl: () => "transient-retry",
+      sleepSyncImpl: (delayMs) => waits.push(delayMs),
+      renameSyncImpl: (sourcePath, destinationPath) => {
+        renameCalls += 1;
+        sources.push(sourcePath);
+        if (renameCalls <= 2) {
+          throw makeFilesystemError("EPERM", "synthetic transient Windows rename denial");
+        }
+        fs.renameSync(sourcePath, destinationPath);
+      }
+    });
+    assert.equal(renameCalls, 3);
+    assert.deepEqual(waits, [25, 50]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(targetPath, "utf8")), { generation: "new" });
+    assert.equal(new Set(sources).size, 1);
+    assert.match(sources[0], new RegExp(`checkpoint\\.json\\.${process.pid}\\.transient-retry\\.tmp$`));
+    assert.equal(fs.existsSync(sources[0]), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function testChatAtomicJsonRenameExhaustionPreservesOldCheckpoint() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-atomic-exhaust-"));
+  const targetPath = path.join(directory, "checkpoint.json");
+  fs.writeFileSync(targetPath, `${JSON.stringify({ generation: "old" })}\n`, "utf8");
+  const waits = [];
+  let renameCalls = 0;
+  let tempPath = "";
+  try {
+    let error = null;
+    try {
+      __writeChatJsonAtomicForTests(targetPath, { generation: "new" }, {
+        randomUUIDImpl: () => "exhausted-retry",
+        sleepSyncImpl: (delayMs) => waits.push(delayMs),
+        renameSyncImpl: (sourcePath) => {
+          renameCalls += 1;
+          tempPath = sourcePath;
+          throw makeFilesystemError("EPERM", "synthetic persistent Windows rename denial");
+        }
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error);
+    assert.equal(error.code, "EPERM");
+    assert.equal(error.atomic_rename_attempts, 7);
+    assert.deepEqual(error.atomic_rename_retry_delays_ms, [25, 50, 100, 200, 400, 500]);
+    assert.equal(renameCalls, 7);
+    assert.deepEqual(waits, [25, 50, 100, 200, 400, 500]);
+    assert.deepEqual(JSON.parse(fs.readFileSync(targetPath, "utf8")), { generation: "old" });
+    assert.equal(fs.existsSync(tempPath), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function testChatAtomicJsonRenameDoesNotRetryNonTransientFailure() {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-atomic-fatal-"));
+  const targetPath = path.join(directory, "checkpoint.json");
+  fs.writeFileSync(targetPath, `${JSON.stringify({ generation: "old" })}\n`, "utf8");
+  const waits = [];
+  let renameCalls = 0;
+  let tempPath = "";
+  try {
+    let error = null;
+    try {
+      __writeChatJsonAtomicForTests(targetPath, { generation: "new" }, {
+        randomUUIDImpl: () => "fatal-error",
+        sleepSyncImpl: (delayMs) => waits.push(delayMs),
+        renameSyncImpl: (sourcePath) => {
+          renameCalls += 1;
+          tempPath = sourcePath;
+          throw makeFilesystemError("ENOSPC", "synthetic disk full");
+        }
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    assert.ok(error);
+    assert.equal(error.code, "ENOSPC");
+    assert.equal(error.atomic_rename_attempts, 1);
+    assert.deepEqual(error.atomic_rename_retry_delays_ms, []);
+    assert.equal(renameCalls, 1);
+    assert.deepEqual(waits, []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(targetPath, "utf8")), { generation: "old" });
+    assert.equal(fs.existsSync(tempPath), false);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function testChatDetachedChildAsyncErrorAndEarlyExitPersist() {
+  const makeChild = () => {
+    const child = new EventEmitter();
+    child.pid = process.pid;
+    child.unrefCalled = false;
+    child.unref = () => {
+      child.unrefCalled = true;
+    };
+    return child;
+  };
+
+  const errorChild = makeChild();
+  __setChatMcpSpawnForTests(() => errorChild);
+  const errorStarted = await startBossChatDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({ delay_ms: 0 })
+  });
+  assert.equal(errorStarted.status, "ACCEPTED");
+  assert.equal(errorStarted.run.context.cv_collection_mode, false);
+  assert.equal(errorStarted.run.context.collect_cv_processing_floor_enabled, false);
+  assert.equal(errorStarted.run.context.collect_cv_processing_floor_min_ms, null);
+  assert.equal(errorStarted.run.context.collect_cv_processing_floor_max_ms, null);
+  assert.equal(errorChild.unrefCalled, true);
+  const asyncError = new Error("asynchronous spawn failure");
+  asyncError.code = "EACCES";
+  assert.doesNotThrow(() => errorChild.emit("error", asyncError));
+  const errorState = JSON.parse(fs.readFileSync(errorStarted.run.artifacts.run_state_path, "utf8"));
+  assert.equal(errorState.status, "failed");
+  assert.equal(errorState.error.code, "CHAT_WORKER_PROCESS_ERROR");
+  assert.equal(errorState.error.worker_error_code, "EACCES");
+  assert.match(errorState.error.message, /asynchronous spawn failure/);
+  assert.equal(errorState.heartbeat_at, errorStarted.run.heartbeat_at);
+  assert.equal(errorState.recovery.worker_last_heartbeat_at, errorStarted.run.heartbeat_at);
+  assert.equal(typeof errorState.recovery.reconciled_at, "string");
+
+  const exitChild = makeChild();
+  __setChatMcpSpawnForTests(() => exitChild);
+  const exitStarted = await startBossChatDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({ delay_ms: 0 })
+  });
+  assert.equal(exitStarted.status, "ACCEPTED");
+  exitChild.emit("exit", 7, null);
+  const exitState = JSON.parse(fs.readFileSync(exitStarted.run.artifacts.run_state_path, "utf8"));
+  assert.equal(exitState.status, "failed");
+  assert.equal(exitState.error.code, "CHAT_WORKER_EXITED_EARLY");
+  assert.equal(exitState.error.worker_exit_code, 7);
+  assert.match(exitState.error.message, /code=7/);
+}
+
+async function testChatDetachedCollectCvBootstrapIncludesProcessingFloor() {
+  const child = new EventEmitter();
+  child.pid = process.pid;
+  child.unref = () => {};
+  __setChatMcpSpawnForTests(() => child);
+
+  const started = await startBossChatDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({
+      criteria: "",
+      delay_ms: 0
+    })
+  });
+  assert.equal(started.status, "ACCEPTED");
+  assert.equal(started.run.context.criteria_present, false);
+  assert.equal(started.run.context.screening_mode, "collect_cv");
+  assert.equal(started.run.context.cv_collection_mode, true);
+  assert.equal(started.run.context.collect_cv_processing_floor_enabled, true);
+  assert.equal(started.run.context.collect_cv_processing_floor_min_ms, 10000);
+  assert.equal(started.run.context.collect_cv_processing_floor_max_ms, 15000);
+  assert.equal(started.run.progress.collect_cv_processing_floor_enabled, true);
+  assert.equal(started.run.progress.collect_cv_processing_floor_count, 0);
+  assert.equal(started.run.progress.collect_cv_processing_floor_delay_requested_ms, 0);
+  assert.equal(started.run.progress.collect_cv_processing_floor_delay_ms, 0);
+
+  child.emit("error", new Error("synthetic collect-CV bootstrap failure"));
+  const failedState = JSON.parse(fs.readFileSync(started.run.artifacts.run_state_path, "utf8"));
+  assert.equal(failedState.status, "failed");
+  assert.equal(failedState.context.collect_cv_processing_floor_enabled, true);
+  assert.equal(fs.existsSync(failedState.artifacts.output_csv), true);
+  const csv = fs.readFileSync(failedState.artifacts.output_csv, "utf8");
+  assert.equal(csv.includes("chat_params.collect_cv_processing_floor_enabled"), true);
+  assert.match(csv, /chat_params\.collect_cv_processing_floor_enabled[^\r\n]*true/);
+}
+
+async function testChatDetachedChildExitDoesNotOverwriteTerminalState() {
+  const child = new EventEmitter();
+  child.pid = process.pid;
+  child.unref = () => {};
+  __setChatMcpSpawnForTests(() => child);
+  const started = await startBossChatDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({ delay_ms: 0 })
+  });
+  assert.equal(started.status, "ACCEPTED");
+
+  const statePath = started.run.artifacts.run_state_path;
+  const terminal = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  terminal.state = "completed";
+  terminal.status = "completed";
+  terminal.completed_at = "2026-01-01T00:00:03.000Z";
+  terminal.error = null;
+  fs.writeFileSync(statePath, `${JSON.stringify(terminal, null, 2)}\n`, "utf8");
+
+  child.emit("exit", 9, "SIGTERM");
+  const afterExit = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(afterExit.status, "completed");
+  assert.equal(afterExit.completed_at, terminal.completed_at);
+  assert.equal(afterExit.error, null);
+}
+
+async function testChatDetachedWorkerSnapshotReplacesBootstrapPid() {
+  installFakeConnector();
+  setChatMcpWorkflowForTests(async (options, runControl) => {
+    assert.equal(options.targetPassCount, 1);
+    runControl.setPhase("chat:test-worker-pid");
+    runControl.updateProgress({
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      llm_screened: 0,
+      passed: 1,
+      requested: 0,
+      request_satisfied: 0,
+      request_skipped: 0,
+      target_count: options.targetPassCount
+    });
+    return {
+      domain: "chat",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      llm_screened: 0,
+      passed: 1,
+      requested: 0,
+      request_satisfied: 0,
+      request_skipped: 0,
+      results: []
+    };
+  });
+
+  const bootstrapPid = 424242;
+  const bootstrap = new EventEmitter();
+  bootstrap.pid = bootstrapPid;
+  bootstrap.unref = () => {};
+  __setChatMcpSpawnForTests(() => bootstrap);
+
+  const started = await startBossChatDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({ target_count: 1, delay_ms: 0 })
+  });
+  assert.equal(started.status, "ACCEPTED");
+  const statePath = started.run.artifacts.run_state_path;
+  const bootstrapState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(bootstrapState.pid, bootstrapPid);
+
+  const workerResult = await runBossChatDetachedWorker({ runId: started.run_id });
+  assert.equal(workerResult.ok, true);
+  const workerState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(workerState.pid, process.pid);
+  assert.notEqual(workerState.pid, bootstrapPid);
+  assert.equal(workerState.status, "completed");
 }
 
 async function main() {
@@ -807,6 +1135,9 @@ async function main() {
   }, null, 2));
   process.env.BOSS_RECOMMEND_SCREEN_CONFIG = configPath;
   try {
+    testChatAtomicJsonRenameRetriesTransientWindowsDenial();
+    testChatAtomicJsonRenameExhaustionPreservesOldCheckpoint();
+    testChatAtomicJsonRenameDoesNotRetryNonTransientFailure();
     await testToolListIncludesChatTools();
     await testChatInputValidationBeforeBrowserConnect();
     resetChatMcpStateForTests();
@@ -835,6 +1166,14 @@ async function main() {
     await testChatCanceledZeroResultWritesArtifacts();
     resetChatMcpStateForTests();
     await testChatStaleDiskRunIsFinalizedWithArtifacts();
+    resetChatMcpStateForTests();
+    await testChatDetachedChildAsyncErrorAndEarlyExitPersist();
+    resetChatMcpStateForTests();
+    await testChatDetachedCollectCvBootstrapIncludesProcessingFloor();
+    resetChatMcpStateForTests();
+    await testChatDetachedChildExitDoesNotOverwriteTerminalState();
+    resetChatMcpStateForTests();
+    await testChatDetachedWorkerSnapshotReplacesBootstrapPid();
     console.log("chat MCP tests passed");
   } finally {
     resetChatMcpStateForTests();

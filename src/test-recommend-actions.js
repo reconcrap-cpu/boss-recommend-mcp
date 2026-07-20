@@ -108,6 +108,139 @@ async function testActionClickScrollsNodeIntoViewBeforeClick() {
   )), true);
 }
 
+async function testActionClickDoesNotUseCachedCenterAfterStaleScroll() {
+  const inputEvents = [];
+  const staleError = new Error("Could not find node with given id");
+  staleError.cdp_method = "DOM.scrollIntoViewIfNeeded";
+  staleError.cdp_connection_epoch = 3;
+  staleError.cdp_replay_policy = "read_only";
+  const client = {
+    DOM: {
+      async scrollIntoViewIfNeeded() {
+        throw staleError;
+      },
+      async getBoxModel() {
+        assert.fail("box model must not be read after stale scroll");
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        inputEvents.push(event);
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => clickRecommendActionControl(client, {
+      kind: "greet",
+      label: "打招呼",
+      center: { x: 999, y: 777 },
+      node_id: 41,
+      selector: "button.btn-greet",
+      root: "recommend-frame"
+    }),
+    (error) => {
+      assert.equal(error.message, "Could not find node with given id");
+      assert.equal(error.code, "RECOMMEND_ACTION_CONTROL_REFRESH_FAILED");
+      assert.equal(error.phase, "recommend:post-action-control-refresh");
+      assert.equal(error.action_control_refresh_step, "scroll_into_view");
+      assert.equal(error.action_control.node_id, 41);
+      assert.equal(error.cached_center_ignored, true);
+      assert.equal(error.cdp_method, "DOM.scrollIntoViewIfNeeded");
+      assert.equal(error.cdp_connection_epoch, 3);
+      assert.equal(error.cdp_replay_policy, "read_only");
+      return true;
+    }
+  );
+  assert.deepEqual(inputEvents, []);
+}
+
+async function testActionClickDoesNotUseCachedCenterAfterStaleBoxRead() {
+  const inputEvents = [];
+  const staleError = new Error("Could not compute box model");
+  staleError.cdp_method = "DOM.getBoxModel";
+  staleError.cdp_outcome_unknown = false;
+  staleError.cdp_connection_epoch = 7;
+  const client = {
+    DOM: {
+      async scrollIntoViewIfNeeded() {
+        return {};
+      },
+      async getBoxModel() {
+        throw staleError;
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        inputEvents.push(event);
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => clickRecommendActionControl(client, {
+      kind: "greet",
+      label: "打招呼",
+      center: { x: 999, y: 777 },
+      node_id: 42
+    }),
+    (error) => {
+      assert.equal(error.message, "Could not compute box model");
+      assert.equal(error.code, "RECOMMEND_ACTION_CONTROL_REFRESH_FAILED");
+      assert.equal(error.phase, "recommend:post-action-control-refresh");
+      assert.equal(error.action_control_refresh_step, "read_box_model");
+      assert.equal(error.cached_center_ignored, true);
+      assert.equal(error.cdp_method, "DOM.getBoxModel");
+      assert.equal(error.cdp_outcome_unknown, false);
+      assert.equal(error.cdp_connection_epoch, 7);
+      return true;
+    }
+  );
+  assert.deepEqual(inputEvents, []);
+}
+
+async function testActionClickRejectsUnreadableFreshGeometry() {
+  const inputEvents = [];
+  const client = {
+    DOM: {
+      async scrollIntoViewIfNeeded() {
+        return {};
+      },
+      async getBoxModel() {
+        return {
+          model: {
+            border: [100, 100, 100, 100, 100, 140, 100, 140]
+          }
+        };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        inputEvents.push(event);
+      }
+    }
+  };
+
+  await assert.rejects(
+    () => clickRecommendActionControl(client, {
+      kind: "greet",
+      label: "打招呼",
+      center: { x: 999, y: 777 },
+      node_id: 43
+    }),
+    (error) => {
+      assert.equal(error.code, "RECOMMEND_ACTION_CONTROL_GEOMETRY_UNREADABLE");
+      assert.equal(error.phase, "recommend:post-action-control-refresh");
+      assert.equal(error.action_control_refresh_step, "read_box_model");
+      assert.equal(error.cdp_method, "DOM.getBoxModel");
+      assert.equal(error.cdp_node_id, 43);
+      assert.equal(error.cached_center_ignored, true);
+      return true;
+    }
+  );
+  assert.deepEqual(inputEvents, []);
+}
+
 function testPostActionResolution() {
   assert.equal(normalizeRecommendPostAction("收藏"), "");
   assert.equal(normalizeRecommendPostAction("favorite"), "");
@@ -164,6 +297,9 @@ testFavoriteClassification();
 testGreetClassification();
 await testGreetQuotaClickGuard();
 await testActionClickScrollsNodeIntoViewBeforeClick();
+await testActionClickDoesNotUseCachedCenterAfterStaleScroll();
+await testActionClickDoesNotUseCachedCenterAfterStaleBoxRead();
+await testActionClickRejectsUnreadableFreshGeometry();
 testPostActionResolution();
 testSummary();
 

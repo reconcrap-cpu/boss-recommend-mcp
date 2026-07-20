@@ -30,6 +30,7 @@ Anti-loop rules:
 - Do not call start_boss_chat_run repeatedly in one turn.
 - Do not call get_boss_chat_run unless user explicitly asks for progress.
 - Do not choose rest_level for the user. Pass the user's choice as `human_behavior.restLevel`.
+- Collect-CV runs automatically enforce a random 10-15 second minimum handling time for every identified candidate, including candidates who already have a CV or pending request. This fixed floor needs no extra input and the selected rest_level still runs afterward.
 
 target_count mapping:
 - Positive integer means explicit cap (for example 20).
