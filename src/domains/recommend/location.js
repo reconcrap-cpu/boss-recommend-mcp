@@ -481,7 +481,8 @@ async function openRecommendLocationPopover(client, frameNodeId, {
 async function confirmRecommendLocationPopover(client, frameNodeId, {
   timeoutMs = 1800,
   intervalMs = 150,
-  controlNodeId
+  controlNodeId,
+  stableCloseMs = 300
 } = {}) {
   const candidates = await findExactLocationConfirmCandidates(client, frameNodeId, { controlNodeId });
   if (!candidates.length) {
@@ -489,27 +490,70 @@ async function confirmRecommendLocationPopover(client, frameNodeId, {
   }
   const clickErrors = [];
   for (const candidate of candidates) {
+    let box;
     try {
-      const box = await clickNodeCenter(client, candidate.node_id, DETERMINISTIC_CLICK_OPTIONS);
-      const started = Date.now();
-      while (Date.now() - started <= timeoutMs) {
-        const control = await findRecommendCurrentCityControl(client, frameNodeId);
-        if (!control) {
-          return {
-            confirmed: true,
-            label: "确认",
-            node_id: candidate.node_id,
-            box
-          };
-        }
-        if (intervalMs > 0) await sleep(intervalMs);
-      }
+      box = await clickNodeCenter(client, candidate.node_id, DETERMINISTIC_CLICK_OPTIONS);
     } catch (error) {
       clickErrors.push({
         node_id: candidate.node_id,
         message: error?.message || String(error)
       });
+      continue;
     }
+
+    const started = Date.now();
+    const requiredStableCloseMs = Math.max(0, Number(stableCloseMs) || 0);
+    let absentSince = null;
+    let absentObservations = 0;
+    let lastObservation = null;
+    while (Date.now() - started <= timeoutMs) {
+      try {
+        const [control, popover] = await Promise.all([
+          findRecommendCurrentCityControl(client, frameNodeId),
+          findVisibleRecommendLocationPopover(client, frameNodeId)
+        ]);
+        const observedAt = Date.now();
+        lastObservation = {
+          control_visible: Boolean(control),
+          popover_visible: Boolean(popover),
+          observed_after_ms: observedAt - started
+        };
+        if (!control && !popover) {
+          absentSince ??= observedAt;
+          absentObservations += 1;
+          if (observedAt - absentSince >= requiredStableCloseMs) {
+            return {
+              confirmed: true,
+              label: "确认",
+              node_id: candidate.node_id,
+              box,
+              stable_close_ms: observedAt - absentSince,
+              stable_close_observations: absentObservations,
+              control_absent: true,
+              popover_invisible: true
+            };
+          }
+        } else {
+          absentSince = null;
+          absentObservations = 0;
+        }
+      } catch (error) {
+        const uncertain = new Error("Recommend location popover close state was uncertain after exact 确认 click");
+        uncertain.cause = error;
+        uncertain.confirm_node_id = candidate.node_id;
+        uncertain.last_observation = lastObservation;
+        throw uncertain;
+      }
+      if (intervalMs > 0) await sleep(intervalMs);
+    }
+
+    const error = new Error("Recommend location popover did not close after exact 确认 click");
+    error.confirm_node_id = candidate.node_id;
+    error.last_observation = lastObservation;
+    error.stable_close_ms = absentSince === null ? 0 : Date.now() - absentSince;
+    error.stable_close_observations = absentObservations;
+    error.click_errors = clickErrors;
+    throw error;
   }
   const error = new Error("Recommend location popover did not close after exact 确认 click");
   error.click_errors = clickErrors;
@@ -581,7 +625,8 @@ export async function ensureRecommendCurrentCityOnly(client, frameNodeId, {
   intervalMs = 150,
   attemptsLimit = 2,
   openAttemptsLimit = 3,
-  settleMs = 250
+  settleMs = 250,
+  closeStableMs = 300
 } = {}) {
   const requested = enabled === true;
   const attempts = [];
@@ -649,7 +694,8 @@ export async function ensureRecommendCurrentCityOnly(client, frameNodeId, {
       const confirmation = await confirmRecommendLocationPopover(client, frameNodeId, {
         timeoutMs,
         intervalMs,
-        controlNodeId: afterToggleControl.node_id
+        controlNodeId: afterToggleControl.node_id,
+        stableCloseMs: closeStableMs
       });
       if (!confirmation.confirmed) {
         throw new Error("Recommend location state was not confirmed");
@@ -671,7 +717,8 @@ export async function ensureRecommendCurrentCityOnly(client, frameNodeId, {
       const stickyClose = await confirmRecommendLocationPopover(client, frameNodeId, {
         timeoutMs,
         intervalMs,
-        controlNodeId: reopened.control.node_id
+        controlNodeId: reopened.control.node_id,
+        stableCloseMs: closeStableMs
       });
       if (!stickyClose.confirmed) {
         throw new Error("Recommend location sticky verification was not confirmed");

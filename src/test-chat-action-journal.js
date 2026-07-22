@@ -300,6 +300,65 @@ function testCorruptionAndConcurrentWriterLockFailClosed() {
   }
 }
 
+function testRevisionCasSurvivesFixedClockAndLegacyRecord() {
+  const baseDir = makeTempDir();
+  try {
+    const fixedNow = "2026-07-21T03:00:00.000Z";
+    const journal = createChatActionJournal({
+      baseDir,
+      now: () => fixedNow
+    });
+    const input = {
+      scope: "account-a/profile-default",
+      candidateId: "candidate-fixed-clock-cas",
+      greeting: "hello",
+      runId: "run-a"
+    };
+    const preAction = journal.transition({ ...input, state: "pre_action" });
+    assert.equal(preAction.record.revision, 1);
+    const firstClaim = journal.transition({
+      ...input,
+      state: "greeting_send_in_flight",
+      expectedRevision: preAction.record.revision,
+      expectedUpdatedAt: preAction.record.updated_at
+    });
+    assert.equal(firstClaim.changed, true);
+    assert.equal(firstClaim.record.revision, 2);
+    assert.equal(firstClaim.record.updated_at, preAction.record.updated_at);
+    assertErrorCode(
+      () => journal.transition({
+        ...input,
+        state: "greeting_send_in_flight",
+        recordIdempotent: true,
+        expectedRevision: preAction.record.revision,
+        expectedUpdatedAt: preAction.record.updated_at
+      }),
+      "CHAT_ACTION_JOURNAL_CONCURRENT_UPDATE"
+    );
+
+    const legacyInput = {
+      scope: "account-a/profile-default",
+      candidateId: "candidate-legacy-no-revision",
+      greeting: "hello",
+      runId: "run-a"
+    };
+    const legacy = journal.transition({ ...legacyInput, state: "pre_action" });
+    const raw = JSON.parse(fs.readFileSync(legacy.file_path, "utf8"));
+    delete raw.revision;
+    fs.writeFileSync(legacy.file_path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    const migratedRead = journal.read(legacyInput);
+    assert.equal(migratedRead.revision, 1);
+    const migratedTransition = journal.transition({
+      ...legacyInput,
+      state: "greeting_send_in_flight",
+      expectedRevision: migratedRead.revision
+    });
+    assert.equal(migratedTransition.record.revision, 2);
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
 assert.deepEqual(CHAT_ACTION_STATES, [
   "pre_action",
   "greeting_send_in_flight",
@@ -314,5 +373,6 @@ testFullStateSequenceIsSharedAcrossRunIdsAndIdempotent();
 testUnknownOutcomeCanOnlyResolveItsInFlightEffect();
 testInvalidTransitionsAndGreetingConflictsFailClosed();
 testCorruptionAndConcurrentWriterLockFailClosed();
+testRevisionCasSurvivesFixedClockAndLegacyRecord();
 
 console.log("chat action journal tests passed");

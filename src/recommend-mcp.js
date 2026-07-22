@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -10,6 +11,7 @@ import {
   enableDomains,
   FORBIDDEN_CDP_METHODS,
   getMainFrameUrl,
+  inspectChromeDebugCommandLine,
   isBossLoginUrl,
   waitForMainFrameUrl,
   sleep
@@ -37,6 +39,7 @@ import {
   closeRecommendDetail,
   createRecommendRunService,
   getRecommendRoots,
+  inspectRecommendFilteredEmptyState,
   listRecommendJobOptions,
   RECOMMEND_TARGET_URL,
   runRecommendWorkflow
@@ -353,6 +356,168 @@ function compactMethodLogForStatus(methodLog = []) {
     })
     .filter((entry) => Boolean(entry.method))
     .slice(-STATUS_METHOD_LOG_TAIL_LIMIT);
+}
+
+function canonicalRecommendChromeHost(host = "") {
+  const normalized = String(host || "").trim().toLowerCase();
+  return ["", "localhost", "127.0.0.1", "::1"].includes(normalized)
+    ? "127.0.0.1"
+    : normalized;
+}
+
+function readChromeCommandLineValue(args = [], name = "") {
+  const prefix = `--${name}=`;
+  for (let index = 0; index < args.length; index += 1) {
+    const value = String(args[index] || "");
+    if (value.startsWith(prefix)) return value.slice(prefix.length).trim();
+    if (value === `--${name}`) return String(args[index + 1] || "").trim();
+  }
+  return "";
+}
+
+function resolveExactChromeProfileDirectory(userDataDir, explicitProfileDirectory = "") {
+  const resolvedUserDataDir = fs.realpathSync(path.resolve(userDataDir));
+  let profileDirectory = String(explicitProfileDirectory || "").trim();
+  if (!profileDirectory) {
+    const localStatePath = path.join(resolvedUserDataDir, "Local State");
+    const localState = JSON.parse(fs.readFileSync(localStatePath, "utf8"));
+    const lastActive = Array.isArray(localState?.profile?.last_active_profiles)
+      ? localState.profile.last_active_profiles.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    const cachedProfiles = Object.keys(localState?.profile?.info_cache || {}).filter(Boolean);
+    const candidates = Array.from(new Set([...lastActive, ...cachedProfiles]));
+    if (candidates.length !== 1) {
+      const error = new Error(
+        "Chrome profile directory is not explicit and Local State does not prove exactly one active profile"
+      );
+      error.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+      throw error;
+    }
+    profileDirectory = candidates[0];
+  }
+  const resolvedProfileDir = fs.realpathSync(path.resolve(resolvedUserDataDir, profileDirectory));
+  const relativeProfile = path.relative(resolvedUserDataDir, resolvedProfileDir);
+  if (!relativeProfile || relativeProfile.startsWith("..") || path.isAbsolute(relativeProfile)) {
+    const error = new Error("Chrome profile directory is not a child of the exact user-data directory");
+    error.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+    throw error;
+  }
+  return {
+    user_data_dir: process.platform === "win32" ? resolvedUserDataDir.toLowerCase() : resolvedUserDataDir,
+    profile_directory: relativeProfile.replaceAll("\\", "/")
+  };
+}
+
+export async function resolveRecommendActionJournalScope({
+  host = DEFAULT_RECOMMEND_HOST,
+  port = DEFAULT_RECOMMEND_PORT,
+  session = null,
+  inspectCommandLine = inspectChromeDebugCommandLine,
+  strictFresh = false
+} = {}) {
+  const canonicalHost = canonicalRecommendChromeHost(host);
+  if (canonicalHost !== "127.0.0.1") {
+    const error = new Error("Live recommend greetings require a local canonical Chrome profile identity");
+    error.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+    throw error;
+  }
+  let userDataDir = "";
+  let profileDirectory = "";
+  let source = "";
+  if (strictFresh === true) {
+    let commandLine = null;
+    try {
+      commandLine = await inspectCommandLine({ host: canonicalHost, port });
+    } catch (error) {
+      const inspectionError = new Error(
+        "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED: fresh Chrome command-line inspection failed"
+      );
+      inspectionError.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+      inspectionError.retryable = false;
+      inspectionError.cause = error;
+      throw inspectionError;
+    }
+    const observedPort = Number(readChromeCommandLineValue(
+      commandLine?.arguments,
+      "remote-debugging-port"
+    ));
+    if (commandLine?.ok !== true || observedPort !== Number(port)) {
+      const inspectionError = new Error(
+        "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED: fresh Chrome process/port identity could not be proven"
+      );
+      inspectionError.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+      inspectionError.retryable = false;
+      inspectionError.expected_port = Number(port);
+      inspectionError.observed_port = Number.isFinite(observedPort) ? observedPort : null;
+      throw inspectionError;
+    }
+    userDataDir = readChromeCommandLineValue(commandLine.arguments, "user-data-dir");
+    profileDirectory = readChromeCommandLineValue(commandLine.arguments, "profile-directory");
+    source = `fresh_${commandLine.source || "chrome_command_line"}`;
+  } else {
+    const injected = session?.profile_identity;
+    if (injected?.verified === true) {
+      userDataDir = String(injected.user_data_dir || "").trim();
+      profileDirectory = String(injected.profile_directory || "").trim();
+      source = "session_verified_profile_identity";
+    } else {
+      let commandLine = null;
+      try {
+        commandLine = await inspectCommandLine({ host: canonicalHost, port });
+      } catch {
+        commandLine = null;
+      }
+      if (commandLine?.ok === true) {
+        userDataDir = readChromeCommandLineValue(commandLine.arguments, "user-data-dir");
+        profileDirectory = readChromeCommandLineValue(commandLine.arguments, "profile-directory");
+        source = commandLine.source || "chrome_command_line";
+      }
+      if (!userDataDir && session?.chrome?.launched === true) {
+        userDataDir = String(session.chrome.user_data_dir || "").trim();
+        source = "same_call_chrome_launch";
+      }
+    }
+  }
+  if (!userDataDir) {
+    const error = new Error(
+      "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED: exact Chrome user-data/profile directory could not be proven"
+    );
+    error.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+    error.retryable = false;
+    throw error;
+  }
+  let exactProfile;
+  try {
+    exactProfile = resolveExactChromeProfileDirectory(userDataDir, profileDirectory);
+  } catch (error) {
+    const safeError = new Error(
+      "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED: exact Chrome profile directory could not be proven"
+    );
+    safeError.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+    safeError.retryable = false;
+    throw safeError;
+  }
+  if (!exactProfile.user_data_dir || !exactProfile.profile_directory) {
+    const error = new Error("Exact Chrome user-data/profile directory could not be proven");
+    error.code = "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED";
+    throw error;
+  }
+  const profileHash = crypto.createHash("sha256")
+    .update(
+      `boss-chrome-profile-v1\u0000${exactProfile.user_data_dir}\u0000${exactProfile.profile_directory}`,
+      "utf8"
+    )
+    .digest("hex");
+  return {
+    scope: `boss-recommend-profile-v2:${canonicalHost}:profile-sha256:${profileHash}`,
+    identity: {
+      verified: true,
+      source,
+      canonical_host: canonicalHost,
+      profile_sha256: profileHash,
+      profile_directory: exactProfile.profile_directory
+    }
+  };
 }
 
 function clonePlain(value, fallback = null) {
@@ -1734,6 +1899,8 @@ function compactHealth(check) {
     status: check.status,
     summary: check.summary,
     drift_report: check.drift_report,
+    empty_bootstrap_refresh: check.empty_bootstrap_refresh || null,
+    accepted_empty_bootstrap: check.accepted_empty_bootstrap || null,
     probes: (check.probes || []).map((probe) => ({
       id: probe.id,
       type: probe.type,
@@ -1744,20 +1911,130 @@ function compactHealth(check) {
   };
 }
 
+function hasOnlyCandidateCardsRequiredFailure(check) {
+  const failedRequiredIds = Array.isArray(check?.summary?.failed_required_ids)
+    ? check.summary.failed_required_ids
+    : [];
+  const blockedRequiredIds = Array.isArray(check?.summary?.blocked_required_ids)
+    ? check.summary.blocked_required_ids
+    : [];
+  return check?.status === HEALTH_STATUS.DEGRADED
+    && failedRequiredIds.length === 1
+    && failedRequiredIds[0] === "candidate_cards"
+    && blockedRequiredIds.length === 0;
+}
+
+function compactRecommendEmptyStateEvidence(emptyState) {
+  if (!emptyState) return null;
+  return {
+    verified: emptyState.verified === true,
+    reason: emptyState.reason || null,
+    text: emptyState.text || null,
+    node_id: emptyState.node_id ?? null,
+    box: emptyState.box || null,
+    accessibility: emptyState.accessibility ? {
+      available: emptyState.accessibility.available ?? null,
+      verified: emptyState.accessibility.verified === true,
+      reason: emptyState.accessibility.reason || null
+    } : null
+  };
+}
+
+function hasExactRecommendFilteredEmptyState(emptyState) {
+  return emptyState?.verified === true
+    && emptyState?.reason === "exact_visible_filtered_empty_state"
+    && emptyState?.accessibility?.verified === true;
+}
+
+function attachRecommendEmptyBootstrapRefreshEvidence(check, refreshEvidence, emptyState = null) {
+  if (!check || refreshEvidence?.attempted !== true) return check;
+  return {
+    ...check,
+    empty_bootstrap_refresh: {
+      ...refreshEvidence,
+      after: {
+        health: compactHealth(check),
+        empty_state: compactRecommendEmptyStateEvidence(emptyState)
+      }
+    }
+  };
+}
+
+export function getRecommendEmptyBootstrapPreflightAction(
+  check,
+  emptyState = null,
+  refreshEvidence = null
+) {
+  if (check?.status === HEALTH_STATUS.HEALTHY) return "accept_healthy";
+  if (!hasOnlyCandidateCardsRequiredFailure(check)) return "wait";
+  if (!hasExactRecommendFilteredEmptyState(emptyState)) return "wait";
+  if (refreshEvidence?.attempted !== true) return "refresh";
+  if (
+    refreshEvidence.completed !== true
+    || refreshEvidence.ok !== true
+    || refreshEvidence.method !== "Page.navigate"
+    || refreshEvidence.target_url !== RECOMMEND_TARGET_URL
+  ) return "wait";
+  return "accept_empty_bootstrap";
+}
+
+export function acceptRecommendEmptyBootstrapHealth(check, emptyState, refreshEvidence = null) {
+  if (
+    getRecommendEmptyBootstrapPreflightAction(check, emptyState, refreshEvidence)
+      !== "accept_empty_bootstrap"
+  ) return null;
+
+  const healthWithRefresh = attachRecommendEmptyBootstrapRefreshEvidence(
+    check,
+    refreshEvidence,
+    emptyState
+  );
+  return {
+    ...healthWithRefresh,
+    accepted_empty_bootstrap: {
+      accepted: true,
+      mode: "exact_filtered_empty_bootstrap",
+      reason: emptyState.reason,
+      original_health_status: check.status,
+      failed_required_ids: [...check.summary.failed_required_ids],
+      blocked_required_ids: [...check.summary.blocked_required_ids],
+      root: "frame",
+      empty_state: compactRecommendEmptyStateEvidence(emptyState),
+      refresh: healthWithRefresh.empty_bootstrap_refresh
+    }
+  };
+}
+
+export function isRecommendConnectorHealthAccepted(health) {
+  if (health?.status === HEALTH_STATUS.HEALTHY) return true;
+  const accepted = health?.accepted_empty_bootstrap;
+  return accepted?.accepted === true
+    && accepted.mode === "exact_filtered_empty_bootstrap"
+    && accepted.original_health_status === HEALTH_STATUS.DEGRADED
+    && getRecommendEmptyBootstrapPreflightAction(
+      health,
+      accepted.empty_state,
+      health.empty_bootstrap_refresh
+    ) === "accept_empty_bootstrap";
+}
+
 async function waitForHealthyRecommend(client, config, {
   timeoutMs = 90000,
-  intervalMs = 1000
+  intervalMs = 1000,
+  refreshSettleMs = 5000,
+  refreshNavigationTimeoutMs = 20000
 } = {}) {
   const started = Date.now();
   let lastCheck = null;
+  let refreshEvidence = null;
   while (Date.now() - started <= timeoutMs) {
     const loginDetection = await detectBossLoginState(client).catch(() => null);
     if (loginDetection?.requires_login) {
-      return {
+      return attachRecommendEmptyBootstrapRefreshEvidence({
         status: "login_required",
         summary: "Boss login is required",
         loginDetection
-      };
+      }, refreshEvidence);
     }
     const roots = await resolveRecommendSelfHealRoots(client, config);
     lastCheck = await runSelfHealCheck({
@@ -1768,10 +2045,86 @@ async function waitForHealthyRecommend(client, config, {
       accessibilityProbes: config.accessibilityProbes,
       viewportProbes: config.viewportProbes
     });
-    if (lastCheck.status === HEALTH_STATUS.HEALTHY) return lastCheck;
+    if (lastCheck.status === HEALTH_STATUS.HEALTHY) {
+      return attachRecommendEmptyBootstrapRefreshEvidence(lastCheck, refreshEvidence);
+    }
+    let emptyState = null;
+    if (hasOnlyCandidateCardsRequiredFailure(lastCheck) && roots.roots.frame) {
+      emptyState = await inspectRecommendFilteredEmptyState(
+        client,
+        roots.roots.frame
+      ).catch((error) => ({
+        verified: false,
+        reason: "filtered_empty_state_probe_failed",
+        error: error?.message || String(error)
+      }));
+    }
+    const action = getRecommendEmptyBootstrapPreflightAction(
+      lastCheck,
+      emptyState,
+      refreshEvidence
+    );
+    if (action === "refresh") {
+      const refreshStarted = Date.now();
+      refreshEvidence = {
+        attempted: true,
+        completed: false,
+        ok: false,
+        method: "Page.navigate",
+        target_url: RECOMMEND_TARGET_URL,
+        before: {
+          health: compactHealth(lastCheck),
+          empty_state: compactRecommendEmptyStateEvidence(emptyState)
+        }
+      };
+      try {
+        const navigationResult = await client.Page.navigate({ url: RECOMMEND_TARGET_URL });
+        if (navigationResult?.errorText) {
+          throw new Error(navigationResult.errorText);
+        }
+        const waited = await waitForMainFrameUrl(
+          client,
+          (url) => isBossLoginUrl(url) || !shouldNavigateToRecommend(url),
+          {
+            timeoutMs: refreshNavigationTimeoutMs,
+            intervalMs: Math.max(250, Math.min(1000, intervalMs))
+          }
+        );
+        if (refreshSettleMs > 0) await sleep(refreshSettleMs);
+        refreshEvidence = {
+          ...refreshEvidence,
+          completed: true,
+          ok: waited?.ok === true,
+          navigation: {
+            frame_id: navigationResult?.frameId || null,
+            loader_id: navigationResult?.loaderId || null,
+            observed_url: waited?.url || null,
+            observed_url_ok: waited?.ok === true
+          },
+          elapsed_ms: Date.now() - refreshStarted
+        };
+      } catch (error) {
+        refreshEvidence = {
+          ...refreshEvidence,
+          completed: true,
+          ok: false,
+          error: error?.message || String(error),
+          elapsed_ms: Date.now() - refreshStarted
+        };
+      }
+      continue;
+    }
+    if (action === "accept_empty_bootstrap") {
+      const accepted = acceptRecommendEmptyBootstrapHealth(
+        lastCheck,
+        emptyState,
+        refreshEvidence
+      );
+      if (accepted) return accepted;
+    }
     await sleep(intervalMs);
   }
-  return lastCheck;
+  return attachRecommendEmptyBootstrapRefreshEvidence(lastCheck, refreshEvidence);
 }
 
 function shouldNavigateToRecommend(url) {
@@ -1868,7 +2221,9 @@ async function connectRecommendChromeSession({
   const selfHealConfig = buildRecommendSelfHealConfig();
   const health = await waitForHealthyRecommend(client, selfHealConfig, {
     timeoutMs: slowLive ? 180000 : 90000,
-    intervalMs: slowLive ? 1200 : 800
+    intervalMs: slowLive ? 1200 : 800,
+    refreshSettleMs: slowLive ? 12000 : 5000,
+    refreshNavigationTimeoutMs: slowLive ? 45000 : 20000
   });
   if (health?.loginDetection?.requires_login) {
     await session.close?.();
@@ -1880,7 +2235,7 @@ async function connectRecommendChromeSession({
       chrome: session.chrome || null
     });
   }
-  if (!health || health.status !== HEALTH_STATUS.HEALTHY) {
+  if (!isRecommendConnectorHealthAccepted(health)) {
     const latestUrl = await getMainFrameUrl(client).catch(() => currentUrl);
     const latestLoginDetection = await detectBossLoginState(client, { currentUrl: latestUrl }).catch(() => ({
       requires_login: isBossLoginUrl(latestUrl),
@@ -2136,7 +2491,8 @@ function buildRecommendFilter(parsed, args = {}) {
     groups.push({
       group: "recentNotView",
       labels: recentNotView,
-      selectAllLabels: true
+      selectAllLabels: true,
+      verifySticky: true
     });
   }
 
@@ -2145,7 +2501,8 @@ function buildRecommendFilter(parsed, args = {}) {
     groups.push({
       group: "degree",
       labels: degree,
-      selectAllLabels: true
+      selectAllLabels: true,
+      verifySticky: true
     });
   }
 
@@ -2154,7 +2511,8 @@ function buildRecommendFilter(parsed, args = {}) {
     groups.push({
       group: "gender",
       labels: gender,
-      selectAllLabels: true
+      selectAllLabels: true,
+      verifySticky: true
     });
   }
 
@@ -2163,7 +2521,8 @@ function buildRecommendFilter(parsed, args = {}) {
     groups.push({
       group: "school",
       labels: school,
-      selectAllLabels: true
+      selectAllLabels: true,
+      verifySticky: true
     });
   }
 
@@ -2206,7 +2565,14 @@ function normalizeRecommendStartInput(args = {}, parsed, configResolution = null
   };
 }
 
-function getRunOptions(args, parsed, normalized, session, configResolution = null) {
+function getRunOptions(
+  args,
+  parsed,
+  normalized,
+  session,
+  configResolution = null,
+  actionJournalScope = ""
+) {
   const slowLive = args.slow_live === true;
   const executePostAction = args.dry_run_post_action === true
     ? false
@@ -2243,6 +2609,14 @@ function getRunOptions(args, parsed, normalized, session, configResolution = nul
     actionTimeoutMs: parsePositiveInteger(args.action_timeout_ms, slowLive ? 12000 : 8000),
     actionIntervalMs: parsePositiveInteger(args.action_interval_ms, 500),
     actionAfterClickDelayMs: parseNonNegativeInteger(args.action_after_click_delay_ms, slowLive ? 1200 : 900),
+    actionJournalScope,
+    reverifyActionJournalScope: actionJournalScope
+      ? async () => resolveRecommendActionJournalScope({
+          host: normalized.host,
+          port: normalized.port,
+          strictFresh: true
+        })
+      : null,
     screeningMode: normalized.screeningMode,
     llmConfig: normalized.screeningMode === "llm" && configResolution?.ok ? {
       ...configResolution.config
@@ -2324,12 +2698,25 @@ function prepareRecommendPipelineStart(args = {}, { workspaceRoot = "" } = {}) {
   };
 }
 
+export function shouldPreserveRecommendDetailOnTerminal(snapshot = null) {
+  return snapshot?.checkpoint?.preserve_detail_on_terminal === true
+    && snapshot?.checkpoint?.action_result_critical_persisted !== true;
+}
+
 async function closeRecommendRunSession(runId) {
   const meta = recommendRunMeta.get(runId);
   if (!meta || meta.closed) return;
   try {
     try {
-      if (meta.session?.client) {
+      let preserveDetail = false;
+      try {
+        const snapshot = recommendRunService.getRecommendRun(runId);
+        preserveDetail = shouldPreserveRecommendDetailOnTerminal(snapshot);
+      } catch {
+        // If the in-memory run is unavailable, retain the existing best-effort cleanup policy.
+      }
+      meta.preserve_detail_on_terminal = preserveDetail;
+      if (meta.session?.client && !preserveDetail) {
         await closeRecommendDetail(meta.session.client, { attemptsLimit: 2 });
       }
     } catch {
@@ -2413,10 +2800,44 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
     };
   }
 
+  let actionJournalScope = "";
+  let actionProfileIdentity = null;
+  const liveGreetingRequested = normalized.postAction === "greet"
+    && args.dry_run_post_action !== true
+    && args.execute_post_action !== false;
+  if (liveGreetingRequested) {
+    try {
+      const resolvedScope = await resolveRecommendActionJournalScope({
+        host: normalized.host,
+        port: normalized.port,
+        session
+      });
+      actionJournalScope = resolvedScope.scope;
+      actionProfileIdentity = resolvedScope.identity;
+    } catch (error) {
+      await session.close?.();
+      return {
+        status: "FAILED",
+        error: {
+          code: error?.code || "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED",
+          message: error?.message || "Exact Chrome profile identity could not be proven",
+          retryable: false
+        }
+      };
+    }
+  }
+
   let started;
   try {
     started = recommendRunService.startRecommendRun({
-      ...getRunOptions(args, parsed, normalized, session, configResolution),
+      ...getRunOptions(
+        args,
+        parsed,
+        normalized,
+        session,
+        configResolution,
+        actionJournalScope
+      ),
       runId: fixedRunId || undefined,
       pid: process.pid
     });
@@ -2444,7 +2865,8 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
       port: normalized.port,
       target_url: session.navigation?.url || session.target?.url || RECOMMEND_TARGET_URL,
       target_id: session.target?.id || null,
-      auto_launch: session.chrome || null
+      auto_launch: session.chrome || null,
+      action_profile_identity: actionProfileIdentity
     },
     health: session.health || null
   });

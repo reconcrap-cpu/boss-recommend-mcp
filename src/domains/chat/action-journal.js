@@ -239,14 +239,31 @@ function appendRunId(runIds, runId) {
 
 const EVIDENCE_KEYS = new Set([
   "action",
+  "action_hit_test_attempt_count",
+  "action_hit_test_last_hit_backend_node_id",
+  "action_hit_test_reason",
   "active_candidate_id",
   "ask_error",
   "ask_ok",
   "confirm_confirmed",
   "confirm_error",
+  "control_backend_node_id",
+  "control_center_x",
+  "control_center_y",
+  "control_label",
+  "control_node_id",
+  "control_root_backend_node_id",
+  "control_root_node_id",
+  "control_rect_height",
+  "control_rect_width",
+  "control_rect_x",
+  "control_rect_y",
+  "control_root",
   "greeting_baseline_count",
   "greeting_evidence_readable",
   "message_observed",
+  "operation_id",
+  "pre_input_cdp_method",
   "request_confirmation_source",
   "request_ready_state_observed",
   "reason",
@@ -269,6 +286,37 @@ function sanitizeEvidence(value = {}) {
     if (typeof raw === "string") result[key] = raw.slice(0, 240);
   }
   return result;
+}
+
+function recordRevision(record) {
+  if (!record) return 0;
+  const historyLength = Array.isArray(record.history) ? record.history.length : 0;
+  const storedRevision = record.revision;
+  if (storedRevision == null) return historyLength;
+  const normalizedRevision = Number(storedRevision);
+  if (
+    !Number.isSafeInteger(normalizedRevision)
+    || normalizedRevision < 1
+    || normalizedRevision !== historyLength
+  ) {
+    throw journalError(
+      "CHAT_ACTION_JOURNAL_CORRUPT",
+      "Boss chat action journal revision does not exactly match its append-only history.",
+      {
+        stored_revision: storedRevision,
+        history_length: historyLength
+      }
+    );
+  }
+  return normalizedRevision;
+}
+
+function withRecordRevision(record) {
+  if (!record) return null;
+  return {
+    ...record,
+    revision: recordRevision(record)
+  };
 }
 
 export function hashChatActionGreeting(greeting) {
@@ -318,7 +366,7 @@ export function createChatActionJournal({
     const filePath = path.join(resolvedBaseDir, `${identity.actionKey}.json`);
     const stored = readJsonRecord(filePath);
     if (!stored) return null;
-    return cloneRecord(validateStoredRecord(stored, identity, filePath));
+    return cloneRecord(withRecordRevision(validateStoredRecord(stored, identity, filePath)));
   }
 
   function transition({
@@ -327,7 +375,10 @@ export function createChatActionJournal({
     state,
     runId = "",
     greeting,
-    evidence = {}
+    evidence = {},
+    recordIdempotent = false,
+    expectedUpdatedAt = null,
+    expectedRevision = null
   } = {}) {
     const identity = createChatActionIdentity({ scope, candidateId });
     const nextState = requireState(state);
@@ -337,7 +388,47 @@ export function createChatActionJournal({
     const lockHandle = acquireRecordLock(lockPath);
     try {
       const stored = readJsonRecord(filePath);
-      const existing = stored ? validateStoredRecord(stored, identity, filePath) : null;
+      const existing = stored
+        ? withRecordRevision(validateStoredRecord(stored, identity, filePath))
+        : null;
+      const observedRevision = recordRevision(existing);
+      if (expectedRevision != null) {
+        const normalizedExpectedRevision = Number(expectedRevision);
+        if (!Number.isSafeInteger(normalizedExpectedRevision) || normalizedExpectedRevision < 0) {
+          throw journalError(
+            "CHAT_ACTION_JOURNAL_REVISION_INVALID",
+            "Boss action journal expected revision must be a non-negative safe integer.",
+            { expected_revision: expectedRevision }
+          );
+        }
+        if (observedRevision !== normalizedExpectedRevision) {
+          throw journalError(
+            "CHAT_ACTION_JOURNAL_CONCURRENT_UPDATE",
+            "Boss action journal changed after it was read; this operation does not own the outbound action.",
+            {
+              action_key: identity.actionKey,
+              expected_revision: normalizedExpectedRevision,
+              observed_revision: observedRevision,
+              expected_updated_at: normalizeText(expectedUpdatedAt) || null,
+              observed_updated_at: normalizeText(existing?.updated_at) || null
+            }
+          );
+        }
+      }
+      if (
+        expectedUpdatedAt != null
+        && normalizeText(existing?.updated_at) !== normalizeText(expectedUpdatedAt)
+      ) {
+        throw journalError(
+          "CHAT_ACTION_JOURNAL_CONCURRENT_UPDATE",
+          "Boss action journal changed after it was read; this operation does not own the outbound action.",
+          {
+            action_key: identity.actionKey,
+            expected_updated_at: normalizeText(expectedUpdatedAt) || null,
+            observed_updated_at: normalizeText(existing?.updated_at) || null
+          }
+        );
+      }
       const suppliedGreeting = greeting == null ? "" : normalizeGreeting(greeting);
       const suppliedGreetingSha256 = suppliedGreeting ? hashChatActionGreeting(suppliedGreeting) : "";
 
@@ -369,7 +460,7 @@ export function createChatActionJournal({
           }
         );
       }
-      if (existing?.state === nextState) {
+      if (existing?.state === nextState && recordIdempotent !== true) {
         return {
           changed: false,
           idempotent: true,
@@ -384,6 +475,7 @@ export function createChatActionJournal({
       const record = existing ? {
         ...existing,
         state: nextState,
+        revision: observedRevision + 1,
         updated_at: at,
         evidence: {
           ...(existing.evidence && typeof existing.evidence === "object" ? existing.evidence : {}),
@@ -407,6 +499,7 @@ export function createChatActionJournal({
         scope_sha256: identity.scopeSha256,
         candidate_id: identity.candidateId,
         state: nextState,
+        revision: 1,
         greeting_sha256: suppliedGreetingSha256,
         evidence: safeEvidence,
         created_at: at,

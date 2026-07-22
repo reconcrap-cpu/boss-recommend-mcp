@@ -2379,6 +2379,7 @@ export async function clickPoint(client, x, y, {
   button = "left",
   clickCount = 1,
   delayMs = 80,
+  moveBeforePress = true,
   humanRestEnabled = null,
   humanInteraction = null
 } = {}) {
@@ -2390,7 +2391,11 @@ export async function clickPoint(client, x, y, {
   const humanEnabled = humanRestEnabled === true
     || humanInteraction?.enabled === true
     || (humanRestEnabled !== false && configured?.enabled === true);
-  if (humanEnabled && mergedHumanInteraction.clickMovementEnabled !== false) {
+  if (
+    moveBeforePress !== false
+    && humanEnabled
+    && mergedHumanInteraction.clickMovementEnabled !== false
+  ) {
     return simulateHumanClick(client, x, y, {
       ...mergedHumanInteraction,
       button,
@@ -2398,7 +2403,9 @@ export async function clickPoint(client, x, y, {
       delayMs
     });
   }
-  await client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" });
+  if (moveBeforePress !== false) {
+    await client.Input.dispatchMouseEvent({ type: "mouseMoved", x, y, button: "none" });
+  }
   await client.Input.dispatchMouseEvent({ type: "mousePressed", x, y, button, clickCount });
   if (delayMs > 0) await sleep(delayMs);
   await client.Input.dispatchMouseEvent({ type: "mouseReleased", x, y, button, clickCount });

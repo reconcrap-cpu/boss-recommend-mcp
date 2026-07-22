@@ -37,6 +37,33 @@ const GENDER_CODE_MAP = {
   2: "女"
 };
 
+const RECOMMEND_NETWORK_CANDIDATE_ID_KEYS = new Set([
+  "candidateid",
+  "encryptjid",
+  "encryptgeekid",
+  "gid",
+  "geekid",
+  "jid",
+  "securityid"
+]);
+
+const RECOMMEND_PLACEHOLDER_PROFILE_NAMES = new Set([
+  "-",
+  "--",
+  "boss用户",
+  "候选人",
+  "匿名",
+  "匿名候选人",
+  "匿名用户",
+  "暂无",
+  "未知",
+  "未填写",
+  "用户",
+  "求职者",
+  "牛人",
+  "保密"
+]);
+
 const LLM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "auto", "current"]);
 const LLM_SCREENING_STRATEGIES = new Set(["single_pass", "fast_first_verified"]);
 const FAST_FIRST_DEFAULT_FAST_MAX_TOKENS = 384;
@@ -756,6 +783,177 @@ function collectObjects(root, {
   return objects;
 }
 
+function normalizeRecommendBindingCandidateId(value = "") {
+  if (!["string", "number"].includes(typeof value)) return "";
+  const raw = normalizeText(value);
+  if (!raw) return "";
+  try {
+    return normalizeText(decodeURIComponent(raw));
+  } catch {
+    return raw;
+  }
+}
+
+function normalizeRecommendBindingName(value = "") {
+  return normalizeText(value).normalize("NFKC").toLocaleLowerCase("zh-CN");
+}
+
+function isRecommendPlaceholderProfileName(value = "") {
+  const normalized = normalizeRecommendBindingName(value);
+  return !normalized
+    || RECOMMEND_PLACEHOLDER_PROFILE_NAMES.has(normalized)
+    || /^[-—–_*＊]+$/u.test(normalized);
+}
+
+function canonicalRecommendNetworkCandidateIdKey(value = "") {
+  return String(value || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
+function collectRecommendNetworkCandidateIdEvidence(networkBody = {}, profileRoots = []) {
+  const evidence = [];
+  const seen = new Set();
+  const add = (value, source) => {
+    const candidateId = normalizeRecommendBindingCandidateId(value);
+    if (!candidateId) return;
+    const key = `${candidateId}\u0000${source}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    evidence.push({ candidate_id: candidateId, source });
+  };
+
+  const rawUrl = normalizeText(networkBody?.url);
+  if (rawUrl) {
+    try {
+      const parsedUrl = new URL(rawUrl, "https://www.zhipin.com");
+      if (/\/geek\/info(?:\/|$)/i.test(parsedUrl.pathname)) {
+        for (const [key, value] of parsedUrl.searchParams.entries()) {
+          const canonicalKey = canonicalRecommendNetworkCandidateIdKey(key);
+          if (RECOMMEND_NETWORK_CANDIDATE_ID_KEYS.has(canonicalKey)) {
+            add(value, `url_query:${canonicalKey}`);
+          }
+        }
+      }
+    } catch {
+      // An unparseable response URL cannot prove candidate identity.
+    }
+  }
+
+  for (const object of profileRoots.filter(isPlainObject)) {
+    for (const [key, value] of Object.entries(object)) {
+      const canonicalKey = canonicalRecommendNetworkCandidateIdKey(key);
+      if (!RECOMMEND_NETWORK_CANDIDATE_ID_KEYS.has(canonicalKey)) continue;
+      add(value, `payload_profile_field:${canonicalKey}`);
+    }
+  }
+
+  return evidence.slice(0, 20);
+}
+
+function collectRecommendResponseCandidateIdDiagnostics(parsedObjects = []) {
+  const ids = [];
+  for (const object of collectObjects(parsedObjects, { maxObjects: 800, maxDepth: 10 })) {
+    for (const [key, value] of Object.entries(object)) {
+      const canonicalKey = canonicalRecommendNetworkCandidateIdKey(key);
+      if (!RECOMMEND_NETWORK_CANDIDATE_ID_KEYS.has(canonicalKey)) continue;
+      const candidateId = normalizeRecommendBindingCandidateId(value);
+      if (candidateId) ids.push(candidateId);
+    }
+  }
+  return [...new Set(ids)].slice(0, 10);
+}
+
+function bindRecommendNetworkProfileToCard(parsedProfile, cardCandidate) {
+  if (!parsedProfile?.ok) return parsedProfile;
+  const expectedCandidateId = normalizeRecommendBindingCandidateId(cardCandidate?.id);
+  const expectedName = normalizeText(cardCandidate?.identity?.name);
+  const normalizedExpectedName = normalizeRecommendBindingName(expectedName);
+  const profileName = normalizeText(parsedProfile?.profile?.identity?.name);
+  const normalizedProfileName = normalizeRecommendBindingName(profileName);
+  const candidateIdEvidence = Array.isArray(parsedProfile.candidate_id_evidence)
+    ? parsedProfile.candidate_id_evidence
+    : [];
+  const observedCandidateIds = [...new Set(candidateIdEvidence.map((item) => (
+    normalizeRecommendBindingCandidateId(item?.candidate_id)
+  )).filter(Boolean))].slice(0, 5);
+  const responseObservedCandidateIds = Array.isArray(parsedProfile.response_candidate_id_diagnostics)
+    ? parsedProfile.response_candidate_id_diagnostics.slice(0, 10)
+    : [];
+  const matchedCandidateIdEvidence = candidateIdEvidence.find((item) => (
+    normalizeRecommendBindingCandidateId(item?.candidate_id) === expectedCandidateId
+  )) || null;
+  const candidateIdConflict = observedCandidateIds.length > 1;
+  const candidateIdVerified = Boolean(
+    expectedCandidateId
+    && observedCandidateIds.length === 1
+    && observedCandidateIds[0] === expectedCandidateId
+  );
+  const profileNameUsable = !isRecommendPlaceholderProfileName(profileName);
+  const expectedNameUsable = !isRecommendPlaceholderProfileName(expectedName);
+  const nameVerified = Boolean(
+    expectedNameUsable
+    && profileNameUsable
+    && normalizedProfileName === normalizedExpectedName
+  );
+  let reason = null;
+  if (!expectedCandidateId) reason = "expected_candidate_id_missing";
+  else if (!candidateIdEvidence.length) reason = "network_candidate_id_evidence_missing";
+  else if (candidateIdConflict) reason = "network_candidate_id_conflict";
+  else if (!candidateIdVerified) reason = "network_candidate_id_mismatch";
+  else if (!expectedNameUsable) reason = "expected_card_name_placeholder_or_missing";
+  else if (!profileNameUsable) reason = "network_profile_name_placeholder_or_missing";
+  else if (!nameVerified) reason = "network_profile_name_mismatch";
+
+  const binding = {
+    required: true,
+    verified: !reason,
+    reason,
+    expected_candidate_id: expectedCandidateId || null,
+    matched_candidate_id_source: candidateIdVerified
+      ? matchedCandidateIdEvidence?.source || null
+      : null,
+    observed_candidate_id_count: candidateIdEvidence.length,
+    observed_candidate_ids: observedCandidateIds,
+    response_observed_candidate_ids: responseObservedCandidateIds,
+    expected_name: expectedName || null,
+    profile_name: profileName || null,
+    exact_name: nameVerified
+  };
+  if (!reason) {
+    return {
+      ...parsedProfile,
+      candidate_binding: binding
+    };
+  }
+
+  const { profile: _excludedProfile, ...diagnostic } = parsedProfile;
+  return {
+    ...diagnostic,
+    ok: false,
+    error: "RECOMMEND_NETWORK_PROFILE_CANDIDATE_BINDING_UNVERIFIED",
+    candidate_binding: binding
+  };
+}
+
+function compactNetworkProfileCandidateBinding(binding = null) {
+  if (!binding) return null;
+  return {
+    verified: binding.verified === true,
+    reason: binding.reason || null,
+    expected_candidate_id: binding.expected_candidate_id || null,
+    matched_candidate_id_source: binding.matched_candidate_id_source || null,
+    observed_candidate_id_count: Number(binding.observed_candidate_id_count) || 0,
+    observed_candidate_ids: Array.isArray(binding.observed_candidate_ids)
+      ? binding.observed_candidate_ids.slice(0, 5)
+      : [],
+    response_observed_candidate_ids: Array.isArray(binding.response_observed_candidate_ids)
+      ? binding.response_observed_candidate_ids.slice(0, 10)
+      : [],
+    expected_name: binding.expected_name || null,
+    profile_name: binding.profile_name || null,
+    exact_name: binding.exact_name === true
+  };
+}
+
 function joinRange(start, end, fallback = "") {
   const left = parseDateLike(start);
   const right = parseDateLike(end);
@@ -889,8 +1087,29 @@ function resolveBossGeekDetail(payload = {}) {
   return found || { sourceKey: "", detail: null };
 }
 
+function resolveBossChatGeekInfoData(payload = {}) {
+  return payload?.zpData?.data
+    || payload?.data
+    || payload?.zpData?.geekInfo
+    || payload?.geekInfo
+    || null;
+}
+
+function resolveBossChatHistoryResumeObject(payload = {}) {
+  const messages = normalizeList(payload?.zpData?.messages).length
+    ? normalizeList(payload?.zpData?.messages)
+    : normalizeList(payload?.messages).length
+      ? normalizeList(payload?.messages)
+      : normalizeList(payload?.data?.messages).length
+        ? normalizeList(payload?.data?.messages)
+        : normalizeList(payload?.zpData?.data?.messages);
+  return messages
+    .map((message) => message?.body?.resume)
+    .find((resume) => resume && typeof resume === "object") || null;
+}
+
 function extractBossChatGeekInfo(payload = {}) {
-  const data = payload?.zpData?.data || payload?.data || payload?.zpData?.geekInfo || payload?.geekInfo;
+  const data = resolveBossChatGeekInfoData(payload);
   if (!data || typeof data !== "object") return null;
   if (!isBossChatProfileShape(data)) return null;
   const educationList = normalizeList(data.eduExpList);
@@ -961,17 +1180,7 @@ function extractBossChatGeekInfo(payload = {}) {
 }
 
 function extractBossChatHistoryResume(payload = {}) {
-  const messages = normalizeList(payload?.zpData?.messages).length
-    ? normalizeList(payload?.zpData?.messages)
-    : normalizeList(payload?.messages).length
-      ? normalizeList(payload?.messages)
-      : normalizeList(payload?.data?.messages).length
-        ? normalizeList(payload?.data?.messages)
-        : normalizeList(payload?.zpData?.data?.messages);
-  const resumes = messages
-    .map((message) => message?.body?.resume)
-    .filter((resume) => resume && typeof resume === "object");
-  const resume = resumes[0];
+  const resume = resolveBossChatHistoryResumeObject(payload);
   if (!resume) return null;
   const user = resume.user || {};
   const educationList = normalizeList(resume.education);
@@ -1177,6 +1386,10 @@ export function extractBossProfileFromNetworkBody(networkBody = {}) {
     tryParseJson(text),
     ...tryParseEmbeddedJsonObjects(text)
   ].filter((item) => item && typeof item === "object");
+  const responseCandidateIdDiagnostics = collectRecommendResponseCandidateIdDiagnostics(
+    parsedObjects
+  );
+  let candidateIdEvidence = collectRecommendNetworkCandidateIdEvidence(networkBody, []);
   if (!parsedObjects.length) {
     const htmlText = /<html|<body|<div|<section|<script/i.test(text) ? htmlToText(text) : "";
     if (htmlText && htmlText.length > 80) {
@@ -1191,6 +1404,8 @@ export function extractBossProfileFromNetworkBody(networkBody = {}) {
         status: networkBody.status ?? null,
         mimeType: networkBody.mimeType || null,
         text_length: text.length,
+        candidate_id_evidence: candidateIdEvidence,
+        response_candidate_id_diagnostics: responseCandidateIdDiagnostics,
         profile: {
           identity: candidate.identity,
           tags: candidate.tags,
@@ -1206,21 +1421,49 @@ export function extractBossProfileFromNetworkBody(networkBody = {}) {
     return {
       ok: false,
       error: "NETWORK_BODY_NOT_JSON",
-      text_length: text.length
+      text_length: text.length,
+      candidate_id_evidence: candidateIdEvidence,
+      response_candidate_id_diagnostics: responseCandidateIdDiagnostics
     };
   }
   let profile = null;
   let parsed = parsedObjects[0];
+  let profileBindingRoots = [];
   for (const candidateObject of parsedObjects) {
-    profile = extractBossGeekDetailInfo(candidateObject)
-      || extractBossChatGeekInfo(candidateObject)
-      || extractBossChatHistoryResume(candidateObject)
-      || extractBossProfileRecursively(candidateObject);
+    const geekDetail = resolveBossGeekDetail(candidateObject).detail;
+    if (geekDetail) {
+      profile = extractBossGeekDetailInfo(candidateObject);
+      profileBindingRoots = [
+        geekDetail,
+        geekDetail.geekBaseInfo,
+        geekDetail.baseInfo,
+        geekDetail.base
+      ].filter(isPlainObject);
+    } else {
+      const chatData = resolveBossChatGeekInfoData(candidateObject);
+      if (isBossChatProfileShape(chatData)) {
+        profile = extractBossChatGeekInfo(candidateObject);
+        profileBindingRoots = [chatData];
+      } else {
+        const historyResume = resolveBossChatHistoryResumeObject(candidateObject);
+        if (historyResume) {
+          profile = extractBossChatHistoryResume(candidateObject);
+          profileBindingRoots = [historyResume, historyResume.user].filter(isPlainObject);
+        } else {
+          profile = extractBossProfileRecursively(candidateObject);
+          profileBindingRoots = [];
+        }
+      }
+    }
     if (profile) {
       parsed = candidateObject;
       break;
     }
   }
+  candidateIdEvidence = collectRecommendNetworkCandidateIdEvidence(
+    networkBody,
+    profileBindingRoots
+  );
   if (!profile) {
     const encryptedPayload = parsedObjects.find((item) => (
       normalizeText(item?.zpData?.encryptGeekDetailInfo || item?.encryptGeekDetailInfo || "")
@@ -1234,7 +1477,9 @@ export function extractBossProfileFromNetworkBody(networkBody = {}) {
       zpData_keys: Object.keys(parsed?.zpData || {}).slice(0, 50),
       data_keys: Object.keys(parsed?.data || parsed?.zpData?.data || {}).slice(0, 50),
       encrypted_resume: Boolean(encryptedPayload),
-      encrypted_resume_length: normalizeText(encryptedPayload?.zpData?.encryptGeekDetailInfo || encryptedPayload?.encryptGeekDetailInfo || "").length
+      encrypted_resume_length: normalizeText(encryptedPayload?.zpData?.encryptGeekDetailInfo || encryptedPayload?.encryptGeekDetailInfo || "").length,
+      candidate_id_evidence: candidateIdEvidence,
+      response_candidate_id_diagnostics: responseCandidateIdDiagnostics
     };
   }
   return {
@@ -1243,6 +1488,8 @@ export function extractBossProfileFromNetworkBody(networkBody = {}) {
     status: networkBody.status ?? null,
     mimeType: networkBody.mimeType || null,
     text_length: text.length,
+    candidate_id_evidence: candidateIdEvidence,
+    response_candidate_id_diagnostics: responseCandidateIdDiagnostics,
     profile
   };
 }
@@ -1269,19 +1516,34 @@ export function buildScreeningCandidateFromDetail({
   source = "live-cdp-detail",
   metadata = {}
 } = {}) {
-  const parsedNetworkProfiles = networkBodies.map(extractBossProfileFromNetworkBody);
+  const normalizedDomain = normalizeDomain(domain);
+  const extractedNetworkProfiles = networkBodies.map(extractBossProfileFromNetworkBody);
+  const parsedNetworkProfiles = normalizedDomain === "recommend"
+    ? extractedNetworkProfiles.map((item) => bindRecommendNetworkProfileToCard(item, cardCandidate))
+    : extractedNetworkProfiles;
   const successfulProfiles = parsedNetworkProfiles.filter((item) => item.ok).map((item) => item.profile);
   const networkText = successfulProfiles.map((profile) => profile.text).filter(Boolean).join("\n\n");
   const networkIdentity = mergeCandidateProfiles(
     ...successfulProfiles.map((profile) => profile.identity)
   );
   const networkTags = unique(successfulProfiles.flatMap((profile) => profile.tags || []));
-  const combinedIdentity = mergeCandidateProfiles(
-    networkIdentity,
-    cardCandidate?.identity
-  );
+  const combinedIdentity = normalizedDomain === "recommend"
+    ? mergeCandidateProfiles(cardCandidate?.identity, networkIdentity)
+    : mergeCandidateProfiles(networkIdentity, cardCandidate?.identity);
+  const networkProfileBinding = normalizedDomain === "recommend"
+    ? {
+        required: true,
+        accepted_count: successfulProfiles.length,
+        rejected_count: parsedNetworkProfiles.filter((item) => (
+          item?.error === "RECOMMEND_NETWORK_PROFILE_CANDIDATE_BINDING_UNVERIFIED"
+        )).length,
+        profiles: parsedNetworkProfiles.map((item) => compactNetworkProfileCandidateBinding(
+          item?.candidate_binding
+        )).filter(Boolean)
+      }
+    : null;
   const candidate = normalizeCandidateProfile({
-    domain,
+    domain: normalizedDomain,
     source,
     id: cardCandidate?.id,
     href: cardCandidate?.links?.href,
@@ -1300,19 +1562,22 @@ export function buildScreeningCandidateFromDetail({
       ...metadata,
       card_candidate_source: cardCandidate?.source || null,
       network_profile_count: successfulProfiles.length,
+      network_profile_binding: networkProfileBinding,
       network_profiles: parsedNetworkProfiles.map((item) => ({
         ok: item.ok,
         url: item.url,
         status: item.status,
         error: item.error,
         text_length: item.text_length,
-        source_keys: item.profile?.source_keys || null
+        source_keys: item.profile?.source_keys || null,
+        candidate_binding: compactNetworkProfileCandidateBinding(item.candidate_binding)
       }))
     }
   });
   return {
     candidate,
-    parsed_network_profiles: parsedNetworkProfiles
+    parsed_network_profiles: parsedNetworkProfiles,
+    network_profile_binding: networkProfileBinding
   };
 }
 

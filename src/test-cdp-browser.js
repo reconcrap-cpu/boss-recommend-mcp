@@ -842,6 +842,10 @@ async function testConfiguredHumanInteractionControlsClickPoint() {
   assert.deepEqual(events.map((event) => event.type), ["mouseMoved", "mousePressed", "mouseReleased"]);
 
   events.length = 0;
+  await clickPoint(guarded, 10, 10, { delayMs: 0, moveBeforePress: false });
+  assert.deepEqual(events.map((event) => event.type), ["mousePressed", "mouseReleased"]);
+
+  events.length = 0;
   configureHumanInteraction(guarded, {
     enabled: true,
     random: createSequenceRandom(Array.from({ length: 80 }, () => 0.5)),

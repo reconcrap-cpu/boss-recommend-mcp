@@ -5,6 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import { resolveHumanBehaviorForRun } from "./chat-runtime-config.js";
+import {
+  acceptRecommendEmptyBootstrapHealth,
+  getRecommendEmptyBootstrapPreflightAction,
+  isRecommendConnectorHealthAccepted,
+  resolveRecommendActionJournalScope,
+  shouldPreserveRecommendDetailOnTerminal
+} from "./recommend-mcp.js";
 
 const {
   createToolsSchema,
@@ -28,6 +36,288 @@ const TOOL_GET_SCHEDULE = "get_recommend_scheduled_run";
 const TOOL_RUN_RECOMMEND = "run_recommend";
 const TOOL_START = "start_recommend_pipeline_run";
 const TOOL_GET = "get_recommend_pipeline_run";
+
+function testExplicitHumanRestLevelAliasOverridesConfigDefault() {
+  const config = {
+    humanBehavior: {
+      profile: "paced_with_rests",
+      restLevel: "low"
+    }
+  };
+  assert.equal(resolveHumanBehaviorForRun({
+    human_behavior: {
+      rest_level: "high"
+    }
+  }, config).restLevel, "high");
+  assert.equal(resolveHumanBehaviorForRun({
+    human_behavior: {
+      restLevel: "medium",
+      rest_level: "high"
+    }
+  }, config).restLevel, "medium");
+}
+
+function testRecommendTerminalCleanupPreservesUnpersistedPostActionDetail() {
+  assert.equal(shouldPreserveRecommendDetailOnTerminal({
+    checkpoint: {
+      preserve_detail_on_terminal: true,
+      action_result_critical_persisted: false
+    }
+  }), true);
+  assert.equal(shouldPreserveRecommendDetailOnTerminal({
+    checkpoint: {
+      preserve_detail_on_terminal: true,
+      action_result_critical_persisted: true
+    }
+  }), false);
+  assert.equal(shouldPreserveRecommendDetailOnTerminal({ checkpoint: {} }), false);
+}
+
+function degradedRecommendHealth(failedRequiredIds = ["candidate_cards"]) {
+  return {
+    status: "degraded",
+    summary: {
+      status: "degraded",
+      failed_required_ids: failedRequiredIds,
+      blocked_required_ids: []
+    },
+    probes: []
+  };
+}
+
+function exactRecommendFilteredEmptyState() {
+  return {
+    verified: true,
+    reason: "exact_visible_filtered_empty_state",
+    text: "没有相关数据",
+    node_id: 42,
+    accessibility: {
+      verified: true,
+      reason: "exact_accessible_text"
+    }
+  };
+}
+
+function successfulRecommendEmptyBootstrapRefresh() {
+  return {
+    attempted: true,
+    completed: true,
+    ok: true,
+    method: "Page.navigate",
+    target_url: "https://www.zhipin.com/web/chat/recommend",
+    before: {
+      health: degradedRecommendHealth(),
+      empty_state: exactRecommendFilteredEmptyState()
+    }
+  };
+}
+
+function testRecommendConnectorRefreshesBeforeExactEmptyBootstrap() {
+  const health = degradedRecommendHealth();
+  const emptyState = exactRecommendFilteredEmptyState();
+  assert.equal(
+    getRecommendEmptyBootstrapPreflightAction(health, emptyState),
+    "refresh"
+  );
+  assert.equal(acceptRecommendEmptyBootstrapHealth(health, emptyState), null);
+}
+
+function testRecommendConnectorAcceptsHealthyAfterEmptyBootstrapRefresh() {
+  const health = {
+    status: "healthy",
+    summary: {
+      status: "healthy",
+      failed_required_ids: [],
+      blocked_required_ids: []
+    }
+  };
+  assert.equal(
+    getRecommendEmptyBootstrapPreflightAction(
+      health,
+      null,
+      successfulRecommendEmptyBootstrapRefresh()
+    ),
+    "accept_healthy"
+  );
+  assert.equal(isRecommendConnectorHealthAccepted(health), true);
+}
+
+function testRecommendConnectorAcceptsExactEmptyAfterBootstrapRefresh() {
+  const health = degradedRecommendHealth();
+  const refresh = successfulRecommendEmptyBootstrapRefresh();
+  const accepted = acceptRecommendEmptyBootstrapHealth(
+    health,
+    exactRecommendFilteredEmptyState(),
+    refresh
+  );
+  assert.ok(accepted);
+  assert.equal(accepted.status, "degraded");
+  assert.equal(accepted.summary, health.summary);
+  assert.equal(accepted.accepted_empty_bootstrap.accepted, true);
+  assert.equal(accepted.accepted_empty_bootstrap.original_health_status, "degraded");
+  assert.deepEqual(accepted.accepted_empty_bootstrap.failed_required_ids, ["candidate_cards"]);
+  assert.equal(accepted.accepted_empty_bootstrap.empty_state.accessibility.verified, true);
+  assert.equal(accepted.empty_bootstrap_refresh.method, "Page.navigate");
+  assert.equal(accepted.empty_bootstrap_refresh.before.health.status, "degraded");
+  assert.equal(accepted.empty_bootstrap_refresh.after.health.status, "degraded");
+  assert.equal(accepted.empty_bootstrap_refresh.after.empty_state.verified, true);
+  assert.equal(isRecommendConnectorHealthAccepted(accepted), true);
+}
+
+function testRecommendConnectorRejectsUnverifiedEmptyBootstrap() {
+  const health = degradedRecommendHealth();
+  const unverified = {
+    ...exactRecommendFilteredEmptyState(),
+    verified: false,
+    reason: "exact_empty_text_not_visible_or_accessible"
+  };
+  assert.equal(
+    getRecommendEmptyBootstrapPreflightAction(
+      health,
+      unverified,
+      successfulRecommendEmptyBootstrapRefresh()
+    ),
+    "wait"
+  );
+  assert.equal(
+    acceptRecommendEmptyBootstrapHealth(
+      health,
+      unverified,
+      successfulRecommendEmptyBootstrapRefresh()
+    ),
+    null
+  );
+  assert.equal(isRecommendConnectorHealthAccepted(health), false);
+}
+
+function testRecommendConnectorRejectsAdditionalRequiredFailure() {
+  const health = degradedRecommendHealth(["candidate_cards", "filter_trigger"]);
+  assert.equal(
+    getRecommendEmptyBootstrapPreflightAction(
+      health,
+      exactRecommendFilteredEmptyState()
+    ),
+    "wait"
+  );
+  assert.equal(
+    acceptRecommendEmptyBootstrapHealth(
+      health,
+      exactRecommendFilteredEmptyState(),
+      successfulRecommendEmptyBootstrapRefresh()
+    ),
+    null
+  );
+  assert.equal(isRecommendConnectorHealthAccepted(health), false);
+}
+
+async function testRecommendActionJournalScopeCanonicalizesLoopbackAndBindsProfile() {
+  const session = {
+    profile_identity: {
+      verified: true,
+      user_data_dir: process.cwd(),
+      profile_directory: "src"
+    }
+  };
+  const localhost = await resolveRecommendActionJournalScope({ host: "localhost", port: 9222, session });
+  const ipv4 = await resolveRecommendActionJournalScope({ host: "127.0.0.1", port: 9333, session });
+  assert.equal(localhost.scope, ipv4.scope);
+  assert.match(localhost.scope, /^boss-recommend-profile-v2:127\.0\.0\.1:profile-sha256:[0-9a-f]{64}$/u);
+  assert.equal(Object.prototype.hasOwnProperty.call(localhost.identity, "user_data_dir"), false);
+  await assert.rejects(
+    () => resolveRecommendActionJournalScope({
+      host: "127.0.0.1",
+      port: 9222,
+      session: {
+        profile_identity: {
+          verified: true,
+          user_data_dir: process.cwd(),
+          profile_directory: "missing-profile"
+        }
+      }
+    }),
+    (error) => error?.code === "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED"
+      || error?.code === "ENOENT"
+  );
+
+  await assert.rejects(
+    () => resolveRecommendActionJournalScope({
+      host: "127.0.0.1",
+      port: 9222,
+      session,
+      strictFresh: true,
+      inspectCommandLine: async () => ({
+        ok: false,
+        source: "process_list",
+        arguments: [],
+        error: "process inspection unavailable"
+      })
+    }),
+    (error) => error?.code === "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED"
+  );
+
+  const freshScope = await resolveRecommendActionJournalScope({
+    host: "127.0.0.1",
+    port: 9222,
+    session: {
+      profile_identity: {
+        verified: true,
+        user_data_dir: process.cwd(),
+        profile_directory: "docs"
+      }
+    },
+    strictFresh: true,
+    inspectCommandLine: async () => ({
+      ok: true,
+      source: "process_list",
+      arguments: [
+        "chrome.exe",
+        "--remote-debugging-port=9222",
+        `--user-data-dir=${process.cwd()}`,
+        "--profile-directory=src"
+      ]
+    })
+  });
+  assert.equal(freshScope.scope, localhost.scope);
+  assert.equal(freshScope.identity.source, "fresh_process_list");
+
+  const takeoverScope = await resolveRecommendActionJournalScope({
+    host: "127.0.0.1",
+    port: 9222,
+    session,
+    strictFresh: true,
+    inspectCommandLine: async () => ({
+      ok: true,
+      source: "process_list",
+      arguments: [
+        "chrome.exe",
+        "--remote-debugging-port=9222",
+        `--user-data-dir=${process.cwd()}`,
+        "--profile-directory=docs"
+      ]
+    })
+  });
+  assert.notEqual(takeoverScope.scope, localhost.scope);
+
+  await assert.rejects(
+    () => resolveRecommendActionJournalScope({
+      host: "127.0.0.1",
+      port: 9222,
+      session,
+      strictFresh: true,
+      inspectCommandLine: async () => ({
+        ok: true,
+        source: "process_list",
+        arguments: [
+          "chrome.exe",
+          "--remote-debugging-port=9333",
+          `--user-data-dir=${process.cwd()}`,
+          "--profile-directory=src"
+        ]
+      })
+    }),
+    (error) => error?.code === "RECOMMEND_ACTION_PROFILE_IDENTITY_UNVERIFIED"
+  );
+}
 const TOOL_LIST_RUNS = "list_recommend_pipeline_runs";
 const TOOL_PAUSE = "pause_recommend_pipeline_run";
 const TOOL_RESUME = "resume_recommend_pipeline_run";
@@ -325,6 +615,11 @@ function installFakeConnector({ onConnect = null } = {}) {
       },
       health: {
         status: "healthy"
+      },
+      profile_identity: {
+        verified: true,
+        user_data_dir: process.cwd(),
+        profile_directory: "src"
       },
       async close() {
         closeCount += 1;
@@ -770,7 +1065,7 @@ async function testRecommendPreparedCronPayloadStartsAccepted() {
   const args = readyArgs({
     delay_ms: 0,
     human_behavior: {
-      restLevel: "high"
+      rest_level: "high"
     }
   });
   const prepared = await callTool(TOOL_PREPARE, args, 5);
@@ -782,8 +1077,9 @@ async function testRecommendPreparedCronPayloadStartsAccepted() {
   assert.equal(started.status, "ACCEPTED");
   assert.equal(started.run.context.confirmation.final_confirmed, true);
   assert.equal(started.run.context.confirmation.job_confirmed, true);
-  await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
+  const completed = await waitForRecommendRun(started.run_id, (run) => run?.status === "completed");
   assert.equal(observedOptions.humanBehavior.restLevel, "high");
+  assert.equal(completed.context.human_rest_level, "high");
 }
 
 async function testRecommendJobListLoginRequiredBlocksCronSetup() {
@@ -2321,14 +2617,14 @@ async function testRecommendMultiSelectFilterMapping() {
       labels: ["近14天没有"],
       selectAllLabels: true,
       allowUnlimited: false,
-      verifySticky: false
+      verifySticky: true
     },
     {
       group: "degree",
       labels: ["本科", "硕士", "博士"],
       selectAllLabels: true,
       allowUnlimited: false,
-      verifySticky: false
+      verifySticky: true
     }
   ]);
 }
@@ -2663,6 +2959,14 @@ async function testRecommendArtifactsUseConfiguredOutputDir(outputDir) {
 }
 
 async function main() {
+  testExplicitHumanRestLevelAliasOverridesConfigDefault();
+  testRecommendTerminalCleanupPreservesUnpersistedPostActionDetail();
+  testRecommendConnectorRefreshesBeforeExactEmptyBootstrap();
+  testRecommendConnectorAcceptsHealthyAfterEmptyBootstrapRefresh();
+  testRecommendConnectorAcceptsExactEmptyAfterBootstrapRefresh();
+  testRecommendConnectorRejectsUnverifiedEmptyBootstrap();
+  testRecommendConnectorRejectsAdditionalRequiredFailure();
+  await testRecommendActionJournalScopeCanonicalizesLoopbackAndBindsProfile();
   const previousHome = process.env.BOSS_RECOMMEND_HOME;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
   const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;

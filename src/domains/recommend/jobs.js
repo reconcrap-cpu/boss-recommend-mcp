@@ -36,17 +36,46 @@ function trimSalarySuffix(label) {
   return stripSalaryText(label);
 }
 
+function splitStructuredJobLabel(label) {
+  const withoutSalary = normalizeText(stripSalaryText(label));
+  const separatorIndex = withoutSalary.lastIndexOf(" _ ");
+  if (separatorIndex < 0) {
+    return {
+      full: normalizeJobText(withoutSalary),
+      role: normalizeJobText(withoutSalary),
+      location: ""
+    };
+  }
+  return {
+    full: normalizeJobText(withoutSalary),
+    role: normalizeJobText(withoutSalary.slice(0, separatorIndex)),
+    location: normalizeJobText(withoutSalary.slice(separatorIndex + 3))
+  };
+}
+
 export function jobLabelMatches(optionLabel, targetLabel) {
   const option = normalizeJobText(optionLabel);
   const target = normalizeJobText(targetLabel);
   const optionWithoutSalary = normalizeJobText(stripSalaryText(optionLabel));
   const targetWithoutSalary = normalizeJobText(stripSalaryText(targetLabel));
   if (!option || !target) return false;
-  return option === target
-    || option.startsWith(target)
+  if (option === target
     || optionWithoutSalary === target
     || option === targetWithoutSalary
-    || optionWithoutSalary === targetWithoutSalary;
+    || optionWithoutSalary === targetWithoutSalary) {
+    return true;
+  }
+
+  const optionParts = splitStructuredJobLabel(optionLabel);
+  const targetParts = splitStructuredJobLabel(targetLabel);
+  // A caller may provide only the role name while Boss renders the option as
+  // "role _ city [salary]".  Accept only that structured metadata suffix;
+  // never restore arbitrary startsWith matching between two role names.
+  return Boolean(
+    !targetParts.location
+    && optionParts.location
+    && optionParts.role === targetParts.role
+  );
 }
 
 function isVisibleBox(box) {

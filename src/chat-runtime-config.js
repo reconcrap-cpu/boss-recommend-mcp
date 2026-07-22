@@ -281,6 +281,8 @@ export function resolveHumanBehaviorForRun(args = {}, config = {}) {
     const rawProfile = readFirstOwn(rawBehavior, ["profile", "mode", "behaviorProfile", "behavior_profile"]);
     if (rawProfile !== undefined) applyHumanBehaviorProfileDefaults(override, rawProfile);
     Object.assign(override, rawBehavior);
+    const rawRestLevel = readFirstOwn(rawBehavior, ["restLevel", "rest_level"]);
+    if (rawRestLevel !== undefined) override.restLevel = rawRestLevel;
   }
 
   const profile = readFirstOwn(args, ["human_behavior_profile", "humanBehaviorProfile"]);

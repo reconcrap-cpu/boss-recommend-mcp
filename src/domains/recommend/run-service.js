@@ -1,4 +1,6 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createRunLifecycleManager } from "../../core/run/index.js";
 import {
@@ -47,6 +49,7 @@ import {
   resolveInfiniteListFallbackPoint
 } from "../../core/infinite-list/index.js";
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
+import { createChatActionJournal } from "../chat/action-journal.js";
 import {
   callScreeningLlm,
   compactScreeningLlmResult,
@@ -60,11 +63,17 @@ import {
   closeRecommendBlockingPanels,
   closeRecommendAvatarPreview,
   closeRecommendDetail,
+  compactRecommendDetailCandidateBinding,
+  createRecommendDetailCandidateBindingError,
   createRecommendDetailNetworkRecorder,
   extractRecommendDetailCandidate,
+  isRecommendDetailCandidateBindingError,
   isRecommendDetailOpenMissError,
+  isRecommendPreClickStaleNoActionError,
   isStaleRecommendNodeError,
   openRecommendCardDetailWithFreshRetry,
+  verifyExactCardClickToNewResumeRootCausality,
+  verifyRecommendDetailCandidateBinding,
   waitForRecommendDetail,
   waitForRecommendDetailNetworkEvents
 } from "./detail.js";
@@ -77,9 +86,12 @@ import { ensureRecommendCurrentCityOnly } from "./location.js";
 import {
   applyRecommendFilterEnvelopeStages,
   buildRecommendFilterSelectionOptions,
-  refreshRecommendListAtEnd
+  inspectRecommendFilteredEmptyState,
+  isVerifiedRecommendFilterApplication,
+  isVerifiedRecommendRefreshExhaustion,
+  refreshRecommendListAtEnd,
+  selectRecommendJobWithRootRefresh
 } from "./refresh.js";
-import { selectRecommendJob } from "./jobs.js";
 import {
   normalizeRecommendPageScope,
   selectRecommendPageScope
@@ -96,9 +108,27 @@ import {
   clickRecommendActionControl,
   normalizeRecommendPostAction,
   resolveRecommendPostAction,
+  verifyRecommendActionControlIdentity,
   waitForRecommendDetailActionControls
 } from "./actions.js";
 import { getRecommendRoots } from "./roots.js";
+
+const RECOMMEND_GREETING_ACTION_FINGERPRINT = "boss-recommend-greet-action-v1";
+
+function defaultRecommendActionJournalDir() {
+  const configuredHome = String(process.env.BOSS_RECOMMEND_HOME || "").trim();
+  const root = configuredHome
+    ? path.resolve(configuredHome)
+    : path.join(os.homedir(), ".boss-recommend-mcp");
+  return path.join(root, "recommend-action-journal");
+}
+
+export function createRecommendGreetingActionJournal(options = {}) {
+  return createChatActionJournal({
+    baseDir: options.baseDir || defaultRecommendActionJournalDir(),
+    now: options.now
+  });
+}
 
 const RECOMMEND_DEBUG_BOUNDARY_MODES = Object.freeze({
   list_end: "debug_force_list_end_after_processed",
@@ -466,54 +496,19 @@ export async function acquireRecommendListReadWithStaleRecovery({
 export async function recoverRecommendListReadStaleContext({
   staleAttempt = 1,
   listState,
-  rootReacquire,
   contextReapply
 } = {}) {
-  if (typeof rootReacquire !== "function") {
-    throw new Error("recoverRecommendListReadStaleContext requires rootReacquire");
-  }
   if (typeof contextReapply !== "function") {
     throw new Error("recoverRecommendListReadStaleContext requires contextReapply");
   }
   const processedKeys = new Set(listState?.processed_keys || []);
   try {
-    if (Number(staleAttempt) <= 1) {
-      try {
-        const rootResult = await rootReacquire();
-        if (Number(rootResult?.card_count) <= 0) {
-          const noCardsError = new Error("Recommend list root reacquire returned no candidate cards");
-          noCardsError.code = "RECOMMEND_LIST_ROOT_REACQUIRE_NO_CARDS";
-          throw noCardsError;
-        }
-        resetInfiniteListForRefreshRound(listState, {
-          reason: "list_read_stale_node_root_reacquire",
-          round: 1,
-          method: "root_reacquire",
-          metadata: {
-            card_count: Number(rootResult?.card_count) || 0,
-            processed_count: processedKeys.size
-          }
-        });
-        return {
-          recovery_mode: "root_reacquire",
-          root_reacquire: rootResult || null
-        };
-      } catch (rootReacquireError) {
-        const contextResult = await contextReapply({ rootReacquireError });
-        return {
-          recovery_mode: "context_reapply",
-          escalated_from: "root_reacquire",
-          root_reacquire_error: compactListReadStaleDiagnostic(rootReacquireError, {
-            attempt: 1
-          }),
-          context_reapply: contextResult || null
-        };
-      }
-    }
     const contextResult = await contextReapply({ rootReacquireError: null });
     return {
       recovery_mode: "context_reapply",
-      escalated_from: "repeated_stale",
+      escalated_from: Number(staleAttempt) <= 1
+        ? "root_only_recovery_disallowed"
+        : "repeated_stale",
       context_reapply: contextResult || null
     };
   } finally {
@@ -547,13 +542,13 @@ function normalizeFilter(filter = {}) {
     labels: normalizeLabels(filter.labels || filter.filterLabels || []),
     selectAllLabels: Boolean(filter.selectAllLabels),
     allowUnlimited: filter.allowUnlimited === true,
-    verifySticky: filter.verifySticky === true,
+    verifySticky: true,
     filterGroups: filterGroups.map((group) => ({
       group: String(group?.group || ""),
       labels: normalizeLabels(group?.labels || group?.filterLabels || []),
       selectAllLabels: group?.selectAllLabels !== false,
       allowUnlimited: group?.allowUnlimited === true,
-      verifySticky: group?.verifySticky === true
+      verifySticky: true
     })).filter((group) => group.group || group.labels.length)
   };
 }
@@ -727,6 +722,46 @@ function compactCandidate(candidate) {
   };
 }
 
+function normalizeRecommendScreeningIdentityValue(value = "") {
+  return String(value || "").replace(/\s+/g, " ").trim().normalize("NFKC");
+}
+
+export function assertRecommendScreeningCandidateMatchesCard({
+  cardCandidate = null,
+  screeningCandidate = null,
+  stage = "before_screening"
+} = {}) {
+  const expectedCandidateId = normalizeRecommendScreeningIdentityValue(cardCandidate?.id);
+  const actualCandidateId = normalizeRecommendScreeningIdentityValue(screeningCandidate?.id);
+  const expectedName = normalizeRecommendScreeningIdentityValue(cardCandidate?.identity?.name);
+  const actualName = normalizeRecommendScreeningIdentityValue(screeningCandidate?.identity?.name);
+  const diagnostic = {
+    schema_version: 1,
+    verified: Boolean(
+      expectedCandidateId
+      && actualCandidateId === expectedCandidateId
+      && expectedName
+      && actualName === expectedName
+    ),
+    stage,
+    expected_candidate_id: expectedCandidateId || null,
+    actual_candidate_id: actualCandidateId || null,
+    exact_candidate_id: Boolean(expectedCandidateId && actualCandidateId === expectedCandidateId),
+    expected_name: expectedName || null,
+    actual_name: actualName || null,
+    exact_name: Boolean(expectedName && actualName === expectedName)
+  };
+  if (diagnostic.verified) return diagnostic;
+
+  const error = new Error(
+    `RECOMMEND_SCREENING_CANDIDATE_IDENTITY_MISMATCH: stage=${stage}; expected=${expectedCandidateId || "missing"}/${expectedName || "missing"}; actual=${actualCandidateId || "missing"}/${actualName || "missing"}`
+  );
+  error.code = "RECOMMEND_SCREENING_CANDIDATE_IDENTITY_MISMATCH";
+  error.phase = "recommend:screening-candidate-identity";
+  error.screening_candidate_identity = diagnostic;
+  throw error;
+}
+
 function compactDetail(detailResult) {
   if (!detailResult) return null;
   return {
@@ -734,7 +769,10 @@ function compactDetail(detailResult) {
     resume_text_length: detailResult.detail?.resume_text?.length || 0,
     network_body_count: detailResult.network_bodies?.filter((item) => item.body).length || 0,
     parsed_network_profile_count: detailResult.parsed_network_profiles?.filter((item) => item.ok).length || 0,
+    network_profile_binding: detailResult.network_profile_binding || null,
+    screening_candidate_identity: detailResult.screening_candidate_identity || null,
     cv_acquisition: detailResult.cv_acquisition || null,
+    candidate_binding: compactRecommendDetailCandidateBinding(detailResult.candidate_binding),
     colleague_contact: detailResult.colleague_contact || null,
     image_evidence: summarizeImageEvidence(detailResult.image_evidence),
     llm_screening: compactScreeningLlmResult(detailResult.llm_result),
@@ -763,7 +801,321 @@ function compactActionDiscovery(discovery) {
   };
 }
 
-async function runRecommendPostAction({
+export async function selectAndVerifyInitialRecommendJob(client, rootState, {
+  jobLabel = "",
+  settleMs = 6000,
+  dropdownTimeoutMs = Math.max(8000, settleMs),
+  totalTimeoutMs = Math.max(30000, dropdownTimeoutMs + settleMs + 4000),
+  retryDelayMs = 1000,
+  selectWithRootRefresh = selectRecommendJobWithRootRefresh
+} = {}) {
+  if (!jobLabel) {
+    throw new Error("selectAndVerifyInitialRecommendJob requires a requested job label");
+  }
+  if (typeof selectWithRootRefresh !== "function") {
+    throw new Error("selectAndVerifyInitialRecommendJob requires selectWithRootRefresh");
+  }
+  const result = await selectWithRootRefresh(client, rootState, {
+    jobLabel,
+    settleMs,
+    dropdownTimeoutMs,
+    totalTimeoutMs,
+    retryDelayMs
+  });
+  const selection = result?.job_selection || null;
+  const sticky = selection?.sticky_verification || null;
+  if (
+    selection?.selected !== true
+    || sticky?.verified !== true
+    || sticky?.menu_close?.ok === false
+  ) {
+    const error = new Error(
+      `Requested recommend job was not independently sticky-verified: requested=${jobLabel}; current=${sticky?.current_label_without_salary || sticky?.current_label || "unknown"}`
+    );
+    error.code = "RECOMMEND_INITIAL_JOB_STICKY_VERIFICATION_FAILED";
+    error.job_selection = compactJobSelection(selection);
+    throw error;
+  }
+  return result;
+}
+
+function compactRecommendActionJournalRecord(record = null, filePath = null) {
+  if (!record) return null;
+  const history = Array.isArray(record.history) ? record.history : [];
+  const last = history[history.length - 1] || null;
+  return {
+    domain: "recommend",
+    schema_version: record.schema_version || 1,
+    action_key: record.action_key || null,
+    candidate_id: record.candidate_id || null,
+    state: record.state || null,
+    revision: Number.isSafeInteger(Number(record.revision)) ? Number(record.revision) : history.length,
+    unknown_origin: record.state === "outcome_unknown" ? last?.from_state || null : null,
+    evidence: record.evidence || {},
+    created_at: record.created_at || null,
+    updated_at: record.updated_at || null,
+    first_run_id: record.first_run_id || null,
+    last_run_id: record.last_run_id || null,
+    file_path: filePath || null
+  };
+}
+
+function recommendGreetingUnknownOrigin(record = null) {
+  const history = Array.isArray(record?.history) ? record.history : [];
+  const last = history[history.length - 1];
+  return record?.state === "outcome_unknown" ? last?.from_state || null : null;
+}
+
+function latestRecommendGreetingEvidence(record = null) {
+  const history = Array.isArray(record?.history) ? record.history : [];
+  return history[history.length - 1]?.evidence || {};
+}
+
+export function isVerifiedRecommendActionJournalScope(scope = "") {
+  return /^boss-recommend-profile-v2:127\.0\.0\.1:profile-sha256:[0-9a-f]{64}$/u.test(
+    String(scope || "").trim()
+  );
+}
+
+function compactRecommendControlEvidence(control = null) {
+  const rect = control?.rect || {};
+  const center = control?.center || {};
+  return {
+    control_node_id: Number.isInteger(Number(control?.node_id)) ? Number(control.node_id) : null,
+    control_backend_node_id: Number.isInteger(Number(control?.backend_node_id))
+      ? Number(control.backend_node_id)
+      : null,
+    control_root: control?.root || null,
+    control_label: String(control?.label || "").trim() || null,
+    control_root_node_id: Number.isInteger(Number(control?.root_node_id))
+      ? Number(control.root_node_id)
+      : null,
+    control_root_backend_node_id: Number.isInteger(Number(control?.root_backend_node_id))
+      ? Number(control.root_backend_node_id)
+      : null,
+    control_center_x: Number.isFinite(Number(center.x)) ? Number(center.x) : null,
+    control_center_y: Number.isFinite(Number(center.y)) ? Number(center.y) : null,
+    control_rect_x: Number.isFinite(Number(rect.x)) ? Number(rect.x) : null,
+    control_rect_y: Number.isFinite(Number(rect.y)) ? Number(rect.y) : null,
+    control_rect_width: Number.isFinite(Number(rect.width)) ? Number(rect.width) : null,
+    control_rect_height: Number.isFinite(Number(rect.height)) ? Number(rect.height) : null
+  };
+}
+
+function compactRecommendPostActionError(error) {
+  if (!error) return null;
+  return {
+    code: error.code || "RECOMMEND_GREETING_CLICK_FAILED",
+    message: String(error.message || error).slice(0, 500),
+    phase: error.phase || null,
+    cdp_method: error.cdp_method || null,
+    cdp_at: error.cdp_at || null,
+    cdp_node_id: Number.isInteger(error.cdp_node_id) ? error.cdp_node_id : null,
+    cdp_outcome_unknown: error.cdp_outcome_unknown === true,
+    recommend_pre_input_aborted: error.recommend_pre_input_aborted === true,
+    recommend_input_dispatched: error.recommend_input_dispatched === true,
+    recommend_action_control_hit_test: error.recommend_action_control_hit_test || null
+  };
+}
+
+export function checkpointRecommendPostActionStopResult(runControl, checkpoint = {}, {
+  candidateResult = null,
+  candidateId = "",
+  actionState = null,
+  resultIndex = null
+} = {}) {
+  try {
+    return runControl.checkpointCritical(checkpoint);
+  } catch (error) {
+    runControl.checkpoint({
+      ...checkpoint,
+      preserve_detail_on_terminal: true,
+      action_result_critical_persisted: false,
+      terminal_preservation: {
+        required: true,
+        reason: "post_action_candidate_result_critical_persistence_failed",
+        candidate_id: String(candidateId || "").trim() || null,
+        action_state: actionState || null,
+        result_index: Number.isInteger(resultIndex) ? resultIndex : null,
+        error: compactRecommendPostActionError(error)
+      }
+    });
+    error.code = error.code || "RECOMMEND_POST_ACTION_RESULT_PERSISTENCE_FAILED";
+    error.phase = error.phase || "recommend:post-action-result-persistence";
+    error.recommend_preserve_detail_on_terminal = true;
+    error.recommend_candidate_result = candidateResult;
+    throw error;
+  }
+}
+
+export function isVerifiedRecommendPostActionCandidateBinding(binding = null, candidateId = "") {
+  const expectedCandidateId = String(candidateId || "").trim();
+  const root = binding?.detail?.root;
+  const rootNodeId = Number(root?.node_id);
+  const rootBackendNodeId = Number(root?.backend_node_id);
+  const exactRoot = Boolean(
+    root?.stable === true
+    && root?.visible === true
+    && root?.canonical === true
+    && root?.action_root === true
+    && Number.isInteger(rootNodeId)
+    && rootNodeId > 0
+    && Number.isInteger(rootBackendNodeId)
+    && rootBackendNodeId > 0
+  );
+  const firstScopes = Array.isArray(binding?.detail?.first?.scopes)
+    ? binding.detail.first.scopes
+    : [];
+  const secondScopes = Array.isArray(binding?.detail?.second?.scopes)
+    ? binding.detail.second.scopes
+    : [];
+  const sampleMatchesRoot = (scopes) => {
+    const visiblePopups = scopes.filter((scope) => (
+      scope?.source === "popup" && scope?.visible === true
+    ));
+    const visibleIframes = scopes.filter((scope) => (
+      scope?.source === "resume_iframe" && scope?.visible === true
+    ));
+    if (visiblePopups.length > 1 || visibleIframes.length > 1) return false;
+    const canonicalScopes = root?.source === "popup" ? visiblePopups : visibleIframes;
+    if (
+      canonicalScopes.length !== 1
+      || Number(canonicalScopes[0]?.node_id) !== rootNodeId
+      || Number(canonicalScopes[0]?.backend_node_id) !== rootBackendNodeId
+    ) {
+      return false;
+    }
+    if (root?.source === "popup") {
+      const contained = root?.contained_iframe || null;
+      if (!contained) return visibleIframes.length === 0;
+      if (visibleIframes.length !== 1) return false;
+      const iframe = visibleIframes[0];
+      return Boolean(
+        contained?.stable === true
+        && contained?.contained === true
+        && iframe?.container_verified === true
+        && Number(iframe?.node_id) === Number(contained?.node_id)
+        && Number(iframe?.backend_node_id) === Number(contained?.backend_node_id)
+        && Number(iframe?.iframe_node_id) === Number(contained?.iframe_node_id)
+        && Number(iframe?.iframe_backend_node_id) === Number(contained?.iframe_backend_node_id)
+        && Number(iframe?.container_node_id) === rootNodeId
+        && Number(iframe?.container_backend_node_id) === rootBackendNodeId
+        && iframe?.selector === contained?.selector
+        && JSON.stringify(iframe?.ancestry?.path || [])
+          === JSON.stringify(contained?.ancestry_path || [])
+      );
+    }
+    return visiblePopups.length === 0 && visibleIframes.length === 1;
+  };
+  const exactStableRootSamples = Boolean(
+    exactRoot
+    && sampleMatchesRoot(firstScopes)
+    && sampleMatchesRoot(secondScopes)
+  );
+  const method = binding?.method;
+  const compactBeforeCard = binding?.card?.before;
+  const provenanceBeforeCard = binding?.card?.pre_click_provenance?.card;
+  const causalBeforeCard = compactBeforeCard && provenanceBeforeCard
+    ? {
+        ...compactBeforeCard,
+        candidate_id: compactBeforeCard.candidate_id ?? provenanceBeforeCard.candidate_id,
+        name: compactBeforeCard.name ?? provenanceBeforeCard.name
+      }
+    : compactBeforeCard || provenanceBeforeCard;
+  const causalProof = method === "exact_card_click_and_new_resume_root"
+    ? verifyExactCardClickToNewResumeRootCausality({
+        cardNodeId: causalBeforeCard?.node_id,
+        expectedCandidateId: binding?.expected_candidate_id,
+        expectedName: binding?.expected_name,
+        beforeCard: causalBeforeCard,
+        afterCard: binding?.card?.after,
+        cardPreClickProvenance: binding?.card?.pre_click_provenance,
+        cardClickEvidence: binding?.card?.click_evidence,
+        clickAttempts: binding?.card?.click_attempts,
+        detailRoot: binding?.detail?.root,
+        rootsBeforeWereCaptured: binding?.detail?.roots_before_capture?.captured === true,
+        rootsBeforeCaptureComplete: binding?.detail?.roots_before_capture?.complete === true,
+        newlyMounted: binding?.detail?.newly_mounted === true,
+        rootMatchesExpected: binding?.detail?.root_matches_expected === true,
+        hasCandidateIdEvidence: binding?.detail?.candidate_id_evidence_present === true,
+        candidateIdProbeComplete: binding?.detail?.candidate_id_probe_complete === true
+      })
+    : null;
+  const exactDetailIdentity = method === "exact_candidate_id_and_name"
+    ? binding?.detail?.candidate_id_probe_complete === true
+      && binding?.detail?.exact_candidate_id === true
+      && binding?.detail?.exact_name === true
+    : method === "exact_name_and_secondary_identity"
+    ? binding?.detail?.candidate_id_probe_complete === true
+      && binding?.detail?.candidate_id_evidence_present === false
+      && binding?.detail?.exact_name === true
+      && binding?.detail?.exact_secondary === true
+    : method === "exact_card_click_and_new_resume_root"
+    ? binding?.detail?.candidate_id_probe_complete === true
+      && binding?.detail?.candidate_id_evidence_present === false
+      && binding?.detail?.exact_name === false
+      && binding?.card?.causal_proof?.verified === true
+      && causalProof?.verified === true
+    : false;
+  return Boolean(
+    expectedCandidateId
+    && binding?.verified === true
+    && binding?.stable === true
+    && binding?.expected_candidate_id === expectedCandidateId
+    && binding?.card?.stable === true
+    && binding?.card?.candidate_id === expectedCandidateId
+    && exactStableRootSamples
+    && exactDetailIdentity
+  );
+}
+
+export function assertRecommendControlMatchesCandidateDetailRoot(
+  control,
+  binding,
+  stage = "post_action"
+) {
+  const boundRoot = binding?.detail?.root;
+  const boundRootNodeId = Number(boundRoot?.node_id);
+  const boundRootBackendNodeId = Number(boundRoot?.backend_node_id);
+  const controlRootNodeId = Number(control?.root_node_id);
+  const controlRootBackendNodeId = Number(control?.root_backend_node_id);
+  const exact = Boolean(
+    Number.isInteger(boundRootNodeId)
+    && boundRootNodeId > 0
+    && Number.isInteger(boundRootBackendNodeId)
+    && boundRootBackendNodeId > 0
+    && boundRoot?.stable === true
+    && boundRoot?.visible === true
+    && boundRoot?.canonical === true
+    && boundRoot?.action_root === true
+    && Number.isInteger(controlRootNodeId)
+    && controlRootNodeId > 0
+    && Number.isInteger(controlRootBackendNodeId)
+    && controlRootBackendNodeId > 0
+    // DOM.getDocument may remap a frontend node id while describeNode still
+    // proves the same immutable backend node.  The action path re-describes
+    // this control root and proves control ancestry again before every Input.
+    && controlRootBackendNodeId === boundRootBackendNodeId
+  );
+  if (!exact) {
+    const error = new Error(
+      `RECOMMEND_ACTION_DETAIL_ROOT_MISMATCH: action control is not bound to the exact candidate detail root at ${stage}`
+    );
+    error.code = "RECOMMEND_ACTION_DETAIL_ROOT_MISMATCH";
+    error.phase = "recommend:post-action-binding";
+    error.expected_root_node_id = boundRootNodeId || null;
+    error.expected_root_backend_node_id = boundRootBackendNodeId || null;
+    error.observed_root_node_id = Number.isInteger(controlRootNodeId) ? controlRootNodeId : null;
+    error.observed_root_backend_node_id = Number.isInteger(controlRootBackendNodeId)
+      ? controlRootBackendNodeId
+      : null;
+    error.retryable = false;
+    throw error;
+  }
+  return true;
+}
+
+export async function runRecommendPostAction({
   client,
   screening,
   actionDiscovery,
@@ -771,7 +1123,15 @@ async function runRecommendPostAction({
   greetCount = 0,
   maxGreetCount = null,
   executePostAction = true,
-  afterClickDelayMs = 900
+  afterClickDelayMs = 900,
+  candidateId = "",
+  actionJournal = null,
+  actionJournalScope = "boss-recommend:default",
+  reverifyActionJournalScope = null,
+  runId = "",
+  candidateBinding = null,
+  reverifyCandidateBinding = null,
+  checkpointCritical = null
 } = {}) {
   const plan = resolveRecommendPostAction({
     postAction,
@@ -806,7 +1166,7 @@ async function runRecommendPostAction({
   }
   result.control = control;
 
-  if (plan.effective === "greet" && control.continue_chat) {
+  if (plan.effective === "greet" && control.continue_chat && !executePostAction) {
     result.reason = "already_connected_continue_chat";
     result.already_connected = true;
     return result;
@@ -817,7 +1177,7 @@ async function runRecommendPostAction({
     result.stop_run = true;
     return result;
   }
-  if (plan.effective === "greet" && control.available === false) {
+  if (plan.effective === "greet" && control.available === false && !control.continue_chat) {
     result.reason = "greet_control_not_available";
     return result;
   }
@@ -831,13 +1191,374 @@ async function runRecommendPostAction({
     return result;
   }
 
+  const normalizedCandidateId = String(candidateId || "").trim();
+  if (!normalizedCandidateId) {
+    const error = new Error(
+      "RECOMMEND_ACTION_CANDIDATE_ID_REQUIRED: refusing greeting without a stable Boss candidate ID"
+    );
+    error.code = "RECOMMEND_ACTION_CANDIDATE_ID_REQUIRED";
+    error.retryable = false;
+    throw error;
+  }
+  if (!isVerifiedRecommendPostActionCandidateBinding(candidateBinding, normalizedCandidateId)) {
+    const error = createRecommendDetailCandidateBindingError(candidateBinding || {
+      schema_version: 1,
+      verified: false,
+      reason: "post_action_candidate_binding_missing",
+      expected_candidate_id: normalizedCandidateId
+    });
+    error.phase = "recommend:post-action-binding";
+    throw error;
+  }
+  result.candidate_binding = compactRecommendDetailCandidateBinding(candidateBinding);
+  assertRecommendControlMatchesCandidateDetailRoot(
+    control,
+    candidateBinding,
+    "initial_control_binding"
+  );
+  if (!isVerifiedRecommendActionJournalScope(actionJournalScope)) {
+    const error = new Error(
+      "RECOMMEND_ACTION_SCOPE_UNVERIFIED: live greeting requires an exact canonical Chrome profile scope"
+    );
+    error.code = "RECOMMEND_ACTION_SCOPE_UNVERIFIED";
+    error.retryable = false;
+    throw error;
+  }
+  if (typeof reverifyCandidateBinding !== "function") {
+    const error = new Error(
+      "RECOMMEND_ACTION_CANDIDATE_REVERIFY_REQUIRED: live greeting requires fresh candidate binding"
+    );
+    error.code = "RECOMMEND_ACTION_CANDIDATE_REVERIFY_REQUIRED";
+    error.retryable = false;
+    throw error;
+  }
+  if (typeof reverifyActionJournalScope !== "function") {
+    const error = new Error(
+      "RECOMMEND_ACTION_SCOPE_REVERIFY_REQUIRED: live greeting requires fresh Chrome profile proof"
+    );
+    error.code = "RECOMMEND_ACTION_SCOPE_REVERIFY_REQUIRED";
+    error.retryable = false;
+    throw error;
+  }
+  if (!actionJournal || typeof actionJournal.read !== "function" || typeof actionJournal.transition !== "function") {
+    const error = new Error(
+      "RECOMMEND_ACTION_JOURNAL_REQUIRED: durable greeting action journal is unavailable"
+    );
+    error.code = "RECOMMEND_ACTION_JOURNAL_REQUIRED";
+    error.retryable = false;
+    throw error;
+  }
+  if (typeof checkpointCritical !== "function") {
+    const error = new Error(
+      "RECOMMEND_CRITICAL_CHECKPOINT_UNAVAILABLE: refusing greeting without required persistence"
+    );
+    error.code = "RECOMMEND_CRITICAL_CHECKPOINT_UNAVAILABLE";
+    error.retryable = false;
+    throw error;
+  }
+
+  const requireFreshActionJournalScope = async (stage) => {
+    const fresh = await reverifyActionJournalScope(stage);
+    const freshScope = String(fresh?.scope || fresh || "").trim();
+    if (!isVerifiedRecommendActionJournalScope(freshScope) || freshScope !== actionJournalScope) {
+      const error = new Error(
+        `RECOMMEND_ACTION_SCOPE_DRIFT: exact Chrome profile scope changed at ${stage}`
+      );
+      error.code = "RECOMMEND_ACTION_SCOPE_DRIFT";
+      error.expected_scope = actionJournalScope;
+      error.observed_scope = freshScope || null;
+      error.retryable = false;
+      throw error;
+    }
+    return freshScope;
+  };
+  const operationId = `${String(runId || "recommend-run").trim() || "recommend-run"}:${crypto.randomUUID()}`;
+  const requireFreshCandidateBinding = async (stage, boundControl = control, {
+    allowScroll = true,
+    settleMs = 120
+  } = {}) => {
+    const normalizedSettleMs = allowScroll
+      ? Math.max(0, Number(settleMs) || 0)
+      : 0;
+    const freshBinding = await reverifyCandidateBinding(stage, {
+      allowScroll: allowScroll === true,
+      settleMs: normalizedSettleMs
+    });
+    if (!isVerifiedRecommendPostActionCandidateBinding(freshBinding, normalizedCandidateId)) {
+      const error = createRecommendDetailCandidateBindingError(freshBinding || {
+        schema_version: 1,
+        verified: false,
+        reason: `post_action_candidate_binding_lost_${stage}`,
+        expected_candidate_id: normalizedCandidateId
+      });
+      error.phase = "recommend:post-action-binding";
+      throw error;
+    }
+    if (
+      allowScroll === false
+      && (
+        freshBinding?.allow_scroll !== false
+        || Number(freshBinding?.settle_ms) !== 0
+      )
+    ) {
+      const error = createRecommendDetailCandidateBindingError({
+        ...freshBinding,
+        verified: false,
+        reason: "non_scrolling_candidate_reproof_unavailable"
+      });
+      error.phase = "recommend:post-action-binding";
+      throw error;
+    }
+    assertRecommendControlMatchesCandidateDetailRoot(boundControl, freshBinding, stage);
+    result.candidate_binding = compactRecommendDetailCandidateBinding(freshBinding);
+    return freshBinding;
+  };
+  await requireFreshActionJournalScope("before_journal_read");
+  let journalRecord = actionJournal.read({
+    scope: actionJournalScope,
+    candidateId: normalizedCandidateId
+  });
+  let journalFilePath = typeof actionJournal.entryPath === "function"
+    ? actionJournal.entryPath({ scope: actionJournalScope, candidateId: normalizedCandidateId })
+    : null;
+  const transitionAction = (state, evidence = {}, {
+    requireChanged = false,
+    recordIdempotent = false,
+    expectedUpdatedAt = null,
+    expectedRevision = null
+  } = {}) => {
+    const transitioned = actionJournal.transition({
+      scope: actionJournalScope,
+      candidateId: normalizedCandidateId,
+      state,
+      runId,
+      greeting: RECOMMEND_GREETING_ACTION_FINGERPRINT,
+      recordIdempotent,
+      expectedUpdatedAt,
+      expectedRevision,
+      evidence: {
+        action: "recommend_greet",
+        active_candidate_id: normalizedCandidateId,
+        operation_id: operationId,
+        ...evidence
+      }
+    });
+    if (requireChanged && transitioned?.changed !== true) {
+      const error = new Error(
+        "RECOMMEND_ACTION_IN_FLIGHT_NOT_OWNED: journal transition was idempotent or owned elsewhere"
+      );
+      error.code = "RECOMMEND_ACTION_IN_FLIGHT_NOT_OWNED";
+      error.retryable = false;
+      throw error;
+    }
+    journalRecord = transitioned.record;
+    journalFilePath = transitioned.file_path || journalFilePath;
+    const transaction = compactRecommendActionJournalRecord(journalRecord, journalFilePath);
+    try {
+      checkpointCritical({ action_transaction: transaction });
+    } catch (error) {
+      if (state === "greeting_send_in_flight" && transitioned?.changed === true) {
+        error.recommend_pre_input_checkpoint_failed = true;
+        error.recommend_owned_operation_id = operationId;
+        throw error;
+      }
+      if (state === "greeting_confirmed" || state === "outcome_unknown") {
+        result.action_transaction_checkpoint_error = compactRecommendPostActionError(error);
+        result.preserve_detail_until_result_persisted = true;
+        result.stop_run = true;
+      } else {
+        throw error;
+      }
+    }
+    result.action_transaction = transaction;
+    return journalRecord;
+  };
+  const preservePostInputJournalFailure = ({
+    error,
+    desiredState,
+    reason,
+    triggeringError = null,
+    inputDispatched = true
+  }) => {
+    const journalError = compactRecommendPostActionError(error);
+    const triggeringActionError = compactRecommendPostActionError(triggeringError);
+    const lastDurableTransaction = compactRecommendActionJournalRecord(
+      journalRecord,
+      journalFilePath
+    );
+    const terminalPreservation = {
+      required: true,
+      reason: "post_input_action_journal_persistence_failed",
+      candidate_id: normalizedCandidateId,
+      operation_id: operationId,
+      action: "recommend_greet",
+      input_dispatched: inputDispatched === true,
+      desired_action_state: desiredState || null,
+      last_durable_action_state: lastDurableTransaction?.state || null,
+      candidate_binding: result.candidate_binding
+        || compactRecommendDetailCandidateBinding(candidateBinding),
+      control: compactRecommendControlEvidence(result.control_confirmation || control),
+      click_result: result.click_result || null,
+      journal_error: journalError,
+      triggering_error: triggeringActionError
+    };
+    result.reason = reason || "greet_post_input_journal_persistence_failed";
+    result.counted_as_greet = false;
+    result.outcome_unknown = true;
+    result.stop_run = true;
+    result.preserve_detail_on_terminal = true;
+    result.preserve_detail_until_result_persisted = true;
+    result.post_input_journal_persistence_failed = true;
+    result.action_input_dispatched = inputDispatched === true;
+    result.action_transaction = lastDurableTransaction;
+    result.terminal_preservation = terminalPreservation;
+    result.error = journalError;
+    if (triggeringActionError) result.triggering_error = triggeringActionError;
+    try {
+      checkpointCritical({
+        preserve_detail_on_terminal: true,
+        action_result_critical_persisted: false,
+        terminal_preservation: terminalPreservation,
+        action_transaction: lastDurableTransaction
+      });
+      result.terminal_preservation_checkpointed = true;
+    } catch (checkpointError) {
+      result.terminal_preservation_checkpointed = false;
+      result.terminal_preservation_checkpoint_error = compactRecommendPostActionError(
+        checkpointError
+      );
+    }
+    return result;
+  };
+
+  if (control.continue_chat) {
+    await requireFreshCandidateBinding("before_continue_chat_reconciliation", control);
+    const reconciledControl = await verifyRecommendActionControlIdentity(client, control, {
+      requireContinueChat: true,
+      requireGeometry: true
+    });
+    await requireFreshCandidateBinding("after_continue_chat_control_verification", reconciledControl);
+    result.control_reconciliation = reconciledControl;
+    const unknownOrigin = recommendGreetingUnknownOrigin(journalRecord);
+    if (
+      journalRecord?.state === "greeting_send_in_flight"
+      || (journalRecord?.state === "outcome_unknown" && unknownOrigin === "greeting_send_in_flight")
+    ) {
+      transitionAction("greeting_confirmed", {
+        reason: "reconciled_from_exact_continue_chat_control"
+      });
+    }
+    result.reason = journalRecord?.state === "greeting_confirmed"
+      ? "greeting_confirmed_by_durable_journal"
+      : "already_connected_continue_chat";
+    result.already_connected = true;
+    result.verified_after_click = true;
+    return result;
+  }
+
+  if (journalRecord?.state === "greeting_confirmed") {
+    result.reason = "greeting_confirmed_by_durable_journal";
+    result.already_connected = true;
+    result.verified_after_click = true;
+    result.action_transaction = compactRecommendActionJournalRecord(journalRecord, journalFilePath);
+    return result;
+  }
+
+  const unknownOrigin = recommendGreetingUnknownOrigin(journalRecord);
+  const latestGreetingReason = latestRecommendGreetingEvidence(journalRecord)?.reason;
+  const replayablePreInputAbort = Boolean(
+    journalRecord?.state === "greeting_send_in_flight"
+    && (
+      latestGreetingReason === "pre_input_checkpoint_aborted"
+      || latestGreetingReason === "pre_input_abort"
+    )
+  );
+  if (
+    (journalRecord?.state === "greeting_send_in_flight" && !replayablePreInputAbort)
+    || (journalRecord?.state === "outcome_unknown" && unknownOrigin === "greeting_send_in_flight")
+  ) {
+    if (journalRecord.state !== "outcome_unknown") {
+      transitionAction("outcome_unknown", {
+        reason: "in_flight_greeting_not_passively_reconciled"
+      });
+    } else {
+      result.action_transaction = compactRecommendActionJournalRecord(journalRecord, journalFilePath);
+      checkpointCritical({ action_transaction: result.action_transaction });
+    }
+    result.reason = "greet_outcome_unknown_preserved_no_replay";
+    result.outcome_unknown = true;
+    result.skipped = true;
+    return result;
+  }
+  if (journalRecord?.state === "outcome_unknown") {
+    result.reason = "greet_outcome_unknown_preserved_no_replay";
+    result.outcome_unknown = true;
+    result.skipped = true;
+    result.action_transaction = compactRecommendActionJournalRecord(journalRecord, journalFilePath);
+    checkpointCritical({ action_transaction: result.action_transaction });
+    return result;
+  }
+  if (!journalRecord) {
+    transitionAction("pre_action", { reason: "greeting_eligible" });
+  }
+  if (journalRecord?.state !== "pre_action" && !replayablePreInputAbort) {
+    const error = new Error(
+      `RECOMMEND_ACTION_JOURNAL_STATE_UNSUPPORTED: ${journalRecord?.state || "unknown"}`
+    );
+    error.code = "RECOMMEND_ACTION_JOURNAL_STATE_UNSUPPORTED";
+    error.retryable = false;
+    throw error;
+  }
+
   result.action_attempted = true;
   result.control_before = control;
   let clickResult;
+  let greetingInFlightPersisted = false;
   try {
     clickResult = await clickRecommendActionControl(client, {
       ...control,
       kind: plan.effective
+    }, {
+      beforeFinalRefresh: async () => {
+        await requireFreshActionJournalScope("immediately_before_greeting_in_flight");
+        await requireFreshCandidateBinding("immediately_before_greeting_control_refresh", control);
+      },
+      beforeClick: async (freshControl) => {
+        const expectedUpdatedAt = journalRecord?.updated_at || null;
+        const expectedRevision = Number(journalRecord?.revision);
+        if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+          const error = new Error(
+            "RECOMMEND_ACTION_JOURNAL_REVISION_REQUIRED: exact journal ownership revision is missing"
+          );
+          error.code = "RECOMMEND_ACTION_JOURNAL_REVISION_REQUIRED";
+          error.retryable = false;
+          throw error;
+        }
+        transitionAction("greeting_send_in_flight", {
+          send_method: "Input.dispatchMouseEvent",
+          reason: "immediately_before_non_replayable_click",
+          active_candidate_id: normalizedCandidateId,
+          ...compactRecommendControlEvidence(freshControl)
+        }, {
+          requireChanged: true,
+          recordIdempotent: replayablePreInputAbort,
+          expectedUpdatedAt,
+          expectedRevision
+        });
+        greetingInFlightPersisted = true;
+      },
+      beforeInput: async () => {
+        await requireFreshActionJournalScope("before_final_greeting_control_verification");
+        await requireFreshCandidateBinding("before_final_greeting_control_verification", control);
+      },
+      immediatelyBeforeInput: async (finalControl) => {
+        await requireFreshActionJournalScope("immediately_before_greeting_input");
+        await requireFreshCandidateBinding(
+          "immediately_before_greeting_input",
+          finalControl,
+          { allowScroll: false, settleMs: 0 }
+        );
+      }
     });
   } catch (error) {
     if (error?.code === GREET_CREDITS_EXHAUSTED_CODE) {
@@ -845,6 +1566,94 @@ async function runRecommendPostAction({
       result.out_of_greet_credits = true;
       result.stop_run = true;
       result.greet_quota = error.greet_quota || control.greet_quota || null;
+      return result;
+    }
+    if (
+      error?.recommend_pre_input_checkpoint_failed === true
+      || (
+        error?.recommend_pre_input_aborted === true
+        && journalRecord?.state === "greeting_send_in_flight"
+        && error?.code !== "RECOMMEND_ACTION_IN_FLIGHT_NOT_OWNED"
+        && error?.code !== "CHAT_ACTION_JOURNAL_CONCURRENT_UPDATE"
+      )
+    ) {
+      const abortReason = error?.recommend_pre_input_checkpoint_failed === true
+        ? "pre_input_checkpoint_aborted"
+        : "pre_input_abort";
+      const hitTestEvidence = error?.recommend_action_control_hit_test || null;
+      const hitTestAttempts = Array.isArray(hitTestEvidence?.attempts)
+        ? hitTestEvidence.attempts
+        : [];
+      const lastHitTestAttempt = hitTestAttempts.at(-1) || null;
+      const aborted = actionJournal.transition({
+        scope: actionJournalScope,
+        candidateId: normalizedCandidateId,
+        state: "greeting_send_in_flight",
+        runId,
+        greeting: RECOMMEND_GREETING_ACTION_FINGERPRINT,
+        recordIdempotent: true,
+        expectedUpdatedAt: journalRecord?.updated_at || null,
+        expectedRevision: journalRecord?.revision ?? null,
+        evidence: {
+          action: "recommend_greet",
+          active_candidate_id: normalizedCandidateId,
+          operation_id: operationId,
+          reason: abortReason,
+          send_method: "Input.dispatchMouseEvent",
+          pre_input_cdp_method: error?.cdp_method || null,
+          action_hit_test_reason: lastHitTestAttempt?.reason || null,
+          action_hit_test_attempt_count: hitTestAttempts.length,
+          action_hit_test_last_hit_backend_node_id: Number.isInteger(
+            Number(lastHitTestAttempt?.hit_backend_node_id)
+          ) ? Number(lastHitTestAttempt.hit_backend_node_id) : null
+        }
+      });
+      journalRecord = aborted.record;
+      journalFilePath = aborted.file_path || journalFilePath;
+      result.action_transaction = compactRecommendActionJournalRecord(journalRecord, journalFilePath);
+      result.reason = abortReason === "pre_input_checkpoint_aborted"
+        ? "greet_pre_input_checkpoint_aborted_replayable"
+        : "greet_pre_input_aborted_replayable";
+      result.pre_input_aborted = true;
+      result.replayable = true;
+      result.stop_run = true;
+      result.error = compactRecommendPostActionError(error);
+      return result;
+    }
+    if (
+      error?.code === "RECOMMEND_ACTION_IN_FLIGHT_NOT_OWNED"
+      || error?.code === "CHAT_ACTION_JOURNAL_CONCURRENT_UPDATE"
+    ) {
+      journalRecord = actionJournal.read({
+        scope: actionJournalScope,
+        candidateId: normalizedCandidateId
+      }) || journalRecord;
+      result.reason = "greet_in_flight_owned_by_another_operation";
+      result.outcome_unknown = true;
+      result.skipped = true;
+      result.stop_run = true;
+      result.action_transaction = compactRecommendActionJournalRecord(journalRecord, journalFilePath);
+      return result;
+    }
+    if (greetingInFlightPersisted || journalRecord?.state === "greeting_send_in_flight") {
+      try {
+        transitionAction("outcome_unknown", {
+          reason: "non_replayable_click_failed_or_disconnected",
+          send_method: error?.cdp_method || "Input.dispatchMouseEvent"
+        });
+      } catch (journalError) {
+        return preservePostInputJournalFailure({
+          error: journalError,
+          desiredState: "outcome_unknown",
+          reason: "greet_post_input_outcome_unknown_persistence_failed",
+          triggeringError: error,
+          inputDispatched: true
+        });
+      }
+      result.reason = "greet_outcome_unknown";
+      result.outcome_unknown = true;
+      result.stop_run = true;
+      result.error = compactRecommendPostActionError(error);
       return result;
     }
     throw error;
@@ -858,37 +1667,101 @@ async function runRecommendPostAction({
     const afterDiscovery = await waitForRecommendDetailActionControls(client, {
       timeoutMs: 2500,
       intervalMs: 300,
-      requireAny: false
+      requireAny: false,
+      requireContinueChat: plan.effective === "greet"
     });
     const afterSummary = afterDiscovery?.summary || {};
     const afterControl = afterSummary.greet;
     result.action_discovery_after = compactActionDiscovery(afterDiscovery);
     result.control_after = afterControl || null;
     if (plan.effective === "greet") {
-      result.verified_after_click = Boolean(
-        afterControl?.continue_chat
-        || String(afterControl?.label || "").includes("继续沟通")
-      );
+      await requireFreshCandidateBinding("after_greeting_before_confirmation", afterControl);
+      const confirmedControl = await verifyRecommendActionControlIdentity(client, afterControl, {
+        requireContinueChat: true,
+        requireGeometry: true
+      });
+      await requireFreshCandidateBinding("after_greeting_control_confirmation", confirmedControl);
+      result.control_confirmation = confirmedControl;
+      result.verified_after_click = confirmedControl.verified === true;
     }
   } catch (error) {
     result.verify_error = {
       message: error?.message || String(error)
     };
   }
+  try {
+    if (result.verified_after_click === true) {
+      transitionAction("greeting_confirmed", {
+        reason: "exact_continue_chat_control_after_click",
+        send_method: "Input.dispatchMouseEvent"
+      });
+      result.counted_as_greet = plan.effective === "greet";
+      result.reason = "greeting_confirmed";
+    } else {
+      transitionAction("outcome_unknown", {
+        reason: "post_click_confirmation_not_observed",
+        send_method: "Input.dispatchMouseEvent"
+      });
+      result.counted_as_greet = false;
+      result.reason = "greet_outcome_unknown";
+      result.outcome_unknown = true;
+      result.stop_run = true;
+    }
+  } catch (journalError) {
+    return preservePostInputJournalFailure({
+      error: journalError,
+      desiredState: result.verified_after_click === true
+        ? "greeting_confirmed"
+        : "outcome_unknown",
+      reason: "greet_post_input_terminal_state_persistence_failed",
+      inputDispatched: true
+    });
+  }
   return result;
+}
+
+function compactRecommendFilteredEmptyState(emptyState) {
+  if (!emptyState) return null;
+  return {
+    verified: Boolean(emptyState.verified),
+    reason: emptyState.reason || null,
+    text: emptyState.text || null,
+    node_id: Number.isInteger(emptyState.node_id) ? emptyState.node_id : null,
+    box: emptyState.box || null,
+    accessibility: emptyState.accessibility || null,
+    selector_counts: emptyState.selector_counts || null,
+    checked_node_count: Number.isInteger(emptyState.checked_node_count)
+      ? emptyState.checked_node_count
+      : 0,
+    candidate_node_count: Number.isInteger(emptyState.candidate_node_count)
+      ? emptyState.candidate_node_count
+      : 0,
+    query_errors: Array.isArray(emptyState.query_errors) ? emptyState.query_errors.slice(0, 20) : []
+  };
+}
+
+export function isVerifiedRecommendRefreshCompletion(refreshResult) {
+  return Boolean(
+    refreshResult?.ok === true
+    && refreshResult?.exhausted === true
+    && refreshResult?.empty_state?.verified === true
+    && Number(refreshResult?.card_count) === 0
+  );
 }
 
 function compactRefreshAttempt(refreshAttempt) {
   if (!refreshAttempt) return null;
   return {
     ok: Boolean(refreshAttempt.ok),
+    exhausted: Boolean(refreshAttempt.exhausted),
     method: refreshAttempt.method || "",
     reason: refreshAttempt.reason || null,
     error: refreshAttempt.error || null,
     error_diagnostic: refreshAttempt.error_diagnostic || null,
     forced_recent_not_view: Boolean(refreshAttempt.forced_recent_not_view),
     target_url: refreshAttempt.target_url || null,
-    card_count: refreshAttempt.card_count || 0,
+    card_count: Number.isInteger(refreshAttempt.card_count) ? refreshAttempt.card_count : 0,
+    empty_state: compactRecommendFilteredEmptyState(refreshAttempt.empty_state),
     elapsed_ms: refreshAttempt.elapsed_ms || 0,
     recovery_settle: refreshAttempt.recovery_settle
       ? {
@@ -907,7 +1780,8 @@ function compactRefreshAttempt(refreshAttempt) {
       label: attempt.label || null,
       before_card_count: attempt.before_card_count || 0,
       after_card_count: attempt.after_card_count || 0,
-      card_count: attempt.card_count || 0,
+      card_count: Number.isInteger(attempt.card_count) ? attempt.card_count : 0,
+      empty_state: compactRecommendFilteredEmptyState(attempt.empty_state),
       elapsed_ms: attempt.elapsed_ms || 0,
       current_city_only: compactCurrentCityOnlyResult(attempt.current_city_only),
       current_city_only_attempts: (attempt.current_city_only_attempts || []).map((cityAttempt) => ({
@@ -972,13 +1846,14 @@ export function countRecommendResultStatuses(results = [], {
     detail_open_failed: results.filter((item) => (
       item.error?.code === "DETAIL_STALE_NODE"
       || item.error?.code === "DETAIL_OPEN_FAILED"
+      || item.error?.code === "RECOMMEND_DETAIL_CANDIDATE_MISMATCH"
     )).length,
     transient_recovered: results.filter((item) => (
-      item.error?.code === "DETAIL_STALE_NODE"
-      || item.error?.code === "DETAIL_OPEN_FAILED"
-      || item.error?.code === "IMAGE_CAPTURE_STALE_NODE"
-      || item.error?.code === "IMAGE_CAPTURE_TIMEOUT"
-      || item.error?.code === "IMAGE_CAPTURE_TOTAL_TIMEOUT"
+      (
+        item.timings?.image_capture_resume?.attempted === true
+        && item.timings?.image_capture_resume?.ok === true
+      )
+      || item.detail?.cv_acquisition?.close_recovery?.ok === true
     )).length,
     colleague_contact_checked: results.filter((item) => item.detail?.colleague_contact?.checked).length,
     recent_colleague_contact_skipped: results.filter((item) => (
@@ -1044,11 +1919,33 @@ function compactError(error, fallbackCode = "RECOMMEND_RUN_ERROR") {
   if (error.target_count != null) {
     result.target_count = error.target_count;
   }
+  if (error.screening_candidate_identity) {
+    result.screening_candidate_identity = error.screening_candidate_identity;
+  }
   if (error.passed_count != null) {
     result.passed_count = error.passed_count;
   }
   if (Array.isArray(error.recommend_detail_open_attempts)) {
     result.recommend_detail_open_attempts = error.recommend_detail_open_attempts;
+  }
+  if (error.recommend_pre_click_retry) {
+    result.recommend_pre_click_retry = error.recommend_pre_click_retry;
+  }
+  if (error.recommend_pre_click_stale_no_action === true) {
+    result.recommend_pre_click_stale_no_action = true;
+    result.recommend_no_click_dispatched = error.recommend_no_click_dispatched === true;
+    result.recommend_click_dispatched = error.recommend_click_dispatched === true;
+    result.recommend_input_dispatched = error.recommend_input_dispatched === true;
+    result.recommend_pre_click_stage = error.recommend_pre_click_stage || null;
+    result.recommend_pre_click_retry_exhausted = error.recommend_pre_click_retry_exhausted === true;
+    result.recommend_pre_click_reacquire_failed = error.recommend_pre_click_reacquire_failed === true;
+  }
+  if (error.recommend_input_dispatched === true) {
+    result.recommend_click_dispatched = error.recommend_click_dispatched === true;
+    result.recommend_input_dispatched = true;
+    result.recommend_post_input_outcome_unknown = error.recommend_post_input_outcome_unknown === true;
+    result.recommend_click_negative_outcome_observed = error.recommend_click_negative_outcome_observed === true;
+    result.recommend_post_input_stage = error.recommend_post_input_stage || null;
   }
   if (Array.isArray(error.click_attempts)) {
     result.click_attempts = error.click_attempts;
@@ -1135,6 +2032,7 @@ export function createRecommendRefreshFailureError(refreshAttempt, {
 export function isRecoverableImageCaptureError(error) {
   if (isRecoverableImageCaptureWorkflowError(error)) return true;
   if (isStaleRecommendNodeError(error)) return true;
+  if (error?.code === "IMAGE_CAPTURE_TARGET_UNAVAILABLE") return true;
   return /Image fallback capture timed out/i.test(String(error?.message || error || ""));
 }
 
@@ -1200,11 +2098,146 @@ function createImageCaptureFailureScreening(candidate, error) {
 }
 
 export function isRecoverableRecommendDetailError(error) {
-  return isStaleRecommendNodeError(error) || isRecommendDetailOpenMissError(error);
+  if (isCandidateLocalRecommendPostClickBindingTimeout(error)) return true;
+  if (
+    error?.recommend_input_dispatched === true
+    && error?.recommend_click_negative_outcome_observed !== true
+  ) return false;
+  return isRecommendPreClickStaleNoActionError(error)
+    || isStaleRecommendNodeError(error)
+    || isRecommendDetailOpenMissError(error)
+    || isRecommendDetailCandidateBindingError(error);
+}
+
+export function isCandidateLocalRecommendPostClickBindingTimeout(error) {
+  const binding = error?.detail_candidate_binding || null;
+  const clickAttempts = Array.isArray(error?.click_attempts) ? error.click_attempts : [];
+  const dispatchedAttempts = clickAttempts.filter(
+    (attempt) => attempt?.input_dispatched === true
+  );
+  return Boolean(
+    isRecommendDetailCandidateBindingError(error)
+    && error?.recommend_clean_pre_action_detail_binding_timeout === true
+    && error?.recommend_click_dispatched === true
+    && error?.recommend_input_dispatched === true
+    && error?.recommend_post_input_outcome_unknown === false
+    && error?.recommend_post_input_stage === "post_card_click_binding"
+    && binding?.reason === "detail_binding_readiness_timeout"
+    && binding?.readiness?.exhausted === true
+    && binding?.readiness?.terminal === false
+    && binding?.readiness?.last_error == null
+    && dispatchedAttempts.length === 1
+    && dispatchedAttempts[0]?.outcome === "detail"
+  );
+}
+
+export function getRecommendDetailFailureDisposition(error) {
+  if (isCandidateLocalRecommendPostClickBindingTimeout(error)) {
+    return {
+      recoverable: true,
+      candidate_local: true,
+      context_recovery: false,
+      allow_post_action: false,
+      reason: "detail_binding_readiness_timeout_failed_closed"
+    };
+  }
+  if (
+    error?.recommend_input_dispatched === true
+    && error?.recommend_click_negative_outcome_observed !== true
+  ) {
+    return {
+      recoverable: false,
+      candidate_local: false,
+      context_recovery: false,
+      allow_post_action: false,
+      reason: "post_input_detail_outcome_unknown_terminal"
+    };
+  }
+  if (isRecommendDetailCandidateBindingError(error)) {
+    return {
+      recoverable: true,
+      candidate_local: true,
+      context_recovery: false,
+      allow_post_action: false,
+      reason: "candidate_binding_failed_closed"
+    };
+  }
+  if (
+    isRecommendPreClickStaleNoActionError(error)
+    && error?.recommend_pre_click_retry_exhausted === true
+    && error?.recommend_pre_click_reacquire_failed !== true
+    && error?.recommend_pre_click_retry?.candidate_local_exhaustion === true
+  ) {
+    return {
+      recoverable: true,
+      candidate_local: true,
+      context_recovery: false,
+      allow_post_action: false,
+      reason: "pre_click_stale_no_action_failed_closed"
+    };
+  }
+  if (isStaleRecommendNodeError(error) || isRecommendDetailOpenMissError(error)) {
+    return {
+      recoverable: true,
+      candidate_local: false,
+      context_recovery: true,
+      allow_post_action: false,
+      reason: "detail_context_recovery_required"
+    };
+  }
+  return {
+    recoverable: false,
+    candidate_local: false,
+    context_recovery: false,
+    allow_post_action: false,
+    reason: "fatal_detail_error"
+  };
 }
 
 function compactRecoverableDetailError(error) {
-  return compactError(error, isStaleRecommendNodeError(error) ? "DETAIL_STALE_NODE" : "DETAIL_OPEN_FAILED");
+  const compact = compactError(
+    error,
+    isRecommendPreClickStaleNoActionError(error)
+      && error?.recommend_pre_click_retry_exhausted === true
+      ? "RECOMMEND_PRE_CLICK_STALE_NO_ACTION"
+      : isStaleRecommendNodeError(error)
+      ? "DETAIL_STALE_NODE"
+      : isRecommendDetailCandidateBindingError(error)
+      ? "RECOMMEND_DETAIL_CANDIDATE_MISMATCH"
+      : "DETAIL_OPEN_FAILED"
+  );
+  if (error?.detail_candidate_binding) {
+    compact.candidate_binding = compactRecommendDetailCandidateBinding(error.detail_candidate_binding);
+  }
+  return compact;
+}
+
+export function preserveRecommendDetailCandidateBindingForRecovery(detailResult, binding = null) {
+  const preservedBinding = binding || null;
+  if (detailResult && typeof detailResult === "object") {
+    detailResult.candidate_binding = preservedBinding;
+  }
+  return preservedBinding;
+}
+
+export function reserveRecommendDetailRecovery(recoveryCounts, candidateKey, limit = 1) {
+  const boundedLimit = Math.max(0, Math.floor(Number(limit) || 0));
+  const currentCount = Number(recoveryCounts?.get?.(candidateKey) || 0);
+  if (currentCount >= boundedLimit) {
+    return {
+      allowed: false,
+      current_count: currentCount,
+      next_count: currentCount,
+      limit: boundedLimit
+    };
+  }
+  recoveryCounts.set(candidateKey, currentCount + 1);
+  return {
+    allowed: true,
+    current_count: currentCount,
+    next_count: currentCount + 1,
+    limit: boundedLimit
+  };
 }
 
 function createRecoverableDetailFailureScreening(candidate, error) {
@@ -1212,8 +2245,14 @@ function createRecoverableDetailFailureScreening(candidate, error) {
     status: "fail",
     passed: false,
     score: 0,
-    reasons: isStaleRecommendNodeError(error)
+    reasons: isRecommendPreClickStaleNoActionError(error)
+      && error?.recommend_pre_click_retry_exhausted === true
+      && error?.recommend_pre_click_reacquire_failed !== true
+      ? ["detail_open_failed", "pre_click_stale_no_action"]
+      : isStaleRecommendNodeError(error)
       ? ["detail_open_failed", "stale_node"]
+      : isRecommendDetailCandidateBindingError(error)
+      ? ["detail_open_failed", "detail_candidate_mismatch"]
       : isRecommendDetailOpenMissError(error)
       ? ["detail_open_failed", "detail_open_miss"]
       : ["detail_open_failed"],
@@ -1231,6 +2270,285 @@ function createRecentColleagueContactSkipScreening(candidate, colleagueContact) 
     reasons: ["skipped_recent_colleague_contact"],
     reason: matched?.text || "Candidate has recent colleague contact history",
     matched_colleague_contact: matched,
+    candidate
+  };
+}
+
+export function isVerifiedColleagueContactInspection(colleagueContact) {
+  const rows = Array.isArray(colleagueContact?.rows) ? colleagueContact.rows : [];
+  const rowCount = Number(colleagueContact?.row_count);
+  const sectionNodeId = Number(colleagueContact?.section_node_id);
+  const sectionBackendNodeId = Number(colleagueContact?.section_backend_node_id);
+  const reason = colleagueContact?.reason;
+  if (reason === "panel_missing") {
+    const absenceProbe = colleagueContact?.absence_probe;
+    const backendNodeIds = Array.isArray(absenceProbe?.scope_backend_node_ids)
+      ? absenceProbe.scope_backend_node_ids
+      : [];
+    return Boolean(
+      colleagueContact?.checked === true
+      && colleagueContact?.panel_found === false
+      && colleagueContact?.recent === false
+      && colleagueContact?.indeterminate === false
+      && absenceProbe?.verified === true
+      && absenceProbe?.selector === ".colleague-collaboration"
+      && Number.isInteger(Number(absenceProbe?.scope_count))
+      && Number(absenceProbe.scope_count) > 0
+      && Number.isInteger(Number(absenceProbe?.stable_scope_count))
+      && Number(absenceProbe.stable_scope_count) > 0
+      && Number(absenceProbe.stable_scope_count) === backendNodeIds.length
+      && backendNodeIds.every((backendNodeId) => (
+        Number.isInteger(Number(backendNodeId)) && Number(backendNodeId) > 0
+      ))
+      && Number.isInteger(Number(absenceProbe?.poll_count))
+      && Number(absenceProbe.poll_count) >= 2
+      && Number(absenceProbe?.elapsed_ms) >= Number(absenceProbe?.timeout_ms)
+      && absenceProbe?.full_window_elapsed === true
+      && Number(absenceProbe?.query_error_count) === 0
+      && absenceProbe?.scope_binding_lost === false
+      && rows.length === 0
+    );
+  }
+  const scrollProbe = colleagueContact?.scroll_probe;
+  const scrollPositions = Array.isArray(scrollProbe?.positions) ? scrollProbe.positions : [];
+  const requestedScrolls = Number(scrollProbe?.scrolls_requested);
+  const completedScrolls = Number(scrollProbe?.scrolls_completed);
+  const endProof = scrollProbe?.end_proof;
+  const seenRowTexts = new Set();
+  let priorRowSignature = null;
+  let priorRowLayoutSignature = null;
+  let recomputedStableSignatureCount = 0;
+  let recomputedEffectiveScrollCount = 0;
+  const scrollPositionsVerified = scrollPositions.every((position, index) => {
+    const rowTexts = Array.isArray(position?.row_texts)
+      ? position.row_texts.map((text) => String(text || "")).sort()
+      : [];
+    const rowIdentityKeys = Array.isArray(position?.row_identity_keys)
+      ? position.row_identity_keys.map((key) => String(key || "")).sort()
+      : [];
+    const rowBackendNodeIds = Array.isArray(position?.row_backend_node_ids)
+      ? position.row_backend_node_ids.map(Number)
+      : [];
+    const orderedRowLayout = Array.isArray(position?.ordered_row_layout)
+      ? position.ordered_row_layout.map((row) => ({
+          backend_node_id: Number(row?.backend_node_id),
+          text: String(row?.text || ""),
+          x: Number(row?.x),
+          y: Number(row?.y),
+          width: Number(row?.width),
+          height: Number(row?.height)
+        }))
+      : [];
+    const recomputedOrderedRowLayout = orderedRowLayout.slice().sort((left, right) => (
+      left.y - right.y
+      || left.x - right.x
+      || left.backend_node_id - right.backend_node_id
+    ));
+    const orderedRowLayoutKeys = recomputedOrderedRowLayout.map((row) => (
+      `${row.text}:${row.x}:${row.y}:${row.width}:${row.height}`
+    ));
+    const persistedOrderedRowLayoutKeys = Array.isArray(position?.ordered_row_layout_keys)
+      ? position.ordered_row_layout_keys.map((key) => String(key || ""))
+      : [];
+    const expectedNewRowTexts = rowTexts.filter((text) => !seenRowTexts.has(text));
+    const rowSignature = JSON.stringify(rowIdentityKeys);
+    const rowLayoutSignature = JSON.stringify(orderedRowLayoutKeys);
+    const expectedScrollEffectObserved = Boolean(
+      index > 0
+      && rowLayoutSignature !== priorRowLayoutSignature
+    );
+    if (expectedScrollEffectObserved) recomputedEffectiveScrollCount += 1;
+    if (
+      index > 0
+      && rowSignature === priorRowSignature
+      && expectedNewRowTexts.length === 0
+    ) {
+      recomputedStableSignatureCount += 1;
+    } else {
+      recomputedStableSignatureCount = 0;
+    }
+    const verified = Boolean(
+      Number(position?.position_index) === index
+      && Number(position?.sampled_after_scroll_count) === index
+      && Number(position?.row_count) > 0
+      && rowTexts.length === Number(position?.row_count)
+      && new Set(rowTexts).size === rowTexts.length
+      && rowIdentityKeys.length === Number(position?.row_count)
+      && new Set(rowIdentityKeys).size === rowIdentityKeys.length
+      && rowBackendNodeIds.length === Number(position?.row_count)
+      && rowBackendNodeIds.every((backendNodeId) => Number.isInteger(backendNodeId) && backendNodeId > 0)
+      && position?.row_signature === rowSignature
+      && orderedRowLayout.length === Number(position?.row_count)
+      && orderedRowLayout.every((row) => (
+        Number.isInteger(row.backend_node_id)
+        && row.backend_node_id > 0
+        && rowBackendNodeIds.includes(row.backend_node_id)
+        && row.text.length > 0
+        && rowTexts.includes(row.text)
+        && [row.x, row.y, row.width, row.height].every(Number.isFinite)
+        && row.width > 0
+        && row.height > 0
+      ))
+      && JSON.stringify(orderedRowLayout) === JSON.stringify(recomputedOrderedRowLayout)
+      && orderedRowLayoutKeys.length === Number(position?.row_count)
+      && new Set(orderedRowLayoutKeys).size === orderedRowLayoutKeys.length
+      && JSON.stringify(persistedOrderedRowLayoutKeys) === JSON.stringify(orderedRowLayoutKeys)
+      && position?.row_layout_signature === rowLayoutSignature
+      && position?.scroll_effect_observed === expectedScrollEffectObserved
+      && Number(position?.cumulative_effective_scroll_count) === recomputedEffectiveScrollCount
+      && Number(position?.new_row_count) === expectedNewRowTexts.length
+      && JSON.stringify(
+        Array.isArray(position?.new_row_texts)
+          ? position.new_row_texts.map((text) => String(text || "")).sort()
+          : []
+      ) === JSON.stringify([...expectedNewRowTexts].sort())
+      && Number(position?.stable_signature_count) === recomputedStableSignatureCount
+      && Number(position?.unreadable_row_count) === 0
+      && position?.binding_before_verified === true
+      && position?.binding_after_verified === true
+    );
+    for (const text of rowTexts) seenRowTexts.add(text);
+    priorRowSignature = rowSignature;
+    priorRowLayoutSignature = rowLayoutSignature;
+    return verified;
+  });
+  const lastScrollPosition = scrollPositions[scrollPositions.length - 1] || null;
+  const exactEndProofVerified = Boolean(
+    endProof?.verified === true
+    && endProof?.method === "effective_scroll_then_repeated_identical_rows"
+    && Number(endProof?.stable_samples_required) === 2
+    && Number(endProof?.stable_samples_observed) >= 2
+    && Number(endProof?.additional_wheel_attempts_without_change) >= 2
+    && endProof?.effective_scroll_observed === true
+    && Number(endProof?.effective_scroll_count) === recomputedEffectiveScrollCount
+    && recomputedEffectiveScrollCount > 0
+    && Number(endProof?.end_position_index) === scrollPositions.length - 1
+    && Number(endProof?.end_scroll_count) === completedScrolls
+    && endProof?.row_signature === lastScrollPosition?.row_signature
+    && Number(lastScrollPosition?.stable_signature_count) >= 2
+    && scrollProbe?.cap_reached_without_end === false
+  );
+  const noRecentScanVerified = reason !== "no_recent_colleague_contact" || Boolean(
+    scrollProbe?.completed === true
+    && scrollProbe?.coverage_verified === true
+    && Number.isInteger(requestedScrolls)
+    && requestedScrolls >= 2
+    && requestedScrolls <= 48
+    && Number.isInteger(completedScrolls)
+    && completedScrolls >= 2
+    && completedScrolls <= requestedScrolls
+    && Number(scrollProbe?.position_count) === completedScrolls + 1
+    && scrollPositions.length === completedScrolls + 1
+    && Number(scrollProbe?.step_delta_y) > 0
+    && Number(scrollProbe?.overlap_ratio) > 0
+    && Number(scrollProbe?.overlap_ratio) < 1
+    && Number(scrollProbe?.effective_scroll_count) === recomputedEffectiveScrollCount
+    && recomputedEffectiveScrollCount > 0
+    && scrollPositionsVerified
+    && exactEndProofVerified
+  );
+  const semanticResultMatchesRows = reason === "recent_colleague_contact_found"
+    ? colleagueContact?.recent === true && rows.some((row) => row?.within_window === true)
+    : reason === "no_recent_colleague_contact"
+      ? colleagueContact?.recent === false && rows.every((row) => row?.within_window === false)
+      : false;
+  return Boolean(
+    colleagueContact?.checked === true
+    && colleagueContact?.panel_found === true
+    && colleagueContact?.indeterminate !== true
+    && typeof colleagueContact?.recent === "boolean"
+    && semanticResultMatchesRows
+    && noRecentScanVerified
+    && String(colleagueContact?.selected_tab_text || "").replace(/\s+/g, "").trim() === "同事沟通进度"
+    && colleagueContact?.selected_tab_count === 1
+    && colleagueContact?.pane_binding_verified === true
+    && colleagueContact?.binding?.verified === true
+    && colleagueContact?.binding?.selection_reverified_after_rows === true
+    && colleagueContact?.binding?.row_scope === "selected_section_descendants"
+    && Number.isInteger(sectionNodeId)
+    && sectionNodeId > 0
+    && Number.isInteger(sectionBackendNodeId)
+    && sectionBackendNodeId > 0
+    && Number.isInteger(rowCount)
+    && rowCount > 0
+    && rows.length === rowCount
+    && (
+      reason !== "no_recent_colleague_contact"
+      || (
+        seenRowTexts.size === rowCount
+        && rows.every((row) => seenRowTexts.has(String(row?.text || "")))
+      )
+    )
+    && rows.every((row) => (
+      Boolean(String(row?.text || "").trim())
+      && Boolean(row?.parsed_date)
+      && typeof row?.within_window === "boolean"
+      && row?.visible === true
+      && Number(row?.section_node_id) === sectionNodeId
+      && Number(row?.section_backend_node_id) === sectionBackendNodeId
+      && Number.isInteger(Number(row?.backend_node_id))
+      && Number(row?.backend_node_id) > 0
+      && (
+        reason !== "no_recent_colleague_contact"
+        || (
+          Array.isArray(row?.observed_at_positions)
+          && row.observed_at_positions.length > 0
+          && row.observed_at_positions.every((position) => (
+            Number.isInteger(Number(position))
+            && Number(position) >= 0
+            && Number(position) <= completedScrolls
+          ))
+        )
+      )
+    ))
+  );
+}
+
+export function getColleagueContactSkipReason(colleagueContact) {
+  if (!isVerifiedColleagueContactInspection(colleagueContact)) {
+    return "colleague_contact_unverified";
+  }
+  return colleagueContact?.recent === true ? "skipped_recent_colleague_contact" : "";
+}
+
+export async function bindRecommendColleagueContactInspectionResult(
+  colleagueContact,
+  { reverifyCandidateBinding } = {}
+) {
+  if (typeof reverifyCandidateBinding !== "function") {
+    const error = new Error("Recommend colleague-contact result requires fresh candidate binding verification");
+    error.code = "RECOMMEND_DETAIL_CANDIDATE_BINDING_REQUIRED";
+    throw error;
+  }
+  const candidateBinding = await reverifyCandidateBinding(
+    "after_colleague_contact_before_result"
+  );
+  if (candidateBinding?.verified !== true) {
+    throw createRecommendDetailCandidateBindingError(candidateBinding);
+  }
+  return {
+    candidate_binding: candidateBinding,
+    skip_reason: getColleagueContactSkipReason(colleagueContact)
+  };
+}
+
+export function resolveEffectiveRecommendDetailLimit({
+  detailLimit = Number.POSITIVE_INFINITY,
+  postActionEnabled = false,
+  requireColleagueContactInspection = false
+} = {}) {
+  if (postActionEnabled || requireColleagueContactInspection) return Number.POSITIVE_INFINITY;
+  return detailLimit;
+}
+
+function createUnverifiedColleagueContactSkipScreening(candidate, colleagueContact) {
+  return {
+    status: "skip",
+    passed: false,
+    score: 0,
+    reasons: ["colleague_contact_unverified"],
+    reason: "Candidate colleague-contact status could not be verified",
+    colleague_contact: colleagueContact,
     candidate
   };
 }
@@ -1266,6 +2584,9 @@ export async function runRecommendWorkflow({
   actionTimeoutMs = 8000,
   actionIntervalMs = 500,
   actionAfterClickDelayMs = 900,
+  actionJournal = null,
+  actionJournalScope = "boss-recommend:default",
+  reverifyActionJournalScope = null,
   screeningMode = "llm",
   llmConfig = null,
   llmTimeoutMs = 120000,
@@ -1312,12 +2633,23 @@ export async function runRecommendWorkflow({
   const normalizedScreeningMode = normalizeScreeningMode(screeningMode);
   const useLlmScreening = normalizedScreeningMode !== "deterministic";
   const postActionEnabled = normalizedPostAction !== "none";
+  const screeningOnlyBindingEnabled = Boolean(
+    normalizedPostAction === "none"
+    && executePostAction === false
+  );
+  const effectiveActionJournal = postActionEnabled && executePostAction
+    ? actionJournal || createRecommendGreetingActionJournal()
+    : actionJournal;
   const shouldSkipRecentColleagueContacted = skipRecentColleagueContacted !== false;
   const normalizedColleagueContactWindowDays = Math.max(1, Number(colleagueContactWindowDays) || 14);
   const colleagueContactReferenceDate = new Date();
   const targetPassCount = Math.max(1, Number(maxCandidates) || 1);
   const detailCountLimit = detailLimit == null ? Number.POSITIVE_INFINITY : Math.max(0, Number(detailLimit) || 0);
-  const effectiveDetailLimit = postActionEnabled ? Number.POSITIVE_INFINITY : detailCountLimit;
+  const effectiveDetailLimit = resolveEffectiveRecommendDetailLimit({
+    detailLimit: detailCountLimit,
+    postActionEnabled,
+    requireColleagueContactInspection: shouldSkipRecentColleagueContacted
+  });
   const networkRecorder = effectiveDetailLimit > 0
     ? createRecommendDetailNetworkRecorder(client)
     : null;
@@ -1362,6 +2694,7 @@ export async function runRecommendWorkflow({
   const listReadStaleDiagnostics = [];
   let domStaleEventCount = 0;
   let currentDomOperation = "recommend:initialize";
+  let currentDetailCandidateBinding = null;
   const domLifecycleTimeline = [];
   const domStaleForensics = [];
   const listFallbackResolver = listFallbackPoint || (async ({ items = [] } = {}) => resolveInfiniteListFallbackPoint(client, {
@@ -1583,6 +2916,7 @@ export async function runRecommendWorkflow({
         key: candidateKey,
         card_node_id: cardNodeId,
         detail_step: detailStep || null,
+        candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
         counters: countRecommendResultStatuses(results, { greetCount }),
         error: compactError(error, "RECOMMEND_IN_PROGRESS_ERROR")
       },
@@ -1624,8 +2958,9 @@ export async function runRecommendWorkflow({
       buttonSettleMs: refreshButtonSettleMs,
       reloadSettleMs: refreshReloadSettleMs
     });
+    const verifiedExhaustion = isVerifiedRecommendRefreshCompletion(refreshResult);
     let blockingPanelClose = null;
-    if (refreshResult.ok) {
+    if (refreshResult.ok && !verifiedExhaustion) {
       blockingPanelClose = await closeRecommendBlockingPanels(client, {
         attemptsLimit: 2,
         rootState: refreshResult.root_state || rootState
@@ -1664,11 +2999,52 @@ export async function runRecommendWorkflow({
       recoveryError.recovery_reason = reason;
       throw attachRecommendRefreshErrorDiagnostic(recoveryError, compactRefresh);
     }
+    if (refreshResult.exhausted && !verifiedExhaustion) {
+      updateRecommendProgress({
+        refresh_method: refreshResult.method || null,
+        refresh_forced_recent_not_view: effectiveForceRecentNotView,
+        recovery_reason: reason,
+        refresh_exhausted_unverified: true
+      });
+      const recoveryError = new Error(
+        `Recommend context recovery returned unverified exhaustion after ${reason}`
+      );
+      recoveryError.code = "RECOMMEND_CONTEXT_RECOVERY_FAILED";
+      recoveryError.refresh_attempt = compactRefresh;
+      recoveryError.recovery_reason = reason;
+      throw attachRecommendRefreshErrorDiagnostic(recoveryError, compactRefresh);
+    }
     if (refreshResult.current_city_only) {
       currentCityOnlyResult = refreshResult.current_city_only;
     }
     if (refreshResult.filter) {
       filterResult = refreshResult.filter;
+    }
+    if (verifiedExhaustion) {
+      rootState = refreshResult.root_state || rootState;
+      cardNodeIds = [];
+      listEndReason = "filtered_list_exhausted";
+      updateRecommendProgress({
+        card_count: 0,
+        refresh_method: refreshResult.method || null,
+        refresh_forced_recent_not_view: effectiveForceRecentNotView,
+        recovery_reason: reason,
+        list_end_reason: listEndReason,
+        refresh_exhausted: true,
+        empty_state_verified: true
+      });
+      runControl.checkpoint({
+        context_recovery: {
+          attempt: contextRecoveryAttempts,
+          reason,
+          refresh: compactRefresh,
+          refresh_exhausted: true,
+          list_end_reason: listEndReason,
+          counters: countRecommendResultStatuses(results, { greetCount })
+        },
+        candidate_list: compactInfiniteListState(listState)
+      });
+      return refreshResult;
     }
     if (!blockingPanelClose?.closed) {
       const panelError = createRecommendBlockingPanelCloseFailureError(blockingPanelClose, `recover:${reason}`);
@@ -1720,14 +3096,15 @@ export async function runRecommendWorkflow({
     await runControl.waitIfPaused();
     runControl.throwIfCanceled();
     runControl.setPhase("recommend:job");
-    jobSelection = await selectRecommendJob(client, rootState.iframe.documentNodeId, {
+    const initialJobSelection = await selectAndVerifyInitialRecommendJob(client, rootState, {
       jobLabel,
-      settleMs: cardTimeoutMs > 45000 ? 12000 : 6000
+      settleMs: cardTimeoutMs > 45000 ? 12000 : 6000,
+      dropdownTimeoutMs: Math.max(8000, Math.min(cardTimeoutMs, 60000)),
+      totalTimeoutMs: Math.max(30000, Math.min(cardTimeoutMs + 15000, 90000)),
+      retryDelayMs: 1000
     });
-    if (!jobSelection.selected) {
-      throw new Error(`Requested recommend job was not selected: ${jobSelection.reason}`);
-    }
-    rootState = await getRecommendRoots(client);
+    jobSelection = initialJobSelection.job_selection;
+    rootState = initialJobSelection.root_state || await getRecommendRoots(client);
     rootState = await ensureRecommendViewport(rootState, "job");
     runControl.checkpoint({
       job_selection: compactJobSelection(jobSelection)
@@ -1778,8 +3155,11 @@ export async function runRecommendWorkflow({
         rootState.iframe.documentNodeId,
         buildRecommendFilterSelectionOptions(normalizedFilter)
       );
-      if (!result.confirmed) {
-        throw new Error("Recommend run filter selection was not confirmed");
+      if (!isVerifiedRecommendFilterApplication(
+        result,
+        buildRecommendFilterSelectionOptions(normalizedFilter)
+      )) {
+        throw new Error("Recommend run filter selection was not fully verified");
       }
       rootState = await getRecommendRoots(client);
       rootState = await ensureRecommendViewport(rootState, "filter");
@@ -1800,15 +3180,46 @@ export async function runRecommendWorkflow({
     timeoutMs: cardTimeoutMs,
     intervalMs: 300
   });
+  let initialEmptyState = null;
   if (!cardNodeIds.length) {
-    throw new Error("No recommend candidate cards found for run service");
+    initialEmptyState = await inspectRecommendFilteredEmptyState(
+      client,
+      rootState.iframe.documentNodeId
+    );
+    const initialExhausted = isVerifiedRecommendRefreshExhaustion({
+      cardCount: 0,
+      filter: normalizedFilter,
+      filterResult,
+      pageScopeResult: pageScopeSelection,
+      currentCityOnlyResult,
+      emptyState: initialEmptyState
+    });
+    if (!initialExhausted) {
+      const error = new Error("No recommend candidate cards found for run service");
+      error.code = "RECOMMEND_INITIAL_LIST_EMPTY_UNVERIFIED";
+      error.empty_state = compactRecommendFilteredEmptyState(initialEmptyState);
+      throw error;
+    }
+    listEndReason = "filtered_list_exhausted";
+    runControl.checkpoint({
+      initial_list_exhausted: true,
+      list_end_reason: listEndReason,
+      empty_state: compactRecommendFilteredEmptyState(initialEmptyState),
+      counters: countRecommendResultStatuses(results, { greetCount })
+    });
   }
 
   updateRecommendProgress({
-    list_end_reason: null
+    card_count: cardNodeIds.length,
+    list_end_reason: listEndReason || null,
+    initial_list_exhausted: listEndReason === "filtered_list_exhausted",
+    empty_state_verified: initialEmptyState?.verified === true
   });
 
-  while (countPassedResults(results) < targetPassCount) {
+  while (
+    countPassedResults(results) < targetPassCount
+    && listEndReason !== "filtered_list_exhausted"
+  ) {
     const candidateStarted = Date.now();
     const timings = {};
     await runControl.waitIfPaused();
@@ -1860,6 +3271,13 @@ export async function runRecommendWorkflow({
         await runControl.waitIfPaused();
         runControl.throwIfCanceled();
         runControl.setPhase("recommend:list-read");
+        if (listEndReason === "filtered_list_exhausted") {
+          return {
+            ok: false,
+            end_reached: true,
+            reason: listEndReason
+          };
+        }
         rootState = await ensureRecommendViewport(rootState, "candidate_loop");
         if (debugForcedListEnd) {
           return {
@@ -1971,40 +3389,12 @@ export async function runRecommendWorkflow({
           return await recoverRecommendListReadStaleContext({
             staleAttempt: diagnostic.attempt,
             listState,
-            rootReacquire: async () => {
-              await runControl.waitIfPaused();
-              runControl.throwIfCanceled();
-              runControl.setPhase("recommend:list-read-root-reacquire");
-              let freshRootState = await getRecommendRoots(client);
-              freshRootState = await ensureRecommendViewport(
-                freshRootState,
-                "list_read_stale_root_reacquire"
-              );
-              const freshCardNodeIds = await waitForRecommendCardNodeIds(
-                client,
-                freshRootState.iframe.documentNodeId,
-                {
-                  timeoutMs: Math.min(cardTimeoutMs, 10000),
-                  intervalMs: 300
-                }
-              );
-              rootState = freshRootState;
-              cardNodeIds = freshCardNodeIds;
-              return {
-                card_count: freshCardNodeIds.length,
-                iframe_document_node_id: freshRootState.iframe.documentNodeId,
-                root_identity: compactRecommendDomRootIdentity(
-                  freshRootState,
-                  currentConnectionEpoch()
-                )
-              };
-            },
-            contextReapply: async ({ rootReacquireError }) => {
+            contextReapply: async () => {
               await runControl.waitIfPaused();
               runControl.throwIfCanceled();
               const recovery = await recoverAndReapplyRecommendContext(
                 "list_read_stale_node",
-                rootReacquireError || error,
+                error,
                 { forceRecentNotView: true }
               );
               return {
@@ -2112,6 +3502,16 @@ export async function runRecommendWorkflow({
     const nextCandidateResult = listReadAcquisition.result;
     if (!nextCandidateResult.ok) {
       listEndReason = nextCandidateResult.reason || "list_exhausted";
+      if (listEndReason === "filtered_list_exhausted") {
+        cardNodeIds = [];
+        updateRecommendProgress({
+          card_count: 0,
+          list_end_reason: listEndReason,
+          refresh_exhausted: true,
+          empty_state_verified: true
+        });
+        break;
+      }
       if (
           (nextCandidateResult.end_reached || isRefreshableListStall(nextCandidateResult.reason))
           && refreshOnEnd
@@ -2152,11 +3552,44 @@ export async function runRecommendWorkflow({
           refresh: compactRefresh
         });
         updateRecommendProgress({
-          card_count: refreshResult.card_count || cardNodeIds.length,
+          card_count: Number.isInteger(refreshResult.card_count)
+            ? refreshResult.card_count
+            : cardNodeIds.length,
           refresh_method: refreshResult.method || null,
           refresh_forced_recent_not_view: Boolean(refreshResult.forced_recent_not_view),
           list_end_reason: listEndReason
         });
+        if (refreshResult.exhausted && !isVerifiedRecommendRefreshCompletion(refreshResult)) {
+          throw createRecommendRefreshFailureError(compactRefresh, {
+            listEndReason,
+            targetCount: targetPassCount,
+            passedCount: countPassedResults(results)
+          });
+        }
+        if (isVerifiedRecommendRefreshCompletion(refreshResult)) {
+          if (refreshResult.current_city_only) {
+            currentCityOnlyResult = refreshResult.current_city_only;
+          }
+          if (refreshResult.filter) {
+            filterResult = refreshResult.filter;
+          }
+          cardNodeIds = [];
+          listEndReason = "filtered_list_exhausted";
+          updateRecommendProgress({
+            card_count: 0,
+            list_end_reason: listEndReason,
+            refresh_exhausted: true,
+            empty_state_verified: true
+          });
+          runControl.checkpoint({
+            refresh_round: refreshRounds,
+            refresh: compactRefresh,
+            refresh_exhausted: true,
+            list_end_reason: listEndReason,
+            counters: countRecommendResultStatuses(results, { greetCount })
+          });
+          break;
+        }
         if (refreshResult.ok) {
           if (refreshResult.current_city_only) {
             currentCityOnlyResult = refreshResult.current_city_only;
@@ -2210,9 +3643,238 @@ export async function runRecommendWorkflow({
     let screeningCandidate = cardCandidate;
     let detailResult = null;
     let recoverableDetailError = null;
+    let candidateLocalDetailFailurePending = false;
+    let candidateLocalDetailTerminalError = null;
     let colleagueContact = null;
-    let skipRecentColleagueContact = false;
+    let colleagueContactSkipReason = "";
     let detailStep = "not_started";
+    let openedDetailState = null;
+    currentDetailCandidateBinding = null;
+
+    async function requireCurrentDetailCandidateBinding(stage, {
+      allowScroll = true,
+      settleMs = 120
+    } = {}) {
+      const bindingContext = openedDetailState?.candidate_binding_context || {
+        card_pre_click_provenance: currentDetailCandidateBinding?.card?.pre_click_provenance || null,
+        detail_roots_before: currentDetailCandidateBinding?.detail?.roots_before_capture || null,
+        expected_detail_root: currentDetailCandidateBinding?.detail?.root || null,
+        allow_card_disappearance: true,
+        card_click_evidence: currentDetailCandidateBinding?.card?.click_evidence || null,
+        click_attempts: currentDetailCandidateBinding?.card?.click_attempts || []
+      };
+      const freshDetailState = await waitForRecommendDetail(client, {
+        timeoutMs: 4000,
+        intervalMs: 200
+      });
+      if (!freshDetailState?.popup && !freshDetailState?.resumeIframe) {
+        throw createRecommendDetailCandidateBindingError({
+          schema_version: 1,
+          verified: false,
+          reason: "detail_not_visible_during_reverification",
+          method: null,
+          expected_candidate_id: cardCandidate?.id || null,
+          expected_name: cardCandidate?.identity?.name || null,
+          card: currentDetailCandidateBinding?.card || null,
+          detail: null
+        });
+      }
+      openedDetailState = {
+        ...freshDetailState,
+        candidate_binding: currentDetailCandidateBinding,
+        candidate_binding_context: bindingContext
+      };
+      const binding = await verifyRecommendDetailCandidateBinding(client, {
+        cardNodeId,
+        cardCandidate,
+        detailState: freshDetailState,
+        cardEvidenceBefore: bindingContext?.card_pre_click_provenance?.card || null,
+        cardPreClickProvenance: bindingContext?.card_pre_click_provenance || null,
+        detailRootsBefore: bindingContext?.detail_roots_before || null,
+        // In zero-outbound screening mode Boss may replace the short-lived
+        // loading dialog with the final resume popup.  Re-prove a stable CV
+        // target in the fresh popup instead of requiring the loading root's
+        // backend identity to survive that legitimate replacement.
+        expectedDetailRoot: screeningOnlyBindingEnabled
+          ? null
+          : bindingContext?.expected_detail_root || null,
+        allowCardDisappearance: bindingContext?.allow_card_disappearance === true,
+        cardClickEvidence: bindingContext?.card_click_evidence || null,
+        clickAttempts: Array.isArray(bindingContext?.click_attempts)
+          ? bindingContext.click_attempts
+          : [],
+        settleMs: allowScroll ? Math.max(0, Number(settleMs) || 0) : 0,
+        allowScroll: allowScroll === true
+      });
+      currentDetailCandidateBinding = binding;
+      if (openedDetailState) {
+        openedDetailState = {
+          ...openedDetailState,
+          candidate_binding: binding,
+          candidate_binding_context: bindingContext
+        };
+      }
+      if (detailResult) detailResult.candidate_binding = binding;
+      checkpointInProgressCandidate({
+        index,
+        candidateKey,
+        cardNodeId,
+        detailStep: stage || detailStep
+      });
+      const acceptedCandidateBinding = Boolean(
+        binding.verified === true
+        || (
+          screeningOnlyBindingEnabled
+          && binding.screening_verified === true
+        )
+      );
+      if (!acceptedCandidateBinding) {
+        throw createRecommendDetailCandidateBindingError(binding);
+      }
+      return binding;
+    }
+
+    async function containCandidateLocalDetailBindingFailure(error, {
+      phase = "recommend:detail-binding",
+      operation = currentDomOperation,
+      forensic = null
+    } = {}) {
+      if (candidateLocalDetailFailurePending) return;
+      if (error?.detail_candidate_binding) {
+        currentDetailCandidateBinding = error.detail_candidate_binding;
+      }
+      currentDetailCandidateBinding = preserveRecommendDetailCandidateBindingForRecovery(
+        detailResult,
+        currentDetailCandidateBinding
+      );
+      candidateLocalDetailFailurePending = true;
+      const localForensic = forensic || checkpointDomStaleForensic(error, {
+        phase,
+        operation,
+        detailStep,
+        candidateIndex: index,
+        candidateKey,
+        cardNodeId
+      });
+      checkpointDomStaleRecovery(localForensic, {
+        status: "candidate_failed_closed_no_context_recovery"
+      });
+      recoverableDetailError = error;
+      detailResult = null;
+      timings.detail_recovered_error = compactRecoverableDetailError(error);
+
+      let detailCleanup = null;
+      let detailCleanupError = null;
+      try {
+        detailCleanup = await closeRecommendDetail(client, { attemptsLimit: 2 });
+      } catch (cleanupError) {
+        detailCleanupError = cleanupError;
+      }
+      let avatarCleanup = null;
+      let avatarCleanupError = null;
+      try {
+        avatarCleanup = await closeRecommendAvatarPreview(client, { attemptsLimit: 2 });
+      } catch (cleanupError) {
+        avatarCleanupError = cleanupError;
+      }
+      let cleanupRootState = null;
+      let cleanupRootError = null;
+      try {
+        cleanupRootState = await getRecommendRoots(client);
+        cleanupRootState = await ensureRecommendViewport(
+          cleanupRootState,
+          "detail_binding_candidate_local_cleanup"
+        );
+      } catch (cleanupError) {
+        cleanupRootError = cleanupError;
+      }
+      let panelCleanup = null;
+      let panelCleanupError = null;
+      try {
+        panelCleanup = await closeRecommendBlockingPanels(client, {
+          attemptsLimit: 2,
+          rootState: cleanupRootState || rootState
+        });
+      } catch (cleanupError) {
+        panelCleanupError = cleanupError;
+      }
+      timings.detail_candidate_local_cleanup = {
+        detail: compactCloseResult(detailCleanup),
+        detail_error: detailCleanupError?.message || null,
+        avatar_preview: compactCloseResult(avatarCleanup),
+        avatar_preview_error: avatarCleanupError?.message || null,
+        blocking_panels: compactCloseResult(panelCleanup),
+        blocking_panels_error: panelCleanupError?.message || null,
+        root_reacquired: Boolean(cleanupRootState?.iframe?.documentNodeId),
+        root_error: cleanupRootError?.message || null,
+        card_count: null
+      };
+      if (
+        detailCleanup?.closed !== true
+        || avatarCleanup?.closed !== true
+        || panelCleanup?.closed !== true
+        || detailCleanupError
+        || avatarCleanupError
+        || panelCleanupError
+        || cleanupRootError
+        || !cleanupRootState?.iframe?.documentNodeId
+      ) {
+        const cleanupError = new Error(
+          "Recommend candidate-local detail binding cleanup did not restore a closed page state"
+        );
+        cleanupError.code = "RECOMMEND_DETAIL_LOCAL_CLEANUP_FAILED";
+        cleanupError.phase = "recommend:detail-binding-cleanup";
+        cleanupError.cleanup = timings.detail_candidate_local_cleanup;
+        cleanupError.detail_candidate_binding = currentDetailCandidateBinding;
+        candidateLocalDetailTerminalError = cleanupError;
+        checkpointInProgressCandidate({
+          index,
+          candidateKey,
+          cardNodeId,
+          detailStep: "detail_binding_cleanup_failed",
+          error: cleanupError
+        });
+        return;
+      }
+
+      try {
+        const freshCardNodeIds = await waitForRecommendCardNodeIds(
+          client,
+          cleanupRootState.iframe.documentNodeId,
+          {
+            timeoutMs: Math.min(cardTimeoutMs, 5000),
+            intervalMs: 300
+          }
+        );
+        if (!Array.isArray(freshCardNodeIds) || freshCardNodeIds.length === 0) {
+          throw new Error("Recommend candidate-local cleanup reacquired no candidate cards");
+        }
+        rootState = cleanupRootState;
+        cardNodeIds = freshCardNodeIds;
+        timings.detail_candidate_local_cleanup.card_count = freshCardNodeIds.length;
+      } catch (reacquireError) {
+        const cleanupError = new Error(
+          "Recommend candidate-local detail cleanup could not reacquire the candidate list"
+        );
+        cleanupError.code = "RECOMMEND_DETAIL_LOCAL_CLEANUP_FAILED";
+        cleanupError.phase = "recommend:detail-binding-cleanup";
+        cleanupError.cause = reacquireError;
+        cleanupError.cleanup = {
+          ...timings.detail_candidate_local_cleanup,
+          reacquire_error: reacquireError?.message || String(reacquireError)
+        };
+        cleanupError.detail_candidate_binding = currentDetailCandidateBinding;
+        candidateLocalDetailTerminalError = cleanupError;
+        checkpointInProgressCandidate({
+          index,
+          candidateKey,
+          cardNodeId,
+          detailStep: "detail_binding_list_reacquire_failed",
+          error: cleanupError
+        });
+      }
+    }
+
     if (index < effectiveDetailLimit) {
       try {
         await runControl.waitIfPaused();
@@ -2254,6 +3916,7 @@ export async function runRecommendWorkflow({
           rootState,
           targetUrl,
           retryTimeoutMs: 8000,
+          acceptScreeningBinding: screeningOnlyBindingEnabled,
           maxAttempts: 3
         });
         addTiming(timings, "candidate_click_ms", openedDetail.timings?.candidate_click_ms);
@@ -2261,51 +3924,78 @@ export async function runRecommendWorkflow({
         cardNodeId = openedDetail.card_node_id || cardNodeId;
         cardCandidate = openedDetail.card_candidate || cardCandidate;
         screeningCandidate = cardCandidate;
+        openedDetailState = openedDetail.detail_state;
+        currentDetailCandidateBinding = openedDetail.candidate_binding || openedDetail.detail_state?.candidate_binding || null;
+        checkpointInProgressCandidate({
+          index,
+          candidateKey,
+          cardNodeId,
+          detailStep: "detail_binding_verified"
+        });
         if (shouldSkipRecentColleagueContacted) {
           detailStep = "check_colleague_contact";
           currentDomOperation = "candidate:detail-colleague-contact";
+          await requireCurrentDetailCandidateBinding("before_colleague_contact");
           checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
           try {
             colleagueContact = await measureTiming(timings, "colleague_contact_check_ms", () => inspectRecentColleagueContact(
               client,
-              openedDetail.detail_state,
+              openedDetailState,
               {
                 referenceDate: colleagueContactReferenceDate,
                 windowDays: normalizedColleagueContactWindowDays
               }
             ));
-            if (colleagueContact?.recent) {
-              skipRecentColleagueContact = true;
-              detailResult = {
-                candidate: screeningCandidate,
-                detail: {
-                  popup_text: "",
-                  resume_text: ""
-                },
-                colleague_contact: colleagueContact,
-                cv_acquisition: {
-                  source: "skipped_recent_colleague_contact",
-                  skipped: true,
-                  reason: "skipped_recent_colleague_contact"
-                }
-              };
-              detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
-              await maybeHumanActionCooldown("after_detail_close", timings);
-            }
           } catch (error) {
             colleagueContact = {
               checked: false,
-              recent: false,
+              panel_found: false,
+              recent: null,
+              indeterminate: true,
               reason: "inspection_failed",
               error: error?.message || String(error),
               window_days: normalizedColleagueContactWindowDays
             };
           }
+          detailStep = "verify_after_colleague_contact";
+          currentDomOperation = "candidate:detail-verify-after-colleague-contact";
+          const boundColleagueResult = await bindRecommendColleagueContactInspectionResult(
+            colleagueContact,
+            { reverifyCandidateBinding: requireCurrentDetailCandidateBinding }
+          );
+          currentDetailCandidateBinding = boundColleagueResult.candidate_binding;
+          colleagueContactSkipReason = boundColleagueResult.skip_reason;
+          if (colleagueContactSkipReason) {
+            detailStep = "colleague_contact_skip_result";
+            currentDomOperation = "candidate:detail-colleague-contact-skip-result";
+            await requireCurrentDetailCandidateBinding("before_colleague_contact_skip_result");
+            detailResult = {
+              candidate: screeningCandidate,
+              candidate_binding: currentDetailCandidateBinding,
+              detail: {
+                popup_text: "",
+                resume_text: ""
+              },
+              colleague_contact: colleagueContact,
+              cv_acquisition: {
+                source: colleagueContactSkipReason,
+                skipped: true,
+                reason: colleagueContactSkipReason
+              }
+            };
+            detailStep = "colleague_contact_skip_close";
+            currentDomOperation = "candidate:detail-colleague-contact-skip-close";
+            await requireCurrentDetailCandidateBinding("before_colleague_contact_skip_close");
+            detailResult.candidate_binding = currentDetailCandidateBinding;
+            detailResult.close_result = await measureTiming(timings, "close_detail_ms", () => closeRecommendDetail(client));
+            await maybeHumanActionCooldown("after_detail_close", timings);
+          }
         }
-        if (!skipRecentColleagueContact) {
+        if (!colleagueContactSkipReason) {
           const waitPlan = getCvNetworkWaitPlan(cvAcquisitionState);
         detailStep = "wait_network";
         currentDomOperation = "candidate:detail-network-wait";
+        await requireCurrentDetailCandidateBinding("before_cv_network_wait");
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         const networkWait = await measureTiming(timings, "network_cv_wait_ms", () => waitForCvNetworkEvents(
           waitForRecommendDetailNetworkEvents,
@@ -2322,11 +4012,12 @@ export async function runRecommendWorkflow({
         }
         detailStep = "extract_detail";
         currentDomOperation = "candidate:detail-extract";
+        await requireCurrentDetailCandidateBinding("before_cv_extract");
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         detailResult = await extractRecommendDetailCandidate(client, {
           cardCandidate,
           cardNodeId,
-          detailState: openedDetail.detail_state,
+          detailState: openedDetailState,
           networkEvents: networkRecorder.events,
           targetUrl,
           closeDetail: false,
@@ -2349,8 +4040,9 @@ export async function runRecommendWorkflow({
         } else {
           detailStep = "wait_capture_target";
           currentDomOperation = "candidate:detail-wait-capture-target";
+          await requireCurrentDetailCandidateBinding("before_cv_capture_target");
           checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
-          captureTargetWait = await waitForCvCaptureTarget(client, openedDetail.detail_state, {
+          captureTargetWait = await waitForCvCaptureTarget(client, openedDetailState, {
             domain: "recommend",
             timeoutMs: 6000,
             intervalMs: 250
@@ -2404,10 +4096,38 @@ export async function runRecommendWorkflow({
                 }
               }
             );
+            const reacquireCaptureTargetAfterBinding = async ({
+              timeoutMs = 4000,
+              intervalMs = 200
+            } = {}) => {
+              const reboundWait = await waitForCvCaptureTarget(client, openedDetailState, {
+                domain: "recommend",
+                timeoutMs,
+                intervalMs
+              });
+              const reboundTarget = reboundWait?.target || null;
+              if (!reboundTarget?.node_id) {
+                const error = new Error(
+                  "Recommend CV capture target was unavailable after binding re-verification"
+                );
+                error.code = "IMAGE_CAPTURE_TARGET_UNAVAILABLE";
+                error.capture_target_wait = reboundWait || null;
+                throw error;
+              }
+              captureTargetWait = reboundWait;
+              captureTarget = reboundTarget;
+              return reboundTarget;
+            };
             try {
               detailStep = "capture_image";
               currentDomOperation = "candidate:detail-capture-image";
+              await requireCurrentDetailCandidateBinding("before_cv_image_capture");
               checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
+              // Binding re-verification obtains a fresh document tree and can
+              // invalidate frontend node ids returned by the earlier target
+              // discovery.  Reacquire the contained CV node after that proof,
+              // then capture it without any intervening DOM-root read.
+              await reacquireCaptureTargetAfterBinding();
               imageEvidence = await measureTiming(
                 timings,
                 "screenshot_capture_ms",
@@ -2449,11 +4169,15 @@ export async function runRecommendWorkflow({
                         intervalMs: 200
                       })
                     }),
-                    capture: (reacquired) => {
+                    capture: async (reacquired) => {
                       rootState = reacquired.root_state;
+                      openedDetailState = reacquired.detail_state;
                       captureTarget = reacquired.target;
                       captureTargetWait = reacquired.target_wait;
                       detailStep = "resume_image_capture";
+                      currentDomOperation = "candidate:detail-resume-image-capture";
+                      await requireCurrentDetailCandidateBinding("before_resumed_cv_image_capture");
+                      await reacquireCaptureTargetAfterBinding();
                       return measureTiming(
                         timings,
                         "screenshot_capture_ms",
@@ -2592,13 +4316,26 @@ export async function runRecommendWorkflow({
           wait_plan: waitPlan,
           network_wait: networkWait,
           parsed_network_profile_count: parsedNetworkProfileCount,
+          network_profile_binding: detailResult.network_profile_binding || null,
           image_evidence: summarizeImageEvidence(imageEvidence),
           capture_target: captureTarget || null,
           capture_target_wait: captureTargetWait
         };
+        detailStep = "verify_before_screening";
+        currentDomOperation = "candidate:detail-verify-before-screening";
+        await requireCurrentDetailCandidateBinding("before_llm_or_local_screening");
+        detailResult.candidate_binding = currentDetailCandidateBinding;
         screeningCandidate = detailResult.candidate;
+        detailResult.screening_candidate_identity = assertRecommendScreeningCandidateMatchesCard({
+          cardCandidate,
+          screeningCandidate,
+          stage: "before_screening_candidate_assignment"
+        });
         }
       } catch (error) {
+        if (error?.detail_candidate_binding) {
+          currentDetailCandidateBinding = error.detail_candidate_binding;
+        }
         if (!isRecoverableRecommendDetailError(error)) throw error;
         const staleForensic = checkpointDomStaleForensic(error, {
           phase: "recommend:detail",
@@ -2608,53 +4345,80 @@ export async function runRecommendWorkflow({
           candidateKey,
           cardNodeId
         });
-        const recoveryCount = candidateRecoveryCounts.get(candidateKey) || 0;
-        if (recoveryCount < 1) {
-          candidateRecoveryCounts.set(candidateKey, recoveryCount + 1);
-          timings.detail_recovery_trigger = compactRecoverableDetailError(error);
-          checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
+        currentDetailCandidateBinding = preserveRecommendDetailCandidateBindingForRecovery(
+          detailResult,
+          currentDetailCandidateBinding
+        );
+        const failureDisposition = getRecommendDetailFailureDisposition(error);
+        if (failureDisposition.candidate_local) {
+          await containCandidateLocalDetailBindingFailure(error, {
+            phase: "recommend:detail",
+            operation: currentDomOperation,
+            forensic: staleForensic
+          });
+        } else {
+          const recoveryReservation = reserveRecommendDetailRecovery(
+            candidateRecoveryCounts,
+            candidateKey,
+            1
+          );
+          if (recoveryReservation.allowed) {
+            timings.detail_recovery_trigger = compactRecoverableDetailError(error);
+            checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep, error });
+            await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
+            await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
+            await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
+            try {
+              const recovery = await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
+                forceRecentNotView: true
+              });
+              checkpointDomStaleRecovery(staleForensic, {
+                status: "recovered",
+                recoveryResult: recovery
+              });
+            } catch (recoveryError) {
+              checkpointDomStaleRecovery(staleForensic, {
+                status: "recovery_failed",
+                recoveryError
+              });
+              throw recoveryError;
+            }
+            continue;
+          }
+          checkpointDomStaleRecovery(staleForensic, { status: "candidate_failed_closed" });
+          recoverableDetailError = error;
+          detailResult = null;
+          timings.detail_recovered_error = compactRecoverableDetailError(error);
           await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
           await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
           await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
-          try {
-            const recovery = await recoverAndReapplyRecommendContext(`detail:${detailStep}`, error, {
-              forceRecentNotView: true
-            });
-            checkpointDomStaleRecovery(staleForensic, {
-              status: "recovered",
-              recoveryResult: recovery
-            });
-          } catch (recoveryError) {
-            checkpointDomStaleRecovery(staleForensic, {
-              status: "recovery_failed",
-              recoveryError
-            });
-            throw recoveryError;
-          }
-          continue;
         }
-        checkpointDomStaleRecovery(staleForensic, { status: "candidate_failed_closed" });
-        recoverableDetailError = error;
-        detailResult = null;
-        timings.detail_recovered_error = compactRecoverableDetailError(error);
-        await closeRecommendDetail(client, { attemptsLimit: 2 }).catch(() => null);
-        await closeRecommendAvatarPreview(client, { attemptsLimit: 2 }).catch(() => null);
-        await closeRecommendBlockingPanels(client, { attemptsLimit: 2, rootState }).catch(() => null);
       }
     }
 
-    await runControl.waitIfPaused();
-    runControl.throwIfCanceled();
+    if (!candidateLocalDetailFailurePending) {
+      await runControl.waitIfPaused();
+      runControl.throwIfCanceled();
+    }
     runControl.setPhase("recommend:screening");
     let llmResult = null;
     const imageAcquisitionFailed = shouldFailClosedRecommendImageAcquisition(detailResult);
     if (useLlmScreening) {
-      if (skipRecentColleagueContact || recoverableDetailError || imageAcquisitionFailed) {
+      if (colleagueContactSkipReason || recoverableDetailError || imageAcquisitionFailed) {
         llmResult = null;
       } else if (!llmConfig) {
         llmResult = createMissingLlmConfigResult();
       } else {
         try {
+          detailStep = "llm_screening_binding";
+          currentDomOperation = "candidate:detail-verify-before-llm";
+          await requireCurrentDetailCandidateBinding("immediately_before_llm_screening");
+          detailResult.candidate_binding = currentDetailCandidateBinding;
+          detailResult.screening_candidate_identity = assertRecommendScreeningCandidateMatchesCard({
+            cardCandidate,
+            screeningCandidate,
+            stage: "immediately_before_llm_screening"
+          });
           const llmTimingKey = detailResult?.image_evidence?.file_paths?.length
             ? "vision_model_ms"
             : "text_model_ms";
@@ -2668,19 +4432,30 @@ export async function runRecommendWorkflow({
             imageDetail: llmImageDetail
           }));
           } catch (error) {
-            if (isFatalLlmProviderError(error)) {
+            if (error?.code === "RECOMMEND_SCREENING_CANDIDATE_IDENTITY_MISMATCH") {
+              throw error;
+            } else if (isRecommendDetailCandidateBindingError(error)) {
+              await containCandidateLocalDetailBindingFailure(error, {
+                phase: "recommend:llm-binding",
+                operation: currentDomOperation
+              });
+              llmResult = null;
+            } else if (isFatalLlmProviderError(error)) {
               throw createFatalLlmRunError(error, {
                 domain: "recommend",
                 candidate: screeningCandidate
               });
+            } else {
+              llmResult = createFailedLlmScreeningResult(error);
             }
-            llmResult = createFailedLlmScreeningResult(error);
           }
       }
       if (detailResult) detailResult.llm_result = llmResult;
     }
-    const screening = skipRecentColleagueContact
+    let screening = colleagueContactSkipReason === "skipped_recent_colleague_contact"
       ? createRecentColleagueContactSkipScreening(screeningCandidate, colleagueContact)
+      : colleagueContactSkipReason === "colleague_contact_unverified"
+      ? createUnverifiedColleagueContactSkipScreening(screeningCandidate, colleagueContact)
       : recoverableDetailError
       ? createRecoverableDetailFailureScreening(screeningCandidate, recoverableDetailError)
       : imageAcquisitionFailed
@@ -2695,7 +4470,12 @@ export async function runRecommendWorkflow({
     let postActionResult = null;
     let closeFailureError = null;
     let closeRecoveryFailure = null;
-    if (postActionEnabled && detailResult && !skipRecentColleagueContact) {
+    if (
+      postActionEnabled
+      && screening?.passed === true
+      && detailResult
+      && !colleagueContactSkipReason
+    ) {
       try {
         const postActionStarted = Date.now();
         await runControl.waitIfPaused();
@@ -2703,6 +4483,8 @@ export async function runRecommendWorkflow({
         runControl.setPhase("recommend:post-action");
         detailStep = "post_action_discovery";
         currentDomOperation = "candidate:post-action-discovery";
+        await requireCurrentDetailCandidateBinding("before_post_action_discovery");
+        detailResult.candidate_binding = currentDetailCandidateBinding;
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         await maybeHumanActionCooldown("before_post_action", timings);
         actionDiscovery = await waitForRecommendDetailActionControls(client, {
@@ -2712,6 +4494,8 @@ export async function runRecommendWorkflow({
         });
         detailStep = "post_action_execute";
         currentDomOperation = "candidate:post-action-execute";
+        await requireCurrentDetailCandidateBinding("before_post_action_execute");
+        detailResult.candidate_binding = currentDetailCandidateBinding;
         checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep });
         postActionResult = await runRecommendPostAction({
           client,
@@ -2721,14 +4505,27 @@ export async function runRecommendWorkflow({
           greetCount,
           maxGreetCount: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
           executePostAction,
-          afterClickDelayMs: actionAfterClickDelayMs
+          afterClickDelayMs: actionAfterClickDelayMs,
+          candidateId: screeningCandidate.id || cardCandidate.id || "",
+          candidateBinding: currentDetailCandidateBinding,
+          reverifyCandidateBinding: async (stage, options = {}) => {
+            await requireCurrentDetailCandidateBinding(stage, options);
+            detailResult.candidate_binding = currentDetailCandidateBinding;
+            checkpointInProgressCandidate({ index, candidateKey, cardNodeId, detailStep: stage });
+            return currentDetailCandidateBinding;
+          },
+          actionJournal: effectiveActionJournal,
+          actionJournalScope,
+          reverifyActionJournalScope,
+          runId: runControl.runId,
+          checkpointCritical: (patch) => runControl.checkpointCritical(patch)
         });
         if (postActionResult.counted_as_greet && postActionResult.action_clicked) {
           greetCount += 1;
         }
         addTiming(timings, "post_action_ms", Date.now() - postActionStarted);
       } catch (error) {
-        checkpointDomStaleForensic(error, {
+        const postActionForensic = checkpointDomStaleForensic(error, {
           phase: "recommend:post-action",
           operation: currentDomOperation,
           detailStep,
@@ -2736,8 +4533,149 @@ export async function runRecommendWorkflow({
           candidateKey,
           cardNodeId
         });
-        throw error;
+        if (isRecommendDetailCandidateBindingError(error)) {
+          await containCandidateLocalDetailBindingFailure(error, {
+            phase: "recommend:post-action-binding",
+            operation: currentDomOperation,
+            forensic: postActionForensic
+          });
+          screening = createRecoverableDetailFailureScreening(screeningCandidate, error);
+          actionDiscovery = null;
+          postActionResult = null;
+        } else {
+          throw error;
+        }
       }
+    }
+    if (postActionResult?.stop_run || postActionResult?.outcome_unknown) {
+      const preservePostInputDetail = postActionResult?.preserve_detail_on_terminal === true;
+      timings.total_ms = Date.now() - candidateStarted;
+      const stopResult = {
+        index,
+        candidate_key: candidateKey,
+        card_node_id: cardNodeId,
+        candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
+        candidate: compactCandidate(screeningCandidate),
+        detail: compactDetail(detailResult),
+        llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
+        screening: compactScreening(screening),
+        action_discovery: compactActionDiscovery(actionDiscovery),
+        post_action: postActionResult,
+        error: recoverableDetailError
+          ? compactRecoverableDetailError(recoverableDetailError)
+          : detailResult?.image_evidence?.ok === false
+          ? compactError({
+            code: detailResult.image_evidence.error_code,
+            message: detailResult.image_evidence.error
+          }, "IMAGE_CAPTURE_FAILED")
+          : null,
+        timings
+      };
+      results.push(stopResult);
+      markInfiniteListCandidateProcessed(listState, candidateKey, {
+        metadata: {
+          result_index: index,
+          candidate_id: screeningCandidate.id || null
+        }
+      });
+      updateRecommendProgress({
+        last_candidate_id: screeningCandidate.id || null,
+        last_candidate_key: candidateKey,
+        last_score: screening.score
+      });
+      const terminalCandidateCheckpoint = {
+        in_progress_candidate: null,
+        results,
+        preserve_detail_on_terminal: preservePostInputDetail,
+        action_result_critical_persisted: !preservePostInputDetail,
+        terminal_preservation: preservePostInputDetail
+          ? postActionResult.terminal_preservation || {
+              required: true,
+              reason: "post_input_action_journal_persistence_failed",
+              candidate_id: screeningCandidate.id || null,
+              action_state: postActionResult?.action_transaction?.state || null,
+              result_index: index
+            }
+          : null,
+        last_candidate: {
+          id: screeningCandidate.id || null,
+          key: candidateKey,
+          identity: screeningCandidate.identity || {},
+          candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
+          screening: {
+            status: screening.status,
+            passed: screening.passed,
+            score: screening.score
+          },
+          llm_screening: compactScreeningLlmResult(llmResult),
+          error: stopResult.error,
+          post_action: postActionResult
+        }
+      };
+      checkpointRecommendPostActionStopResult(runControl, terminalCandidateCheckpoint, {
+        candidateResult: stopResult,
+        candidateId: screeningCandidate.id || "",
+        actionState: postActionResult?.action_transaction?.state || null,
+        resultIndex: index
+      });
+      listEndReason = postActionResult.reason || "post_action_stop";
+      break;
+    }
+    if (
+      postActionResult?.action_clicked === true
+      && postActionResult?.action_transaction?.state === "greeting_confirmed"
+    ) {
+      const durablePostActionResult = {
+        index,
+        candidate_key: candidateKey,
+        card_node_id: cardNodeId,
+        candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
+        candidate: compactCandidate(screeningCandidate),
+        detail: compactDetail(detailResult),
+        llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
+        screening: compactScreening(screening),
+        action_discovery: compactActionDiscovery(actionDiscovery),
+        post_action: postActionResult,
+        error: recoverableDetailError
+          ? compactRecoverableDetailError(recoverableDetailError)
+          : detailResult?.image_evidence?.ok === false
+          ? compactError({
+              code: detailResult.image_evidence.error_code,
+              message: detailResult.image_evidence.error
+            }, "IMAGE_CAPTURE_FAILED")
+          : null,
+        timings: {
+          ...timings,
+          total_ms: Date.now() - candidateStarted
+        },
+        provisional_before_detail_cleanup: true
+      };
+      checkpointRecommendPostActionStopResult(runControl, {
+        in_progress_candidate: null,
+        results: [...results, durablePostActionResult],
+        preserve_detail_on_terminal: false,
+        action_result_critical_persisted: true,
+        post_action_candidate_result_persisted: true,
+        last_candidate: {
+          id: screeningCandidate.id || null,
+          key: candidateKey,
+          identity: screeningCandidate.identity || {},
+          candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
+          screening: {
+            status: screening.status,
+            passed: screening.passed,
+            score: screening.score
+          },
+          llm_screening: compactScreeningLlmResult(llmResult),
+          error: durablePostActionResult.error,
+          post_action: postActionResult
+        }
+      }, {
+        candidateResult: durablePostActionResult,
+        candidateId: screeningCandidate.id || "",
+        actionState: "greeting_confirmed",
+        resultIndex: index
+      });
     }
     if (detailResult && closeDetail && !detailResult.close_result?.closed) {
       runControl.setPhase("recommend:close-detail");
@@ -2796,6 +4734,7 @@ export async function runRecommendWorkflow({
       index,
       candidate_key: candidateKey,
       card_node_id: cardNodeId,
+      candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
       candidate: compactCandidate(screeningCandidate),
       detail: compactDetail(detailResult),
       llm_screening: detailResult ? null : compactScreeningLlmResult(llmResult),
@@ -2828,13 +4767,37 @@ export async function runRecommendWorkflow({
       last_score: screening.score
     });
     const checkpointStarted = Date.now();
-    runControl.checkpoint({
+    const completedCandidateCheckpoint = {
       in_progress_candidate: null,
       results,
+      candidate_list: compactInfiniteListState(listState),
+      candidate_local_detail_failure: candidateLocalDetailFailurePending
+        ? {
+            required: true,
+            terminal: Boolean(candidateLocalDetailTerminalError),
+            candidate_id: screeningCandidate.id || null,
+            candidate_key: candidateKey,
+            result_index: index,
+            binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
+            cleanup: timings.detail_candidate_local_cleanup || null
+          }
+        : null,
+      candidate_local_detail_terminal: candidateLocalDetailTerminalError
+        ? {
+            required: true,
+            code: candidateLocalDetailTerminalError.code || null,
+            phase: candidateLocalDetailTerminalError.phase || null,
+            candidate_id: screeningCandidate.id || null,
+            candidate_key: candidateKey,
+            result_index: index,
+            cleanup: candidateLocalDetailTerminalError.cleanup || null
+          }
+        : null,
       last_candidate: {
         id: screeningCandidate.id || null,
         key: candidateKey,
         identity: screeningCandidate.identity || {},
+        candidate_binding: compactRecommendDetailCandidateBinding(currentDetailCandidateBinding),
         screening: {
           status: screening.status,
           passed: screening.passed,
@@ -2842,10 +4805,26 @@ export async function runRecommendWorkflow({
         },
         llm_screening: compactScreeningLlmResult(llmResult),
         error: compactResult.error,
-        post_action: postActionResult
-      }
-    });
+          post_action: postActionResult
+        }
+    };
+    if (candidateLocalDetailFailurePending) {
+      runControl.checkpointCritical(completedCandidateCheckpoint);
+    } else {
+      runControl.checkpoint(completedCandidateCheckpoint);
+    }
     addTiming(compactResult.timings, "checkpoint_save_ms", Date.now() - checkpointStarted);
+
+    if (candidateLocalDetailTerminalError) {
+      candidateLocalDetailTerminalError.candidate_result_persisted = true;
+      candidateLocalDetailTerminalError.candidate_result_index = index;
+      throw candidateLocalDetailTerminalError;
+    }
+
+    if (candidateLocalDetailFailurePending) {
+      await runControl.waitIfPaused();
+      runControl.throwIfCanceled();
+    }
 
     if (closeRecoveryFailure) {
       throw closeRecoveryFailure;
@@ -2924,6 +4903,29 @@ export async function runRecommendWorkflow({
   };
 }
 
+function createRecommendPostActionTerminalFailure(summary = null) {
+  const results = Array.isArray(summary?.results) ? summary.results : [];
+  const stoppedResult = [...results].reverse().find((result) => (
+    result?.post_action?.stop_run === true
+  )) || null;
+  const postAction = stoppedResult?.post_action || null;
+  if (!postAction) return null;
+  if (
+    postAction.out_of_greet_credits === true
+    || postAction.reason === "greet_credits_exhausted"
+  ) return null;
+  const reason = String(postAction.reason || summary?.list_end_reason || "unknown").trim();
+  const error = new Error(`Recommend post-action terminal failure: ${reason}`);
+  error.code = postAction.outcome_unknown === true
+    ? "RECOMMEND_GREET_OUTCOME_UNKNOWN"
+    : postAction.pre_input_aborted === true
+    ? "RECOMMEND_GREET_PRE_INPUT_ABORTED"
+    : "RECOMMEND_POST_ACTION_TERMINAL_FAILURE";
+  error.phase = "recommend:post-action-terminal";
+  error.run_summary = summary;
+  return error;
+}
+
 export function createRecommendRunService({
   lifecycle,
   idPrefix = "recommend",
@@ -2965,6 +4967,9 @@ export function createRecommendRunService({
     actionTimeoutMs = 8000,
     actionIntervalMs = 500,
     actionAfterClickDelayMs = 900,
+    actionJournal = null,
+    actionJournalScope = "boss-recommend:default",
+    reverifyActionJournalScope = null,
     screeningMode = "llm",
     llmConfig = null,
     llmTimeoutMs = 120000,
@@ -3034,6 +5039,8 @@ export function createRecommendRunService({
         max_greet_count: Number.isInteger(maxGreetCount) ? maxGreetCount : null,
         execute_post_action: Boolean(executePostAction),
         action_timeout_ms: actionTimeoutMs,
+        action_journal_enabled: Boolean(normalizedPostAction !== "none" && executePostAction),
+        action_journal_scope: actionJournalScope,
         screening_mode: normalizedScreeningMode,
         llm_configured: Boolean(llmConfig),
         llm_timeout_ms: llmTimeoutMs,
@@ -3086,52 +5093,60 @@ export function createRecommendRunService({
         debug_boundary_trigger_count: 0
       },
       checkpoint: {},
-      task: (runControl) => workflow({
-        client,
-        targetUrl,
-        criteria,
-        jobLabel,
-        pageScope: requestedPageScope,
-        fallbackPageScope: normalizedFallbackPageScope,
-        filter: normalizedFilter,
-        maxCandidates,
-        detailLimit: normalizedDetailLimit,
-        closeDetail,
-        delayMs,
-        cardTimeoutMs,
-        maxImagePages,
-        imageWheelDeltaY,
-        cvAcquisitionMode,
-        listMaxScrolls,
-        listStableSignatureLimit,
-        listWheelDeltaY,
-        listSettleMs,
-        listFallbackPoint,
-        refreshOnEnd,
-        maxRefreshRounds,
-        refreshButtonSettleMs,
-        refreshReloadSettleMs,
-        postAction: normalizedPostAction,
-        maxGreetCount,
-        executePostAction,
-        actionTimeoutMs,
-        actionIntervalMs,
-        actionAfterClickDelayMs,
-        screeningMode: normalizedScreeningMode,
-        llmConfig,
-        llmTimeoutMs,
-        llmImageLimit,
-        llmImageDetail,
-        imageOutputDir,
-        humanRestEnabled: effectiveHumanRestEnabled,
-        humanBehavior: effectiveHumanBehavior,
-        skipRecentColleagueContacted: shouldSkipRecentColleagueContacted,
-        colleagueContactWindowDays: normalizedColleagueContactWindowDays,
-        debugTestMode: debugBoundaryOptions.debugTestMode,
-        debugForceListEndAfterProcessed: debugBoundaryOptions.debugForceListEndAfterProcessed,
-        debugForceContextRecoveryAfterProcessed: debugBoundaryOptions.debugForceContextRecoveryAfterProcessed,
-        debugForceCdpReconnectAfterProcessed: debugBoundaryOptions.debugForceCdpReconnectAfterProcessed
-      }, runControl)
+      task: async (runControl) => {
+        const summary = await workflow({
+          client,
+          targetUrl,
+          criteria,
+          jobLabel,
+          pageScope: requestedPageScope,
+          fallbackPageScope: normalizedFallbackPageScope,
+          filter: normalizedFilter,
+          maxCandidates,
+          detailLimit: normalizedDetailLimit,
+          closeDetail,
+          delayMs,
+          cardTimeoutMs,
+          maxImagePages,
+          imageWheelDeltaY,
+          cvAcquisitionMode,
+          listMaxScrolls,
+          listStableSignatureLimit,
+          listWheelDeltaY,
+          listSettleMs,
+          listFallbackPoint,
+          refreshOnEnd,
+          maxRefreshRounds,
+          refreshButtonSettleMs,
+          refreshReloadSettleMs,
+          postAction: normalizedPostAction,
+          maxGreetCount,
+          executePostAction,
+          actionTimeoutMs,
+          actionIntervalMs,
+          actionAfterClickDelayMs,
+          actionJournal,
+          actionJournalScope,
+          reverifyActionJournalScope,
+          screeningMode: normalizedScreeningMode,
+          llmConfig,
+          llmTimeoutMs,
+          llmImageLimit,
+          llmImageDetail,
+          imageOutputDir,
+          humanRestEnabled: effectiveHumanRestEnabled,
+          humanBehavior: effectiveHumanBehavior,
+          skipRecentColleagueContacted: shouldSkipRecentColleagueContacted,
+          colleagueContactWindowDays: normalizedColleagueContactWindowDays,
+          debugTestMode: debugBoundaryOptions.debugTestMode,
+          debugForceListEndAfterProcessed: debugBoundaryOptions.debugForceListEndAfterProcessed,
+          debugForceContextRecoveryAfterProcessed: debugBoundaryOptions.debugForceContextRecoveryAfterProcessed,
+          debugForceCdpReconnectAfterProcessed: debugBoundaryOptions.debugForceCdpReconnectAfterProcessed
+        }, runControl);
+        const terminalFailure = createRecommendPostActionTerminalFailure(summary);
+        if (terminalFailure) throw terminalFailure;
+        return summary;
+      }
     });
   }
 

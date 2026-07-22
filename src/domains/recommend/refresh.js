@@ -1,4 +1,10 @@
-import { sleep } from "../../core/browser/index.js";
+import {
+  getNodeBox,
+  getOuterHTML,
+  querySelectorAll,
+  sleep
+} from "../../core/browser/index.js";
+import { htmlToText, normalizeText } from "../../core/screening/index.js";
 import {
   buildRecommendSelfHealConfig,
   resolveRecommendSelfHealRoots
@@ -12,6 +18,7 @@ import {
   waitForRecommendCardNodeIds
 } from "./cards.js";
 import {
+  RECOMMEND_BOTTOM_MARKER_SELECTORS,
   RECOMMEND_RECENT_NOT_VIEW_LABEL,
   RECOMMEND_TARGET_URL
 } from "./constants.js";
@@ -54,11 +61,15 @@ export function buildRecommendFilterGroups(filter = {}, {
 
   for (const spec of sourceGroups) {
     const group = normalizeFilterGroup(spec);
-    if (group.group || group.labels.length) groups.push(group);
+    if (group.group || group.labels.length) {
+      group.verifySticky = true;
+      groups.push(group);
+    }
   }
 
   const rootGroup = normalizeFilterGroup(filter);
   if ((rootGroup.group || rootGroup.labels.length) && !groups.length) {
+    rootGroup.verifySticky = true;
     groups.push(rootGroup);
   }
 
@@ -69,13 +80,14 @@ export function buildRecommendFilterGroups(filter = {}, {
         recentGroup.labels.push(RECOMMEND_RECENT_NOT_VIEW_LABEL);
       }
       recentGroup.selectAllLabels = true;
+      recentGroup.verifySticky = true;
     } else {
       groups.unshift({
         group: "recentNotView",
         labels: [RECOMMEND_RECENT_NOT_VIEW_LABEL],
         selectAllLabels: true,
         allowUnlimited: false,
-        verifySticky: false
+        verifySticky: true
       });
     }
   }
@@ -136,6 +148,229 @@ export async function applyRecommendFilterEnvelopeStages(filter = {}, {
 
 function refreshFailureReason(method = "") {
   return method === "page_navigate" ? "page_navigate_failed" : "page_reload_failed";
+}
+
+export function isVerifiedRecommendFilterApplication(filterResult, filterOptions = {}) {
+  if (filterResult?.confirmed !== true) return false;
+  const requestedGroups = Array.isArray(filterOptions.filterGroups) && filterOptions.filterGroups.length
+    ? filterOptions.filterGroups
+    : (filterOptions.group || filterOptions.labels?.length ? [filterOptions] : []);
+  const normalizedRequested = requestedGroups
+    .filter((group) => group && String(group.group || "").trim() && Array.isArray(group.labels) && group.labels.length)
+    .map((group) => ({
+      group: String(group.group || "").trim(),
+      labels: [...new Set(normalizeLabels(group.labels).map((label) => label.replace(/\s+/g, "")))],
+      allowUnlimited: group.allowUnlimited === true,
+      selectAllLabels: group.selectAllLabels !== false
+    }));
+  if (!normalizedRequested.length) return true;
+  if (filterResult?.sticky_verification?.verified !== true) return false;
+  const verifiedGroups = Array.isArray(filterResult.sticky_verification.groups)
+    ? filterResult.sticky_verification.groups
+    : [];
+  if (verifiedGroups.length !== normalizedRequested.length) return false;
+  return normalizedRequested.every((requested) => {
+    const matches = verifiedGroups.filter((group) => String(group?.group || "") === requested.group);
+    if (matches.length !== 1 || matches[0]?.verified !== true) return false;
+    const verifiedLabels = normalizeLabels(matches[0].requested_labels || [])
+      .map((label) => label.replace(/\s+/g, ""));
+    const uniqueVerifiedLabels = [...new Set(verifiedLabels)];
+    if (
+      uniqueVerifiedLabels.length !== requested.labels.length
+      || !requested.labels.every((label) => uniqueVerifiedLabels.includes(label))
+    ) {
+      return false;
+    }
+    const activeLabels = [...new Set(normalizeLabels(matches[0].active_labels || [])
+      .map((label) => label.replace(/\s+/g, "")))];
+    if (matches[0].unavailable === true) {
+      return requested.allowUnlimited
+        && requested.labels.length === 1
+        && requested.labels[0] === "不限"
+        && activeLabels.length === 0;
+    }
+    if (!requested.selectAllLabels) {
+      return activeLabels.length === 1 && requested.labels.includes(activeLabels[0]);
+    }
+    return activeLabels.length === requested.labels.length
+      && requested.labels.every((label) => activeLabels.includes(label));
+  });
+}
+
+const RECOMMEND_FILTERED_EMPTY_TEXTS = Object.freeze([
+  "没有相关数据",
+  "暂无相关数据"
+]);
+
+const RECOMMEND_FILTERED_EMPTY_TEXT_SCAN_SELECTORS = Object.freeze([
+  ...RECOMMEND_BOTTOM_MARKER_SELECTORS,
+  "[class*=\"empty\"]",
+  "[class*=\"no-data\"]",
+  "[class*=\"nodata\"]",
+  "div, span, p, section, li"
+]);
+
+function normalizeRecommendFilteredEmptyText(value = "") {
+  return normalizeText(value).replace(/\s+/g, "");
+}
+
+function isUsableVisibleBox(box) {
+  return Number(box?.rect?.width || 0) > 2 && Number(box?.rect?.height || 0) > 2;
+}
+
+async function inspectRecommendEmptyStateAccessibility(client, nodeId, expectedText) {
+  if (typeof client?.Accessibility?.getPartialAXTree !== "function") {
+    return {
+      available: false,
+      verified: false,
+      reason: "accessibility_unavailable"
+    };
+  }
+  try {
+    const result = await client.Accessibility.getPartialAXTree({
+      nodeId,
+      fetchRelatives: true
+    });
+    const expected = normalizeRecommendFilteredEmptyText(expectedText);
+    const nodes = (result?.nodes || []).map((node) => ({
+      ignored: node?.ignored === true,
+      role: node?.role?.value || "",
+      name: node?.name?.value || "",
+      value: node?.value?.value || ""
+    }));
+    const match = nodes.find((node) => (
+      !node.ignored
+      && [node.name, node.value].some((value) => (
+        normalizeRecommendFilteredEmptyText(value) === expected
+      ))
+    ));
+    return {
+      available: true,
+      verified: Boolean(match),
+      reason: match ? "exact_accessible_text" : "exact_accessible_text_missing",
+      match: match || null,
+      node_count: nodes.length
+    };
+  } catch (error) {
+    return {
+      available: true,
+      verified: false,
+      reason: "accessibility_probe_failed",
+      error: error?.message || String(error)
+    };
+  }
+}
+
+export async function inspectRecommendFilteredEmptyState(client, rootNodeId, {
+  selectors = RECOMMEND_FILTERED_EMPTY_TEXT_SCAN_SELECTORS,
+  exactTexts = RECOMMEND_FILTERED_EMPTY_TEXTS,
+  maxNodes = 2500
+} = {}) {
+  if (!client || !rootNodeId) {
+    return {
+      verified: false,
+      reason: "missing_client_or_root",
+      text: null,
+      node_id: null
+    };
+  }
+  const expectedTexts = new Set(
+    (exactTexts || []).map(normalizeRecommendFilteredEmptyText).filter(Boolean)
+  );
+  const selectorCounts = {};
+  const queryErrors = [];
+  const nodeIds = [];
+  for (const selector of selectors || []) {
+    try {
+      const matches = await querySelectorAll(client, rootNodeId, selector);
+      selectorCounts[selector] = matches.length;
+      nodeIds.push(...matches);
+    } catch (error) {
+      selectorCounts[selector] = null;
+      queryErrors.push({
+        selector,
+        error: error?.message || String(error)
+      });
+    }
+  }
+
+  const uniqueNodeIds = Array.from(new Set(nodeIds.filter(Boolean)))
+    .slice(0, Math.max(0, Number(maxNodes) || 0));
+  let checkedNodeCount = 0;
+  for (const nodeId of uniqueNodeIds) {
+    let text = "";
+    try {
+      text = normalizeRecommendFilteredEmptyText(htmlToText(await getOuterHTML(client, nodeId)));
+    } catch {
+      continue;
+    }
+    if (!expectedTexts.has(text)) continue;
+    checkedNodeCount += 1;
+    let box = null;
+    try {
+      box = await getNodeBox(client, nodeId);
+    } catch {
+      continue;
+    }
+    if (!isUsableVisibleBox(box)) continue;
+    const accessibility = await inspectRecommendEmptyStateAccessibility(client, nodeId, text);
+    if (accessibility.verified !== true) continue;
+    return {
+      verified: true,
+      reason: "exact_visible_filtered_empty_state",
+      text,
+      node_id: nodeId,
+      box: {
+        x: box.rect.x,
+        y: box.rect.y,
+        width: box.rect.width,
+        height: box.rect.height
+      },
+      accessibility,
+      selector_counts: selectorCounts,
+      checked_node_count: checkedNodeCount,
+      candidate_node_count: uniqueNodeIds.length,
+      query_errors: queryErrors.slice(0, 20)
+    };
+  }
+
+  return {
+    verified: false,
+    reason: checkedNodeCount > 0
+      ? "exact_empty_text_not_visible_or_accessible"
+      : "exact_empty_text_not_found",
+    text: null,
+    node_id: null,
+    selector_counts: selectorCounts,
+    checked_node_count: checkedNodeCount,
+    candidate_node_count: uniqueNodeIds.length,
+    query_errors: queryErrors.slice(0, 20)
+  };
+}
+
+export function isVerifiedRecommendRefreshExhaustion({
+  cardCount = 0,
+  filter = {},
+  filterResult = null,
+  pageScopeResult = null,
+  currentCityOnlyResult = null,
+  emptyState = null
+} = {}) {
+  if (
+    Number(cardCount) !== 0
+    || pageScopeResult?.selected !== true
+    || emptyState?.verified !== true
+  ) return false;
+  const filterEnabled = filter?.enabled !== false;
+  if (filterEnabled && !isVerifiedRecommendFilterApplication(
+    filterResult,
+    buildRecommendFilterSelectionOptions(filter)
+  )) {
+    return false;
+  }
+  const currentCityOnlyRequested = filter?.currentCityOnly === true || filter?.current_city_only === true;
+  if (currentCityOnlyRequested && currentCityOnlyResult?.effective !== true) return false;
+  return true;
 }
 
 function safeDiagnosticText(value, maxLength = 4000) {
@@ -216,7 +451,7 @@ export function isRetryableRecommendFilterReapplyError(error) {
     current = current?.cause;
   }
   const message = messages.join("\n");
-  return /Recommend filter panel did not open|Recommend filter trigger was not found|Recommend filter confirm button was not found|No matching recommend filter option|Invalid (?:backend )?node(?:\s*id)?|Node with given id does not exist|No node found for given backend id/i.test(message);
+  return /Recommend filter panel did not open|Recommend filter trigger was not found|Recommend filter confirm button was not found|Recommend filter application was not verified|No matching recommend filter option|Invalid (?:backend )?node(?:\s*id)?|Node with given id does not exist|No node found for given backend id/i.test(message);
 }
 
 function compactFilterReapplyError(error) {
@@ -371,9 +606,10 @@ export async function selectRecommendJobWithRootRefresh(client, rootState, {
   throw wrapped;
 }
 
-async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
+export async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
   maxAttempts = 3,
-  retryDelayMs = 1500
+  retryDelayMs = 1500,
+  selectFilter = selectAndConfirmFirstSafeFilter
 } = {}) {
   const attempts = [];
   let currentRootState = rootState;
@@ -381,11 +617,17 @@ async function selectAndConfirmRefreshFilter(client, rootState, filterOptions, {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     try {
-      const filter = await selectAndConfirmFirstSafeFilter(
+      const filter = await selectFilter(
         client,
         currentRootState.iframe.documentNodeId,
         filterOptions
       );
+      if (!isVerifiedRecommendFilterApplication(filter, filterOptions)) {
+        const verificationError = new Error("Recommend filter application was not verified after refresh");
+        verificationError.code = "RECOMMEND_FILTER_APPLICATION_UNVERIFIED";
+        verificationError.filter_result = filter;
+        throw verificationError;
+      }
       attempts.push({
         ok: true,
         method: "filter_reapply",
@@ -580,11 +822,24 @@ async function applyRefreshMethod(client, method, {
       timeoutMs: cardTimeoutMs,
       intervalMs: 500
     });
-    if (!cardNodeIds.length) {
+    const emptyState = cardNodeIds.length === 0
+      ? await inspectRecommendFilteredEmptyState(client, currentRootState.iframe.documentNodeId)
+      : null;
+    const exhausted = isVerifiedRecommendRefreshExhaustion({
+      cardCount: cardNodeIds.length,
+      filter,
+      filterResult,
+      pageScopeResult,
+      currentCityOnlyResult,
+      emptyState
+    });
+    if (!cardNodeIds.length && !exhausted) {
       throw new Error("No recommend candidate cards were found after refresh reload");
     }
     return {
       ok: true,
+      exhausted,
+      reason: exhausted ? "filtered_list_exhausted" : null,
       method,
       target_url: method === "page_navigate" ? (targetUrl || RECOMMEND_TARGET_URL) : null,
       job_selection: jobSelection,
@@ -596,6 +851,7 @@ async function applyRefreshMethod(client, method, {
       filter: filterResult,
       filter_reapply_attempts: filterReapplyAttempts,
       card_count: cardNodeIds.length,
+      empty_state: emptyState,
       root_state: currentRootState,
       forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false),
       elapsed_ms: Date.now() - started
@@ -700,19 +956,48 @@ export async function refreshRecommendListAtEnd(client, {
           timeoutMs: cardTimeoutMs,
           intervalMs: 500
         });
-        return {
-          ok: cardNodeIds.length > 0,
-          method: "end_refresh_button",
-          attempts,
+        const emptyState = cardNodeIds.length === 0
+          ? await inspectRecommendFilteredEmptyState(client, currentRootState.iframe.documentNodeId)
+          : null;
+        const exhausted = isVerifiedRecommendRefreshExhaustion({
+          cardCount: cardNodeIds.length,
+          filter,
+          filterResult,
+          pageScopeResult,
+          currentCityOnlyResult,
+          emptyState
+        });
+        if (cardNodeIds.length > 0 || exhausted) {
+          return {
+            ok: true,
+            exhausted,
+            reason: exhausted ? "filtered_list_exhausted" : null,
+            method: "end_refresh_button",
+            attempts,
+            page_scope: pageScopeResult,
+            current_city_only: currentCityOnlyResult,
+            current_city_only_attempts: currentCityOnlyAttempts,
+            filter: filterResult,
+            filter_reapply_attempts: filterReapplyAttempts,
+            card_count: cardNodeIds.length,
+            empty_state: emptyState,
+            root_state: currentRootState,
+            forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false)
+          };
+        }
+        attempts.push({
+          ok: false,
+          method: "end_refresh_button_after_click",
+          reason: "end_refresh_empty_state_unverified",
           page_scope: pageScopeResult,
           current_city_only: currentCityOnlyResult,
           current_city_only_attempts: currentCityOnlyAttempts,
           filter: filterResult,
           filter_reapply_attempts: filterReapplyAttempts,
-          card_count: cardNodeIds.length,
-          root_state: currentRootState,
+          card_count: 0,
+          empty_state: emptyState,
           forced_recent_not_view: Boolean(forceRecentNotView && filter.enabled !== false)
-        };
+        });
       } catch (error) {
         attempts.push({
           ok: false,

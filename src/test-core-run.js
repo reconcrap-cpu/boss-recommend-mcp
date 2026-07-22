@@ -161,6 +161,27 @@ async function testFailureSnapshotPreservesCdpDiagnostics() {
   assert.match(final.error.stack, /Could not find node with given id/);
 }
 
+async function testFailureSnapshotPreservesAttachedRunSummary() {
+  const manager = createRunLifecycleManager({ idPrefix: "test" });
+  const expectedSummary = {
+    list_end_reason: "greet_outcome_unknown",
+    results: [{ candidate_id: "candidate-unknown" }]
+  };
+  const started = manager.startRun({
+    name: "attached-summary-failure",
+    task: async () => {
+      const error = new Error("terminal post-action failure");
+      error.code = "RECOMMEND_GREET_OUTCOME_UNKNOWN";
+      error.run_summary = expectedSummary;
+      throw error;
+    }
+  });
+  const final = await manager.waitForRun(started.runId);
+  assert.equal(final.status, RUN_STATUS_FAILED);
+  assert.equal(final.error.code, "RECOMMEND_GREET_OUTCOME_UNKNOWN");
+  assert.deepEqual(final.summary, expectedSummary);
+}
+
 async function testSleepCleansAbortListenersAfterResolution() {
   const originalAddEventListener = AbortSignal.prototype.addEventListener;
   const originalRemoveEventListener = AbortSignal.prototype.removeEventListener;
@@ -246,5 +267,6 @@ await testCriticalCheckpointPersistenceFailureStopsBeforeFollowingWork();
 await testSleepCleansAbortListenersAfterResolution();
 await testPauseResumeCancel();
 await testFailureSnapshotPreservesCdpDiagnostics();
+await testFailureSnapshotPreservesAttachedRunSummary();
 
 console.log("Core run lifecycle tests passed");

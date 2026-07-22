@@ -420,6 +420,7 @@ function testBuildScreeningCandidateFromDetailUsesCleanNetworkText() {
         zpData: {
           geekDetailInfo: {
             geekBaseInfo: {
+              encryptGeekId: "candidate-1",
               name: "钱七",
               gender: 1,
               degreeCategory: "硕士",
@@ -443,6 +444,322 @@ function testBuildScreeningCandidateFromDetailUsesCleanNetworkText() {
   assert.equal(built.candidate.text.raw.includes("\"zpData\""), false);
   assert.equal(built.parsed_network_profiles.length, 1);
   assert.equal(built.parsed_network_profiles[0].ok, true);
+  assert.equal(built.parsed_network_profiles[0].candidate_binding.verified, true);
+  assert.equal(built.network_profile_binding.accepted_count, 1);
+}
+
+function testRecommendNetworkProfileRequiresExactCardIdAndName() {
+  const cardCandidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "card",
+    id: "candidate-a",
+    text: "朱余哲\n博士\n卡片可见经历",
+    identity: {
+      name: "朱余哲",
+      current_company: "卡片公司"
+    },
+    tags: ["卡片标签"]
+  });
+  const exactBody = {
+    url: "https://www.zhipin.com/wapi/zpjob/view/geek/info?encryptJid=candidate-a",
+    body: {
+      body: JSON.stringify({
+        zpData: {
+          geekDetailInfo: {
+            geekBaseInfo: {
+              name: "朱余哲",
+              userDescription: "网络精确绑定经历"
+            },
+            geekWorkExpList: [{ formattedCompany: "网络公司", positionName: "算法研究员" }],
+            geekEduExpList: [{ school: "浙江大学", degreeName: "博士" }],
+            geekSkillList: ["3DGS"]
+          }
+        }
+      })
+    }
+  };
+  const built = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    detailText: "详情可见文本",
+    networkBodies: [exactBody]
+  });
+  assert.equal(built.parsed_network_profiles[0].ok, true);
+  assert.equal(built.parsed_network_profiles[0].candidate_binding.verified, true);
+  assert.equal(
+    built.parsed_network_profiles[0].candidate_binding.matched_candidate_id_source,
+    "url_query:encryptjid"
+  );
+  assert.equal(built.candidate.id, "candidate-a");
+  assert.equal(built.candidate.identity.name, "朱余哲");
+  assert.equal(built.candidate.identity.current_company, "卡片公司");
+  assert.equal(built.candidate.identity.school, "浙江大学");
+  assert.equal(built.candidate.text.raw.includes("网络精确绑定经历"), true);
+  assert.equal(built.candidate.tags.includes("3DGS"), true);
+}
+
+function testRecommendNetworkProfileMismatchIsFullyExcludedForImageFallback() {
+  const cardCandidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "card",
+    id: "33e97f1cf19aef040XB73t-_FlJQ",
+    text: "朱余哲\n博士\n卡片唯一文本",
+    identity: { name: "朱余哲" },
+    tags: ["卡片标签"]
+  });
+  const staleBodyWithoutCandidateId = {
+    url: "https://www.zhipin.com/wapi/zpjob/view/geek/info",
+    body: {
+      body: JSON.stringify({
+        zpData: {
+          geekDetailInfo: {
+            geekBaseInfo: {
+              name: "杨雯语",
+              userDescription: "不应进入筛选的旧网络简历"
+            },
+            geekEduExpList: [{ school: "错误学校", degreeName: "博士" }],
+            geekSkillList: ["错误网络标签"]
+          }
+        }
+      })
+    }
+  };
+  const built = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    detailText: "当前详情页可见文本",
+    networkBodies: [staleBodyWithoutCandidateId]
+  });
+  const rejected = built.parsed_network_profiles[0];
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error, "RECOMMEND_NETWORK_PROFILE_CANDIDATE_BINDING_UNVERIFIED");
+  assert.equal(rejected.candidate_binding.reason, "network_candidate_id_evidence_missing");
+  assert.equal(rejected.profile, undefined);
+  assert.equal(built.network_profile_binding.accepted_count, 0);
+  assert.equal(built.network_profile_binding.rejected_count, 1);
+  assert.equal(built.candidate.id, "33e97f1cf19aef040XB73t-_FlJQ");
+  assert.equal(built.candidate.identity.name, "朱余哲");
+  assert.equal(built.candidate.identity.school, null);
+  assert.equal(built.candidate.text.raw.includes("不应进入筛选的旧网络简历"), false);
+  assert.equal(built.candidate.text.raw.includes("杨雯语"), false);
+  assert.equal(built.candidate.tags.includes("错误网络标签"), false);
+  const messages = buildScreeningLlmMessages({
+    candidate: built.candidate,
+    criteria: "必须有可见科研经历"
+  });
+  const promptText = getPromptText(messages);
+  assert.equal(promptText.includes("不应进入筛选的旧网络简历"), false);
+  assert.equal(promptText.includes("杨雯语"), false);
+}
+
+function testRecommendNetworkProfileRejectsWrongNameAndGenericUid() {
+  const cardCandidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "card",
+    id: "candidate-a",
+    text: "朱余哲\n博士",
+    identity: { name: "朱余哲" }
+  });
+  const bodyFor = (baseInfo) => ({
+    body: {
+      body: JSON.stringify({
+        zpData: {
+          geekDetailInfo: {
+            geekBaseInfo: baseInfo,
+            geekEduExpList: [{ school: "不可采信学校" }]
+          }
+        }
+      })
+    }
+  });
+  const wrongName = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [bodyFor({ encryptGeekId: "candidate-a", name: "杨雯语" })]
+  });
+  assert.equal(wrongName.parsed_network_profiles[0].ok, false);
+  assert.equal(
+    wrongName.parsed_network_profiles[0].candidate_binding.reason,
+    "network_profile_name_mismatch"
+  );
+  assert.equal(wrongName.candidate.identity.name, "朱余哲");
+  assert.equal(wrongName.candidate.identity.school, null);
+
+  const wrongCandidateId = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [bodyFor({ encryptGeekId: "candidate-b", name: "朱余哲" })]
+  });
+  assert.equal(wrongCandidateId.parsed_network_profiles[0].ok, false);
+  assert.equal(
+    wrongCandidateId.parsed_network_profiles[0].candidate_binding.reason,
+    "network_candidate_id_mismatch"
+  );
+  assert.deepEqual(
+    wrongCandidateId.parsed_network_profiles[0].candidate_binding.observed_candidate_ids,
+    ["candidate-b"]
+  );
+  assert.equal(wrongCandidateId.candidate.identity.school, null);
+
+  const conflictingCandidateIds = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [{
+      url: "https://www.zhipin.com/wapi/zpjob/view/geek/info?securityId=candidate-a",
+      body: {
+        body: JSON.stringify({
+          zpData: {
+            context: { encryptGeekId: "candidate-a" },
+            geekDetailInfo: {
+              geekBaseInfo: {
+                encryptGeekId: "candidate-b",
+                name: "朱余哲",
+                userDescription: "同名B候选人污染正文"
+              },
+              geekEduExpList: [{ school: "同名B候选人学校" }]
+            }
+          }
+        })
+      }
+    }]
+  });
+  assert.equal(conflictingCandidateIds.parsed_network_profiles[0].ok, false);
+  assert.equal(
+    conflictingCandidateIds.parsed_network_profiles[0].candidate_binding.reason,
+    "network_candidate_id_conflict"
+  );
+  assert.deepEqual(
+    conflictingCandidateIds.parsed_network_profiles[0].candidate_binding.observed_candidate_ids,
+    ["candidate-a", "candidate-b"]
+  );
+  assert.equal(conflictingCandidateIds.candidate.text.raw.includes("同名B候选人污染正文"), false);
+  assert.equal(conflictingCandidateIds.candidate.identity.school, null);
+
+  const outerCandidateIdCannotAuthorizeIdlessProfile = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [{
+      body: {
+        body: JSON.stringify({
+          zpData: {
+            context: { encryptGeekId: "candidate-a" },
+            geekDetailInfo: {
+              geekBaseInfo: {
+                name: "朱余哲",
+                userDescription: "外层A授权不了无ID同名B正文"
+              },
+              geekEduExpList: [{ school: "无ID同名B学校" }]
+            }
+          }
+        })
+      }
+    }]
+  });
+  const outerRejected = outerCandidateIdCannotAuthorizeIdlessProfile.parsed_network_profiles[0];
+  assert.equal(outerRejected.ok, false);
+  assert.equal(outerRejected.candidate_binding.reason, "network_candidate_id_evidence_missing");
+  assert.deepEqual(outerRejected.candidate_binding.observed_candidate_ids, []);
+  assert.deepEqual(outerRejected.candidate_binding.response_observed_candidate_ids, ["candidate-a"]);
+  assert.equal(
+    outerCandidateIdCannotAuthorizeIdlessProfile.candidate.text.raw.includes(
+      "外层A授权不了无ID同名B正文"
+    ),
+    false
+  );
+  assert.equal(outerCandidateIdCannotAuthorizeIdlessProfile.candidate.identity.school, null);
+
+  const genericUidOnly = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [bodyFor({ uid: "candidate-a", name: "朱余哲" })]
+  });
+  assert.equal(genericUidOnly.parsed_network_profiles[0].ok, false);
+  assert.equal(
+    genericUidOnly.parsed_network_profiles[0].candidate_binding.reason,
+    "network_candidate_id_evidence_missing"
+  );
+
+  const placeholderName = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [bodyFor({ encryptGeekId: "candidate-a", name: "求职者" })]
+  });
+  assert.equal(placeholderName.parsed_network_profiles[0].ok, false);
+  assert.equal(
+    placeholderName.parsed_network_profiles[0].candidate_binding.reason,
+    "network_profile_name_placeholder_or_missing"
+  );
+}
+
+function testRecommendMixedNetworkBatchUsesOnlyExactBoundProfile() {
+  const cardCandidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "card",
+    id: "candidate-a",
+    text: "朱余哲\n博士",
+    identity: { name: "朱余哲" }
+  });
+  const networkBody = ({ candidateId, name, marker, skill }) => ({
+    body: {
+      body: JSON.stringify({
+        zpData: {
+          geekDetailInfo: {
+            geekBaseInfo: {
+              encryptGeekId: candidateId,
+              name,
+              userDescription: marker
+            },
+            geekSkillList: [skill]
+          }
+        }
+      })
+    }
+  });
+  const built = buildScreeningCandidateFromDetail({
+    cardCandidate,
+    networkBodies: [
+      networkBody({
+        candidateId: "candidate-b",
+        name: "杨雯语",
+        marker: "B候选人旧网络正文",
+        skill: "B候选人旧标签"
+      }),
+      networkBody({
+        candidateId: "candidate-a",
+        name: "朱余哲",
+        marker: "A候选人精确网络正文",
+        skill: "A候选人精确标签"
+      })
+    ]
+  });
+  assert.deepEqual(built.parsed_network_profiles.map((item) => item.ok), [false, true]);
+  assert.equal(built.network_profile_binding.accepted_count, 1);
+  assert.equal(built.network_profile_binding.rejected_count, 1);
+  assert.equal(built.candidate.text.raw.includes("A候选人精确网络正文"), true);
+  assert.equal(built.candidate.text.raw.includes("B候选人旧网络正文"), false);
+  assert.equal(built.candidate.tags.includes("A候选人精确标签"), true);
+  assert.equal(built.candidate.tags.includes("B候选人旧标签"), false);
+}
+
+function testNonRecommendNetworkProfileCompatibilityIsPreserved() {
+  const cardCandidate = normalizeCandidateProfile({
+    domain: "recruit",
+    source: "card",
+    id: "recruit-candidate",
+    text: "招聘候选人",
+    identity: { name: "招聘候选人" }
+  });
+  const built = buildScreeningCandidateFromDetail({
+    domain: "recruit",
+    cardCandidate,
+    networkBodies: [{
+      body: {
+        body: JSON.stringify({
+          zpData: {
+            geekDetailInfo: {
+              geekBaseInfo: { name: "招聘候选人" },
+              geekEduExpList: [{ school: "兼容学校" }]
+            }
+          }
+        })
+      }
+    }]
+  });
+  assert.equal(built.parsed_network_profiles[0].ok, true);
+  assert.equal(built.candidate.identity.school, "兼容学校");
+  assert.equal(built.network_profile_binding, null);
 }
 
 function testBuildScreeningLlmMessages() {
@@ -1761,6 +2078,11 @@ testBossNetworkEncryptedResumeExplainsImageFallback();
 testBossChatGeekInfoExtraction();
 testBossChatHistoryResumeExtraction();
 testBuildScreeningCandidateFromDetailUsesCleanNetworkText();
+testRecommendNetworkProfileRequiresExactCardIdAndName();
+testRecommendNetworkProfileMismatchIsFullyExcludedForImageFallback();
+testRecommendNetworkProfileRejectsWrongNameAndGenericUid();
+testRecommendMixedNetworkBatchUsesOnlyExactBoundProfile();
+testNonRecommendNetworkProfileCompatibilityIsPreserved();
 testBuildScreeningLlmMessages();
 testBuildScreeningLlmMessagesFailFastForAllThinkingModes();
 testBuildScreeningLlmMessagesFastFirstRequiresReviewOnCounterevidence();

@@ -776,6 +776,17 @@ function normalizeStickyVerificationSpecs(options = {}) {
   })).filter((spec) => spec.group && spec.labels.length);
 }
 
+function normalizeUniqueFilterLabels(labels = []) {
+  return [...new Set(labels.map(normalizeFilterOptionLabel).filter(Boolean))];
+}
+
+function activeFilterLabelsMatchRequestedExactly(requestedLabels = [], activeLabels = []) {
+  const requested = normalizeUniqueFilterLabels(requestedLabels);
+  const active = normalizeUniqueFilterLabels(activeLabels);
+  return requested.length === active.length
+    && requested.every((label) => active.includes(label));
+}
+
 function findUnavailableGroup(unavailableGroups = [], group = "") {
   return unavailableGroups.find((item) => item?.group === group) || null;
 }
@@ -806,13 +817,20 @@ export async function verifyFilterGroupsSticky(client, frameNodeId, {
   for (const spec of normalizedSpecs) {
     const unavailable = findUnavailableGroup(unavailableGroups, spec.group);
     if (unavailable) {
+      const requestedLabels = normalizeUniqueFilterLabels(spec.labels);
+      const reason = unavailable.reason || "control_unavailable_default";
+      const unavailableDefaultVerified = spec.group === RECOMMEND_ACTIVITY_GROUP
+        && spec.allowUnlimited === true
+        && requestedLabels.length === 1
+        && requestedLabels[0] === normalizeFilterOptionLabel("不限")
+        && /control_unavailable_default$/.test(reason);
       groups.push({
         group: spec.group,
-        requested_labels: spec.labels,
+        requested_labels: requestedLabels,
         active_labels: [],
-        verified: true,
+        verified: unavailableDefaultVerified,
         unavailable: true,
-        reason: unavailable.reason || "control_unavailable_default"
+        reason
       });
     } else {
       availableSpecs.push(spec);
@@ -827,15 +845,15 @@ export async function verifyFilterGroupsSticky(client, frameNodeId, {
       const options = await listFilterOptions(client, frameNodeId, {
         groupOrder: [spec.group]
       });
-      const requestedLabels = spec.labels.map(normalizeFilterOptionLabel).filter(Boolean);
-      const activeLabels = options
+      const requestedLabels = normalizeUniqueFilterLabels(spec.labels);
+      const activeLabels = normalizeUniqueFilterLabels(options
         .filter((option) => option.group === spec.group && option.active)
-        .map((option) => normalizeFilterOptionLabel(option.label));
-      const verified = spec.selectAllLabels === false
-        ? requestedLabels.length === 1
-          && activeLabels.length === 1
-          && activeLabels[0] === requestedLabels[0]
-        : requestedLabels.every((label) => activeLabels.includes(label));
+        .map((option) => option.label));
+      const verified = requestedLabels.length > 0 && (
+        spec.selectAllLabels === false
+          ? activeLabels.length === 1 && requestedLabels.includes(activeLabels[0])
+          : activeFilterLabelsMatchRequestedExactly(requestedLabels, activeLabels)
+      );
       groups.push({
         group: spec.group,
         requested_labels: requestedLabels,

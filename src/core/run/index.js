@@ -278,7 +278,8 @@ export function createRunLifecycleManager({
       }
       setStatus(entry, RUN_STATUS_FAILED, {
         completedAt: now(),
-        error: errorDiagnostic(error, entry.run.phase)
+        error: errorDiagnostic(error, entry.run.phase),
+        summary: error?.run_summary || entry.run.summary
       });
     }
   }
