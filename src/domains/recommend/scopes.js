@@ -155,7 +155,7 @@ async function waitForRecommendPageScope(client, frameNodeId, scope, {
       ...active,
       card_count: cardCount
     };
-    if (active.scope === scope && cardCount > 0) {
+    if (active.scope === scope) {
       return {
         ok: true,
         elapsed_ms: Date.now() - started,

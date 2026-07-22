@@ -23,6 +23,12 @@ export const RUN_STAGE_FINALIZE = "finalize";
 
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 120_000;
 const DEFAULT_RETENTION_MS = 24 * 60 * 60 * 1000;
+const RETENTION_PROTECTED_RUN_STATES = new Set([
+  RUN_STATE_QUEUED,
+  RUN_STATE_RUNNING,
+  RUN_STATE_PAUSED,
+  "canceling"
+]);
 
 const VALID_RUN_MODES = new Set([RUN_MODE_SYNC, RUN_MODE_ASYNC]);
 const VALID_RUN_STATES = new Set([
@@ -162,6 +168,18 @@ function defaultResume(resume = {}) {
     output_csv: normalizeMessage(resume?.output_csv || ""),
     worker_stdout_path: normalizeMessage(resume?.worker_stdout_path || ""),
     worker_stderr_path: normalizeMessage(resume?.worker_stderr_path || ""),
+    worker_exit_status_path: normalizeMessage(resume?.worker_exit_status_path || ""),
+    worker_launcher: normalizeMessage(resume?.worker_launcher || ""),
+    worker_launch_id: normalizeMessage(resume?.worker_launch_id || ""),
+    worker_supervisor_pid: Number.isInteger(resume?.worker_supervisor_pid) && resume.worker_supervisor_pid > 0
+      ? resume.worker_supervisor_pid
+      : null,
+    worker_node_pid: Number.isInteger(resume?.worker_node_pid) && resume.worker_node_pid > 0
+      ? resume.worker_node_pid
+      : null,
+    worker_launched_at: normalizeMessage(resume?.worker_launched_at || ""),
+    worker_started_at: normalizeMessage(resume?.worker_started_at || ""),
+    worker_launch_committed: resume?.worker_launch_committed === true,
     follow_up_phase: normalizeMessage(resume?.follow_up_phase || ""),
     chat_run_id: normalizeMessage(resume?.chat_run_id || ""),
     chat_state: normalizeMessage(resume?.chat_state || ""),
@@ -336,8 +354,30 @@ export function cleanupExpiredRuns(retentionMs = getRunRetentionMs()) {
   ensureRunsDir();
   const removed = [];
   const failed = [];
+  const preservedActive = [];
   const now = Date.now();
   const entries = fs.readdirSync(getRunsDir(), { withFileTypes: true });
+  const activeRunIds = new Set();
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const filePath = path.join(getRunsDir(), entry.name);
+    const persisted = safeReadJson(filePath);
+    const runId = normalizeRunId(persisted?.run_id || persisted?.runId || "");
+    const state = (normalizeMessage(persisted?.state || persisted?.status || "") || "").toLowerCase();
+    if (
+      runId
+      && entry.name === `${runId}.json`
+      && RETENTION_PROTECTED_RUN_STATES.has(state)
+    ) {
+      activeRunIds.add(runId);
+    }
+  }
+  const protectedArtifactNames = new Set();
+  for (const runId of activeRunIds) {
+    protectedArtifactNames.add(`${runId}.json`);
+    protectedArtifactNames.add(`${runId}.checkpoint.json`);
+    protectedArtifactNames.add(`${runId}.worker.exit.json`);
+  }
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
     const filePath = path.join(getRunsDir(), entry.name);
@@ -345,6 +385,10 @@ export function cleanupExpiredRuns(retentionMs = getRunRetentionMs()) {
       const stat = fs.statSync(filePath);
       const age = now - Number(stat.mtimeMs || 0);
       if (age < retentionMs) continue;
+      if (protectedArtifactNames.has(entry.name)) {
+        preservedActive.push(filePath);
+        continue;
+      }
       fs.unlinkSync(filePath);
       removed.push(filePath);
     } catch (error) {
@@ -354,5 +398,5 @@ export function cleanupExpiredRuns(retentionMs = getRunRetentionMs()) {
       });
     }
   }
-  return { removed, failed };
+  return { removed, failed, preserved_active: preservedActive };
 }

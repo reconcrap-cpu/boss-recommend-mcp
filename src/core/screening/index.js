@@ -68,6 +68,7 @@ const LLM_THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", 
 const LLM_SCREENING_STRATEGIES = new Set(["single_pass", "fast_first_verified"]);
 const FAST_FIRST_DEFAULT_FAST_MAX_TOKENS = 384;
 const FATAL_LLM_PROVIDER_MAX_RETRIES = 2;
+const LLM_PROVIDER_CIRCUITS = new WeakMap();
 
 function nowIso() {
   return new Date().toISOString();
@@ -150,6 +151,7 @@ function normalizeLlmProviderConfigs(config = {}) {
 }
 
 function compactLlmProviderFailure(error, providerConfig = {}, providerIndex = 0) {
+  const fatalClassification = classifyFatalLlmProviderError(error);
   return {
     index: providerIndex + 1,
     name: normalizeText(providerConfig.llmProviderName || providerConfig.name || providerConfig.label || providerConfig.id) || null,
@@ -157,8 +159,49 @@ function compactLlmProviderFailure(error, providerConfig = {}, providerIndex = 0
     model: normalizeText(providerConfig.model) || null,
     status: Number.isFinite(Number(error?.status)) ? Number(error.status) : null,
     attempts: Number(error?.llm_attempt_count) || 0,
-    message: String(error?.message || error || "").slice(0, 500)
+    message: String(error?.message || error || "").slice(0, 500),
+    fatal: Boolean(fatalClassification),
+    fatal_code: fatalClassification?.code || null,
+    fatal_reason: fatalClassification?.reason || null,
+    circuit_open: Boolean(error?.llm_provider_circuit_open || fatalClassification),
+    circuit_skipped: Boolean(error?.llm_provider_circuit_skipped)
   };
+}
+
+function resolveLlmProviderCircuitState(config) {
+  if (!config || (typeof config !== "object" && typeof config !== "function")) {
+    return new Map();
+  }
+  let state = LLM_PROVIDER_CIRCUITS.get(config);
+  if (!state) {
+    state = new Map();
+    LLM_PROVIDER_CIRCUITS.set(config, state);
+  }
+  return state;
+}
+
+function llmProviderCircuitKey(providerConfig = {}, providerIndex = 0) {
+  return [
+    providerIndex,
+    normalizeBaseUrl(providerConfig.baseUrl),
+    normalizeText(providerConfig.llmProviderName || providerConfig.name || providerConfig.label || providerConfig.id),
+    normalizeText(providerConfig.model)
+  ].join("\u0000");
+}
+
+function createOpenLlmProviderCircuitError(circuit = {}) {
+  const error = new Error(
+    `LLM provider circuit is open: ${circuit.message || circuit.code || "fatal provider failure"}`
+  );
+  error.code = circuit.code || "LLM_FATAL_PROVIDER_ERROR";
+  error.status = Number.isFinite(Number(circuit.status)) ? Number(circuit.status) : null;
+  error.llm_fatal_provider_error = true;
+  error.llm_fatal_reason = circuit.reason || "fatal_provider_error";
+  error.llm_attempt_count = 0;
+  error.llm_provider_circuit_open = true;
+  error.llm_provider_circuit_skipped = true;
+  error.llm_provider_circuit_opened_at = circuit.opened_at || null;
+  return error;
 }
 
 export function classifyFatalLlmProviderError(error) {
@@ -213,6 +256,16 @@ export function createFatalLlmRunError(error, { domain = "", candidate = null } 
   fatal.provider_error_code = error?.provider_error_code || null;
   fatal.provider_error_type = error?.provider_error_type || null;
   fatal.provider_error_message = error?.provider_error_message || null;
+  fatal.llm_provider_failures = Array.isArray(error?.llm_provider_failures)
+    ? error.llm_provider_failures
+    : [];
+  fatal.llm_model_failures = Array.isArray(error?.llm_model_failures)
+    ? error.llm_model_failures
+    : fatal.llm_provider_failures;
+  fatal.llm_fatal_provider_count = Number(error?.llm_fatal_provider_count) || 0;
+  fatal.llm_fatal_provider_codes = Array.isArray(error?.llm_fatal_provider_codes)
+    ? error.llm_fatal_provider_codes
+    : [];
   fatal.domain = domain || null;
   fatal.candidate_id = candidate?.id || null;
   fatal.candidate_name = candidate?.identity?.name || null;
@@ -2021,6 +2074,10 @@ async function callScreeningLlmWithProvider({
   const effectiveTimeoutMs = parsePositiveNumber(config.llmTimeoutMs ?? config.timeoutMs, timeoutMs) || timeoutMs;
   const maxRetries = normalizeLlmMaxRetries(config.llmMaxRetries ?? config.maxRetries);
   const maxAttempts = maxRetries + 1;
+  const providerCount = Number.isFinite(Number(config.llmProviderCount))
+    ? Math.max(1, Number(config.llmProviderCount))
+    : 1;
+  const fatalProviderMaxRetries = providerCount > 1 ? 0 : FATAL_LLM_PROVIDER_MAX_RETRIES;
   let lastError = null;
   let attempt = 0;
   let fatalProviderAttempts = 0;
@@ -2130,7 +2187,7 @@ async function callScreeningLlmWithProvider({
         error.code = fatalClassification.code;
         error.llm_fatal_provider_error = true;
         error.llm_fatal_reason = fatalClassification.reason;
-        if (fatalProviderAttempts <= FATAL_LLM_PROVIDER_MAX_RETRIES) {
+        if (fatalProviderAttempts <= fatalProviderMaxRetries) {
           await sleepMs(Math.min(2500, 500 * fatalProviderAttempts));
           continue;
         }
@@ -2273,6 +2330,9 @@ async function callSinglePassScreeningLlm(args = {}) {
     });
   }
 
+  const providerCircuitState = args.providerCircuitState instanceof Map
+    ? args.providerCircuitState
+    : resolveLlmProviderCircuitState(args.config);
   const providerFailures = [];
   let lastError = null;
   for (let index = 0; index < providers.length; index += 1) {
@@ -2281,6 +2341,14 @@ async function callSinglePassScreeningLlm(args = {}) {
       llmProviderIndex: index,
       llmProviderCount: providers.length
     };
+    const circuitKey = llmProviderCircuitKey(providerConfig, index);
+    const openCircuit = providerCircuitState.get(circuitKey);
+    if (openCircuit) {
+      const circuitError = createOpenLlmProviderCircuitError(openCircuit);
+      lastError = circuitError;
+      providerFailures.push(compactLlmProviderFailure(circuitError, providerConfig, index));
+      continue;
+    }
     try {
       const previousAttempts = providerFailures.reduce((sum, item) => sum + (Number(item.attempts) || 0), 0);
       const result = await callScreeningLlmWithProvider({
@@ -2295,8 +2363,18 @@ async function callSinglePassScreeningLlm(args = {}) {
         fallback_count: providerFailures.length
       };
     } catch (error) {
-      if (isFatalLlmProviderError(error)) throw error;
       lastError = error;
+      const fatalClassification = classifyFatalLlmProviderError(error);
+      if (fatalClassification) {
+        providerCircuitState.set(circuitKey, {
+          code: fatalClassification.code,
+          reason: fatalClassification.reason,
+          status: Number.isFinite(Number(error?.status)) ? Number(error.status) : null,
+          message: String(error?.message || error || "").slice(0, 500),
+          opened_at: nowIso()
+        });
+        error.llm_provider_circuit_open = true;
+      }
       providerFailures.push(compactLlmProviderFailure(error, providerConfig, index));
       if (index < providers.length - 1) {
         await sleepMs(Math.min(1500, 250 * (index + 1)));
@@ -2314,6 +2392,16 @@ async function callSinglePassScreeningLlm(args = {}) {
   finalError.llm_attempt_count = totalAttempts;
   finalError.image_input_count = lastError?.image_input_count || 0;
   finalError.image_inputs = lastError?.image_inputs || [];
+  const fatalProviderFailures = providerFailures.filter((item) => item.fatal || item.circuit_open);
+  if (fatalProviderFailures.length > 0) {
+    finalError.code = "LLM_ALL_PROVIDERS_UNAVAILABLE";
+    finalError.llm_fatal_provider_error = true;
+    finalError.llm_fatal_reason = "all_providers_unavailable";
+    finalError.llm_fatal_provider_count = fatalProviderFailures.length;
+    finalError.llm_fatal_provider_codes = fatalProviderFailures
+      .map((item) => item.fatal_code)
+      .filter(Boolean);
+  }
   throw finalError;
 }
 
@@ -2388,13 +2476,19 @@ async function callFastFirstVerifiedScreeningLlm(args = {}) {
 }
 
 export async function callScreeningLlm(args = {}) {
+  const callArgs = args.providerCircuitState instanceof Map
+    ? args
+    : {
+      ...args,
+      providerCircuitState: resolveLlmProviderCircuitState(args.config)
+    };
   const strategy = normalizeLlmScreeningStrategy(
-    args.config?.llmScreeningStrategy
-    ?? args.config?.screeningStrategy
-    ?? args.config?.screening_strategy
+    callArgs.config?.llmScreeningStrategy
+    ?? callArgs.config?.screeningStrategy
+    ?? callArgs.config?.screening_strategy
   );
   if (strategy === "fast_first_verified") {
-    return callFastFirstVerifiedScreeningLlm(args);
+    return callFastFirstVerifiedScreeningLlm(callArgs);
   }
-  return callSinglePassScreeningLlm(args);
+  return callSinglePassScreeningLlm(callArgs);
 }

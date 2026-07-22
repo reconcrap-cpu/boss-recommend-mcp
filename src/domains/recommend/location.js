@@ -506,7 +506,12 @@ async function confirmRecommendLocationPopover(client, frameNodeId, {
     let absentSince = null;
     let absentObservations = 0;
     let lastObservation = null;
-    while (Date.now() - started <= timeoutMs) {
+    // Always take at least one post-click observation. A zero timeout is useful
+    // for deterministic callers/tests and must not turn a completed click into
+    // an unobserved global failure merely because the clock ticked first.
+    let observedOnce = false;
+    while (!observedOnce || Date.now() - started <= timeoutMs) {
+      observedOnce = true;
       try {
         const [control, popover] = await Promise.all([
           findRecommendCurrentCityControl(client, frameNodeId),

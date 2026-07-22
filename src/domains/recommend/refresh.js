@@ -76,10 +76,9 @@ export function buildRecommendFilterGroups(filter = {}, {
   if (forceRecentNotView) {
     const recentGroup = groups.find((item) => item.group === "recentNotView");
     if (recentGroup) {
-      if (!recentGroup.labels.some((label) => label.replace(/\s+/g, "") === RECOMMEND_RECENT_NOT_VIEW_LABEL)) {
-        recentGroup.labels.push(RECOMMEND_RECENT_NOT_VIEW_LABEL);
-      }
+      recentGroup.labels = [RECOMMEND_RECENT_NOT_VIEW_LABEL];
       recentGroup.selectAllLabels = true;
+      recentGroup.allowUnlimited = false;
       recentGroup.verifySticky = true;
     } else {
       groups.unshift({
@@ -354,7 +353,8 @@ export function isVerifiedRecommendRefreshExhaustion({
   filterResult = null,
   pageScopeResult = null,
   currentCityOnlyResult = null,
-  emptyState = null
+  emptyState = null,
+  forceRecentNotView = false
 } = {}) {
   if (
     Number(cardCount) !== 0
@@ -364,7 +364,7 @@ export function isVerifiedRecommendRefreshExhaustion({
   const filterEnabled = filter?.enabled !== false;
   if (filterEnabled && !isVerifiedRecommendFilterApplication(
     filterResult,
-    buildRecommendFilterSelectionOptions(filter)
+    buildRecommendFilterSelectionOptions(filter, { forceRecentNotView })
   )) {
     return false;
   }
@@ -461,7 +461,7 @@ function compactFilterReapplyError(error) {
 export function isRetryableRecommendJobSelectionError(error) {
   if (isStaleRecommendNodeError(error)) return true;
   const message = String(error?.message || error || "");
-  return /Recommend job trigger was not found|Recommend job dropdown did not mount options|Recommend job dropdown did not expose visible options|Matched recommend job has no clickable center|Matched recommend job has no visible clickable option|Recommend job selection was not sticky|Recommend job dropdown remained open after sticky verification/i.test(message);
+  return /Recommend job selection was not confirmed|Recommend job trigger was not found|Recommend job dropdown did not mount options|Recommend job dropdown did not expose visible options|Matched recommend job has no clickable center|Matched recommend job has no visible clickable option|Recommend job selection was not sticky|Recommend job dropdown remained open after sticky verification/i.test(message);
 }
 
 function compactJobSelectionAttempt({
@@ -542,6 +542,14 @@ export async function selectRecommendJobWithRootRefresh(client, rootState, {
         settleMs,
         dropdownTimeoutMs
       });
+      if (selection?.selected !== true) {
+        const selectionError = new Error(
+          `Recommend job selection was not confirmed: ${selection?.reason || "job_not_found"}`
+        );
+        selectionError.code = "RECOMMEND_JOB_SELECTION_NOT_CONFIRMED";
+        selectionError.job_selection = selection;
+        throw selectionError;
+      }
       if (selection.selected) {
         const stickyRootState = await waitForFreshRecommendRoots(client, {
           timeoutMs: Math.min(10000, Math.max(2000, totalTimeoutMs - (Date.now() - started))),
@@ -831,7 +839,8 @@ async function applyRefreshMethod(client, method, {
       filterResult,
       pageScopeResult,
       currentCityOnlyResult,
-      emptyState
+      emptyState,
+      forceRecentNotView
     });
     if (!cardNodeIds.length && !exhausted) {
       throw new Error("No recommend candidate cards were found after refresh reload");
@@ -898,14 +907,25 @@ export async function refreshRecommendListAtEnd(client, {
   let currentRootState = rootState || null;
 
   if (preferEndRefreshButton) {
-    currentRootState = currentRootState || await getRecommendRoots(client);
-    const buttonResult = await clickRecommendEndRefreshButton(
-      client,
-      currentRootState.iframe.documentNodeId,
-      { settleMs: buttonSettleMs }
-    );
-    attempts.push(buttonResult);
-    if (buttonResult.ok) {
+    let buttonResult = null;
+    try {
+      currentRootState = currentRootState || await getRecommendRoots(client);
+      buttonResult = await clickRecommendEndRefreshButton(
+        client,
+        currentRootState.iframe.documentNodeId,
+        { settleMs: buttonSettleMs }
+      );
+      attempts.push(buttonResult);
+    } catch (error) {
+      attempts.push({
+        ok: false,
+        method: "end_refresh_button",
+        reason: "end_refresh_button_failed",
+        error: error?.message || String(error),
+        error_diagnostic: compactRecommendRefreshErrorDiagnostic(error)
+      });
+    }
+    if (buttonResult?.ok) {
       let pageScopeResult = null;
       let currentCityOnlyResult = null;
       let currentCityOnlyAttempts = [];
@@ -965,7 +985,8 @@ export async function refreshRecommendListAtEnd(client, {
           filterResult,
           pageScopeResult,
           currentCityOnlyResult,
-          emptyState
+          emptyState,
+          forceRecentNotView
         });
         if (cardNodeIds.length > 0 || exhausted) {
           return {

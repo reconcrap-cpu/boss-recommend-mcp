@@ -17,6 +17,7 @@ import {
   ensureChromeDebugPort,
   generateBezierPath,
   getMissingRequiredChromeFlags,
+  getCdpMethodLogStats,
   getNodeBox,
   FORBIDDEN_CDP_DOMAINS,
   FORBIDDEN_CDP_METHODS,
@@ -24,9 +25,12 @@ import {
   insertText,
   isChromeDebugUnavailableError,
   isBossLoginUrl,
+  isSafeBoundedCdpMethod,
   normalizeHumanBehaviorOptions,
   normalizeHumanRestLevel,
+  openChromeTarget,
   resolveHumanClickPointForBox,
+  selectReconnectChromeTarget,
   scrollNodeIntoView,
   simulateHumanClick
 } from "./core/browser/index.js";
@@ -96,7 +100,7 @@ async function testGuardedClientReconnectsClosedTransport() {
   const calls = [];
   const methodLog = [];
   const listener = () => {};
-  function makeClient(name, { failGetBody = false } = {}) {
+  function makeClient(name, { failLayoutMetrics = false } = {}) {
     return {
       Page: {
         async enable() {
@@ -106,6 +110,13 @@ async function testGuardedClientReconnectsClosedTransport() {
         async bringToFront() {
           calls.push(`${name}:Page.bringToFront`);
           return {};
+        },
+        async getLayoutMetrics() {
+          calls.push(`${name}:Page.getLayoutMetrics`);
+          if (failLayoutMetrics) {
+            throw new Error("WebSocket is not open: readyState 3 (CLOSED)");
+          }
+          return { cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 } };
         }
       },
       Network: {
@@ -119,13 +130,6 @@ async function testGuardedClientReconnectsClosedTransport() {
         },
         responseReceived(nextListener) {
           calls.push(`${name}:Network.responseReceived:${nextListener === listener}`);
-        },
-        async getResponseBody() {
-          calls.push(`${name}:Network.getResponseBody`);
-          if (failGetBody) {
-            throw new Error("WebSocket is not open: readyState 3 (CLOSED)");
-          }
-          return { body: name };
         }
       },
       async close() {
@@ -134,7 +138,7 @@ async function testGuardedClientReconnectsClosedTransport() {
     };
   }
 
-  const first = makeClient("first", { failGetBody: true });
+  const first = makeClient("first", { failLayoutMetrics: true });
   const second = makeClient("second");
   const guarded = createGuardedCdpClient(first, {
     methodLog,
@@ -146,29 +150,404 @@ async function testGuardedClientReconnectsClosedTransport() {
   await guarded.Network.setCacheDisabled({ cacheDisabled: true });
   guarded.Network.responseReceived(listener);
 
-  const result = await guarded.Network.getResponseBody({ requestId: "1" });
-  assert.deepEqual(result, { body: "second" });
+  const result = await guarded.Page.getLayoutMetrics();
+  assert.equal(result.cssLayoutViewport.clientWidth, 1200);
   assert.deepEqual(calls, [
     "first:Page.enable",
     "first:Network.enable",
     "first:Page.bringToFront",
     "first:Network.setCacheDisabled:true",
     "first:Network.responseReceived:true",
-    "first:Network.getResponseBody",
+    "first:Page.getLayoutMetrics",
     "second:Page.enable",
     "second:Network.enable",
     "second:Network.setCacheDisabled:true",
     "second:Network.responseReceived:true",
-    "second:Network.getResponseBody"
+    "second:Page.getLayoutMetrics"
   ]);
-  const initialBodyCall = methodLog.find((entry) => entry.method === "Network.getResponseBody");
-  const replayedBodyCall = methodLog.find((entry) => entry.method === "Network.getResponseBody:retry_after_reconnect");
-  assert.equal(initialBodyCall?.connection_epoch, 1);
-  assert.equal(initialBodyCall?.replay_policy, "safe_read_only");
-  assert.equal(replayedBodyCall?.connection_epoch, 2);
-  assert.equal(replayedBodyCall?.replay_of_connection_epoch, 1);
+  const initialReadCall = methodLog.find((entry) => entry.method === "Page.getLayoutMetrics");
+  const replayedReadCall = methodLog.find((entry) => entry.method === "Page.getLayoutMetrics:retry_after_reconnect");
+  assert.equal(initialReadCall?.connection_epoch, 1);
+  assert.equal(initialReadCall?.replay_policy, "safe_read_only");
+  assert.equal(replayedReadCall?.connection_epoch, 2);
+  assert.equal(replayedReadCall?.replay_of_connection_epoch, 1);
   assert.equal(guarded.__connectionEpoch, 2);
   assertNoForbiddenCdpCalls(methodLog);
+}
+
+async function testGuardedClientDoesNotReplaySessionScopedNetworkBody() {
+  const calls = [];
+  const methodLog = [];
+  const first = {
+    Network: {
+      async getResponseBody() {
+        calls.push("first:Network.getResponseBody");
+        throw new Error("WebSocket is not open: readyState 3 (CLOSED)");
+      }
+    }
+  };
+  const second = {
+    Network: {
+      async getResponseBody() {
+        calls.push("second:Network.getResponseBody");
+        return { body: "must-not-be-used" };
+      }
+    }
+  };
+  const guarded = createGuardedCdpClient(first, {
+    methodLog,
+    reconnect: async () => second
+  });
+
+  await assert.rejects(
+    () => guarded.Network.getResponseBody({ requestId: "old-session-request" }),
+    (error) => {
+      assert.equal(error.cdp_method, "Network.getResponseBody");
+      assert.equal(error.cdp_outcome_unknown, true);
+      assert.equal(error.cdp_reconnected, true);
+      assert.equal(error.cdp_replay_policy, "not_allowlisted");
+      assert.equal(error.cdp_replay_suppressed, true);
+      return true;
+    }
+  );
+  assert.deepEqual(calls, ["first:Network.getResponseBody"]);
+  assert.deepEqual(methodLog.map((entry) => entry.method), ["Network.getResponseBody"]);
+  assert.equal(guarded.__connectionEpoch, 2);
+}
+
+async function testSafeReadDeadlineRequiresExplicitBoundaryReconnect() {
+  const calls = [];
+  const methodLog = [];
+  const guarded = createGuardedCdpClient({
+    Page: {
+      getLayoutMetrics() {
+        calls.push("first:Page.getLayoutMetrics");
+        return new Promise(() => {});
+      }
+    }
+  }, {
+    methodLog,
+    methodTimeoutMs: 20,
+    reconnectTimeoutMs: 100,
+    reconnect: async () => ({
+      Page: {
+        async getLayoutMetrics() {
+          calls.push("second:Page.getLayoutMetrics");
+          return { cssLayoutViewport: { clientWidth: 1440, clientHeight: 900 } };
+        }
+      }
+    })
+  });
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => guarded.Page.getLayoutMetrics(),
+    (error) => {
+      assert.equal(error.code, "CDP_METHOD_TIMEOUT");
+      assert.equal(error.cdp_outcome_unknown, false);
+      assert.equal(error.cdp_reconnect_required, true);
+      assert.equal(error.cdp_replay_suppressed, true);
+      return true;
+    }
+  );
+  assert.ok(Date.now() - startedAt < 500, "a permanently pending read must stay bounded");
+  assert.equal(guarded.__connectionEpoch, 1);
+  const reconnected = await guarded.__abandonAndReconnect({ reason: "safe_read_timeout" });
+  assert.equal(reconnected.reconnected, true);
+  const result = await guarded.Page.getLayoutMetrics();
+  assert.equal(result.cssLayoutViewport.clientWidth, 1440);
+  assert.deepEqual(calls, [
+    "first:Page.getLayoutMetrics",
+    "second:Page.getLayoutMetrics"
+  ]);
+  assert.equal(guarded.__connectionEpoch, 2);
+  assert.deepEqual(methodLog.map((entry) => entry.method), [
+    "Page.getLayoutMetrics",
+    "Page.getLayoutMetrics"
+  ]);
+  assert.equal(methodLog[0].deadline_policy, "bounded_safe_method");
+  assert.equal(methodLog[0].deadline_ms, 20);
+}
+
+async function testSessionScopedReadDeadlineReconnectsWithoutReplay() {
+  const calls = [];
+  const guarded = createGuardedCdpClient({
+    Network: {
+      getResponseBody() {
+        calls.push("first:Network.getResponseBody");
+        return new Promise(() => {});
+      }
+    }
+  }, {
+    methodTimeoutMs: 20,
+    reconnectTimeoutMs: 100,
+    reconnect: async () => ({
+      Network: {
+        async getResponseBody() {
+          calls.push("second:Network.getResponseBody");
+          return { body: "must-not-be-used" };
+        }
+      }
+    })
+  });
+
+  await assert.rejects(
+    () => guarded.Network.getResponseBody({ requestId: "old-session-request" }),
+    (error) => {
+      assert.equal(error.code, "CDP_METHOD_TIMEOUT");
+      assert.equal(error.cdp_timeout, true);
+      assert.equal(error.cdp_timeout_ms, 20);
+      assert.equal(error.cdp_outcome_unknown, false);
+      assert.equal(error.cdp_reconnected, undefined);
+      assert.equal(error.cdp_reconnect_required, true);
+      assert.equal(error.cdp_replay_suppressed, true);
+      assert.equal(error.cdp_deadline_policy, "bounded_safe_method");
+      return true;
+    }
+  );
+  assert.deepEqual(calls, ["first:Network.getResponseBody"]);
+  assert.equal(guarded.__connectionEpoch, 1);
+}
+
+async function testOutboundInputIsNeverTimedOutOrReplayedByGuard() {
+  let resolveInput = null;
+  let reconnectCount = 0;
+  const guarded = createGuardedCdpClient({
+    Input: {
+      dispatchMouseEvent() {
+        return new Promise((resolve) => {
+          resolveInput = resolve;
+        });
+      }
+    }
+  }, {
+    methodTimeoutMs: 10,
+    reconnectTimeoutMs: 10,
+    reconnect: async () => {
+      reconnectCount += 1;
+      return {};
+    }
+  });
+
+  const inputPromise = guarded.Input.dispatchMouseEvent({ type: "mousePressed", x: 1, y: 1 });
+  const early = await Promise.race([
+    inputPromise.then(() => "input"),
+    new Promise((resolve) => setTimeout(() => resolve("timer"), 35))
+  ]);
+  assert.equal(early, "timer", "the browser guard must not invent an Input outcome");
+  assert.equal(reconnectCount, 0);
+  resolveInput({});
+  await inputPromise;
+}
+
+async function testReconnectAndSetupReplayHaveIndependentDeadlines() {
+  const first = {
+    Page: {
+      async enable() {
+        return {};
+      },
+      async getLayoutMetrics() {
+        throw new Error("Connection closed");
+      }
+    }
+  };
+  let closeCount = 0;
+  const second = {
+    Page: {
+      enable() {
+        return new Promise(() => {});
+      },
+      async getLayoutMetrics() {
+        return {};
+      }
+    },
+    async close() {
+      closeCount += 1;
+    }
+  };
+  const guarded = createGuardedCdpClient(first, {
+    methodTimeoutMs: 20,
+    reconnectTimeoutMs: 80,
+    closeTimeoutMs: 20,
+    reconnect: async () => second
+  });
+  await guarded.Page.enable();
+
+  const startedAt = Date.now();
+  await assert.rejects(
+    () => guarded.Page.getLayoutMetrics(),
+    (error) => {
+      assert.equal(error.cdp_method, "Page.getLayoutMetrics");
+      assert.match(error.cdp_reconnect_error, /Page\.enable timed out after 20ms/);
+      return true;
+    }
+  );
+  assert.ok(Date.now() - startedAt < 500, "session setup replay must not hang reconnect forever");
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(closeCount, 1);
+  assert.equal(guarded.__connectionEpoch, 1);
+}
+
+function testOnlySafeMethodsReceiveBrowserGuardDeadlines() {
+  for (const method of [
+    "DOM.getDocument",
+    "DOM.getOuterHTML",
+    "Network.getResponseBody",
+    "Page.captureScreenshot",
+    "Page.enable",
+    "Network.setCacheDisabled"
+  ]) {
+    assert.equal(isSafeBoundedCdpMethod(method), true, `${method} should be bounded`);
+  }
+  for (const method of [
+    "Input.dispatchMouseEvent",
+    "Input.dispatchKeyEvent",
+    "Input.insertText",
+    "Page.navigate",
+    "Page.reload",
+    "DOM.focus"
+  ]) {
+    assert.equal(isSafeBoundedCdpMethod(method), false, `${method} must remain outside auto-deadline policy`);
+  }
+}
+
+async function testOpenTargetTimeoutDoesNotRetryUnknownCreation() {
+  const calls = [];
+  let aborted = false;
+  const result = await openChromeTarget({
+    host: "127.0.0.1",
+    port: 9222,
+    url: "https://example.test",
+    timeoutMs: 20,
+    _fetch: async (_url, options) => {
+      calls.push(options.method);
+      options.signal.addEventListener("abort", () => {
+        aborted = true;
+      }, { once: true });
+      return new Promise(() => {});
+    }
+  });
+  assert.deepEqual(calls, ["PUT"]);
+  assert.equal(aborted, true);
+  assert.equal(result.ok, false);
+  assert.equal(result.method, "PUT");
+  assert.equal(result.outcome_unknown, true);
+  assert.equal(result.replay_suppressed, true);
+  assert.match(result.error, /timed out after 20ms/);
+
+  const transportCalls = [];
+  const transportFailure = await openChromeTarget({
+    host: "127.0.0.1",
+    port: 9222,
+    url: "https://example.test",
+    timeoutMs: 20,
+    _fetch: async (_url, options) => {
+      transportCalls.push(options.method);
+      throw new Error("socket reset after request write");
+    }
+  });
+  assert.deepEqual(transportCalls, ["PUT"]);
+  assert.equal(transportFailure.outcome_unknown, true);
+  assert.equal(transportFailure.replay_suppressed, true);
+
+  const methodFallbackCalls = [];
+  const methodFallback = await openChromeTarget({
+    host: "127.0.0.1",
+    port: 9222,
+    url: "https://example.test",
+    timeoutMs: 20,
+    _fetch: async (_url, options) => {
+      methodFallbackCalls.push(options.method);
+      if (options.method === "PUT") return { ok: false, status: 405 };
+      return {
+        ok: true,
+        async json() {
+          return { id: "target-1", url: "https://example.test" };
+        }
+      };
+    }
+  });
+  assert.deepEqual(methodFallbackCalls, ["PUT", "GET"]);
+  assert.equal(methodFallback.ok, true);
+  assert.equal(methodFallback.target_id, "target-1");
+}
+
+async function testMethodLogIsBoundedWithFullRunAuditStats() {
+  const methodLog = [];
+  const guarded = createGuardedCdpClient({
+    Page: {
+      async getLayoutMetrics() {
+        return { cssLayoutViewport: { clientWidth: 1200, clientHeight: 800 } };
+      }
+    }
+  }, {
+    methodLog,
+    methodLogLimit: 3
+  });
+
+  for (let index = 0; index < 6; index += 1) {
+    await guarded.Page.getLayoutMetrics();
+  }
+
+  assert.ok(methodLog.length <= 3);
+  const stats = getCdpMethodLogStats(methodLog);
+  assert.equal(stats.total_count, 6);
+  assert.equal(stats.retained_count, methodLog.length);
+  assert.equal(stats.method_summary["Page.getLayoutMetrics"], 6);
+  assert.deepEqual(assertNoForbiddenCdpCalls(methodLog), {
+    verified: true,
+    proof: "method_log_inspection",
+    method_log_count: 6,
+    runtime_domain_method_count: 0,
+    forbidden_method_count: 0
+  });
+
+  const runtimeDomain = ["Run", "time"].join("");
+  const forbiddenMethodLog = [{ method: `${runtimeDomain}.evaluate` }];
+  const forbiddenGuarded = createGuardedCdpClient({
+    Page: {
+      async getLayoutMetrics() {
+        return {};
+      }
+    }
+  }, {
+    methodLog: forbiddenMethodLog,
+    methodLogLimit: 2
+  });
+  for (let index = 0; index < 4; index += 1) {
+    await forbiddenGuarded.Page.getLayoutMetrics();
+  }
+  assert.equal(forbiddenMethodLog.some((entry) => entry.method === `${runtimeDomain}.evaluate`), false);
+  const forbiddenStats = getCdpMethodLogStats(forbiddenMethodLog);
+  assert.equal(forbiddenStats.total_count, 5);
+  assert.equal(forbiddenStats.runtime_domain_method_count, 1);
+  assert.equal(forbiddenStats.forbidden_method_count, 1);
+  assert.throws(
+    () => assertNoForbiddenCdpCalls(forbiddenMethodLog),
+    /Forbidden CDP methods were used/
+  );
+}
+
+function testReconnectTargetFallsBackToFreshMatchingTarget() {
+  const targetUrl = "https://www.zhipin.com/web/chat/recommend";
+  const matcher = (target) => target?.type === "page" && target?.url === targetUrl;
+  const freshTarget = { id: "fresh", type: "page", url: targetUrl };
+  const unrelatedTarget = { id: "other", type: "page", url: "https://example.com" };
+
+  assert.equal(selectReconnectChromeTarget(
+    [unrelatedTarget, freshTarget],
+    { activeTarget: { id: "gone" }, matcher }
+  ), freshTarget);
+  assert.equal(selectReconnectChromeTarget(
+    [unrelatedTarget],
+    { activeTarget: { id: "gone" }, matcher }
+  ), null);
+
+  const sameTarget = { id: "stable", type: "page", url: targetUrl };
+  assert.equal(selectReconnectChromeTarget(
+    [freshTarget, sameTarget],
+    { activeTarget: sameTarget, matcher }
+  ), sameTarget);
 }
 
 async function testGuardedClientDoesNotReplayScreenshot() {
@@ -1165,7 +1544,16 @@ async function testBossLoginDomDetection() {
 
 testForbiddenCdpConfigurationWithoutExecutingMethods();
 await testAllowedDomainsAreLogged();
+await testMethodLogIsBoundedWithFullRunAuditStats();
+testReconnectTargetFallsBackToFreshMatchingTarget();
 await testGuardedClientReconnectsClosedTransport();
+await testGuardedClientDoesNotReplaySessionScopedNetworkBody();
+await testSafeReadDeadlineRequiresExplicitBoundaryReconnect();
+await testSessionScopedReadDeadlineReconnectsWithoutReplay();
+await testOutboundInputIsNeverTimedOutOrReplayedByGuard();
+await testReconnectAndSetupReplayHaveIndependentDeadlines();
+testOnlySafeMethodsReceiveBrowserGuardDeadlines();
+await testOpenTargetTimeoutDoesNotRetryUnknownCreation();
 await testGuardedClientDoesNotReplayScreenshot();
 await testGuardedClientDoesNotReplayStateChangingOrUnknownMethods();
 await testGuardedClientCanExplicitlyAbandonAndReconnect();

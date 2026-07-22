@@ -5,6 +5,7 @@ import {
   clickRecommendActionControl,
   normalizeRecommendPostAction,
   resolveRecommendPostAction,
+  runRecommendNonReplayableInputWithDeadline,
   summarizeRecommendActionControls
 } from "./domains/recommend/actions.js";
 import { GREET_CREDITS_EXHAUSTED_CODE } from "./core/greet-quota/index.js";
@@ -1016,6 +1017,50 @@ function testSummary() {
   assert.equal(summary.counts.greet, 1);
 }
 
+async function testNonReplayableInputTimeoutAbandonsBeforeReconnectAndNeverReplays() {
+  let rejectPendingInput = null;
+  let actionCalls = 0;
+  let closeCalls = 0;
+  let reconnectCalls = 0;
+  const client = {
+    async close() {
+      closeCalls += 1;
+      rejectPendingInput?.(new Error("old transport closed"));
+      return true;
+    },
+    async __abandonAndReconnect() {
+      reconnectCalls += 1;
+      return { reconnected: true, previous_connection_epoch: 1, connection_epoch: 2 };
+    }
+  };
+  await assert.rejects(
+    runRecommendNonReplayableInputWithDeadline(client, () => {
+      actionCalls += 1;
+      return new Promise((resolve, reject) => {
+        rejectPendingInput = reject;
+      });
+    }, {
+      timeoutMs: 15,
+      closeTimeoutMs: 100,
+      settlementTimeoutMs: 100
+    }),
+    (error) => {
+      assert.equal(error.code, "RECOMMEND_ACTION_INPUT_TIMEOUT");
+      assert.equal(error.cdp_method, "Input.dispatchMouseEvent");
+      assert.equal(error.cdp_outcome_unknown, true);
+      assert.equal(error.cdp_replay_suppressed, true);
+      assert.equal(error.recommend_input_dispatched, true);
+      assert.equal(error.recommend_input_transport_contained, true);
+      assert.equal(error.recommend_input_transport_abandon_failed, false);
+      assert.equal(error.input_timeout_diagnostic.reconnect_succeeded, true);
+      return true;
+    }
+  );
+  assert.equal(actionCalls, 1);
+  assert.equal(closeCalls, 1);
+  assert.equal(reconnectCalls, 1);
+}
+
 testFavoriteClassification();
 testGreetClassification();
 await testGreetQuotaClickGuard();
@@ -1033,6 +1078,7 @@ await testActionClickFailsClosedWhenExactRootMembershipIsMissing();
 await testActionClickUsesOnlyFreshExactHitTestedFallbackPoint();
 await testActionClickFailsClosedWhenEveryPointHitsForeignControl();
 await testActionClickAcceptsOnlyBackendProvenExactControlDescendant();
+await testNonReplayableInputTimeoutAbandonsBeforeReconnectAndNeverReplays();
 testPostActionResolution();
 testSummary();
 

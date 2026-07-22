@@ -792,6 +792,7 @@ export function compactViewportHealthResult(result = null) {
         }
       : null,
     rootReacquisition: result.rootReacquisition || null,
+    failureConfirmation: result.failureConfirmation || null,
     error: result.error || null
   };
 }
@@ -1386,6 +1387,8 @@ export function createViewportRunGuard({
   repair = true,
   recoveryDelayMs = 900,
   recoverySettleMs = 520,
+  failureConfirmationAttempts = 2,
+  failureConfirmationDelayMs = 180,
   maxEvents = 10
 } = {}) {
   if (!client) throw new Error("createViewportRunGuard requires a guarded CDP client");
@@ -1435,7 +1438,7 @@ export function createViewportRunGuard({
     if (!currentRootState && typeof getRoots === "function") {
       currentRootState = await getRoots(client);
     }
-    const roots = rootNodesFromState(currentRootState);
+    let roots = rootNodesFromState(currentRootState);
     let latestReacquiredRootState = null;
     const reacquireRoots = typeof getRoots === "function"
       ? async () => {
@@ -1445,22 +1448,66 @@ export function createViewportRunGuard({
         }
       : null;
     stats.checks += 1;
-    const health = await ensureHealthyViewport(client, {
-      roots,
-      root,
-      frameOwnerRoot,
-      reason,
-      repair,
-      recoveryDelayMs,
-      recoverySettleMs,
-      baseline,
-      reacquireRoots
-    });
+    const maxFailureConfirmations = Math.max(1, Number(failureConfirmationAttempts) || 1);
+    let health = null;
+    let firstFailure = null;
+    for (let attempt = 1; attempt <= maxFailureConfirmations; attempt += 1) {
+      health = await ensureHealthyViewport(client, {
+        roots,
+        root,
+        frameOwnerRoot,
+        reason,
+        repair,
+        recoveryDelayMs,
+        recoverySettleMs,
+        baseline,
+        reacquireRoots
+      });
+      if (health.ok) {
+        if (firstFailure) {
+          health.failureConfirmation = {
+            attempted: true,
+            attempts: attempt,
+            transient_failure_recovered: true,
+            first_error: firstFailure.error || null
+          };
+        }
+        break;
+      }
+      if (!firstFailure) firstFailure = compactViewportHealthResult(health);
+      const retryableUnreadableFailure = Boolean(
+        !health.state?.ok
+        || health.state?.collapseEvidence?.unreadable
+        || health.before?.collapseEvidence?.unreadable
+      );
+      if (attempt >= maxFailureConfirmations || !retryableUnreadableFailure) {
+        health.failureConfirmation = {
+          attempted: true,
+          attempts: attempt,
+          transient_failure_recovered: false,
+          first_error: firstFailure.error || null
+        };
+        break;
+      }
+      if (failureConfirmationDelayMs > 0) await sleep(failureConfirmationDelayMs);
+      if (typeof getRoots === "function") {
+        try {
+          currentRootState = await getRoots(client);
+          latestReacquiredRootState = currentRootState;
+          roots = rootNodesFromState(currentRootState);
+        } catch {
+          // The next health attempt retains the original evidence and performs
+          // its own bounded root reacquisition before declaring collapse.
+        }
+      }
+    }
     if (health.baselineEstablished) stats.baseline_establishments += 1;
     if (health.rebaselined) stats.rebaselines += 1;
     if (health.before?.collapseEvidence?.baselineDrift) stats.baseline_drift_detections += 1;
     if (
-      !health.state?.ok
+      firstFailure?.state?.collapseEvidence?.unreadable
+      || firstFailure?.before?.collapseEvidence?.unreadable
+      || !health.state?.ok
       || health.state?.collapseEvidence?.unreadable
       || health.before?.collapseEvidence?.unreadable
     ) {

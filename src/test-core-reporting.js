@@ -5,6 +5,7 @@ import path from "node:path";
 import {
   LEGACY_RESULT_HEADER,
   buildLegacyScreenInputRows,
+  legacyScreenResultRow,
   writeLegacyScreenCsv
 } from "./core/reporting/legacy-csv.js";
 
@@ -150,6 +151,33 @@ assert.equal(csv.includes("\"network\""), true);
 assert.equal(csv.includes("\"2000\""), true);
 assert.equal(csv.includes("\"123\""), true);
 assert.equal(csv.includes("\"800\""), true);
+
+const actionResultColumn = LEGACY_RESULT_HEADER.indexOf("动作执行结果");
+assert.notEqual(actionResultColumn, -1);
+assert.equal(
+  legacyScreenResultRow({
+    post_action: {
+      requested: "greet",
+      action_clicked: true,
+      assumed_sent: true,
+      reason: "greet_confirmation_not_observed_assumed_sent"
+    }
+  })[actionResultColumn],
+  "assumed_sent"
+);
+assert.equal(
+  legacyScreenResultRow({
+    post_action: {
+      requested: "greet",
+      action_clicked: true,
+      skipped: true,
+      action_transaction: {
+        state: "greeting_assumed_sent"
+      }
+    }
+  })[actionResultColumn],
+  "assumed_sent"
+);
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("Core reporting tests passed");

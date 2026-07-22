@@ -1987,6 +1987,263 @@ async function testCallScreeningLlmFallsBackToNextConfiguredModel() {
   }
 }
 
+async function testCallScreeningLlmFatalProviderFallsBackAndKeepsCircuitOpen() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const config = {
+    llmMaxRetries: 0,
+    llmModels: [
+      {
+        name: "denied-primary",
+        baseUrl: "https://denied.example.com/v1",
+        apiKey: "denied-key",
+        model: "denied-model"
+      },
+      {
+        name: "healthy-backup",
+        baseUrl: "https://healthy.example.com/v1",
+        apiKey: "healthy-key",
+        model: "healthy-model"
+      }
+    ]
+  };
+  globalThis.fetch = async (url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push({ url: String(url), model: payload.model });
+    if (payload.model === "denied-model") {
+      return {
+        ok: false,
+        status: 403,
+        async text() {
+          return JSON.stringify({
+            error: {
+              message: "model access denied",
+              type: "permission_denied",
+              code: "forbidden"
+            }
+          });
+        }
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: { content: "{\"passed\": true}" },
+              finish_reason: "stop"
+            }
+          ]
+        });
+      }
+    };
+  };
+  const candidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "fixture",
+    id: "fatal-provider-fallback",
+    text: "赵六\n算法工程师\n博士"
+  });
+  try {
+    const first = await callScreeningLlm({
+      candidate,
+      criteria: "算法经验",
+      config,
+      timeoutMs: 1000
+    });
+    assert.deepEqual(calls.map((item) => item.model), ["denied-model", "healthy-model"]);
+    assert.equal(first.provider.name, "healthy-backup");
+    assert.equal(first.fallback_count, 1);
+    assert.equal(first.attempt_count, 2);
+    assert.equal(first.llm_model_failures.length, 1);
+    assert.equal(first.llm_model_failures[0].fatal, true);
+    assert.equal(first.llm_model_failures[0].fatal_code, "LLM_PERMISSION_DENIED");
+    assert.equal(first.llm_model_failures[0].circuit_open, true);
+    assert.equal(first.llm_model_failures[0].circuit_skipped, false);
+
+    const second = await callScreeningLlm({
+      candidate,
+      criteria: "算法经验",
+      config,
+      timeoutMs: 1000
+    });
+    assert.deepEqual(calls.map((item) => item.model), ["denied-model", "healthy-model", "healthy-model"]);
+    assert.equal(second.provider.name, "healthy-backup");
+    assert.equal(second.fallback_count, 1);
+    assert.equal(second.attempt_count, 1);
+    assert.equal(second.llm_model_failures[0].fatal_code, "LLM_PERMISSION_DENIED");
+    assert.equal(second.llm_model_failures[0].attempts, 0);
+    assert.equal(second.llm_model_failures[0].circuit_open, true);
+    assert.equal(second.llm_model_failures[0].circuit_skipped, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmFastFirstReusesFatalProviderCircuitForVerify() {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload.model);
+    if (payload.model === "quota-model") {
+      return {
+        ok: false,
+        status: 429,
+        async text() {
+          return JSON.stringify({
+            error: {
+              message: "insufficient quota",
+              type: "insufficient_quota",
+              code: "insufficient_quota"
+            }
+          });
+        }
+      };
+    }
+    const isFastPass = calls.filter((model) => model === "backup-model").length === 1;
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: isFastPass
+                  ? "{\"passed\": true, \"summary\": \"初筛通过\", \"review_required\": true}"
+                  : "{\"passed\": true}"
+              },
+              finish_reason: "stop"
+            }
+          ]
+        });
+      }
+    };
+  };
+  try {
+    const result = await callScreeningLlm({
+      candidate: normalizeCandidateProfile({
+        domain: "recommend",
+        source: "fixture",
+        id: "fast-first-fatal-fallback",
+        text: "候选人\n视觉算法工程师\n博士"
+      }),
+      criteria: "视觉算法经验",
+      config: {
+        llmScreeningStrategy: "fast_first_verified",
+        llmFastThinkingLevel: "current",
+        llmVerifyThinkingLevel: "low",
+        llmMaxRetries: 0,
+        llmModels: [
+          {
+            name: "quota-primary",
+            baseUrl: "https://quota.example.com/v1",
+            apiKey: "quota-key",
+            model: "quota-model"
+          },
+          {
+            name: "backup",
+            baseUrl: "https://backup.example.com/v1",
+            apiKey: "backup-key",
+            model: "backup-model"
+          }
+        ]
+      },
+      timeoutMs: 1000
+    });
+    assert.deepEqual(calls, ["quota-model", "backup-model", "backup-model"]);
+    assert.equal(result.passed, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.provider.name, "backup");
+    assert.equal(result.llm_model_failures[0].fatal_code, "LLM_QUOTA_EXCEEDED");
+    assert.equal(result.llm_model_failures[0].circuit_skipped, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function testCallScreeningLlmThrowsFatalOnlyAfterAllProvidersUnavailable() {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  const config = {
+    llmMaxRetries: 0,
+    llmModels: [
+      {
+        name: "auth-primary",
+        baseUrl: "https://auth.example.com/v1",
+        apiKey: "invalid-key",
+        model: "auth-model"
+      },
+      {
+        name: "billing-backup",
+        baseUrl: "https://billing.example.com/v1",
+        apiKey: "billing-key",
+        model: "billing-model"
+      }
+    ]
+  };
+  globalThis.fetch = async (_url, options) => {
+    calls += 1;
+    const payload = JSON.parse(options.body);
+    const authFailure = payload.model === "auth-model";
+    return {
+      ok: false,
+      status: authFailure ? 401 : 402,
+      async text() {
+        return JSON.stringify({
+          error: authFailure
+            ? { message: "invalid api key", type: "authentication_error", code: "invalid_api_key" }
+            : { message: "insufficient balance; payment required", type: "billing_error", code: "billing_required" }
+        });
+      }
+    };
+  };
+  const candidate = normalizeCandidateProfile({
+    domain: "recommend",
+    source: "fixture",
+    id: "all-fatal-providers",
+    text: "候选人\n算法工程师"
+  });
+  try {
+    await assert.rejects(
+      () => callScreeningLlm({ candidate, criteria: "算法经验", config, timeoutMs: 1000 }),
+      (error) => {
+        assert.equal(isFatalLlmProviderError(error), true);
+        assert.equal(error.code, "LLM_ALL_PROVIDERS_UNAVAILABLE");
+        assert.equal(error.llm_fatal_reason, "all_providers_unavailable");
+        assert.equal(error.llm_attempt_count, 2);
+        assert.equal(error.llm_provider_failures.length, 2);
+        assert.deepEqual(error.llm_fatal_provider_codes, ["LLM_AUTH_FAILED", "LLM_BILLING_REQUIRED"]);
+        assert.equal(error.llm_provider_failures.every((item) => item.circuit_open), true);
+        assert.equal(error.llm_provider_failures.every((item) => !item.circuit_skipped), true);
+        const wrapped = createFatalLlmRunError(error, { domain: "recommend", candidate });
+        assert.equal(wrapped.code, "LLM_ALL_PROVIDERS_UNAVAILABLE");
+        assert.equal(wrapped.llm_provider_failures.length, 2);
+        assert.deepEqual(wrapped.llm_fatal_provider_codes, ["LLM_AUTH_FAILED", "LLM_BILLING_REQUIRED"]);
+        return true;
+      }
+    );
+    assert.equal(calls, 2);
+
+    await assert.rejects(
+      () => callScreeningLlm({ candidate, criteria: "算法经验", config, timeoutMs: 1000 }),
+      (error) => {
+        assert.equal(isFatalLlmProviderError(error), true);
+        assert.equal(error.code, "LLM_ALL_PROVIDERS_UNAVAILABLE");
+        assert.equal(error.llm_attempt_count, 0);
+        assert.equal(error.llm_provider_failures.every((item) => item.circuit_skipped), true);
+        return true;
+      }
+    );
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 function testFatalLlmProviderErrorClassification() {
   const budget = new Error("LLM request failed: 400 {\"error\":{\"message\":\"Budget has been exceeded! Current cost: 100.1, Max budget: 100.0\",\"type\":\"budget_exceeded\",\"code\":\"400\"}}");
   budget.status = 400;
@@ -1999,6 +2256,23 @@ function testFatalLlmProviderErrorClassification() {
   assert.deepEqual(classifyFatalLlmProviderError(auth), {
     code: "LLM_AUTH_FAILED",
     reason: "auth_failed"
+  });
+  const permission = new Error("LLM request failed: 403 forbidden");
+  permission.status = 403;
+  assert.deepEqual(classifyFatalLlmProviderError(permission), {
+    code: "LLM_PERMISSION_DENIED",
+    reason: "permission_denied"
+  });
+  const quota = new Error("LLM request failed: insufficient_quota");
+  quota.provider_error_code = "insufficient_quota";
+  assert.deepEqual(classifyFatalLlmProviderError(quota), {
+    code: "LLM_QUOTA_EXCEEDED",
+    reason: "quota_exceeded"
+  });
+  const billing = new Error("LLM request failed: insufficient balance; payment required");
+  assert.deepEqual(classifyFatalLlmProviderError(billing), {
+    code: "LLM_BILLING_REQUIRED",
+    reason: "billing_required"
   });
   const invalidJson = new Error("LLM response was not valid JSON");
   assert.equal(classifyFatalLlmProviderError(invalidJson), null);
@@ -2106,6 +2380,9 @@ await testCallScreeningLlmVerifierCurrentSummaryIsPreserved();
 await testCallScreeningLlmFastFirstSupportsConfiguredLevelPairs();
 await testCallScreeningLlmRetriesTransientFailure();
 await testCallScreeningLlmFallsBackToNextConfiguredModel();
+await testCallScreeningLlmFatalProviderFallsBackAndKeepsCircuitOpen();
+await testCallScreeningLlmFastFirstReusesFatalProviderCircuitForVerify();
+await testCallScreeningLlmThrowsFatalOnlyAfterAllProvidersUnavailable();
 testFatalLlmProviderErrorClassification();
 await testCallScreeningLlmFatalProviderErrorRetriesTwiceThenThrows();
 

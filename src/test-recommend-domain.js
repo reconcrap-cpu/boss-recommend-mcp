@@ -64,6 +64,10 @@ import {
   waitForRecommendDetail,
   verifyRecommendJobSelection
 } from "./domains/recommend/index.js";
+import {
+  createRecommendDetailNetworkRecorder,
+  waitForRecommendDetailNetworkEvents
+} from "./domains/recommend/detail.js";
 
 function testFilterOptionHelpers() {
   assert.equal(normalizeFilterOptionLabel("  不 限  "), "不限");
@@ -928,6 +932,27 @@ async function testColleagueContactInspectorWaitsForLatePanel() {
   assert.equal(sectionQueries >= 2, true);
   assert.equal(result.panel_found, true);
   assert.equal(result.recent, true);
+}
+
+async function testRecommendNetworkRecorderSubscriptionFailureDegradesToImageFallback() {
+  const recorder = createRecommendDetailNetworkRecorder({
+    Network: {
+      responseReceived() {
+        throw new Error("transient event subscription failure");
+      },
+      loadingFinished() {},
+      loadingFailed() {}
+    }
+  });
+  assert.equal(recorder.available, false);
+  assert.equal(recorder.warnings[0].method, "Network.responseReceived");
+  const waited = await waitForRecommendDetailNetworkEvents(recorder, {
+    timeoutMs: 1000,
+    intervalMs: 100
+  });
+  assert.equal(waited.ok, false);
+  assert.equal(waited.unavailable, true);
+  assert.equal(waited.elapsed_ms, 0);
 }
 
 async function testRecommendCurrentCityOnlyRejectsTransientControlDisappearanceWhilePopoverRemainsVisible() {
@@ -2369,6 +2394,40 @@ async function testRefreshRecoveryFallsBackFromNavigateToReload() {
   assert.equal(result.attempts[1].error_diagnostic.cdp_backend_node_id, 88);
   assert.deepEqual(result.attempts[1].error_diagnostic.cdp_param_keys, ["ignoreCache"]);
   assert.deepEqual(result.error_diagnostic, result.attempts[1].error_diagnostic);
+}
+
+async function testRefreshRecoveryFallsBackWhenEndRefreshSetupThrows() {
+  const calls = [];
+  const rootError = new Error("recommend iframe temporarily unavailable");
+  rootError.cdp_method = "DOM.getDocument";
+  const reloadError = new Error("reload fallback reached");
+  const result = await refreshRecommendListAtEnd({
+    DOM: {
+      async getDocument() {
+        calls.push("get_roots");
+        throw rootError;
+      }
+    },
+    Page: {
+      async reload() {
+        calls.push("reload");
+        throw reloadError;
+      }
+    }
+  }, {
+    preferEndRefreshButton: true,
+    reloadSettleMs: 0
+  });
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(calls, ["get_roots", "reload"]);
+  assert.equal(result.attempts[0].method, "end_refresh_button");
+  assert.equal(result.attempts[0].reason, "end_refresh_button_failed");
+  assert.equal(result.attempts[0].error, "recommend iframe temporarily unavailable");
+  assert.equal(result.attempts[0].error_diagnostic.cdp_method, "DOM.getDocument");
+  assert.equal(result.attempts[1].method, "page_reload");
+  assert.equal(result.attempts[1].reason, "page_reload_failed");
+  assert.equal(result.attempts[1].error, "reload fallback reached");
 }
 
 function createRecommendDetailBindingClient({
@@ -4302,6 +4361,50 @@ function testRecommendRefreshExhaustionRequiresExactEmptyStateAndContext() {
     ...base,
     cardCount: 1
   }), false);
+
+  const forcedRecentFilter = {
+    enabled: true,
+    filterGroups: [{
+      group: "activity",
+      labels: ["不限"],
+      selectAllLabels: false,
+      allowUnlimited: true,
+      verifySticky: true
+    }]
+  };
+  const forcedRecentResult = {
+    confirmed: true,
+    sticky_verification: {
+      verified: true,
+      groups: [{
+        group: "recentNotView",
+        requested_labels: ["近14天没有"],
+        active_labels: ["近14天没有"],
+        verified: true
+      }, {
+        group: "activity",
+        requested_labels: ["不限"],
+        active_labels: [],
+        verified: true,
+        unavailable: true,
+        reason: "activity_control_unavailable_default"
+      }]
+    }
+  };
+  assert.equal(isVerifiedRecommendRefreshExhaustion({
+    ...base,
+    filter: forcedRecentFilter,
+    filterResult: forcedRecentResult,
+    currentCityOnlyResult: null,
+    forceRecentNotView: true
+  }), true);
+  assert.equal(isVerifiedRecommendRefreshExhaustion({
+    ...base,
+    filter: forcedRecentFilter,
+    filterResult: forcedRecentResult,
+    currentCityOnlyResult: null,
+    forceRecentNotView: false
+  }), false);
 }
 
 function testRecommendFilterApplicationRequiresAllStickyGroups() {
@@ -5201,6 +5304,53 @@ async function testPageScopeFallbackToRecommend() {
   assert.equal(result.after.card_count, 2);
 }
 
+async function testPageScopeSelectionDoesNotRequireCardsToFinishLoading() {
+  let current = false;
+  const client = {
+    DOM: {
+      async querySelectorAll({ selector }) {
+        if (String(selector).includes("candidate-card-wrap")) return { nodeIds: [] };
+        return { nodeIds: [1] };
+      },
+      async getAttributes() {
+        return {
+          attributes: [
+            "class",
+            current ? "tab-item curr" : "tab-item",
+            "data-status",
+            "0",
+            "title",
+            "推荐"
+          ]
+        };
+      },
+      async getOuterHTML() {
+        return {
+          outerHTML: `<span class="${current ? "tab-item curr" : "tab-item"}" data-status="0" title="推荐">推荐</span>`
+        };
+      },
+      async getBoxModel() {
+        return { model: { border: [10, 10, 50, 10, 50, 40, 10, 40] } };
+      }
+    },
+    Input: {
+      async dispatchMouseEvent(event) {
+        if (event.type === "mouseReleased") current = true;
+        return {};
+      }
+    }
+  };
+  const result = await selectRecommendPageScope(client, 99, {
+    pageScope: "recommend",
+    fallbackScope: "recommend",
+    settleMs: 0,
+    timeoutMs: 300
+  });
+  assert.equal(result.selected, true);
+  assert.equal(result.after.scope, "recommend");
+  assert.equal(result.after.card_count, 0);
+}
+
 async function testCloseRecommendDetailWaitsUntilClosed() {
   let detailVisible = true;
   let closePollsRemaining = null;
@@ -5467,6 +5617,7 @@ await testRecommendCurrentCityOnlyRetriesStaleControlState();
 await testRecommendCurrentCityOnlyDoesNotTreatFailedOpenAsUnavailable();
 await testRecommendCurrentCityOnlyRejectsTransientControlDisappearanceWhilePopoverRemainsVisible();
 testNetworkPatterns();
+await testRecommendNetworkRecorderSubscriptionFailureDegradesToImageFallback();
 testColleagueContactDateParsing();
 await testColleagueContactSamplesEveryScrollPosition();
 await testColleagueContactFindsRecentRowBeyondLegacyScrollCap();
@@ -5522,6 +5673,7 @@ testRetryableRecommendJobSelectionError();
 testRecommendCardFieldParser();
 await testCardCandidateReader();
 await testRefreshRecoveryFallsBackFromNavigateToReload();
+await testRefreshRecoveryFallsBackWhenEndRefreshSetupThrows();
 await testRecommendFilteredEmptyStateRequiresExactVisibleDomAndAccessibility();
 testRecommendRefreshExhaustionRequiresExactEmptyStateAndContext();
 testRecommendFilterApplicationRequiresAllStickyGroups();
@@ -5537,6 +5689,7 @@ await testFindFreshRecommendCardNodeByKey();
 await testStaleResumeIframeDetailHtmlReadIsNonFatal();
 await testPageScopeHelpers();
 await testPageScopeFallbackToRecommend();
+await testPageScopeSelectionDoesNotRequireCardsToFinishLoading();
 await testCloseRecommendDetailWaitsUntilClosed();
 await testCloseRecommendDetailClicksOutsideModalBeforeEscape();
 await testCloseRecommendDetailReportsFinalVerificationWhenStillOpen();

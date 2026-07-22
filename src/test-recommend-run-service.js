@@ -25,6 +25,7 @@ import {
 import {
   acquireRecommendListReadWithStaleRecovery,
   bindRecommendColleagueContactInspectionResult,
+  classifyRecommendWorkflowCompletion,
   compactRecommendDomRootIdentity,
   createRecommendDomStaleForensicEvent,
   createRecommendDebugBoundaryController,
@@ -32,20 +33,301 @@ import {
   getRecommendDetailFailureDisposition,
   isCandidateLocalRecommendPostClickBindingTimeout,
   createRecommendRefreshFailureError,
+  createRecommendSourceUnverifiedUnderfillError,
   checkpointRecommendPostActionStopResult,
   assertRecommendScreeningCandidateMatchesCard,
   assertRecommendControlMatchesCandidateDetailRoot,
   isVerifiedRecommendPostActionCandidateBinding,
   isVerifiedRecommendRefreshCompletion,
+  isVerifiedRecommendSourceEndResult,
   isRecoverableRecommendDetailError,
+  normalizeRecommendRefreshRoundLimit,
   normalizeRecommendDebugBoundaryOptions,
   preserveRecommendDetailCandidateBindingForRecovery,
   reserveRecommendDetailRecovery,
   resolveEffectiveRecommendDetailLimit,
+  resolveRecommendTechnicalRecoveryBudget,
+  resolveRecommendSourceRefreshDecision,
   recoverRecommendListReadStaleContext,
   runRecommendPostAction,
   selectAndVerifyInitialRecommendJob
 } from "./domains/recommend/run-service.js";
+
+function testRecommendCompletionClassificationRequiresVerifiedSourceEnd() {
+  assert.deepEqual(
+    classifyRecommendWorkflowCompletion({ passedCount: 5, targetCount: 5 }),
+    {
+      completion_reason: "target_reached",
+      target_reached: true,
+      source_exhausted: false,
+      source_exhaustion_verified: false,
+      source_unverified_underfill: false,
+      post_action_stopped: false,
+      clean_completion: true
+    }
+  );
+  const exhaustedBelowTarget = classifyRecommendWorkflowCompletion({
+    passedCount: 3,
+    targetCount: 5,
+    listEndReason: "filtered_list_exhausted"
+  });
+  assert.equal(exhaustedBelowTarget.completion_reason, "source_exhausted");
+  assert.equal(exhaustedBelowTarget.source_exhausted, true);
+  assert.equal(exhaustedBelowTarget.source_exhaustion_verified, true);
+  assert.equal(exhaustedBelowTarget.source_unverified_underfill, false);
+  assert.equal(exhaustedBelowTarget.clean_completion, true);
+  assert.equal(createRecommendSourceUnverifiedUnderfillError(exhaustedBelowTarget), null);
+  const underfill = classifyRecommendWorkflowCompletion({
+    passedCount: 3,
+    targetCount: 5,
+    listEndReason: "source_unverified_underfill"
+  });
+  assert.equal(underfill.source_unverified_underfill, true);
+  assert.equal(underfill.clean_completion, false);
+  const error = createRecommendSourceUnverifiedUnderfillError({
+    ...underfill,
+    passed: 3,
+    target_count: 5
+  });
+  assert.equal(error.code, "RECOMMEND_SOURCE_UNVERIFIED_UNDERFILL");
+  assert.equal(error.retryable, true);
+  assert.equal(createRecommendSourceUnverifiedUnderfillError({
+    source_unverified_underfill: false
+  }), null);
+  const quotaStoppedAtTarget = classifyRecommendWorkflowCompletion({
+    passedCount: 5,
+    targetCount: 5,
+    listEndReason: "greet_credits_exhausted"
+  });
+  assert.equal(quotaStoppedAtTarget.completion_reason, "post_action_stopped");
+  assert.equal(quotaStoppedAtTarget.target_reached, true);
+  assert.equal(quotaStoppedAtTarget.clean_completion, false);
+}
+
+function testRecommendRefreshBudgetsRemainExactlyTwo() {
+  const source = fs.readFileSync(
+    new URL("./domains/recommend/run-service.js", import.meta.url),
+    "utf8"
+  );
+  assert.equal(
+    /const RECOMMEND_CONTEXT_RECOVERY_MAX_ATTEMPTS = 2;/.test(source),
+    true,
+    "a nonterminal Recommend fault must fail the run only after exactly two full refresh/reapply attempts"
+  );
+  assert.equal(
+    /maxRefreshRounds = 2,/.test(source),
+    true,
+    "target-underfill exhaustion must retain the two-refresh default"
+  );
+  assert.equal(normalizeRecommendRefreshRoundLimit(undefined), 2);
+  assert.equal(normalizeRecommendRefreshRoundLimit(3), 2);
+  assert.equal(normalizeRecommendRefreshRoundLimit(2), 2);
+  assert.equal(normalizeRecommendRefreshRoundLimit(1), 1);
+  assert.equal(normalizeRecommendRefreshRoundLimit(0), 0);
+  const mcpSource = fs.readFileSync(new URL("./recommend-mcp.js", import.meta.url), "utf8");
+  assert.match(
+    mcpSource,
+    /maxRefreshRounds:\s*Math\.min\(2,\s*parseNonNegativeInteger\(args\.max_refresh_rounds,\s*2\)\)/,
+    "the public MCP surface must not allow a source refresh budget above two"
+  );
+}
+
+function testRecommendVerifiedExhaustionCannotShortCircuitTwoRefreshRounds() {
+  const exactEmpty = {
+    ok: false,
+    end_reached: true,
+    reason: "filtered_list_exhausted"
+  };
+  assert.equal(isVerifiedRecommendSourceEndResult(exactEmpty), true);
+  assert.equal(isVerifiedRecommendSourceEndResult({
+    ok: false,
+    end_reached: true,
+    reason: "bottom_marker",
+    bottom_marker: { found: true }
+  }), true);
+  assert.equal(isVerifiedRecommendSourceEndResult({
+    ok: false,
+    end_reached: true,
+    reason: "scroll_failed"
+  }), false);
+  assert.equal(isVerifiedRecommendSourceEndResult({
+    ok: false,
+    end_reached: true,
+    reason: "empty_visible_list"
+  }), false);
+  assert.equal(isVerifiedRecommendSourceEndResult({
+    ok: false,
+    end_reached: true,
+    reason: "stable_visible_signature"
+  }), false);
+
+  const first = resolveRecommendSourceRefreshDecision({
+    sourceEndVerified: true,
+    refreshRounds: 0,
+    maxRefreshRounds: 2
+  });
+  assert.equal(first.action, "refresh");
+  assert.equal(first.next_refresh_round, 1);
+  const second = resolveRecommendSourceRefreshDecision({
+    sourceEndVerified: true,
+    refreshRounds: 1,
+    maxRefreshRounds: 2
+  });
+  assert.equal(second.action, "refresh");
+  assert.equal(second.next_refresh_round, 2);
+  const exhausted = resolveRecommendSourceRefreshDecision({
+    sourceEndVerified: true,
+    refreshRounds: 2,
+    maxRefreshRounds: 2
+  });
+  assert.equal(exhausted.action, "complete_exhausted");
+  const unverified = resolveRecommendSourceRefreshDecision({
+    sourceEndVerified: false,
+    refreshRounds: 2,
+    maxRefreshRounds: 2
+  });
+  assert.equal(unverified.action, "fail_unverified_underfill");
+
+  const source = fs.readFileSync(
+    new URL("./domains/recommend/run-service.js", import.meta.url),
+    "utf8"
+  );
+  const listEndStart = source.indexOf("if (!nextCandidateResult.ok)");
+  const candidateBodyStart = source.indexOf(
+    'runControl.setPhase("recommend:candidate")',
+    listEndStart
+  );
+  const listEndBranch = source.slice(listEndStart, candidateBodyStart);
+  assert.match(listEndBranch, /resolveRecommendSourceRefreshDecision\(\{/);
+  assert.match(listEndBranch, /refreshRounds\s*\+=\s*1/);
+  assert.match(
+    listEndBranch,
+    /recoverAndReapplyRecommendContext\(\s*`source_exhaustion_refresh_round_/,
+    "source exhaustion refreshes must use the full context reapply path"
+  );
+  const candidateCommitStart = source.indexOf("await persistCandidateResult(compactResult)");
+  const candidateCommitEnd = source.indexOf("const checkpointStarted", candidateCommitStart);
+  assert.doesNotMatch(
+    source.slice(candidateCommitStart, candidateCommitEnd),
+    /refreshRounds\s*=\s*0/,
+    "candidate progress must not reset the run-wide exhaustion refresh budget"
+  );
+  const workflowStart = source.indexOf("export async function runRecommendWorkflow");
+  const workflowEnd = source.indexOf("export function createRecommendRunService", workflowStart);
+  const workflow = source.slice(workflowStart, workflowEnd);
+  assert.equal(
+    (workflow.match(/let refreshRounds\s*=\s*0/g) || []).length,
+    1,
+    "the source-exhaustion refresh budget must be initialized exactly once per run"
+  );
+  assert.equal(
+    (workflow.match(/refreshRounds\s*\+=\s*1/g) || []).length,
+    1,
+    "only the source-exhaustion state machine may consume a source refresh round"
+  );
+  assert.equal(
+    (workflow.match(/refreshRounds\s*=\s*0/g) || []).length,
+    1,
+    "no candidate or recovery branch may reset the source refresh budget"
+  );
+}
+
+function testRecommendEveryRefreshReappliesFilterAndRecentNotView() {
+  const source = fs.readFileSync(
+    new URL("./domains/recommend/run-service.js", import.meta.url),
+    "utf8"
+  );
+  const recoveryStart = source.indexOf("async function recoverRecommendContextOnce");
+  const recoveryEnd = source.indexOf("async function recoverAndReapplyRecommendContext", recoveryStart);
+  const recovery = source.slice(recoveryStart, recoveryEnd);
+  assert.match(recovery, /filter:\s*normalizedFilter/);
+  assert.match(recovery, /jobLabel/);
+  assert.match(recovery, /preferEndRefreshButton:\s*false/);
+  assert.match(recovery, /forceNavigate:\s*true/);
+  assert.match(recovery, /forceRecentNotView:\s*effectiveForceRecentNotView/);
+  assert.match(
+    recovery,
+    /const effectiveForceRecentNotView = normalizedFilter\.enabled && forceRecentNotView;/
+  );
+  const refreshSource = fs.readFileSync(
+    new URL("./domains/recommend/refresh.js", import.meta.url),
+    "utf8"
+  );
+  const refreshStart = refreshSource.indexOf("async function applyRefreshMethod");
+  const refreshImplementation = refreshSource.slice(refreshStart);
+  assert.equal(
+    (refreshImplementation.match(/applyRecommendFilterEnvelopeStages\(filter/g) || []).length >= 2,
+    true,
+    "both end-refresh-button and reload/navigate paths must reapply the full filter envelope"
+  );
+  assert.equal(
+    (
+      refreshImplementation.match(
+        /buildRecommendFilterSelectionOptions\(filter,\s*\{\s*forceRecentNotView\s*\}\)/g
+      ) || []
+    ).length >= 2,
+    true,
+    "both refresh paths must force and verify the recent-not-view filter"
+  );
+  assert.equal(
+    (
+      refreshImplementation.match(
+        /isVerifiedRecommendRefreshExhaustion\(\{[\s\S]*?forceRecentNotView/g
+      ) || []
+    ).length >= 2,
+    true,
+    "empty-state verification must use the same forced recent-not-view filter that was applied"
+  );
+  const forcedRecentGroups = buildRecommendFilterGroups({
+    filterGroups: [{
+      group: "recentNotView",
+      labels: ["3天内未查看"],
+      selectAllLabels: true,
+      allowUnlimited: true
+    }]
+  }, { forceRecentNotView: true });
+  assert.deepEqual(forcedRecentGroups[0].labels, ["近14天没有"]);
+  assert.equal(forcedRecentGroups[0].allowUnlimited, false);
+}
+
+function testRecommendTechnicalRecoveryBudgetCannotMultiplyAcrossLayers() {
+  assert.deepEqual(resolveRecommendTechnicalRecoveryBudget({
+    attemptsWithoutProgress: 0,
+    requestedAttempts: 2
+  }), {
+    used: 0,
+    remaining: 2,
+    attempt_limit: 2,
+    exhausted: false,
+    max_attempts: 2
+  });
+  assert.equal(resolveRecommendTechnicalRecoveryBudget({
+    attemptsWithoutProgress: 1,
+    requestedAttempts: 2
+  }).attempt_limit, 1);
+  assert.equal(resolveRecommendTechnicalRecoveryBudget({
+    attemptsWithoutProgress: 2,
+    requestedAttempts: 2
+  }).exhausted, true);
+
+  const source = fs.readFileSync(
+    new URL("./domains/recommend/run-service.js", import.meta.url),
+    "utf8"
+  );
+  const listReadStart = source.indexOf("let listReadAcquisition");
+  const candidateStart = source.indexOf('runControl.setPhase("recommend:candidate")', listReadStart);
+  const listReadBranch = source.slice(listReadStart, candidateStart);
+  assert.equal(
+    (listReadBranch.match(/technicalBudget:\s*true/g) || []).length >= 3,
+    true,
+    "stale reads, transient list failures, and technical stalls must share one two-attempt budget"
+  );
+  assert.doesNotMatch(
+    listReadBranch,
+    /technicalRecoveryAttemptsWithoutProgress\s*\+=\s*1/,
+    "outer list recovery layers must not multiply the physical refresh budget"
+  );
+}
 
 function testCanvasCausalBindingEvidenceIsReusedBeforeEveryDetailRead() {
   const source = fs.readFileSync(
@@ -199,6 +481,33 @@ function testRecommendPreLlmInvariantRunsBeforeModelCall() {
   assert.ok(llmCallIndex > invariantIndex);
   const guardedBlock = source.slice(bindingIndex, llmCallIndex);
   assert.match(guardedBlock, /stage:\s*"immediately_before_llm_screening"/);
+}
+
+function testGenericListReadRecoveryCannotCatchCandidateOrOutboundFailures() {
+  const source = fs.readFileSync(
+    new URL("./domains/recommend/run-service.js", import.meta.url),
+    "utf8"
+  );
+  const acquisitionStart = source.indexOf(
+    "listReadAcquisition = await acquireRecommendListReadWithStaleRecovery({"
+  );
+  const nextCandidateRead = source.indexOf(
+    "const nextCandidateResult = listReadAcquisition.result;",
+    acquisitionStart
+  );
+  const recoveryCatch = source.lastIndexOf("} catch (error) {", nextCandidateRead);
+  const candidatePhase = source.indexOf(
+    'runControl.setPhase("recommend:candidate")',
+    nextCandidateRead
+  );
+  assert.ok(acquisitionStart > 0);
+  assert.ok(recoveryCatch > acquisitionStart);
+  assert.ok(recoveryCatch < nextCandidateRead);
+  assert.ok(nextCandidateRead < candidatePhase);
+  const recoveryScope = source.slice(acquisitionStart, nextCandidateRead);
+  assert.doesNotMatch(recoveryScope, /callScreeningLlm\s*\(/);
+  assert.doesNotMatch(recoveryScope, /clickRecommendActionControl\s*\(/);
+  assert.doesNotMatch(recoveryScope, /persistCandidateResult\s*\(/);
 }
 
 function createVerifiedRecommendCandidateBinding(candidateId = "candidate-1") {
@@ -647,7 +956,7 @@ async function testLifecycleDelegation() {
       assert.equal(options.pageScope, "featured");
       assert.equal(options.fallbackPageScope, "recommend");
       assert.equal(options.refreshOnEnd, true);
-      assert.equal(options.maxRefreshRounds, 3);
+      assert.equal(options.maxRefreshRounds, 2);
       assert.equal(options.postAction, "none");
       assert.equal(options.executePostAction, true);
       assert.equal(options.filter.currentCityOnly, true);
@@ -717,7 +1026,7 @@ async function testLifecycleDelegation() {
   assert.equal(started.context.job_label, "算法工程师");
   assert.equal(started.context.requested_page_scope, "featured");
   assert.equal(started.context.fallback_page_scope, "recommend");
-  assert.equal(started.context.max_refresh_rounds, 3);
+  assert.equal(started.context.max_refresh_rounds, 2);
 
   await waitUntil(() => service.getRecommendRun(started.runId).progress.processed >= 2);
   service.pauseRecommendRun(started.runId);
@@ -778,6 +1087,27 @@ async function testPostActionTerminalStopFailsLifecycleButPreservesSummary() {
   const completed = await completedService.waitForRecommendRun(completedStart.runId);
   assert.equal(completed.status, RUN_STATUS_COMPLETED);
   assert.deepEqual(completed.summary, quotaSummary);
+}
+
+async function testSourceUnverifiedUnderfillFailsLifecycleWithRecoverableSummary() {
+  const summary = {
+    target_count: 10,
+    passed: 4,
+    completion_reason: "source_unverified_underfill",
+    source_unverified_underfill: true,
+    clean_completion: false,
+    results: []
+  };
+  const service = createRecommendRunService({
+    idPrefix: "test_recommend_underfill",
+    workflow: async () => summary
+  });
+  const started = service.startRecommendRun({ client: {} });
+  const final = await service.waitForRecommendRun(started.runId);
+  assert.equal(final.status, RUN_STATUS_FAILED);
+  assert.equal(final.error.code, "RECOMMEND_SOURCE_UNVERIFIED_UNDERFILL");
+  assert.equal(final.error.phase, "recommend:completion");
+  assert.deepEqual(final.summary, summary);
 }
 
 function testDebugBoundaryValidationAndOnceOnlyController() {
@@ -1451,7 +1781,13 @@ function testRecommendStatusCountersRequireSuccessfulRecoveryEvidence() {
           close_recovery: { ok: true, method: "refresh" }
         }
       },
-      post_action: { action_clicked: true }
+      post_action: {
+        action_clicked: true,
+        counted_as_greet: true,
+        greet_budget_consumed: true,
+        protected_from_replay: true,
+        action_transaction: { state: "greeting_confirmed" }
+      }
     },
     {
       screening: { passed: false },
@@ -1486,21 +1822,50 @@ function testRecommendStatusCountersRequireSuccessfulRecoveryEvidence() {
       timings: {
         image_capture_resume: { attempted: true, ok: true }
       }
+    },
+    {
+      screening: { passed: true },
+      detail: null,
+      post_action: {
+        action_clicked: true,
+        counted_as_greet: true,
+        greet_budget_consumed: true,
+        assumed_sent: true,
+        protected_from_replay: true,
+        action_transaction: { state: "greeting_assumed_sent" }
+      }
     }
   ], {
-    greetCount: 1
+    greetCount: 2
   });
 
-  assert.equal(counts.processed, 5);
-  assert.equal(counts.screened, 5);
+  assert.equal(counts.processed, 6);
+  assert.equal(counts.screened, 6);
   assert.equal(counts.detail_opened, 3);
-  assert.equal(counts.passed, 1);
+  assert.equal(counts.passed, 2);
   assert.equal(counts.llm_screened, 1);
-  assert.equal(counts.greet_count, 1);
-  assert.equal(counts.post_action_clicked, 1);
+  assert.equal(counts.greet_count, 2);
+  assert.equal(counts.greet_confirmed_count, 1);
+  assert.equal(counts.greet_assumed_sent_count, 1);
+  assert.equal(counts.greet_protected_no_replay_count, 2);
+  assert.equal(counts.post_action_clicked, 2);
   assert.equal(counts.detail_open_failed, 2);
   assert.equal(counts.image_capture_failed, 1);
   assert.equal(counts.transient_recovered, 2);
+
+  const degradedJournalCounts = countRecommendResultStatuses([{
+    screening: { passed: true },
+    post_action: {
+      action_clicked: true,
+      counted_as_greet: true,
+      greet_budget_consumed: true,
+      assumed_sent: true,
+      protected_from_replay: true,
+      action_transaction: { state: "greeting_send_in_flight" }
+    }
+  }], { greetCount: 1 });
+  assert.equal(degradedJournalCounts.greet_assumed_sent_count, 1);
+  assert.equal(degradedJournalCounts.greet_protected_no_replay_count, 1);
 
   const terminalMismatchCounts = countRecommendResultStatuses(
     Array.from({ length: 5 }, (_, index) => ({
@@ -1670,13 +2035,13 @@ function testPreClickStaleNoActionDispositionRequiresExactRetryExhaustion() {
     recommend_post_input_outcome_unknown: true,
     recommend_post_input_stage: "post_card_click_detail_poll"
   });
-  assert.equal(isRecoverableRecommendDetailError(postInputUnknown), false);
+  assert.equal(isRecoverableRecommendDetailError(postInputUnknown), true);
   assert.deepEqual(getRecommendDetailFailureDisposition(postInputUnknown), {
-    recoverable: false,
-    candidate_local: false,
+    recoverable: true,
+    candidate_local: true,
     context_recovery: false,
     allow_post_action: false,
-    reason: "post_input_detail_outcome_unknown_terminal"
+    reason: "detail_card_click_uncertain_candidate_quarantined"
   });
 
   const cleanPostClickBindingTimeout = Object.assign(
@@ -1736,10 +2101,10 @@ function testPreClickStaleNoActionDispositionRequiresExactRetryExhaustion() {
       mutation
     );
     assert.equal(isCandidateLocalRecommendPostClickBindingTimeout(unsafe), false);
-    assert.equal(isRecoverableRecommendDetailError(unsafe), false);
+    assert.equal(isRecoverableRecommendDetailError(unsafe), true);
     assert.equal(
       getRecommendDetailFailureDisposition(unsafe).reason,
-      "post_input_detail_outcome_unknown_terminal"
+      "detail_card_click_uncertain_candidate_quarantined"
     );
   }
 
@@ -1799,7 +2164,8 @@ function testCandidateLocalCriticalCheckpointIncludesProcessedListState() {
   const containmentCalls = source.match(/await containCandidateLocalDetailBindingFailure\(error, \{/g) || [];
   assert.equal(containmentCalls.length >= 3, true);
   assert.match(source, /phase: "recommend:llm-binding"/);
-  assert.match(source, /phase: "recommend:post-action-binding"/);
+  assert.match(source, /"recommend:post-action-binding"/);
+  assert.match(source, /"recommend:post-action-pre-outbound"/);
   assert.match(source, /screening = createRecoverableDetailFailureScreening\(screeningCandidate, error\)/);
   assert.match(source, /actionDiscovery = null;\s*postActionResult = null/);
   const checkpointStart = source.indexOf("const completedCandidateCheckpoint = {");
@@ -1956,16 +2322,20 @@ async function testRecommendGreetingJournalProtectsUnknownClickAndReconcilesExac
       runId: "run-unknown",
       checkpointCritical: (patch) => checkpoints.push(patch)
     });
-    assert.equal(unknown.outcome_unknown, true);
-    assert.equal(unknown.stop_run, true);
-    assert.equal(unknown.counted_as_greet, false);
+    assert.notEqual(unknown.outcome_unknown, true);
+    assert.notEqual(unknown.stop_run, true);
+    assert.equal(unknown.counted_as_greet, true);
+    assert.equal(unknown.greet_budget_consumed, true);
+    assert.equal(unknown.assumed_sent, true);
+    assert.equal(unknown.protected_from_replay, true);
+    assert.equal(unknown.confirmation_status, "assumed_sent");
     assert.equal(inputCalls, 1);
     assert.deepEqual(
       checkpoints.map((checkpoint) => checkpoint.action_transaction.state),
-      ["pre_action", "greeting_send_in_flight", "outcome_unknown"]
+      ["pre_action", "greeting_send_in_flight", "greeting_assumed_sent"]
     );
     const unknownRecord = journal.read({ scope, candidateId });
-    assert.equal(unknownRecord.state, "outcome_unknown");
+    assert.equal(unknownRecord.state, "greeting_assumed_sent");
     assert.equal(unknownRecord.evidence.control_node_id, 501);
     assert.equal(unknownRecord.evidence.control_backend_node_id, 1501);
     assert.equal(unknownRecord.evidence.control_label, "打招呼");
@@ -1988,8 +2358,12 @@ async function testRecommendGreetingJournalProtectsUnknownClickAndReconcilesExac
       runId: "run-replacement",
       checkpointCritical: (patch) => checkpoints.push(patch)
     });
-    assert.equal(protectedResult.reason, "greet_outcome_unknown_preserved_no_replay");
-    assert.equal(protectedResult.outcome_unknown, true);
+    assert.equal(protectedResult.reason, "greet_assumed_sent_preserved_no_replay");
+    assert.equal(protectedResult.assumed_sent, true);
+    assert.equal(protectedResult.protected_from_replay, true);
+    assert.equal(protectedResult.counted_as_greet, false);
+    assert.equal(protectedResult.greet_budget_consumed, false);
+    assert.equal(protectedResult.action_transaction.state, "greeting_assumed_sent");
     assert.equal(inputCalls, 1);
 
     const reconciledCandidateId = "candidate-greet-reconciled";
@@ -2267,7 +2641,8 @@ async function testRecommendPreInputCheckpointAbortIsDurableAndReplayable() {
     });
     assert.equal(aborted.pre_input_aborted, true);
     assert.equal(aborted.replayable, true);
-    assert.equal(aborted.stop_run, true);
+    assert.notEqual(aborted.stop_run, true);
+    assert.equal(aborted.action_transaction_checkpoint_degraded, true);
     assert.equal(inputCalls, 0);
     const abortedRecord = journal.read({
       scope: VERIFIED_RECOMMEND_ACTION_SCOPE,
@@ -2292,11 +2667,13 @@ async function testRecommendPreInputCheckpointAbortIsDurableAndReplayable() {
       checkpointCritical() {}
     });
     assert.equal(inputCalls, 1);
-    assert.equal(replay.outcome_unknown, true);
+    assert.equal(replay.assumed_sent, true);
+    assert.equal(replay.greet_budget_consumed, true);
+    assert.notEqual(replay.stop_run, true);
     assert.equal(journal.read({
       scope: VERIFIED_RECOMMEND_ACTION_SCOPE,
       candidateId
-    }).state, "outcome_unknown");
+    }).state, "greeting_assumed_sent");
   } finally {
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
@@ -2357,7 +2734,8 @@ async function testRecommendActionHitTestAbortIsDurableReplayableAndZeroInput() 
     assert.equal(inputCalls, 0);
     assert.equal(result.pre_input_aborted, true);
     assert.equal(result.replayable, true);
-    assert.equal(result.stop_run, true);
+    assert.notEqual(result.stop_run, true);
+    assert.equal(result.skipped, true);
     assert.equal(result.reason, "greet_pre_input_aborted_replayable");
     assert.equal(result.outcome_unknown, undefined);
     assert.equal(result.error.code, "RECOMMEND_ACTION_CONTROL_HIT_TEST_UNVERIFIED");
@@ -2454,7 +2832,8 @@ async function testRecommendConcurrentForeignOwnerCannotAuthorizeInput() {
     });
     assert.equal(inputCalls, 0);
     assert.equal(result.reason, "greet_in_flight_owned_by_another_operation");
-    assert.equal(result.stop_run, true);
+    assert.notEqual(result.stop_run, true);
+    assert.equal(result.protected_from_replay, true);
     const record = journal.read({ scope: VERIFIED_RECOMMEND_ACTION_SCOPE, candidateId });
     assert.equal(record.state, "greeting_send_in_flight");
     assert.equal(record.last_run_id, "foreign-run");
@@ -3106,7 +3485,9 @@ async function testRecommendFinalInputUsesGeometryAfterNonScrollingCandidateRepr
       checkpointCritical() {}
     });
 
-    assert.equal(result.outcome_unknown, true);
+    assert.equal(result.assumed_sent, true);
+    assert.equal(result.greet_budget_consumed, true);
+    assert.notEqual(result.stop_run, true);
     assert.equal(inputEvents.length, 1);
     assert.deepEqual(inputEvents[0], {
       type: "mousePressed",
@@ -3178,10 +3559,13 @@ async function testRecommendPostInputJournalFailurePreservesDetailAndPreventsRep
     assert.equal(fixture.clicked, true);
     assert.equal(fixture.inputCalls > 0, true);
     assert.equal(result.action_clicked, true);
-    assert.equal(result.counted_as_greet, false);
-    assert.equal(result.outcome_unknown, true);
-    assert.equal(result.stop_run, true);
-    assert.equal(result.preserve_detail_on_terminal, true);
+    assert.equal(result.counted_as_greet, true);
+    assert.equal(result.greet_budget_consumed, true);
+    assert.equal(result.outcome_unknown, false);
+    assert.equal(result.assumed_sent, true);
+    assert.equal(result.protected_from_replay, true);
+    assert.notEqual(result.stop_run, true);
+    assert.notEqual(result.preserve_detail_on_terminal, true);
     assert.equal(result.post_input_journal_persistence_failed, true);
     assert.equal(result.action_transaction.state, "greeting_send_in_flight");
     assert.equal(result.error.code, "CHAT_ACTION_JOURNAL_LOCK_TIMEOUT");
@@ -3189,7 +3573,7 @@ async function testRecommendPostInputJournalFailurePreservesDetailAndPreventsRep
     assert.equal(result.terminal_preservation.input_dispatched, true);
     assert.equal(result.terminal_preservation.control.control_root_node_id, 10);
     const emergencyCheckpoint = checkpoints.at(-1);
-    assert.equal(emergencyCheckpoint.preserve_detail_on_terminal, true);
+    assert.equal(emergencyCheckpoint.preserve_detail_on_terminal, false);
     assert.equal(emergencyCheckpoint.action_result_critical_persisted, false);
     assert.equal(emergencyCheckpoint.terminal_preservation.candidate_id, candidateId);
 
@@ -3210,13 +3594,94 @@ async function testRecommendPostInputJournalFailurePreservesDetailAndPreventsRep
       runId: "post-input-journal-failure-replay",
       checkpointCritical() {}
     });
-    assert.equal(replay.reason, "greet_outcome_unknown_preserved_no_replay");
-    assert.equal(replay.outcome_unknown, true);
+    assert.equal(replay.reason, "greet_assumed_sent_preserved_no_replay");
+    assert.equal(replay.assumed_sent, true);
+    assert.equal(replay.protected_from_replay, true);
+    assert.equal(replay.greet_budget_consumed, false);
     assert.equal(fixture.inputCalls, inputCallsAfterFailure);
     assert.equal(journal.read({
       scope: VERIFIED_RECOMMEND_ACTION_SCOPE,
       candidateId
-    }).state, "outcome_unknown");
+    }).state, "greeting_assumed_sent");
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+async function testRecommendUnchangedPostClickLabelIsAssumedSentAndContinuable() {
+  const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "recommend-post-click-assumed-sent-"));
+  try {
+    const journal = createRecommendGreetingActionJournal({ baseDir });
+    const candidateId = "candidate-post-click-label-unchanged";
+    const binding = createVerifiedRecommendCandidateBinding(candidateId);
+    const fixture = createPostClickRecommendActionClient({ confirmedLabel: "打招呼" });
+    const actionDiscovery = {
+      summary: {
+        greet: {
+          found: true,
+          kind: "greet",
+          label: "打招呼",
+          available: true,
+          continue_chat: false,
+          disabled: false,
+          node_id: 501,
+          backend_node_id: 1501,
+          root: "top:detail-popup",
+          root_node_id: 10,
+          root_backend_node_id: 1010
+        }
+      }
+    };
+    const result = await runRecommendPostAction({
+      client: fixture.client,
+      screening: { passed: true },
+      actionDiscovery,
+      postAction: "greet",
+      executePostAction: true,
+      afterClickDelayMs: 0,
+      candidateId,
+      candidateBinding: binding,
+      reverifyCandidateBinding: async () => binding,
+      actionJournal: journal,
+      actionJournalScope: VERIFIED_RECOMMEND_ACTION_SCOPE,
+      reverifyActionJournalScope: async () => VERIFIED_RECOMMEND_ACTION_SCOPE,
+      runId: "post-click-assumed-sent-run",
+      checkpointCritical() {}
+    });
+    assert.equal(fixture.clicked, true);
+    assert.equal(fixture.inputCalls > 0, true);
+    assert.equal(result.action_clicked, true);
+    assert.equal(result.verified_after_click, undefined);
+    assert.equal(result.assumed_sent, true);
+    assert.equal(result.protected_from_replay, true);
+    assert.equal(result.counted_as_greet, true);
+    assert.equal(result.greet_budget_consumed, true);
+    assert.equal(result.confirmation_status, "assumed_sent");
+    assert.notEqual(result.outcome_unknown, true);
+    assert.notEqual(result.stop_run, true);
+    assert.equal(result.action_transaction.state, "greeting_assumed_sent");
+
+    const inputCallsAfterAssumption = fixture.inputCalls;
+    const replay = await runRecommendPostAction({
+      client: fixture.client,
+      screening: { passed: true },
+      actionDiscovery,
+      postAction: "greet",
+      executePostAction: true,
+      afterClickDelayMs: 0,
+      candidateId,
+      candidateBinding: binding,
+      reverifyCandidateBinding: async () => binding,
+      actionJournal: journal,
+      actionJournalScope: VERIFIED_RECOMMEND_ACTION_SCOPE,
+      reverifyActionJournalScope: async () => VERIFIED_RECOMMEND_ACTION_SCOPE,
+      runId: "post-click-assumed-sent-replacement",
+      checkpointCritical() {}
+    });
+    assert.equal(replay.reason, "greet_assumed_sent_preserved_no_replay");
+    assert.equal(replay.assumed_sent, true);
+    assert.equal(replay.greet_budget_consumed, false);
+    assert.equal(fixture.inputCalls, inputCallsAfterAssumption);
   } finally {
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
@@ -3267,25 +3732,28 @@ async function testRecommendCandidateDriftAfterExactPostClickControlStaysUnknown
     });
     assert.equal(fixture.clicked, true);
     assert.equal(result.verified_after_click, undefined);
-    assert.equal(result.outcome_unknown, true);
-    assert.equal(result.counted_as_greet, false);
+    assert.equal(result.assumed_sent, true);
+    assert.equal(result.protected_from_replay, true);
+    assert.equal(result.counted_as_greet, true);
+    assert.equal(result.greet_budget_consumed, true);
+    assert.notEqual(result.stop_run, true);
     assert.equal(journal.read({
       scope: VERIFIED_RECOMMEND_ACTION_SCOPE,
       candidateId
-    }).state, "outcome_unknown");
+    }).state, "greeting_assumed_sent");
   } finally {
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
 }
 
 async function testRecommendPostClickJournalCheckpointFailurePreservesResultPath() {
-  for (const finalState of ["outcome_unknown", "greeting_confirmed"]) {
+  for (const finalState of ["greeting_assumed_sent", "greeting_confirmed"]) {
     const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), `recommend-post-click-${finalState}-`));
     try {
       const journal = createRecommendGreetingActionJournal({ baseDir });
       const candidateId = `candidate-post-click-${finalState}`;
       const binding = createVerifiedRecommendCandidateBinding(candidateId);
-      const clickError = finalState === "outcome_unknown"
+      const clickError = finalState === "greeting_assumed_sent"
         ? Object.assign(new Error("click transport failed"), {
             cdp_method: "Input.dispatchMouseEvent",
             cdp_outcome_unknown: true
@@ -3329,8 +3797,9 @@ async function testRecommendPostClickJournalCheckpointFailurePreservesResultPath
         }
       });
       assert.equal(result.action_transaction.state, finalState);
-      assert.equal(result.stop_run, true);
-      assert.equal(result.preserve_detail_until_result_persisted, true);
+      assert.notEqual(result.stop_run, true);
+      assert.notEqual(result.preserve_detail_until_result_persisted, true);
+      assert.equal(result.action_transaction_checkpoint_degraded, true);
       assert.equal(Boolean(result.action_transaction_checkpoint_error), true);
       assert.equal(journal.read({
         scope: VERIFIED_RECOMMEND_ACTION_SCOPE,
@@ -3339,8 +3808,7 @@ async function testRecommendPostClickJournalCheckpointFailurePreservesResultPath
 
       const candidateResult = { candidate: { id: candidateId }, post_action: result };
       const fallbackCheckpoints = [];
-      await assert.rejects(
-        async () => checkpointRecommendPostActionStopResult({
+      await checkpointRecommendPostActionStopResult({
           checkpointCritical() { throw new Error("full result persistence failed"); },
           checkpoint(patch) { fallbackCheckpoints.push(patch); }
         }, {
@@ -3352,13 +3820,12 @@ async function testRecommendPostClickJournalCheckpointFailurePreservesResultPath
           candidateId,
           actionState: finalState,
           resultIndex: 0
-        }),
-        (error) => error?.recommend_preserve_detail_on_terminal === true
-      );
+        });
       assert.equal(fallbackCheckpoints.length, 1);
       assert.equal(fallbackCheckpoints[0].results[0], candidateResult);
-      assert.equal(fallbackCheckpoints[0].preserve_detail_on_terminal, true);
-      assert.equal(fallbackCheckpoints[0].action_result_critical_persisted, false);
+      assert.equal(fallbackCheckpoints[0].preserve_detail_on_terminal, false);
+      assert.equal(fallbackCheckpoints[0].action_result_critical_persisted, true);
+      assert.equal(fallbackCheckpoints[0].critical_checkpoint_degraded, true);
       assert.equal(fallbackCheckpoints[0].terminal_preservation.action_state, finalState);
     } finally {
       fs.rmSync(baseDir, { recursive: true, force: true });
@@ -3368,10 +3835,17 @@ async function testRecommendPostClickJournalCheckpointFailurePreservesResultPath
 
 await testLifecycleDelegation();
 await testPostActionTerminalStopFailsLifecycleButPreservesSummary();
+await testSourceUnverifiedUnderfillFailsLifecycleWithRecoverableSummary();
+testRecommendCompletionClassificationRequiresVerifiedSourceEnd();
+testRecommendRefreshBudgetsRemainExactlyTwo();
+testRecommendVerifiedExhaustionCannotShortCircuitTwoRefreshRounds();
+testRecommendEveryRefreshReappliesFilterAndRecentNotView();
+testRecommendTechnicalRecoveryBudgetCannotMultiplyAcrossLayers();
 testCanvasCausalBindingEvidenceIsReusedBeforeEveryDetailRead();
 testPostActionBindingIsGatedByPassedScreening();
 testRecommendScreeningCandidateIdentityInvariantFailsClosed();
 testRecommendPreLlmInvariantRunsBeforeModelCall();
+testGenericListReadRecoveryCannotCatchCandidateOrOutboundFailures();
 testDebugBoundaryValidationAndOnceOnlyController();
 await testListReadStaleRecoveryThenSuccess();
 testDomStaleForensicEventIsSafeAndCorrelatable();
@@ -3410,6 +3884,7 @@ await testRecommendPostCheckpointDriftAbortsBeforeInputReplayably();
 await testRecommendCandidateSwapDuringFinalControlVerificationAbortsBeforeInput();
 await testRecommendFinalInputUsesGeometryAfterNonScrollingCandidateReproof();
 await testRecommendPostInputJournalFailurePreservesDetailAndPreventsReplay();
+await testRecommendUnchangedPostClickLabelIsAssumedSentAndContinuable();
 await testRecommendCandidateDriftAfterExactPostClickControlStaysUnknown();
 await testRecommendPostClickJournalCheckpointFailurePreservesResultPath();
 

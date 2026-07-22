@@ -252,6 +252,12 @@ export function createImageCaptureWorkflowRetryTracker({
         count,
         retry_limit: normalizedLimit
       };
+    },
+    release(candidateKey) {
+      return counts.delete(keyFor(candidateKey));
+    },
+    size() {
+      return counts.size;
     }
   };
 }

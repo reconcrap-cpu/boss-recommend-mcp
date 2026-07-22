@@ -4,10 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
+import { recordDetachedWorkerExit } from "./detached-worker.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 import { resolveHumanBehaviorForRun } from "./chat-runtime-config.js";
 import {
   acceptRecommendEmptyBootstrapHealth,
+  compactRecommendRunForStatus,
   getRecommendEmptyBootstrapPreflightAction,
   isRecommendConnectorHealthAccepted,
   resolveRecommendActionJournalScope,
@@ -26,6 +28,7 @@ const {
   setRecommendMcpJobReaderForTests,
   setRecommendMcpWorkflowForTests,
   setRecommendSchedulerSpawnForTests,
+  setRecommendDetachedWorkerLauncherForTests,
   setSpawnProcessImplForTests
 } = __testables;
 
@@ -36,6 +39,64 @@ const TOOL_GET_SCHEDULE = "get_recommend_scheduled_run";
 const TOOL_RUN_RECOMMEND = "run_recommend";
 const TOOL_START = "start_recommend_pipeline_run";
 const TOOL_GET = "get_recommend_pipeline_run";
+
+function testRecommendStatusPreservesWorkflowCompletionSemantics() {
+  const compact = compactRecommendRunForStatus({
+    status: "failed",
+    result: {
+      results_count: 4,
+      results: [{ candidate_id: "tail-only" }]
+    },
+    checkpoint: {
+      results_count: 4,
+      results: [{ candidate_id: "tail-only" }]
+    },
+    summary: {
+      domain: "recommend",
+      target_count: 10,
+      results_count: 4,
+      results: [{ candidate_id: "tail-only" }],
+      results_truncated: true,
+      completion_reason: "source_unverified_underfill",
+      target_reached: false,
+      source_exhausted: false,
+      source_exhaustion_verified: false,
+      source_unverified_underfill: true,
+      post_action_stopped: false,
+      clean_completion: false,
+      refresh_rounds: 9,
+      consecutive_refresh_attempts_without_progress: 3,
+      candidate_result_journal: {
+        journal_file: "candidate-results.test.ndjson",
+        raw_record_count: 5,
+        committed_count: 4,
+        duplicate_count: 1,
+        tail_truncated: true
+      }
+    }
+  });
+
+  assert.equal(compact.result.results_count, 4);
+  assert.equal(compact.result.results_available, true);
+  assert.equal(Object.hasOwn(compact.result, "results"), false);
+  assert.equal(compact.checkpoint.results_count, 4);
+  assert.equal(compact.summary.results_count, 4);
+  assert.equal(compact.summary.target_count, 10);
+  assert.equal(compact.summary.completion_reason, "source_unverified_underfill");
+  assert.equal(compact.summary.source_unverified_underfill, true);
+  assert.equal(compact.summary.source_exhaustion_verified, false);
+  assert.equal(compact.summary.clean_completion, false);
+  assert.equal(compact.summary.results_truncated, true);
+  assert.equal(compact.summary.refresh_rounds, 9);
+  assert.equal(compact.summary.consecutive_refresh_attempts_without_progress, 3);
+  assert.deepEqual(compact.summary.candidate_result_journal, {
+    journal_file: "candidate-results.test.ndjson",
+    raw_record_count: 5,
+    committed_count: 4,
+    superseded_record_count: 1,
+    tail_truncated: true
+  });
+}
 
 function testExplicitHumanRestLevelAliasOverridesConfigDefault() {
   const config = {
@@ -2030,6 +2091,8 @@ async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
   fs.mkdirSync(runsDir, { recursive: true });
   const statePath = path.join(runsDir, `${runId}.json`);
   const checkpointPath = path.join(runsDir, `${runId}.checkpoint.json`);
+  const exitStatusPath = path.join(runsDir, `${runId}.worker.exit.json`);
+  const expectedLaunchId = "current-deadpid-launch";
   const startedAt = new Date(Date.now() - 60_000).toISOString();
   const checkpoint = {
     updatedAt: startedAt,
@@ -2042,6 +2105,20 @@ async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
     ]
   };
   fs.writeFileSync(checkpointPath, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8");
+  fs.writeFileSync(exitStatusPath, `${JSON.stringify({
+    schema_version: 1,
+    domain: "recommend",
+    run_id: runId,
+    launch_id: "stale-deadpid-launch",
+    wrapper_pid: 987654322,
+    worker_pid: 987654321,
+    started_at: startedAt,
+    exited_at: new Date().toISOString(),
+    exit_code: 23,
+    nonzero: true,
+    termination_kind: "observed_child_exit",
+    wrapper_error: null
+  }, null, 2)}\n`, "utf8");
   fs.writeFileSync(statePath, `${JSON.stringify({
     run_id: runId,
     state: "running",
@@ -2071,7 +2148,9 @@ async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
       }
     },
     resume: {
-      checkpoint_path: checkpointPath
+      checkpoint_path: checkpointPath,
+      worker_launch_id: expectedLaunchId,
+      worker_supervisor_pid: 987654322
     },
     result: null,
     error: null
@@ -2082,6 +2161,14 @@ async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
   assert.equal(payload.run.state, "failed");
   assert.equal(payload.run.pid, 987654321);
   assert.equal(payload.run.error.code, "RUN_PROCESS_EXITED");
+  assert.equal(payload.run.error.diagnostic_source, "pid_reconciliation");
+  assert.equal(payload.run.recovery.classification, "worker_process_exited");
+  assert.equal(payload.run.recovery.safe_for_outer_ai_agent, false);
+  assert.equal(payload.run.recovery.automatic_restart_allowed, false);
+  assert.equal(payload.run.recovery.requires_durable_action_journal_audit, true);
+  assert.equal(payload.run.recovery.worker_last_heartbeat_at, startedAt);
+  assert.equal(payload.run.recovery.resume_failed_run_in_place_allowed, false);
+  assert.equal(payload.run.heartbeat_at, startedAt);
   assert.equal(payload.persistence.source, "disk");
   assert.equal(payload.persistence.active_control_available, false);
   assert.equal(payload.persistence.stale_process_reconciled, true);
@@ -2090,6 +2177,109 @@ async function testRecommendDiskRunningRunWithDeadPidIsReconciled() {
   assert.equal(payload.run.result.passed_count, 1);
   assert.equal(fs.existsSync(payload.run.result.output_csv), true);
   assert.equal(fs.existsSync(payload.run.result.report_json), true);
+}
+
+async function testRecommendDeadPidUsesMatchingSupervisorExitSidecar() {
+  resetRecommendMcpStateForTests();
+  const runId = "mcp_recommend_exit_sidecar_test";
+  const runsDir = path.join(process.env.BOSS_RECOMMEND_HOME, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const statePath = path.join(runsDir, `${runId}.json`);
+  const checkpointPath = path.join(runsDir, `${runId}.checkpoint.json`);
+  const exitStatusPath = path.join(runsDir, `${runId}.worker.exit.json`);
+  const launchId = "recommend-exit-sidecar-launch";
+  const startedAt = new Date(Date.now() - 120_000).toISOString();
+  const exitedAt = new Date(Date.now() - 30_000).toISOString();
+  fs.writeFileSync(checkpointPath, `${JSON.stringify({
+    updatedAt: startedAt,
+    in_progress_candidate: {
+      key: "recommend:id:pre-action-only",
+      detail_step: "open_detail",
+      candidate_binding: null,
+      action_state: null,
+      error: null
+    },
+    results: []
+  }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(exitStatusPath, `${JSON.stringify({
+    schema_version: 1,
+    domain: "recommend",
+    run_id: runId,
+    launch_id: launchId,
+    wrapper_pid: 876540001,
+    worker_pid: 876540002,
+    started_at: startedAt,
+    exited_at: exitedAt,
+    exit_code: 23,
+    nonzero: true,
+    termination_kind: "observed_child_exit",
+    wrapper_error: null
+  }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    run_id: runId,
+    state: "running",
+    status: "running",
+    stage: "recommend:detail",
+    started_at: startedAt,
+    updated_at: startedAt,
+    heartbeat_at: startedAt,
+    pid: process.pid,
+    progress: {
+      target_count: 10,
+      processed: 4,
+      screened: 4,
+      passed: 0,
+      skipped: 4,
+      greet_count: 0
+    },
+    context: {
+      instruction: "推荐页筛选算法候选人",
+      confirmation: { job_value: "算法工程师" },
+      overrides: {
+        job: "算法工程师",
+        criteria: "候选人具备算法经验",
+        target_count: 10,
+        post_action: "greet",
+        max_greet_count: 10
+      }
+    },
+    resume: {
+      checkpoint_path: checkpointPath,
+      worker_launch_id: launchId,
+      worker_supervisor_pid: 876540001,
+      worker_node_pid: 876540002,
+      worker_exit_status_path: exitStatusPath
+    },
+    result: null,
+    error: null
+  }, null, 2)}\n`, "utf8");
+
+  const payload = await callTool(TOOL_GET, { run_id: runId }, 322);
+  assert.equal(payload.status, "RUN_STATUS");
+  assert.equal(payload.run.state, "failed");
+  assert.equal(payload.run.error.code, "RECOMMEND_WORKER_EXITED_NONZERO");
+  assert.equal(payload.run.error.worker_exit_code, 23);
+  assert.equal(payload.run.error.worker_launch_id, launchId);
+  assert.equal(payload.run.error.worker_pid, 876540002);
+  assert.equal(payload.run.error.supervisor_pid, 876540001);
+  assert.equal(payload.run.error.worker_exited_at, exitedAt);
+  assert.equal(payload.run.error.diagnostic_source, "windows_cim_exit_sidecar");
+  assert.equal(payload.run.recovery.classification, "worker_process_exited");
+  assert.equal(payload.run.recovery.safe_for_outer_ai_agent, false);
+  assert.equal(payload.run.recovery.automatic_restart_allowed, false);
+  assert.equal(payload.run.recovery.requires_durable_action_journal_audit, true);
+  assert.equal(
+    payload.run.recovery.recommended_action,
+    "audit_durable_action_journals_then_start_one_reduced_target_replacement_only"
+  );
+  assert.equal(payload.run.recovery.worker_last_heartbeat_at, startedAt);
+  assert.equal(payload.run.heartbeat_at, startedAt);
+  assert.equal(payload.run.resume.worker_supervisor_pid, 876540001);
+  assert.equal(payload.run.resume.worker_exit_status_path, exitStatusPath);
+  assert.equal(
+    payload.run.recovery.constraints.some((item) => item.includes("Never replay greeting_send_in_flight")),
+    true
+  );
 }
 
 async function testRecommendDiskCancelRequestedDeadPidIsReconciledAsCanceled() {
@@ -2207,11 +2397,17 @@ async function testRecommendListRunsReturnsCompactLatest() {
       }
     }, null, 2)}\n`, "utf8");
   }
+  fs.writeFileSync(path.join(runsDir, `${newerId}.worker.exit.json`), `${JSON.stringify({
+    run_id: `${newerId}.worker.exit`,
+    state: "paused",
+    updated_at: new Date(Date.now() + 60_000).toISOString()
+  })}\n`, "utf8");
 
   const payload = await callTool(TOOL_LIST_RUNS, { state: "paused", limit: 1 }, 322);
   assert.equal(payload.status, "OK");
   assert.equal(payload.count, 1);
   assert.equal(payload.latest_run.run_id, newerId);
+  assert.equal(payload.total_matching, 2);
   assert.equal(payload.runs[0].run_id, newerId);
   assert.equal(payload.runs[0].result.output_csv, `C:/tmp/${newerId}.csv`);
   assert.deepEqual(payload.runs[0].progress, {
@@ -2303,6 +2499,85 @@ async function testRecommendCompletedStatusOmitsInlineResults() {
   assert.equal(JSON.stringify(checkpoint).includes(marker), true);
 }
 
+async function testRecommendOptionalArtifactFailuresDoNotBlockTerminalState() {
+  installFakeConnector();
+  let releaseWorkflow;
+  let markWorkflowEntered;
+  const workflowEntered = new Promise((resolve) => {
+    markWorkflowEntered = resolve;
+  });
+  const workflowRelease = new Promise((resolve) => {
+    releaseWorkflow = resolve;
+  });
+  const results = [{
+    index: 0,
+    candidate: { id: "artifact-warning-candidate", identity: { name: "候选人-可选产物失败" } },
+    screening: { passed: false, status: "screened", score: 0 }
+  }];
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:artifact-warning-test");
+    runControl.updateProgress({
+      card_count: 1,
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    runControl.checkpoint({ results, checkpoint_marker: "critical-checkpoint-survived" });
+    markWorkflowEntered();
+    await workflowRelease;
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      detail_opened: 1,
+      passed: 0,
+      results
+    };
+  });
+
+  const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 327_1);
+  assert.equal(started.status, "ACCEPTED");
+  await workflowEntered;
+  const outputDir = outputDirForTests();
+  fs.mkdirSync(outputDir, { recursive: true });
+  const csvPath = path.join(outputDir, `${started.run_id}.results.csv`);
+  const reportPath = path.join(outputDir, `${started.run_id}.report.json`);
+  const blockers = [`${csvPath}.tmp`, `${reportPath}.tmp`];
+  for (const blocker of blockers) fs.mkdirSync(blocker, { recursive: true });
+  try {
+    releaseWorkflow();
+    const completed = await waitForRecommendRun(started.run_id, (run) => run?.state === "completed");
+    assert.equal(completed.state, "completed");
+    assert.deepEqual(
+      completed.artifact_warnings.map((warning) => warning.artifact).sort(),
+      ["report_json", "results_csv"]
+    );
+    assert.equal(
+      completed.artifact_warnings.every((warning) => (
+        warning.code === "RECOMMEND_OPTIONAL_ARTIFACT_WRITE_FAILED"
+        && warning.retryable === true
+      )),
+      true
+    );
+
+    const statePath = path.join(process.env.BOSS_RECOMMEND_HOME, "runs", `${started.run_id}.json`);
+    const checkpointPath = path.join(process.env.BOSS_RECOMMEND_HOME, "runs", `${started.run_id}.checkpoint.json`);
+    const persisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.equal(persisted.state, "completed");
+    assert.equal(persisted.artifact_warnings.length, 2);
+    assert.equal(persisted.artifacts.warnings.length, 2);
+    const checkpoint = JSON.parse(fs.readFileSync(checkpointPath, "utf8"));
+    assert.equal(checkpoint.checkpoint_marker, "critical-checkpoint-survived");
+    assert.equal(checkpoint.results.length, 1);
+    assert.equal(fs.existsSync(csvPath), false);
+    assert.equal(fs.existsSync(reportPath), false);
+  } finally {
+    releaseWorkflow();
+    for (const blocker of blockers) fs.rmSync(blocker, { recursive: true, force: true });
+  }
+}
+
 async function testRecommendDetachedCancelSocketFailureFinalizesCanceled() {
   const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
   const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
@@ -2346,7 +2621,8 @@ async function testRecommendDetachedCancelSocketFailureFinalizesCanceled() {
 
     const workerResult = await runDetachedWorkerForTests({
       runId: started.run_id,
-      workerPid: 456790
+      workerPid: 456790,
+      launchId: started.run.resume.worker_launch_id
     });
     assert.equal(workerResult.ok, true);
     const payload = await callTool(TOOL_GET, { run_id: started.run_id }, 325);
@@ -2371,17 +2647,110 @@ async function testRecommendDetachedCancelSocketFailureFinalizesCanceled() {
   }
 }
 
+async function testRecommendSupervisorExitRecorderMarksFailureImmediately() {
+  const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
+  process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  setSpawnProcessImplForTests(() => ({
+    pid: process.pid,
+    unref() {}
+  }));
+  try {
+    const started = await callTool(TOOL_START, readyArgs({
+      delay_ms: 0,
+      debug_test_mode: true,
+      screening_mode: "deterministic",
+      no_filter: true,
+      detail_limit: 1,
+      execute_post_action: false
+    }), 323_1);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.run.state, "queued");
+
+    const staleRecord = await recordDetachedWorkerExit({
+      domain: "recommend",
+      runId: started.run_id,
+      workerExitCode: 137,
+      workerPid: 476544,
+      supervisorPid: process.pid,
+      launchId: "stale-launch-id"
+    });
+    assert.deepEqual(staleRecord, { ok: true, persisted: false });
+    const stillQueued = await callTool(TOOL_GET, { run_id: started.run_id }, 323_15);
+    assert.equal(stillQueued.run.state, "queued");
+    const staleWorker = await runDetachedWorkerForTests({
+      runId: started.run_id,
+      workerPid: 476545,
+      launchId: "stale-launch-id"
+    });
+    assert.equal(staleWorker.ok, false);
+    assert.match(staleWorker.error, /launch identity does not match/);
+
+    const missingSupervisorRecord = await recordDetachedWorkerExit({
+      domain: "recommend",
+      runId: started.run_id,
+      workerExitCode: 137,
+      workerPid: 476544,
+      launchId: started.run.resume.worker_launch_id
+    });
+    assert.deepEqual(missingSupervisorRecord, { ok: true, persisted: false });
+
+    const recorded = await recordDetachedWorkerExit({
+      domain: "recommend",
+      runId: started.run_id,
+      workerExitCode: 137,
+      workerPid: 476544,
+      supervisorPid: process.pid,
+      launchId: started.run.resume.worker_launch_id
+    });
+    assert.deepEqual(recorded, { ok: true, persisted: true });
+
+    const payload = await callTool(TOOL_GET, { run_id: started.run_id }, 323_2);
+    assert.equal(payload.run.state, "failed");
+    assert.equal(payload.run.error.code, "DETACHED_WORKER_EXITED_EARLY");
+    assert.equal(payload.run.error.worker_exit_code, 137);
+    assert.equal(payload.run.error.worker_pid, 476544);
+    assert.equal(payload.run.error.supervisor_pid, process.pid);
+    assert.equal(payload.run.error.diagnostic_source, "windows_cim_supervisor");
+    assert.equal(payload.run.recovery.classification, "worker_process_exited");
+    assert.equal(payload.run.recovery.automatic_restart_allowed, false);
+    assert.equal(payload.run.recovery.requires_durable_action_journal_audit, true);
+    const lateWorker = await runDetachedWorkerForTests({
+      runId: started.run_id,
+      workerPid: 476546,
+      launchId: started.run.resume.worker_launch_id
+    });
+    assert.equal(lateWorker.ok, false);
+    assert.match(lateWorker.error, /already terminal/);
+    const stillFailed = await callTool(TOOL_GET, { run_id: started.run_id }, 323_3);
+    assert.equal(stillFailed.run.state, "failed");
+  } finally {
+    setSpawnProcessImplForTests(null);
+    if (previousDetached === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_DETACHED = previousDetached;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+  }
+}
+
 async function testRecommendDetachedStartUsesWorkerProcess() {
   const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
   const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
   process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
   process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
-  let spawnCall = null;
+  let launcherOptions = null;
   let unrefCalled = false;
   let connectOptions = null;
   let workflowOptions = null;
-  setSpawnProcessImplForTests((command, args, options) => {
-    spawnCall = { command, args, options };
+  setRecommendDetachedWorkerLauncherForTests((options) => {
+    launcherOptions = options;
     return {
       pid: 456789,
       unref() {
@@ -2434,17 +2803,27 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(started.run.state, "queued");
     assert.ok(started.run.resume.worker_stdout_path.endsWith(`${started.run_id}.worker.stdout.log`));
     assert.ok(started.run.resume.worker_stderr_path.endsWith(`${started.run_id}.worker.stderr.log`));
+    assert.ok(started.run.resume.worker_exit_status_path.endsWith(`${started.run_id}.worker.exit.json`));
+    assert.equal(started.run.resume.worker_launcher, process.platform === "win32" ? "windows_cim_supervisor" : "posix_detached_spawn");
+    assert.equal(started.run.resume.worker_launch_id, launcherOptions.launchId);
+    assert.equal(started.run.resume.worker_supervisor_pid, process.platform === "win32" ? 456789 : null);
     assert.equal(fs.existsSync(started.run.resume.worker_stdout_path), true);
     assert.equal(fs.existsSync(started.run.resume.worker_stderr_path), true);
     assert.equal(unrefCalled, true);
-    assert.equal(spawnCall.args.includes("--detached-worker"), true);
-    assert.equal(spawnCall.args.includes(started.run_id), true);
-    assert.equal(spawnCall.options.detached, true);
-    assert.equal(spawnCall.options.stdio[0], "ignore");
+    assert.equal(launcherOptions.domain, "recommend");
+    assert.equal(launcherOptions.runId, started.run_id);
+    assert.match(launcherOptions.workerScriptPath, /detached-worker\.js$/);
+    assert.equal(launcherOptions.stdoutPath, started.run.resume.worker_stdout_path);
+    assert.equal(launcherOptions.stderrPath, started.run.resume.worker_stderr_path);
+    assert.equal(launcherOptions.exitStatusPath, started.run.resume.worker_exit_status_path);
+    assert.equal(path.isAbsolute(launcherOptions.recommendRuntimeHomePath), true);
+    assert.equal(path.isAbsolute(launcherOptions.screenConfigPath), true);
+    assert.equal(started.run.context.args.overrides.job, startArgs.overrides.job);
 
     const workerResult = await runDetachedWorkerForTests({
       runId: started.run_id,
-      workerPid: 456789
+      workerPid: 456789,
+      launchId: started.run.resume.worker_launch_id
     });
     assert.equal(workerResult.ok, true);
     assert.equal(connectOptions.port, 9777);
@@ -2458,7 +2837,63 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(completed.run.pid, process.pid);
     assert.equal(completed.run.progress.processed, 1);
   } finally {
-    setSpawnProcessImplForTests(null);
+    setRecommendDetachedWorkerLauncherForTests(null);
+    if (previousDetached === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_DETACHED = previousDetached;
+    }
+    if (previousInproc === undefined) {
+      delete process.env.BOSS_RECOMMEND_CDP_INPROC;
+    } else {
+      process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+  }
+}
+
+async function testRecommendAmbiguousLauncherFailureCannotReviveRun() {
+  const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
+  const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
+  process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  let workerAttempt = null;
+  let capturedRunId = null;
+  let workflowCalls = 0;
+  setRecommendMcpWorkflowForTests(async () => {
+    workflowCalls += 1;
+    return { domain: "recommend", processed: 0, screened: 0, passed: 0, results: [] };
+  });
+  setRecommendDetachedWorkerLauncherForTests((options) => {
+    capturedRunId = options.runId;
+    workerAttempt = runDetachedWorkerForTests({
+      runId: options.runId,
+      workerPid: 456792,
+      launchId: options.launchId
+    });
+    const error = new Error("CIM result was lost after process creation");
+    error.code = "WINDOWS_CIM_RESULT_INVALID";
+    throw error;
+  });
+  try {
+    const failed = await callTool(TOOL_START, readyArgs({
+      delay_ms: 0,
+      debug_test_mode: true,
+      screening_mode: "deterministic",
+      no_filter: true,
+      detail_limit: 1,
+      execute_post_action: false
+    }), 333_1);
+    assert.equal(failed.status, "FAILED");
+    assert.equal(failed.error.code, "RUN_WORKER_LAUNCH_FAILED");
+    assert.ok(workerAttempt);
+    const workerResult = await workerAttempt;
+    assert.equal(workerResult.ok, false);
+    assert.match(workerResult.error, /already terminal/);
+    assert.equal(workflowCalls, 0);
+    const persisted = await callTool(TOOL_GET, { run_id: capturedRunId }, 333_2);
+    assert.equal(persisted.run.state, "failed");
+  } finally {
+    setRecommendDetachedWorkerLauncherForTests(null);
     if (previousDetached === undefined) {
       delete process.env.BOSS_RECOMMEND_CDP_DETACHED;
     } else {
@@ -2507,8 +2942,10 @@ async function testRecommendOpenClawWorkspaceForcesDetachedWorker() {
     assert.equal(started.run.pid, 567890);
     assert.equal(started.run.state, "queued");
     assert.equal(unrefCalled, true);
-    assert.equal(spawnCall.args.includes("--detached-worker"), true);
+    assert.equal(spawnCall.args.includes("--domain"), true);
+    assert.equal(spawnCall.args.includes("recommend"), true);
     assert.equal(spawnCall.args.includes(started.run_id), true);
+    assert.match(spawnCall.args[0], /detached-worker\.js$/);
     assert.equal(spawnCall.options.detached, true);
   } finally {
     setSpawnProcessImplForTests(null);
@@ -2707,7 +3144,8 @@ async function testRecommendDetachedDiskFallbackPreservesSafeCdpEvidence() {
     assert.equal(started.status, "ACCEPTED");
     const workerResult = await runDetachedWorkerForTests({
       runId: started.run_id,
-      workerPid: 456791
+      workerPid: 456791,
+      launchId: started.run.resume.worker_launch_id
     });
     assert.equal(workerResult.ok, true);
 
@@ -2959,6 +3397,7 @@ async function testRecommendArtifactsUseConfiguredOutputDir(outputDir) {
 }
 
 async function main() {
+  testRecommendStatusPreservesWorkflowCompletionSemantics();
   testExplicitHumanRestLevelAliasOverridesConfigDefault();
   testRecommendTerminalCleanupPreservesUnpersistedPostActionDetail();
   testRecommendConnectorRefreshesBeforeExactEmptyBootstrap();
@@ -3088,15 +3527,23 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendDiskRunningRunWithDeadPidIsReconciled();
     resetRecommendMcpStateForTests();
+    await testRecommendDeadPidUsesMatchingSupervisorExitSidecar();
+    resetRecommendMcpStateForTests();
     await testRecommendDiskCancelRequestedDeadPidIsReconciledAsCanceled();
     resetRecommendMcpStateForTests();
     await testRecommendListRunsReturnsCompactLatest();
     resetRecommendMcpStateForTests();
     await testRecommendCompletedStatusOmitsInlineResults();
     resetRecommendMcpStateForTests();
+    await testRecommendOptionalArtifactFailuresDoNotBlockTerminalState();
+    resetRecommendMcpStateForTests();
+    await testRecommendSupervisorExitRecorderMarksFailureImmediately();
+    resetRecommendMcpStateForTests();
     await testRecommendDetachedCancelSocketFailureFinalizesCanceled();
     resetRecommendMcpStateForTests();
     await testRecommendDetachedStartUsesWorkerProcess();
+    resetRecommendMcpStateForTests();
+    await testRecommendAmbiguousLauncherFailureCannotReviveRun();
     resetRecommendMcpStateForTests();
     await testRecommendDetachedDiskFallbackPreservesSafeCdpEvidence();
     resetRecommendMcpStateForTests();

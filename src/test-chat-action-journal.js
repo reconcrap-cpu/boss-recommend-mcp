@@ -187,12 +187,54 @@ function testUnknownOutcomeCanOnlyResolveItsInFlightEffect() {
       () => journal.transition({ ...greetingUnknown, state: "request_confirmed", runId: "run-b" }),
       "CHAT_ACTION_TRANSITION_INVALID"
     );
+    const greetingAssumedSent = journal.transition({
+      ...greetingUnknown,
+      state: "greeting_assumed_sent",
+      runId: "run-b",
+      evidence: {
+        assumption_policy: "at_most_once_assume_sent",
+        confirmation_status: "not_observed",
+        protected_from_replay: true,
+        input_dispatched: true,
+        ignored_secret: "must-not-persist"
+      }
+    });
+    assert.equal(greetingAssumedSent.record.state, "greeting_assumed_sent");
+    assert.equal(greetingAssumedSent.record.schema_version, 1);
+    assert.equal(
+      greetingAssumedSent.record.evidence.assumption_policy,
+      "at_most_once_assume_sent"
+    );
+    assert.equal(greetingAssumedSent.record.evidence.confirmation_status, "not_observed");
+    assert.equal(greetingAssumedSent.record.evidence.protected_from_replay, true);
+    assert.equal(greetingAssumedSent.record.evidence.input_dispatched, true);
+    assert.equal(greetingAssumedSent.record.evidence.ignored_secret, undefined);
+    assert.doesNotMatch(JSON.stringify(greetingAssumedSent.record), /must-not-persist/);
+    assertErrorCode(
+      () => journal.transition({ ...greetingUnknown, state: "request_in_flight", runId: "run-b" }),
+      "CHAT_ACTION_TRANSITION_INVALID"
+    );
+    assertErrorCode(
+      () => journal.transition({ ...greetingUnknown, state: "outcome_unknown", runId: "run-b" }),
+      "CHAT_ACTION_TRANSITION_INVALID"
+    );
     const greetingResolved = journal.transition({
       ...greetingUnknown,
       state: "greeting_confirmed",
-      runId: "run-b"
+      runId: "run-b",
+      evidence: { confirmation_status: "passively_confirmed" }
     });
     assert.equal(greetingResolved.record.state, "greeting_confirmed");
+    assert.deepEqual(
+      greetingResolved.record.history.map((entry) => entry.state),
+      [
+        "pre_action",
+        "greeting_send_in_flight",
+        "outcome_unknown",
+        "greeting_assumed_sent",
+        "greeting_confirmed"
+      ]
+    );
 
     const requestUnknown = {
       scope: "account-a/profile-default",
@@ -208,12 +250,78 @@ function testUnknownOutcomeCanOnlyResolveItsInFlightEffect() {
       () => journal.transition({ ...requestUnknown, state: "greeting_confirmed", runId: "run-b" }),
       "CHAT_ACTION_TRANSITION_INVALID"
     );
+    assertErrorCode(
+      () => journal.transition({ ...requestUnknown, state: "greeting_assumed_sent", runId: "run-b" }),
+      "CHAT_ACTION_TRANSITION_INVALID"
+    );
     const requestResolved = journal.transition({
       ...requestUnknown,
       state: "request_confirmed",
       runId: "run-b"
     });
     assert.equal(requestResolved.record.state, "request_confirmed");
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function testGreetingInFlightCanBecomeAssumedSentAndOnlyThenConfirmed() {
+  const baseDir = makeTempDir();
+  try {
+    const journal = createChatActionJournal({ baseDir });
+    const input = {
+      scope: "account-a/profile-default",
+      candidateId: "candidate-direct-assumed-sent",
+      greeting: "hello",
+      runId: "run-a"
+    };
+    journal.transition({ ...input, state: "pre_action" });
+    journal.transition({ ...input, state: "greeting_send_in_flight" });
+    const assumed = journal.transition({
+      ...input,
+      state: "greeting_assumed_sent",
+      evidence: {
+        assumption_policy: "at_most_once_assume_sent",
+        confirmation_status: "readback_unverified",
+        protected_from_replay: true,
+        input_dispatched: true
+      }
+    });
+    assert.equal(assumed.record.state, "greeting_assumed_sent");
+
+    const idempotent = journal.transition({
+      ...input,
+      state: "greeting_assumed_sent",
+      runId: "run-b"
+    });
+    assert.equal(idempotent.changed, false);
+    assert.equal(idempotent.idempotent, true);
+    assert.deepEqual(idempotent.record, assumed.record);
+    assertErrorCode(
+      () => journal.transition({ ...input, state: "request_in_flight", runId: "run-b" }),
+      "CHAT_ACTION_TRANSITION_INVALID"
+    );
+    assertErrorCode(
+      () => journal.transition({ ...input, state: "outcome_unknown", runId: "run-b" }),
+      "CHAT_ACTION_TRANSITION_INVALID"
+    );
+
+    const confirmed = journal.transition({
+      ...input,
+      state: "greeting_confirmed",
+      runId: "run-b",
+      evidence: { confirmation_status: "passively_confirmed" }
+    });
+    assert.equal(confirmed.record.state, "greeting_confirmed");
+    assert.deepEqual(
+      confirmed.record.history.map((entry) => entry.state),
+      [
+        "pre_action",
+        "greeting_send_in_flight",
+        "greeting_assumed_sent",
+        "greeting_confirmed"
+      ]
+    );
   } finally {
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
@@ -271,7 +379,13 @@ function testInvalidTransitionsAndGreetingConflictsFailClosed() {
 function testCorruptionAndConcurrentWriterLockFailClosed() {
   const baseDir = makeTempDir();
   try {
-    const journal = createChatActionJournal({ baseDir });
+    const journal = createChatActionJournal({
+      baseDir,
+      lockOptions: {
+        acquireTimeoutMs: 0,
+        sleep: () => {}
+      }
+    });
     const corruptInput = {
       scope: "account-a/profile-default",
       candidateId: "candidate-corrupt"
@@ -296,6 +410,231 @@ function testCorruptionAndConcurrentWriterLockFailClosed() {
     );
     assert.equal(fs.existsSync(lockedPath), false);
   } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function writeLockFile(lockPath, {
+  pid = 999_999_999,
+  token = "stale-lock-token",
+  released = false,
+  ageMs = 60_000
+} = {}) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, `${JSON.stringify({
+    schema_version: 1,
+    pid,
+    token,
+    released
+  })}\n`, "utf8");
+  const timestamp = new Date(Date.now() - ageMs);
+  fs.utimesSync(lockPath, timestamp, timestamp);
+}
+
+function testStaleLockRecoveryRequiresOldAgeAndProvablyDeadPid() {
+  const baseDir = makeTempDir();
+  try {
+    const journal = createChatActionJournal({
+      baseDir,
+      lockOptions: {
+        acquireTimeoutMs: 0,
+        staleMinAgeMs: 5_000,
+        sleep: () => {},
+        isProcessAlive: () => false
+      }
+    });
+    const staleInput = {
+      scope: "account-a/profile-default",
+      candidateId: "candidate-stale-lock",
+      greeting: "hello",
+      state: "pre_action",
+      runId: "run-a"
+    };
+    const stalePath = `${journal.entryPath(staleInput)}.lock`;
+    writeLockFile(stalePath, { ageMs: 60_000 });
+    const recovered = journal.transition(staleInput);
+    assert.equal(recovered.record.state, "pre_action");
+    assert.equal(fs.existsSync(stalePath), false);
+
+    const freshInput = {
+      ...staleInput,
+      candidateId: "candidate-fresh-dead-lock"
+    };
+    const freshPath = `${journal.entryPath(freshInput)}.lock`;
+    writeLockFile(freshPath, { ageMs: 0 });
+    assertErrorCode(
+      () => journal.transition(freshInput),
+      "CHAT_ACTION_JOURNAL_BUSY"
+    );
+    assert.equal(fs.existsSync(journal.entryPath(freshInput)), false);
+
+    const liveJournal = createChatActionJournal({
+      baseDir,
+      lockOptions: {
+        acquireTimeoutMs: 0,
+        staleMinAgeMs: 5_000,
+        sleep: () => {},
+        isProcessAlive: () => true
+      }
+    });
+    const liveInput = {
+      ...staleInput,
+      candidateId: "candidate-live-old-lock"
+    };
+    const livePath = `${liveJournal.entryPath(liveInput)}.lock`;
+    writeLockFile(livePath, { ageMs: 60_000 });
+    assertErrorCode(
+      () => liveJournal.transition(liveInput),
+      "CHAT_ACTION_JOURNAL_BUSY"
+    );
+    assert.equal(fs.existsSync(liveJournal.entryPath(liveInput)), false);
+  } finally {
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function testTransientWindowsRenameAndLockUnlinkErrorsAreRetried() {
+  const baseDir = makeTempDir();
+  const originalRenameSync = fs.renameSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let renameFailures = 2;
+  let lockUnlinkFailures = 2;
+  let sleepCalls = 0;
+  try {
+    fs.renameSync = (...args) => {
+      if (renameFailures > 0) {
+        renameFailures -= 1;
+        const error = new Error("transient Windows rename contention");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalRenameSync(...args);
+    };
+    fs.unlinkSync = (target, ...args) => {
+      if (String(target).endsWith(".lock") && lockUnlinkFailures > 0) {
+        lockUnlinkFailures -= 1;
+        const error = new Error("transient Windows unlink contention");
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalUnlinkSync(target, ...args);
+    };
+    const journal = createChatActionJournal({
+      baseDir,
+      lockOptions: {
+        fileOperationAttempts: 4,
+        fileOperationRetryMinMs: 0,
+        fileOperationRetryMaxMs: 0,
+        sleep: () => { sleepCalls += 1; }
+      }
+    });
+    const result = journal.transition({
+      scope: "account-a/profile-default",
+      candidateId: "candidate-windows-retry",
+      greeting: "hello",
+      state: "pre_action",
+      runId: "run-a"
+    });
+    assert.equal(result.record.state, "pre_action");
+    assert.equal(renameFailures, 0);
+    assert.equal(lockUnlinkFailures, 0);
+    assert.equal(sleepCalls, 4);
+    assert.equal(fs.existsSync(`${result.file_path}.lock`), false);
+  } finally {
+    fs.renameSync = originalRenameSync;
+    fs.unlinkSync = originalUnlinkSync;
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function testTransientExistingLockUsesBoundedWaitAndThenAcquires() {
+  const baseDir = makeTempDir();
+  const originalOpenSync = fs.openSync;
+  let transientExists = 2;
+  let waitCalls = 0;
+  try {
+    const journal = createChatActionJournal({
+      baseDir,
+      lockOptions: {
+        acquireTimeoutMs: 1_000,
+        retryMinMs: 0,
+        retryMaxMs: 0,
+        sleep: () => { waitCalls += 1; }
+      }
+    });
+    const input = {
+      scope: "account-a/profile-default",
+      candidateId: "candidate-transient-eexist",
+      greeting: "hello",
+      state: "pre_action",
+      runId: "run-a"
+    };
+    const lockPath = `${journal.entryPath(input)}.lock`;
+    fs.openSync = (target, flags, ...args) => {
+      if (target === lockPath && flags === "wx" && transientExists > 0) {
+        transientExists -= 1;
+        const error = new Error("transient lock visibility");
+        error.code = "EEXIST";
+        throw error;
+      }
+      return originalOpenSync(target, flags, ...args);
+    };
+    const result = journal.transition(input);
+    assert.equal(result.record.state, "pre_action");
+    assert.equal(transientExists, 0);
+    assert.equal(waitCalls, 2);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.rmSync(baseDir, { recursive: true, force: true });
+  }
+}
+
+function testExhaustedLockCleanupDoesNotInvalidateCommittedTransition() {
+  const baseDir = makeTempDir();
+  const originalUnlinkSync = fs.unlinkSync;
+  try {
+    fs.unlinkSync = (target, ...args) => {
+      if (String(target).endsWith(".lock")) {
+        const error = new Error("persistent Windows lock cleanup contention");
+        error.code = "EPERM";
+        throw error;
+      }
+      return originalUnlinkSync(target, ...args);
+    };
+    const journal = createChatActionJournal({
+      baseDir,
+      lockOptions: {
+        fileOperationAttempts: 2,
+        fileOperationRetryMinMs: 0,
+        fileOperationRetryMaxMs: 0,
+        acquireTimeoutMs: 0,
+        sleep: () => {}
+      }
+    });
+    const input = {
+      scope: "account-a/profile-default",
+      candidateId: "candidate-released-lock-recovery",
+      greeting: "hello",
+      runId: "run-a"
+    };
+    const committed = journal.transition({ ...input, state: "pre_action" });
+    const lockPath = `${committed.file_path}.lock`;
+    assert.equal(committed.record.state, "pre_action");
+    assert.equal(fs.existsSync(lockPath), true);
+    const leftover = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    assert.equal(leftover.released, true);
+
+    fs.unlinkSync = originalUnlinkSync;
+    const advanced = journal.transition({
+      ...input,
+      state: "greeting_send_in_flight",
+      expectedRevision: committed.record.revision
+    });
+    assert.equal(advanced.record.state, "greeting_send_in_flight");
+    assert.equal(advanced.record.revision, 2);
+    assert.equal(fs.existsSync(lockPath), false);
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
     fs.rmSync(baseDir, { recursive: true, force: true });
   }
 }
@@ -362,6 +701,7 @@ function testRevisionCasSurvivesFixedClockAndLegacyRecord() {
 assert.deepEqual(CHAT_ACTION_STATES, [
   "pre_action",
   "greeting_send_in_flight",
+  "greeting_assumed_sent",
   "greeting_confirmed",
   "request_in_flight",
   "request_confirmed",
@@ -371,8 +711,13 @@ testStableIdentityRequiresScopeAndCandidateId();
 testGreetingIsHashedAndNeverStored();
 testFullStateSequenceIsSharedAcrossRunIdsAndIdempotent();
 testUnknownOutcomeCanOnlyResolveItsInFlightEffect();
+testGreetingInFlightCanBecomeAssumedSentAndOnlyThenConfirmed();
 testInvalidTransitionsAndGreetingConflictsFailClosed();
 testCorruptionAndConcurrentWriterLockFailClosed();
+testStaleLockRecoveryRequiresOldAgeAndProvablyDeadPid();
+testTransientWindowsRenameAndLockUnlinkErrorsAreRetried();
+testTransientExistingLockUsesBoundedWaitAndThenAcquires();
+testExhaustedLockCleanupDoesNotInvalidateCommittedTransition();
 testRevisionCasSurvivesFixedClockAndLegacyRecord();
 
 console.log("chat action journal tests passed");

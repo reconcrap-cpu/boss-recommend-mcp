@@ -87,8 +87,11 @@ export function buildWindowsDetachedWorkerCommand({
   workerScriptPath,
   domain,
   runId,
+  launchId,
   stdoutPath,
   stderrPath,
+  exitStatusPath,
+  recommendRuntimeHomePath = "",
   chatRuntimeHomePath = "",
   screenConfigPath = ""
 }) {
@@ -110,11 +113,18 @@ export function buildWindowsDetachedWorkerCommand({
     domain,
     "-RunId",
     runId,
+    "-LaunchId",
+    launchId,
     "-StdoutPath",
     stdoutPath,
     "-StderrPath",
-    stderrPath
+    stderrPath,
+    "-ExitStatusPath",
+    exitStatusPath
   ];
+  if (recommendRuntimeHomePath) {
+    args.push("-RecommendRuntimeHomePath", recommendRuntimeHomePath);
+  }
   if (chatRuntimeHomePath) {
     args.push("-ChatRuntimeHomePath", chatRuntimeHomePath);
   }
@@ -155,8 +165,11 @@ function launchWindowsDetachedWorker(options) {
     workerScriptPath,
     domain,
     runId,
+    launchId,
     stdoutPath,
     stderrPath,
+    exitStatusPath,
+    recommendRuntimeHomePath,
     chatRuntimeHomePath,
     screenConfigPath,
     wrapperScriptPath = WINDOWS_WRAPPER_PATH,
@@ -170,8 +183,11 @@ function launchWindowsDetachedWorker(options) {
     workerScriptPath,
     domain,
     runId,
+    launchId,
     stdoutPath,
     stderrPath,
+    exitStatusPath,
+    recommendRuntimeHomePath,
     chatRuntimeHomePath,
     screenConfigPath
   });
@@ -228,6 +244,7 @@ function launchPosixDetachedWorker({
   workerScriptPath,
   domain,
   runId,
+  launchId,
   stdoutPath,
   stderrPath,
   spawnImpl = spawn,
@@ -241,7 +258,9 @@ function launchPosixDetachedWorker({
       "--domain",
       domain,
       "--run-id",
-      runId
+      runId,
+      "--launch-id",
+      launchId
     ], {
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
@@ -260,16 +279,25 @@ export function launchDetachedWorker(options = {}) {
   const workerScriptPath = assertControlledPath(options.workerScriptPath, "workerScriptPath", platform);
   const stdoutPath = assertControlledPath(options.stdoutPath, "stdoutPath", platform);
   const stderrPath = assertControlledPath(options.stderrPath, "stderrPath", platform);
+  const exitStatusPath = assertControlledPath(
+    options.exitStatusPath || `${stderrPath}.exit.json`,
+    "exitStatusPath",
+    platform
+  );
   const domain = assertControlledToken(options.domain, "domain", SAFE_DOMAIN_PATTERN);
   if (!SAFE_DOMAINS.has(domain)) {
     throw createLauncherError("DETACHED_WORKER_ARGUMENT_INVALID", "domain is not supported by the detached launcher");
   }
   const runId = assertControlledToken(options.runId, "runId", SAFE_RUN_ID_PATTERN);
+  const launchId = assertControlledToken(options.launchId || runId, "launchId", SAFE_RUN_ID_PATTERN);
   const wrapperScriptPath = platform === "win32"
     ? assertControlledPath(options.wrapperScriptPath || WINDOWS_WRAPPER_PATH, "wrapperScriptPath", platform)
     : options.wrapperScriptPath;
   const chatRuntimeHomePath = options.chatRuntimeHomePath
     ? assertControlledPath(options.chatRuntimeHomePath, "chatRuntimeHomePath", platform)
+    : "";
+  const recommendRuntimeHomePath = options.recommendRuntimeHomePath
+    ? assertControlledPath(options.recommendRuntimeHomePath, "recommendRuntimeHomePath", platform)
     : "";
   const screenConfigPath = options.screenConfigPath
     ? assertControlledPath(options.screenConfigPath, "screenConfigPath", platform)
@@ -279,6 +307,7 @@ export function launchDetachedWorker(options = {}) {
     : ensureLogFile;
   prepareLogFile(stdoutPath);
   prepareLogFile(stderrPath);
+  fs.mkdirSync(path.dirname(exitStatusPath), { recursive: true });
   const normalized = {
     ...options,
     platform,
@@ -286,8 +315,11 @@ export function launchDetachedWorker(options = {}) {
     workerScriptPath,
     stdoutPath,
     stderrPath,
+    exitStatusPath,
+    recommendRuntimeHomePath,
     domain,
     runId,
+    launchId,
     wrapperScriptPath,
     chatRuntimeHomePath,
     screenConfigPath

@@ -8,6 +8,7 @@ export const CHAT_ACTION_JOURNAL_SCHEMA_VERSION = 1;
 export const CHAT_ACTION_STATES = Object.freeze([
   "pre_action",
   "greeting_send_in_flight",
+  "greeting_assumed_sent",
   "greeting_confirmed",
   "request_in_flight",
   "request_confirmed",
@@ -15,14 +16,39 @@ export const CHAT_ACTION_STATES = Object.freeze([
 ]);
 
 const CHAT_ACTION_STATE_SET = new Set(CHAT_ACTION_STATES);
+const RETRYABLE_WINDOWS_FILE_ERROR_CODES = new Set([
+  "EACCES",
+  "EBUSY",
+  "EEXIST",
+  "EPERM"
+]);
+const RELEASED_LOCK_TOKENS = new Map();
+const DEFAULT_LOCK_OPTIONS = Object.freeze({
+  acquireTimeoutMs: 2_000,
+  retryMinMs: 20,
+  retryMaxMs: 200,
+  staleMinAgeMs: 30_000,
+  fileOperationAttempts: 6,
+  fileOperationRetryMinMs: 10,
+  fileOperationRetryMaxMs: 200
+});
 const INITIAL_STATE = "pre_action";
 const ALLOWED_TRANSITIONS = Object.freeze({
   pre_action: new Set(["greeting_send_in_flight"]),
-  greeting_send_in_flight: new Set(["greeting_confirmed", "outcome_unknown"]),
+  greeting_send_in_flight: new Set([
+    "greeting_assumed_sent",
+    "greeting_confirmed",
+    "outcome_unknown"
+  ]),
+  greeting_assumed_sent: new Set(["greeting_confirmed"]),
   greeting_confirmed: new Set(["request_in_flight"]),
   request_in_flight: new Set(["request_confirmed", "outcome_unknown"]),
   request_confirmed: new Set(),
-  outcome_unknown: new Set(["greeting_confirmed", "request_confirmed"])
+  outcome_unknown: new Set([
+    "greeting_assumed_sent",
+    "greeting_confirmed",
+    "request_confirmed"
+  ])
 });
 
 function normalizeText(value) {
@@ -100,6 +126,100 @@ function cloneRecord(record) {
   return record == null ? null : JSON.parse(JSON.stringify(record));
 }
 
+function sleepSync(milliseconds) {
+  const duration = Math.max(0, Math.floor(Number(milliseconds) || 0));
+  if (duration <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, duration);
+}
+
+function finiteNonNegative(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+}
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : fallback;
+}
+
+function normalizeLockOptions(options = {}) {
+  const retryMinMs = finiteNonNegative(options.retryMinMs, DEFAULT_LOCK_OPTIONS.retryMinMs);
+  const retryMaxMs = Math.max(
+    retryMinMs,
+    finiteNonNegative(options.retryMaxMs, DEFAULT_LOCK_OPTIONS.retryMaxMs)
+  );
+  const fileOperationRetryMinMs = finiteNonNegative(
+    options.fileOperationRetryMinMs,
+    DEFAULT_LOCK_OPTIONS.fileOperationRetryMinMs
+  );
+  const fileOperationRetryMaxMs = Math.max(
+    fileOperationRetryMinMs,
+    finiteNonNegative(
+      options.fileOperationRetryMaxMs,
+      DEFAULT_LOCK_OPTIONS.fileOperationRetryMaxMs
+    )
+  );
+  return Object.freeze({
+    acquireTimeoutMs: finiteNonNegative(
+      options.acquireTimeoutMs,
+      DEFAULT_LOCK_OPTIONS.acquireTimeoutMs
+    ),
+    retryMinMs,
+    retryMaxMs,
+    staleMinAgeMs: finiteNonNegative(
+      options.staleMinAgeMs,
+      DEFAULT_LOCK_OPTIONS.staleMinAgeMs
+    ),
+    fileOperationAttempts: positiveInteger(
+      options.fileOperationAttempts,
+      DEFAULT_LOCK_OPTIONS.fileOperationAttempts
+    ),
+    fileOperationRetryMinMs,
+    fileOperationRetryMaxMs,
+    sleep: typeof options.sleep === "function" ? options.sleep : sleepSync,
+    isProcessAlive: typeof options.isProcessAlive === "function"
+      ? options.isProcessAlive
+      : (pid) => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          return error?.code !== "ESRCH";
+        }
+      }
+  });
+}
+
+function retryDelay(attempt, minimum, maximum) {
+  return Math.min(maximum, minimum * (2 ** Math.max(0, attempt - 1)));
+}
+
+function retryWindowsFileOperation(operation, {
+  attempts,
+  retryMinMs,
+  retryMaxMs,
+  sleep,
+  enoentIsSuccess = false
+}) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return operation();
+    } catch (error) {
+      if (enoentIsSuccess && error?.code === "ENOENT") return undefined;
+      lastError = error;
+      if (
+        !RETRYABLE_WINDOWS_FILE_ERROR_CODES.has(error?.code)
+        || attempt >= attempts
+      ) {
+        throw error;
+      }
+      sleep(retryDelay(attempt, retryMinMs, retryMaxMs));
+    }
+  }
+  throw lastError;
+}
+
 function readJsonRecord(filePath) {
   if (!fs.existsSync(filePath)) return null;
   try {
@@ -117,7 +237,7 @@ function readJsonRecord(filePath) {
   }
 }
 
-function writeJsonAtomic(filePath, payload) {
+function writeJsonAtomic(filePath, payload, lockOptions) {
   const directory = path.dirname(filePath);
   fs.mkdirSync(directory, { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -128,7 +248,15 @@ function writeJsonAtomic(filePath, payload) {
     fs.fsyncSync(fileHandle);
     fs.closeSync(fileHandle);
     fileHandle = null;
-    fs.renameSync(tempPath, filePath);
+    retryWindowsFileOperation(
+      () => fs.renameSync(tempPath, filePath),
+      {
+        attempts: lockOptions.fileOperationAttempts,
+        retryMinMs: lockOptions.fileOperationRetryMinMs,
+        retryMaxMs: lockOptions.fileOperationRetryMaxMs,
+        sleep: lockOptions.sleep
+      }
+    );
 
     // Directory fsync is unsupported on some Windows/filesystem combinations.
     // The record itself has already been atomically replaced, so this is best-effort.
@@ -144,48 +272,222 @@ function writeJsonAtomic(filePath, payload) {
   } finally {
     if (fileHandle != null) fs.closeSync(fileHandle);
     try {
-      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      if (fs.existsSync(tempPath)) {
+        retryWindowsFileOperation(
+          () => fs.unlinkSync(tempPath),
+          {
+            attempts: lockOptions.fileOperationAttempts,
+            retryMinMs: lockOptions.fileOperationRetryMinMs,
+            retryMaxMs: lockOptions.fileOperationRetryMaxMs,
+            sleep: lockOptions.sleep,
+            enoentIsSuccess: true
+          }
+        );
+      }
     } catch {
       // A leftover temp file is never treated as a committed journal record.
     }
   }
 }
 
-function acquireRecordLock(lockPath) {
-  let handle = null;
+function parseLockRecord(raw) {
+  const text = normalizeText(raw);
+  if (!text) return null;
   try {
-    handle = fs.openSync(lockPath, "wx", 0o600);
-    fs.writeFileSync(handle, `${process.pid}\n`, "utf8");
-    fs.fsyncSync(handle);
-    return handle;
-  } catch (error) {
-    if (handle != null) {
-      try {
-        fs.closeSync(handle);
-      } catch {}
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {}
-    }
-    if (error?.code === "EEXIST") {
-      throw journalError(
-        "CHAT_ACTION_JOURNAL_BUSY",
-        "The Boss chat action journal record is locked by another writer; outbound action must fail closed.",
-        { lock_path: lockPath }
-      );
-    }
-    throw error;
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const pid = Number(parsed.pid);
+    return {
+      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+      token: normalizeText(parsed.token) || null,
+      released: parsed.released === true
+    };
+  } catch {
+    const pid = Number(text);
+    return {
+      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+      token: null,
+      released: false
+    };
   }
 }
 
-function releaseRecordLock(lockPath, handle) {
+function lockSnapshot(lockPath) {
   try {
-    if (handle != null) fs.closeSync(handle);
+    const stat = fs.statSync(lockPath);
+    const raw = fs.readFileSync(lockPath, "utf8");
+    return {
+      raw,
+      record: parseLockRecord(raw),
+      ageMs: Math.max(0, Date.now() - stat.mtimeMs),
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    return { unreadable: true };
+  }
+}
+
+function sameLockSnapshot(first, second) {
+  if (!first || !second || first.unreadable || second.unreadable) return false;
+  return (
+    first.raw === second.raw
+    && first.dev === second.dev
+    && first.ino === second.ino
+    && first.size === second.size
+    && first.mtimeMs === second.mtimeMs
+  );
+}
+
+function canSafelyReclaimLock(lockPath, snapshot, lockOptions) {
+  const record = snapshot?.record;
+  if (!record) return false;
+  if (
+    record.released === true
+    || (
+      record.token
+      && RELEASED_LOCK_TOKENS.get(lockPath) === record.token
+    )
+  ) {
+    return true;
+  }
+  if (
+    snapshot.ageMs < lockOptions.staleMinAgeMs
+    || !Number.isSafeInteger(record.pid)
+    || record.pid <= 0
+    || record.pid === process.pid
+  ) {
+    return false;
+  }
+  try {
+    return lockOptions.isProcessAlive(record.pid) === false;
+  } catch {
+    return false;
+  }
+}
+
+function tryReclaimRecordLock(lockPath, lockOptions) {
+  const first = lockSnapshot(lockPath);
+  if (!canSafelyReclaimLock(lockPath, first, lockOptions)) return false;
+  const second = lockSnapshot(lockPath);
+  if (!sameLockSnapshot(first, second)) return false;
+  try {
+    retryWindowsFileOperation(
+      () => fs.unlinkSync(lockPath),
+      {
+        attempts: lockOptions.fileOperationAttempts,
+        retryMinMs: lockOptions.fileOperationRetryMinMs,
+        retryMaxMs: lockOptions.fileOperationRetryMaxMs,
+        sleep: lockOptions.sleep,
+        enoentIsSuccess: true
+      }
+    );
+    if (second?.record?.token) RELEASED_LOCK_TOKENS.delete(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireRecordLock(lockPath, lockOptions) {
+  const startedAt = Date.now();
+  let retryAttempt = 0;
+  while (true) {
+    let handle = null;
+    const token = crypto.randomUUID();
+    try {
+      handle = fs.openSync(lockPath, "wx", 0o600);
+      const metadata = {
+        schema_version: 1,
+        pid: process.pid,
+        token,
+        created_at_ms: Date.now(),
+        released: false
+      };
+      fs.writeFileSync(handle, `${JSON.stringify(metadata)}\n`, "utf8");
+      fs.fsyncSync(handle);
+      return { handle, token, metadata };
+    } catch (error) {
+      if (handle != null) {
+        try {
+          fs.closeSync(handle);
+        } catch {}
+        try {
+          retryWindowsFileOperation(
+            () => fs.unlinkSync(lockPath),
+            {
+              attempts: lockOptions.fileOperationAttempts,
+              retryMinMs: lockOptions.fileOperationRetryMinMs,
+              retryMaxMs: lockOptions.fileOperationRetryMaxMs,
+              sleep: lockOptions.sleep,
+              enoentIsSuccess: true
+            }
+          );
+        } catch {}
+      }
+      if (error?.code !== "EEXIST") throw error;
+      if (tryReclaimRecordLock(lockPath, lockOptions)) continue;
+      if (Date.now() - startedAt >= lockOptions.acquireTimeoutMs) {
+        throw journalError(
+          "CHAT_ACTION_JOURNAL_BUSY",
+          "The Boss chat action journal record remained locked after bounded waiting; outbound action must fail closed.",
+          {
+            lock_path: lockPath,
+            waited_ms: Date.now() - startedAt
+          }
+        );
+      }
+      retryAttempt += 1;
+      lockOptions.sleep(retryDelay(
+        retryAttempt,
+        lockOptions.retryMinMs,
+        lockOptions.retryMaxMs
+      ));
+    }
+  }
+}
+
+function releaseRecordLock(lockPath, lockOwner, lockOptions) {
+  const handle = lockOwner?.handle ?? null;
+  let releasedMarkerWritten = false;
+  try {
+    if (handle != null) {
+      try {
+        fs.ftruncateSync(handle, 0);
+        fs.writeSync(handle, `${JSON.stringify({
+          ...lockOwner.metadata,
+          released: true,
+          released_at_ms: Date.now()
+        })}\n`, 0, "utf8");
+        fs.fsyncSync(handle);
+        releasedMarkerWritten = true;
+      } catch {
+        // The process-local token still proves ownership for a later retry.
+        if (lockOwner?.token) RELEASED_LOCK_TOKENS.set(lockPath, lockOwner.token);
+      }
+      fs.closeSync(handle);
+    }
   } finally {
     try {
-      fs.unlinkSync(lockPath);
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+      retryWindowsFileOperation(
+        () => fs.unlinkSync(lockPath),
+        {
+          attempts: lockOptions.fileOperationAttempts,
+          retryMinMs: lockOptions.fileOperationRetryMinMs,
+          retryMaxMs: lockOptions.fileOperationRetryMaxMs,
+          sleep: lockOptions.sleep,
+          enoentIsSuccess: true
+        }
+      );
+      RELEASED_LOCK_TOKENS.delete(lockPath);
+    } catch {
+      // A released marker (and process-local token) makes the leftover lock
+      // safely reclaimable by the next writer. The committed journal update
+      // must not be converted into a global failure by Windows/AV cleanup lag.
+      if (releasedMarkerWritten) RELEASED_LOCK_TOKENS.delete(lockPath);
     }
   }
 }
@@ -202,7 +504,10 @@ function isAllowedTransition(record, nextState) {
   if (record.state === "outcome_unknown") {
     const origin = outcomeUnknownOrigin(record);
     return (
-      (origin === "greeting_send_in_flight" && nextState === "greeting_confirmed")
+      (
+        origin === "greeting_send_in_flight"
+        && ["greeting_assumed_sent", "greeting_confirmed"].includes(nextState)
+      )
       || (origin === "request_in_flight" && nextState === "request_confirmed")
     );
   }
@@ -243,8 +548,10 @@ const EVIDENCE_KEYS = new Set([
   "action_hit_test_last_hit_backend_node_id",
   "action_hit_test_reason",
   "active_candidate_id",
+  "assumption_policy",
   "ask_error",
   "ask_ok",
+  "confirmation_status",
   "confirm_confirmed",
   "confirm_error",
   "control_backend_node_id",
@@ -264,6 +571,7 @@ const EVIDENCE_KEYS = new Set([
   "message_observed",
   "operation_id",
   "pre_input_cdp_method",
+  "protected_from_replay",
   "request_confirmation_source",
   "request_ready_state_observed",
   "reason",
@@ -271,7 +579,8 @@ const EVIDENCE_KEYS = new Set([
   "request_baseline_count",
   "resume_attachment_after_count",
   "resume_attachment_baseline_count",
-  "send_method"
+  "send_method",
+  "input_dispatched"
 ]);
 
 function sanitizeEvidence(value = {}) {
@@ -346,7 +655,8 @@ export function createChatActionIdentity({ scope, candidateId } = {}) {
 
 export function createChatActionJournal({
   baseDir = defaultBaseDir(),
-  now = () => new Date()
+  now = () => new Date(),
+  lockOptions = {}
 } = {}) {
   const resolvedBaseDir = path.resolve(normalizeText(baseDir) || defaultBaseDir());
   if (typeof now !== "function") {
@@ -355,6 +665,7 @@ export function createChatActionJournal({
       "Boss chat action journal now must be a function."
     );
   }
+  const resolvedLockOptions = normalizeLockOptions(lockOptions);
 
   function entryPath(input = {}) {
     const identity = createChatActionIdentity(input);
@@ -385,7 +696,7 @@ export function createChatActionJournal({
     const filePath = path.join(resolvedBaseDir, `${identity.actionKey}.json`);
     const lockPath = `${filePath}.lock`;
     fs.mkdirSync(resolvedBaseDir, { recursive: true });
-    const lockHandle = acquireRecordLock(lockPath);
+    const lockHandle = acquireRecordLock(lockPath, resolvedLockOptions);
     try {
       const stored = readJsonRecord(filePath);
       const existing = stored
@@ -515,7 +826,7 @@ export function createChatActionJournal({
           evidence: safeEvidence
         }]
       };
-      writeJsonAtomic(filePath, record);
+      writeJsonAtomic(filePath, record, resolvedLockOptions);
       return {
         changed: true,
         idempotent: false,
@@ -523,7 +834,7 @@ export function createChatActionJournal({
         record: cloneRecord(record)
       };
     } finally {
-      releaseRecordLock(lockPath, lockHandle);
+      releaseRecordLock(lockPath, lockHandle, resolvedLockOptions);
     }
   }
 

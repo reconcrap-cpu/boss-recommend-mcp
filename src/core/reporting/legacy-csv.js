@@ -192,6 +192,10 @@ function firstBoolean(...values) {
 
 function actionResultText(row = {}) {
   const action = row.post_action || row.action || {};
+  const actionState = normalizeText(action.action_transaction?.state || action.state).toLowerCase();
+  if (action.assumed_sent === true || actionState === "greeting_assumed_sent") {
+    return "assumed_sent";
+  }
   if (action.requested === true && !action.skipped) {
     return firstText(action.reason, action.kind, action.type, "requested");
   }

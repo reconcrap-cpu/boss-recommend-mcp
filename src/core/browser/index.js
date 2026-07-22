@@ -52,12 +52,52 @@ const SAFE_READ_ONLY_CDP_REPLAY_METHODS = new Set([
   "Browser.getWindowBounds",
   "Browser.getWindowForTarget",
   "DOM.getDocument",
-  "Network.getResponseBody",
   "Page.getFrameTree",
   "Page.getLayoutMetrics",
   "Target.getTargetInfo",
   "Target.getTargets"
 ]);
+// A timeout is only safe when abandoning the command cannot create a duplicate
+// business action. This list is deliberately broader than the replay list:
+// several reads carry session-scoped node/request/search ids, so they may be
+// bounded and followed by a fresh session, but must never be replayed there.
+const SAFE_BOUNDED_CDP_METHODS = new Set([
+  "Accessibility.getFullAXTree",
+  "Accessibility.getPartialAXTree",
+  "Browser.getBrowserCommandLine",
+  "Browser.getVersion",
+  "Browser.getWindowBounds",
+  "Browser.getWindowForTarget",
+  "Browser.setWindowBounds",
+  "DOM.describeNode",
+  "DOM.discardSearchResults",
+  "DOM.getAttributes",
+  "DOM.getBoxModel",
+  "DOM.getDocument",
+  "DOM.getNodeForLocation",
+  "DOM.getOuterHTML",
+  "DOM.getSearchResults",
+  "DOM.performSearch",
+  "DOM.pushNodesByBackendIdsToFrontend",
+  "DOM.querySelector",
+  "DOM.querySelectorAll",
+  "DOM.scrollIntoViewIfNeeded",
+  "Network.getResponseBody",
+  "Network.setCacheDisabled",
+  "Page.bringToFront",
+  "Page.captureScreenshot",
+  "Page.getFrameTree",
+  "Page.getLayoutMetrics",
+  "Target.getTargetInfo",
+  "Target.getTargets"
+]);
+export const DEFAULT_CDP_METHOD_TIMEOUT_MS = 30_000;
+export const DEFAULT_CDP_RECONNECT_TIMEOUT_MS = 20_000;
+export const DEFAULT_CDP_CONNECTION_TIMEOUT_MS = 15_000;
+export const DEFAULT_CDP_CLOSE_TIMEOUT_MS = 3_000;
+export const DEFAULT_CDP_METHOD_LOG_LIMIT = 4096;
+const CDP_METHOD_LOG_RETENTION_RATIO = 0.75;
+const cdpMethodLogStats = new WeakMap();
 const BOSS_LOGIN_DOM_SELECTORS = [
   ".login-box",
   ".login-form",
@@ -368,25 +408,180 @@ function methodName(domain, method) {
   return `${String(domain)}.${String(method)}`;
 }
 
-function recordMethod(methodLog, method, metadata = {}) {
-  if (Array.isArray(methodLog)) {
-    methodLog.push({ method, at: nowIso(), ...metadata });
+function normalizeCdpTimeoutMs(value, fallback) {
+  if (value === 0 || value === "0") return 0;
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed > 0) return Math.max(1, Math.floor(parsed));
+  return Math.max(1, Math.floor(Number(fallback) || 1));
+}
+
+export function isSafeBoundedCdpMethod(method) {
+  const canonicalMethod = String(method || "").replace(/:retry_after_reconnect$/, "");
+  if (canonicalMethod.startsWith("Input.")) return false;
+  const [domain, operation] = canonicalMethod.split(".");
+  if (operation === "enable" && ALLOWED_CDP_DOMAINS.has(domain)) return true;
+  return SAFE_BOUNDED_CDP_METHODS.has(canonicalMethod);
+}
+
+function createCdpTimeoutError({ code, label, timeoutMs, method = null }) {
+  const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+  error.name = "CdpTimeoutError";
+  error.code = code;
+  error.cdp_timeout = true;
+  error.cdp_timeout_ms = timeoutMs;
+  if (method) error.cdp_method = method;
+  return error;
+}
+
+function runWithCdpDeadline(operation, {
+  timeoutMs,
+  code = "CDP_METHOD_TIMEOUT",
+  label = "CDP operation",
+  method = null,
+  onTimeout = null,
+  onLateResolve = null
+} = {}) {
+  const normalizedTimeoutMs = normalizeCdpTimeoutMs(timeoutMs, DEFAULT_CDP_METHOD_TIMEOUT_MS);
+  if (normalizedTimeoutMs === 0) {
+    return Promise.resolve().then(operation);
+  }
+  let expired = false;
+  let timer = null;
+  const source = Promise.resolve().then(operation);
+  // Promise.race alone leaves a late rejection without useful ownership. Keep
+  // explicit handlers so a timed-out CRI promise can settle later without an
+  // unhandled rejection, and so late-created clients can be closed.
+  source.then(
+    (value) => {
+      if (expired && typeof onLateResolve === "function") {
+        Promise.resolve().then(() => onLateResolve(value)).catch(() => {});
+      }
+    },
+    () => {}
+  );
+  return new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      if (typeof onTimeout === "function") {
+        try {
+          onTimeout();
+        } catch {}
+      }
+      reject(createCdpTimeoutError({
+        code,
+        label,
+        timeoutMs: normalizedTimeoutMs,
+        method
+      }));
+    }, normalizedTimeoutMs);
+    source.then(
+      (value) => {
+        if (expired) return;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (expired) return;
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+function createCdpMethodLogStats(methodLog = []) {
+  const methodCounts = new Map();
+  const forbiddenMethods = new Set();
+  let runtimeDomainMethodCount = 0;
+  let forbiddenMethodCount = 0;
+  for (const entry of methodLog) {
+    const method = String(entry?.method || "");
+    methodCounts.set(method, (methodCounts.get(method) || 0) + 1);
+    const canonicalMethod = method.replace(/:retry_after_reconnect$/, "");
+    if (canonicalMethod.split(".")[0] === "Runtime") runtimeDomainMethodCount += 1;
+    if (isForbiddenMethod(canonicalMethod)) {
+      forbiddenMethodCount += 1;
+      forbiddenMethods.add(canonicalMethod);
+    }
+  }
+  return {
+    totalCount: methodLog.length,
+    runtimeDomainMethodCount,
+    forbiddenMethodCount,
+    forbiddenMethods,
+    methodCounts
+  };
+}
+
+function ensureCdpMethodLogStats(methodLog = []) {
+  let stats = cdpMethodLogStats.get(methodLog);
+  if (!stats) {
+    stats = createCdpMethodLogStats(methodLog);
+    cdpMethodLogStats.set(methodLog, stats);
+  }
+  return stats;
+}
+
+function recordMethod(methodLog, method, metadata = {}, { maxEntries = DEFAULT_CDP_METHOD_LOG_LIMIT } = {}) {
+  if (!Array.isArray(methodLog)) return;
+  const stats = ensureCdpMethodLogStats(methodLog);
+  const normalizedMethod = String(method || "");
+  const canonicalMethod = normalizedMethod.replace(/:retry_after_reconnect$/, "");
+  stats.totalCount += 1;
+  stats.methodCounts.set(normalizedMethod, (stats.methodCounts.get(normalizedMethod) || 0) + 1);
+  if (canonicalMethod.split(".")[0] === "Runtime") stats.runtimeDomainMethodCount += 1;
+  if (isForbiddenMethod(canonicalMethod)) {
+    stats.forbiddenMethodCount += 1;
+    stats.forbiddenMethods.add(canonicalMethod);
+  }
+  methodLog.push({ method: normalizedMethod, at: nowIso(), ...metadata });
+  const normalizedLimit = Math.max(1, Math.floor(Number(maxEntries) || DEFAULT_CDP_METHOD_LOG_LIMIT));
+  if (methodLog.length > normalizedLimit) {
+    const retainedCount = Math.max(1, Math.floor(normalizedLimit * CDP_METHOD_LOG_RETENTION_RATIO));
+    methodLog.splice(0, methodLog.length - retainedCount);
   }
 }
 
+export function getCdpMethodLogStats(methodLog = []) {
+  if (!Array.isArray(methodLog)) {
+    return {
+      total_count: 0,
+      retained_count: 0,
+      runtime_domain_method_count: 0,
+      forbidden_method_count: 0,
+      forbidden_methods: [],
+      method_summary: {}
+    };
+  }
+  const stats = cdpMethodLogStats.get(methodLog) || createCdpMethodLogStats(methodLog);
+  return {
+    total_count: Math.max(stats.totalCount, methodLog.length),
+    retained_count: methodLog.length,
+    runtime_domain_method_count: stats.runtimeDomainMethodCount,
+    forbidden_method_count: stats.forbiddenMethodCount,
+    forbidden_methods: [...stats.forbiddenMethods],
+    method_summary: Object.fromEntries(stats.methodCounts)
+  };
+}
+
 export function assertNoForbiddenCdpCalls(methodLog = []) {
-  const forbidden = methodLog.filter((entry) => isForbiddenMethod(entry?.method));
-  if (forbidden.length > 0) {
-    const methods = forbidden.map((entry) => entry.method).join(", ");
+  const stats = getCdpMethodLogStats(methodLog);
+  const retainedForbiddenMethods = methodLog
+    .map((entry) => String(entry?.method || "").replace(/:retry_after_reconnect$/, ""))
+    .filter((method) => isForbiddenMethod(method));
+  const forbiddenMethods = [...new Set([
+    ...stats.forbidden_methods,
+    ...retainedForbiddenMethods
+  ])];
+  if (forbiddenMethods.length > 0) {
+    const methods = forbiddenMethods.join(", ");
     throw new Error(`Forbidden CDP methods were used: ${methods}`);
   }
   return {
     verified: true,
     proof: "method_log_inspection",
-    method_log_count: methodLog.length,
-    runtime_domain_method_count: methodLog.filter((entry) => (
-      String(entry?.method || "").replace(/:retry_after_reconnect$/, "").split(".")[0] === "Runtime"
-    )).length,
+    method_log_count: stats.total_count,
+    runtime_domain_method_count: stats.runtime_domain_method_count,
     forbidden_method_count: 0
   };
 }
@@ -1023,12 +1218,21 @@ function execFileText(file, args = [], { timeoutMs = 5000, maxBuffer = 1024 * 10
 
 async function inspectChromeCommandLineViaCdp({
   host = DEFAULT_CHROME_HOST,
-  port = DEFAULT_CHROME_PORT
+  port = DEFAULT_CHROME_PORT,
+  timeoutMs = DEFAULT_CDP_CONNECTION_TIMEOUT_MS
 } = {}) {
   let client = null;
   try {
-    client = await CDP({ host, port });
-    const result = await client.Browser.getBrowserCommandLine();
+    client = await openRawChromeCdpClient({ host, port }, timeoutMs);
+    const result = await runWithCdpDeadline(
+      () => client.Browser.getBrowserCommandLine(),
+      {
+        timeoutMs,
+        code: "CDP_METHOD_TIMEOUT",
+        label: "Browser.getBrowserCommandLine",
+        method: "Browser.getBrowserCommandLine"
+      }
+    );
     const args = parseChromeCommandLineArgs(result?.arguments || result?.commandLine || result?.command_line || []);
     if (args.length === 0) {
       return {
@@ -1052,7 +1256,7 @@ async function inspectChromeCommandLineViaCdp({
     };
   } finally {
     if (client) {
-      await client.close().catch(() => {});
+      await closeCdpClientWithDeadline(client).catch(() => {});
     }
   }
 }
@@ -1264,14 +1468,22 @@ export async function closeChromeDebugInstance({
   try {
     let client = null;
     try {
-      client = await CDP({ host, port });
+      client = await openRawChromeCdpClient({ host, port }, timeoutMs);
       if (typeof client?.Browser?.close !== "function") {
         throw new Error("Browser.close is not available");
       }
       browserCloseAttempted = true;
-      await client.Browser.close();
+      await runWithCdpDeadline(
+        () => client.Browser.close(),
+        {
+          timeoutMs,
+          code: "CDP_BROWSER_CLOSE_TIMEOUT",
+          label: "Browser.close",
+          method: "Browser.close"
+        }
+      );
     } finally {
-      if (client) await client.close().catch(() => {});
+      if (client) await closeCdpClientWithDeadline(client).catch(() => {});
     }
   } catch (error) {
     browserCloseError = error?.message || String(error || "");
@@ -1600,19 +1812,37 @@ export async function ensureChromeDebugPort({
 export async function openChromeTarget({
   host = DEFAULT_CHROME_HOST,
   port = DEFAULT_CHROME_PORT,
-  url
+  url,
+  timeoutMs = DEFAULT_CDP_CONNECTION_TIMEOUT_MS,
+  _fetch = fetch
 } = {}) {
   const encodedUrl = encodeURIComponent(url || "about:blank");
   const endpoint = `http://${host}:${port}/json/new?${encodedUrl}`;
   const methods = ["PUT", "GET"];
   let lastError = null;
   for (const method of methods) {
+    const abortController = new AbortController();
     try {
-      const response = await fetch(endpoint, { method });
+      const response = await runWithCdpDeadline(
+        () => _fetch(endpoint, { method, signal: abortController.signal }),
+        {
+          timeoutMs,
+          code: "CDP_OPEN_TARGET_TIMEOUT",
+          label: `DevTools /json/new ${method}`,
+          onTimeout: () => abortController.abort()
+        }
+      );
       if (response.ok) {
         let payload = null;
         try {
-          payload = await response.json();
+          payload = await runWithCdpDeadline(
+            () => response.json(),
+            {
+              timeoutMs,
+              code: "CDP_OPEN_TARGET_RESPONSE_TIMEOUT",
+              label: "DevTools /json/new response"
+            }
+          );
         } catch {}
         return {
           ok: true,
@@ -1622,8 +1852,27 @@ export async function openChromeTarget({
         };
       }
       lastError = new Error(`DevTools /json/new returned ${response.status}`);
+      // Only an explicit method rejection proves PUT did not create a target.
+      // Transport failures and ambiguous statuses must not be retried through
+      // GET because /json/new itself is state-changing.
+      if (!(method === "PUT" && Number(response.status) === 405)) break;
     } catch (error) {
-      lastError = error;
+      if (error?.code === "CDP_OPEN_TARGET_TIMEOUT") {
+        return {
+          ok: false,
+          method,
+          outcome_unknown: true,
+          replay_suppressed: true,
+          error: error.message
+        };
+      }
+      return {
+        ok: false,
+        method,
+        outcome_unknown: true,
+        replay_suppressed: true,
+        error: error?.message || String(error || "Failed to open Chrome target")
+      };
     }
   }
   return {
@@ -1782,14 +2031,19 @@ const SAFE_CDP_ERROR_FIELDS = [
   "cdp_reconnected_epoch",
   "cdp_replayed_after_reconnect",
   "cdp_replay_suppressed",
+  "cdp_reconnect_required",
   "cdp_outcome_unknown",
   "cdp_reconnect_error",
+  "cdp_timeout",
+  "cdp_timeout_ms",
+  "cdp_deadline_policy",
   "cdp_param_keys"
 ];
 
 function wrapNodeCdpError(error, { operation, method, nodeId }) {
   const wrapped = new Error(error?.message || String(error), { cause: error });
   wrapped.name = error?.name || "Error";
+  if (error?.code) wrapped.code = error.code;
   wrapped.node_id = nodeId;
   for (const field of SAFE_CDP_ERROR_FIELDS) {
     const value = error?.[field];
@@ -1813,7 +2067,32 @@ function shouldReplayCdpSetupCall(domain, method) {
     || (domain === "Network" && method === "setCacheDisabled");
 }
 
-export function createGuardedCdpClient(client, { methodLog = [], reconnect = null } = {}) {
+function closeCdpClientWithDeadline(client, timeoutMs = DEFAULT_CDP_CLOSE_TIMEOUT_MS) {
+  if (typeof client?.close !== "function") return Promise.resolve(false);
+  return runWithCdpDeadline(
+    () => client.close(),
+    {
+      timeoutMs,
+      code: "CDP_CLOSE_TIMEOUT",
+      label: "CDP client close"
+    }
+  ).then(() => true);
+}
+
+function scheduleBestEffortCdpClose(client, timeoutMs = DEFAULT_CDP_CLOSE_TIMEOUT_MS) {
+  Promise.resolve()
+    .then(() => closeCdpClientWithDeadline(client, timeoutMs))
+    .catch(() => {});
+}
+
+export function createGuardedCdpClient(client, {
+  methodLog = [],
+  methodLogLimit = DEFAULT_CDP_METHOD_LOG_LIMIT,
+  reconnect = null,
+  methodTimeoutMs = DEFAULT_CDP_METHOD_TIMEOUT_MS,
+  reconnectTimeoutMs = DEFAULT_CDP_RECONNECT_TIMEOUT_MS,
+  closeTimeoutMs = DEFAULT_CDP_CLOSE_TIMEOUT_MS
+} = {}) {
   let currentClient = client;
   let reconnectInFlight = null;
   let connectionEpoch = 1;
@@ -1824,7 +2103,16 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
     for (const call of setupCalls) {
       const fn = nextClient?.[call.domain]?.[call.method];
       if (typeof fn === "function") {
-        await fn.call(nextClient[call.domain], cloneCdpParams(call.params));
+        const fullMethod = methodName(call.domain, call.method);
+        await runWithCdpDeadline(
+          () => fn.call(nextClient[call.domain], cloneCdpParams(call.params)),
+          {
+            timeoutMs: methodTimeoutMs,
+            code: "CDP_METHOD_TIMEOUT",
+            label: fullMethod,
+            method: fullMethod
+          }
+        );
       }
     }
     for (const subscription of eventSubscriptions) {
@@ -1842,14 +2130,32 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
     }
     if (!reconnectInFlight) {
       const reconnectFromEpoch = connectionEpoch;
-      reconnectInFlight = Promise.resolve()
-        .then(() => reconnect())
-        .then(async (nextClient) => {
+      let candidateClient = null;
+      reconnectInFlight = runWithCdpDeadline(
+        async () => {
+          const nextClient = await reconnect();
           if (!nextClient) throw new Error("CDP reconnect returned no client");
+          candidateClient = nextClient;
           await replaySessionSetup(nextClient);
+          return nextClient;
+        },
+        {
+          timeoutMs: reconnectTimeoutMs,
+          code: "CDP_RECONNECT_TIMEOUT",
+          label: "CDP reconnect",
+          onLateResolve: (lateClient) => closeCdpClientWithDeadline(lateClient, closeTimeoutMs)
+        }
+      )
+        .then((nextClient) => {
           currentClient = nextClient;
           connectionEpoch = reconnectFromEpoch + 1;
           return nextClient;
+        })
+        .catch((error) => {
+          if (candidateClient && candidateClient !== currentClient) {
+            scheduleBestEffortCdpClose(candidateClient, closeTimeoutMs);
+          }
+          throw error;
         })
         .finally(() => {
           reconnectInFlight = null;
@@ -1864,29 +2170,79 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
     params = {}
   }) {
     const invocationEpoch = connectionEpoch;
-    const replayableAfterReconnect = isSafeReadOnlyCdpReplay(methodNameForLog);
-    const replayPolicy = replayableAfterReconnect ? "safe_read_only" : "not_allowlisted";
+    const [methodDomain, methodOperation] = String(methodNameForLog || "").split(".");
+    const setupCall = shouldReplayCdpSetupCall(methodDomain, methodOperation);
+    const readOnlyReplay = isSafeReadOnlyCdpReplay(methodNameForLog);
+    const replayableAfterReconnect = readOnlyReplay || setupCall;
+    const replayPolicy = readOnlyReplay
+      ? "safe_read_only"
+      : setupCall
+        ? "safe_idempotent_setup"
+        : "not_allowlisted";
+    const boundedMethod = isSafeBoundedCdpMethod(methodNameForLog);
+    const normalizedMethodTimeoutMs = normalizeCdpTimeoutMs(
+      methodTimeoutMs,
+      DEFAULT_CDP_METHOD_TIMEOUT_MS
+    );
+    const deadlinePolicy = boundedMethod
+      ? normalizedMethodTimeoutMs > 0 ? "bounded_safe_method" : "disabled"
+      : "unbounded_non_idempotent_or_unknown";
     recordMethod(methodLog, methodNameForLog, {
       connection_epoch: invocationEpoch,
-      replay_policy: replayPolicy
-    });
+      replay_policy: replayPolicy,
+      deadline_policy: deadlinePolicy,
+      ...(boundedMethod && normalizedMethodTimeoutMs > 0
+        ? { deadline_ms: normalizedMethodTimeoutMs }
+        : {})
+    }, { maxEntries: methodLogLimit });
+    const invokeOnce = (activeClient) => boundedMethod
+      ? runWithCdpDeadline(
+        () => invoke(activeClient),
+        {
+          timeoutMs: normalizedMethodTimeoutMs,
+          code: "CDP_METHOD_TIMEOUT",
+          label: methodNameForLog,
+          method: methodNameForLog
+        }
+      )
+      : Promise.resolve().then(() => invoke(activeClient));
     try {
-      return await invoke(currentClient);
+      return await invokeOnce(currentClient);
     } catch (error) {
       const closedTransport = isClosedCdpTransportError(error);
-      if (!closedTransport) {
+      const methodTimedOut = error?.code === "CDP_METHOD_TIMEOUT" && error?.cdp_timeout === true;
+      // Do not reconnect in the background after a method deadline. Some
+      // higher-level capture helpers have shorter budgets and may already have
+      // moved on; a delayed reconnect could otherwise invalidate a later
+      // candidate's freshly-bound DOM ids. The caller gets an explicit signal
+      // and may synchronously call __abandonAndReconnect at a safe boundary.
+      if (methodTimedOut) {
         throw annotateCdpError(error, methodNameForLog, params, {
           cdp_connection_epoch: invocationEpoch,
-          cdp_replay_policy: replayPolicy
+          cdp_outcome_unknown: false,
+          cdp_reconnect_required: true,
+          cdp_replay_policy: replayPolicy,
+          cdp_replay_suppressed: true,
+          cdp_deadline_policy: deadlinePolicy
         });
       }
+      if (!closedTransport && !methodTimedOut) {
+        throw annotateCdpError(error, methodNameForLog, params, {
+          cdp_connection_epoch: invocationEpoch,
+          cdp_replay_policy: replayPolicy,
+          cdp_deadline_policy: deadlinePolicy
+        });
+      }
+
+      const outcomeUnknown = !replayableAfterReconnect;
 
       if (typeof reconnect !== "function") {
         throw annotateCdpError(error, methodNameForLog, params, {
           cdp_connection_epoch: invocationEpoch,
-          cdp_outcome_unknown: !replayableAfterReconnect,
+          cdp_outcome_unknown: outcomeUnknown,
           cdp_replay_policy: replayPolicy,
-          cdp_replay_suppressed: !replayableAfterReconnect
+          cdp_replay_suppressed: !replayableAfterReconnect,
+          cdp_deadline_policy: deadlinePolicy
         });
       }
 
@@ -1895,21 +2251,23 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
       } catch (reconnectError) {
         throw annotateCdpError(error, methodNameForLog, params, {
           cdp_connection_epoch: invocationEpoch,
-          cdp_outcome_unknown: !replayableAfterReconnect,
+          cdp_outcome_unknown: outcomeUnknown,
           cdp_reconnect_error: String(reconnectError?.message || reconnectError || ""),
           cdp_replay_policy: replayPolicy,
-          cdp_replay_suppressed: !replayableAfterReconnect
+          cdp_replay_suppressed: !replayableAfterReconnect,
+          cdp_deadline_policy: deadlinePolicy
         });
       }
 
       if (!replayableAfterReconnect) {
         throw annotateCdpError(error, methodNameForLog, params, {
           cdp_connection_epoch: invocationEpoch,
-          cdp_outcome_unknown: true,
+          cdp_outcome_unknown: outcomeUnknown,
           cdp_reconnected: connectionEpoch !== invocationEpoch,
           cdp_reconnected_epoch: connectionEpoch,
           cdp_replay_policy: replayPolicy,
-          cdp_replay_suppressed: true
+          cdp_replay_suppressed: true,
+          cdp_deadline_policy: deadlinePolicy
         });
       }
 
@@ -1917,14 +2275,15 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
         connection_epoch: connectionEpoch,
         replay_of_connection_epoch: invocationEpoch,
         replay_policy: replayPolicy
-      });
+      }, { maxEntries: methodLogLimit });
       try {
-        return await invoke(currentClient);
+        return await invokeOnce(currentClient);
       } catch (retryError) {
         throw annotateCdpError(retryError, methodNameForLog, params, {
           cdp_connection_epoch: connectionEpoch,
           cdp_replayed_after_reconnect: true,
-          cdp_replay_policy: replayPolicy
+          cdp_replay_policy: replayPolicy,
+          cdp_deadline_policy: deadlinePolicy
         });
       }
     }
@@ -1947,7 +2306,7 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
       }
 
       if (property === "close") {
-        return async () => currentClient?.close?.();
+        return async () => closeCdpClientWithDeadline(currentClient, closeTimeoutMs);
       }
 
       if (property === "__rawClient") return currentClient;
@@ -1995,7 +2354,7 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
               recordMethod(methodLog, fullMethod, {
                 connection_epoch: connectionEpoch,
                 replay_policy: "event_subscription"
-              });
+              }, { maxEntries: methodLogLimit });
               return domainValue.call(domainTarget, params);
             }
             if (shouldReplayCdpSetupCall(property, method)) {
@@ -2026,18 +2385,52 @@ export function createGuardedCdpClient(client, { methodLog = [], reconnect = nul
 
 export async function listChromeTargets({
   host = DEFAULT_CHROME_HOST,
-  port = DEFAULT_CHROME_PORT
+  port = DEFAULT_CHROME_PORT,
+  timeoutMs = DEFAULT_CDP_CONNECTION_TIMEOUT_MS
 } = {}) {
-  return CDP.List({ host, port });
+  return runWithCdpDeadline(
+    () => CDP.List({ host, port }),
+    {
+      timeoutMs,
+      code: "CDP_TARGET_LIST_TIMEOUT",
+      label: `CDP target list ${host}:${port}`
+    }
+  );
+}
+
+function openRawChromeCdpClient(options, timeoutMs = DEFAULT_CDP_CONNECTION_TIMEOUT_MS) {
+  return runWithCdpDeadline(
+    () => CDP(options),
+    {
+      timeoutMs,
+      code: "CDP_CONNECTION_TIMEOUT",
+      label: "CDP connection",
+      onLateResolve: (lateClient) => closeCdpClientWithDeadline(lateClient)
+    }
+  );
+}
+
+export function selectReconnectChromeTarget(latestTargets = [], {
+  activeTarget = null,
+  matcher = () => false
+} = {}) {
+  const sameTarget = activeTarget?.id
+    ? latestTargets.find((item) => item?.id === activeTarget.id)
+    : null;
+  return sameTarget || latestTargets.find(matcher) || null;
 }
 
 export async function connectToChromeTarget({
   host = DEFAULT_CHROME_HOST,
   port = DEFAULT_CHROME_PORT,
   targetUrlIncludes,
-  targetPredicate
+  targetPredicate,
+  connectionTimeoutMs = DEFAULT_CDP_CONNECTION_TIMEOUT_MS,
+  methodTimeoutMs = DEFAULT_CDP_METHOD_TIMEOUT_MS,
+  reconnectTimeoutMs = DEFAULT_CDP_RECONNECT_TIMEOUT_MS,
+  closeTimeoutMs = DEFAULT_CDP_CLOSE_TIMEOUT_MS
 } = {}) {
-  const targets = await listChromeTargets({ host, port });
+  const targets = await listChromeTargets({ host, port, timeoutMs: connectionTimeoutMs });
   const matcher = normalizeTargetMatcher({ targetUrlIncludes, targetPredicate });
   const target = targets.find(matcher);
   if (!target) {
@@ -2045,24 +2438,40 @@ export async function connectToChromeTarget({
     throw new Error(`No matching Chrome target found on ${host}:${port}.\nAvailable targets:\n${urls}`);
   }
 
-  let rawClient = await CDP({ host, port, target });
+  let rawClient = await openRawChromeCdpClient(
+    { host, port, target },
+    connectionTimeoutMs
+  );
   let activeTarget = target;
   const methodLog = [];
   const client = createGuardedCdpClient(rawClient, {
     methodLog,
+    methodTimeoutMs,
+    reconnectTimeoutMs,
+    closeTimeoutMs,
     reconnect: async () => {
-      const latestTargets = await listChromeTargets({ host, port });
-      const nextTarget = activeTarget?.id
-        ? latestTargets.find((item) => item?.id === activeTarget.id)
-        : latestTargets.find(matcher);
+      const latestTargets = await listChromeTargets({
+        host,
+        port,
+        timeoutMs: connectionTimeoutMs
+      });
+      const nextTarget = selectReconnectChromeTarget(latestTargets, {
+        activeTarget,
+        matcher
+      });
       if (!nextTarget) {
         const urls = latestTargets.map((item) => item.url).filter(Boolean).join("\n");
         throw new Error(`No matching Chrome target found while reconnecting to ${host}:${port}.\nAvailable targets:\n${urls}`);
       }
+      const previousRawClient = rawClient;
+      const nextRawClient = await openRawChromeCdpClient(
+        { host, port, target: nextTarget },
+        connectionTimeoutMs
+      );
       try {
-        await rawClient.close();
+        await closeCdpClientWithDeadline(previousRawClient, closeTimeoutMs);
       } catch {}
-      rawClient = await CDP({ host, port, target: nextTarget });
+      rawClient = nextRawClient;
       activeTarget = nextTarget;
       return rawClient;
     }
@@ -2078,7 +2487,12 @@ export async function connectToChromeTarget({
     },
     methodLog,
     async close() {
-      await rawClient.close();
+      try {
+        return await closeCdpClientWithDeadline(rawClient, closeTimeoutMs);
+      } catch (error) {
+        if (error?.code === "CDP_CLOSE_TIMEOUT") return false;
+        throw error;
+      }
     }
   };
 }

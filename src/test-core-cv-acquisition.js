@@ -274,6 +274,11 @@ function testDedicatedImageCaptureRetryCounterIndependence() {
   assert.equal(tracker.consume("candidate-2").allowed, true);
   detailRecoveryCounts.set("candidate-2", 1);
   assert.equal(tracker.count("candidate-2"), 1);
+  assert.equal(tracker.size(), 2);
+  assert.equal(tracker.release("candidate-1"), true);
+  assert.equal(tracker.count("candidate-1"), 0);
+  assert.equal(tracker.hasBudget("candidate-1"), true);
+  assert.equal(tracker.size(), 1);
 }
 
 async function testConfirmedCheckpointAndLightweightReacquire() {

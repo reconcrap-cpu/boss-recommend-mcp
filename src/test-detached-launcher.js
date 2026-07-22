@@ -36,6 +36,7 @@ function testWindowsCimLaunchUsesOnlyControlledArguments() {
     runId: "mcp_chat_safe-123",
     stdoutPath: "C:\\Temp\\worker.stdout.log",
     stderrPath: "C:\\Temp\\worker.stderr.log",
+    recommendRuntimeHomePath: "C:\\Users\\tester\\.boss-recommend-mcp",
     chatRuntimeHomePath: "C:\\Users\\tester\\.boss-recommend-mcp\\boss-chat",
     screenConfigPath: "C:\\Users\\tester\\.boss-recommend-mcp\\screening-config.json",
     prepareLogFileImpl: (filePath) => preparedLogs.push(filePath),
@@ -68,6 +69,11 @@ function testWindowsCimLaunchUsesOnlyControlledArguments() {
   assert.match(script, /windows-detached-worker\.ps1/);
   assert.match(script, /-Domain chat/);
   assert.match(script, /-RunId mcp_chat_safe-123/);
+  assert.match(script, /-LaunchId mcp_chat_safe-123/);
+  assert.match(script, /-ExitStatusPath/);
+  assert.match(script, /C:\\Temp\\worker\.stderr\.log\.exit\.json/);
+  assert.match(script, /-RecommendRuntimeHomePath/);
+  assert.match(script, /C:\\Users\\tester\\\.boss-recommend-mcp/);
   assert.match(script, /-ChatRuntimeHomePath/);
   assert.match(script, /C:\\Users\\tester\\\.boss-recommend-mcp\\boss-chat/);
   assert.match(script, /-ScreenConfigPath/);
@@ -80,6 +86,9 @@ function testWindowsCimLaunchUsesOnlyControlledArguments() {
   );
   assert.match(wrapperSource, /EnvironmentVariables\['BOSS_CHAT_HOME'\]/);
   assert.match(wrapperSource, /EnvironmentVariables\['BOSS_RECOMMEND_SCREEN_CONFIG'\]/);
+  assert.match(wrapperSource, /EnvironmentVariables\['BOSS_RECOMMEND_HOME'\]/);
+  assert.match(wrapperSource, /Write-WorkerExitStatus/);
+  assert.match(wrapperSource, /--record-exit/);
 }
 
 function testWindowsCimFailuresAreExplicit() {
@@ -116,6 +125,184 @@ function testWindowsCimFailuresAreExplicit() {
     ...common,
     domain: "arbitrary"
   }), (error) => error?.code === "DETACHED_WORKER_ARGUMENT_INVALID");
+  assert.throws(() => launchDetachedWorker({
+    ...common,
+    exitStatusPath: "relative-exit.json"
+  }), (error) => error?.code === "DETACHED_WORKER_PATH_INVALID");
+}
+
+async function waitUntil(predicate, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+function removeTempDirBestEffort(tempDir) {
+  try {
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  } catch (error) {
+    if (process.platform !== "win32" || !["EPERM", "EBUSY"].includes(error?.code)) throw error;
+  }
+}
+
+async function testWindowsSupervisorPersistsObservedExitSidecar() {
+  if (process.platform !== "win32") return;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-windows-supervisor-test-"));
+  const workerScriptPath = path.join(tempDir, "exit-23-worker.mjs");
+  const stdoutPath = path.join(tempDir, "worker.stdout.log");
+  const stderrPath = path.join(tempDir, "worker.stderr.log");
+  const exitStatusPath = path.join(tempDir, "worker.exit.json");
+  fs.writeFileSync(workerScriptPath, "process.exit(23);\n", "utf8");
+  let child = null;
+  try {
+    child = launchDetachedWorker({
+      nodePath: process.execPath,
+      workerScriptPath,
+      domain: "recommend",
+      runId: "mcp_recommend_exit_sidecar_test",
+      stdoutPath,
+      stderrPath,
+      exitStatusPath
+    });
+    assert.equal(await waitUntil(() => fs.existsSync(exitStatusPath)), true);
+    const payload = JSON.parse(fs.readFileSync(exitStatusPath, "utf8"));
+    assert.equal(payload.schema_version, 1);
+    assert.equal(payload.domain, "recommend");
+    assert.equal(payload.run_id, "mcp_recommend_exit_sidecar_test");
+    assert.equal(payload.launch_id, "mcp_recommend_exit_sidecar_test");
+    assert.equal(payload.wrapper_pid, child.pid);
+    assert.equal(Number.isInteger(payload.worker_pid), true);
+    assert.equal(payload.exit_code, 23);
+    assert.equal(payload.nonzero, true);
+    assert.equal(payload.termination_kind, "observed_child_exit");
+    assert.equal(Number.isFinite(Date.parse(payload.started_at)), true);
+    assert.equal(Number.isFinite(Date.parse(payload.exited_at)), true);
+    assert.equal(
+      await waitUntil(() => {
+        try {
+          process.kill(child.pid, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }),
+      true
+    );
+    assert.equal(fs.readdirSync(tempDir).some((name) => name.includes(".tmp.")), false);
+  } finally {
+    removeTempDirBestEffort(tempDir);
+  }
+}
+
+async function testWindowsSupervisorPersistsForcedWorkerTermination() {
+  if (process.platform !== "win32") return;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-windows-supervisor-kill-test-"));
+  const workerScriptPath = path.join(tempDir, "long-running-worker.mjs");
+  const workerPidPath = path.join(tempDir, "worker.pid");
+  const stdoutPath = path.join(tempDir, "worker.stdout.log");
+  const stderrPath = path.join(tempDir, "worker.stderr.log");
+  const exitStatusPath = path.join(tempDir, "worker.exit.json");
+  fs.writeFileSync(workerScriptPath, [
+    'import fs from "node:fs";',
+    'if (process.argv.includes("--record-exit")) process.exit(0);',
+    `fs.writeFileSync(${JSON.stringify(workerPidPath)}, String(process.pid), "utf8");`,
+    'console.log("worker-ready");',
+    'setInterval(() => {}, 1000);'
+  ].join("\n"), "utf8");
+  let supervisor = null;
+  let workerPid = null;
+  try {
+    supervisor = launchDetachedWorker({
+      nodePath: process.execPath,
+      workerScriptPath,
+      domain: "recommend",
+      runId: "mcp_recommend_forced_worker_termination_test",
+      stdoutPath,
+      stderrPath,
+      exitStatusPath
+    });
+    assert.equal(await waitUntil(() => fs.existsSync(workerPidPath)), true);
+    workerPid = Number.parseInt(fs.readFileSync(workerPidPath, "utf8"), 10);
+    assert.equal(Number.isInteger(workerPid) && workerPid > 0, true);
+    assert.notEqual(workerPid, supervisor.pid);
+    assert.equal(
+      await waitUntil(() => fs.existsSync(stdoutPath) && fs.readFileSync(stdoutPath, "utf8").includes("worker-ready")),
+      true
+    );
+    process.kill(workerPid);
+    assert.equal(await waitUntil(() => fs.existsSync(exitStatusPath)), true);
+    const payload = JSON.parse(fs.readFileSync(exitStatusPath, "utf8"));
+    assert.equal(payload.domain, "recommend");
+    assert.equal(payload.run_id, "mcp_recommend_forced_worker_termination_test");
+    assert.equal(payload.launch_id, "mcp_recommend_forced_worker_termination_test");
+    assert.equal(payload.wrapper_pid, supervisor.pid);
+    assert.equal(payload.worker_pid, workerPid);
+    assert.notEqual(payload.exit_code, 0);
+    assert.equal(payload.nonzero, true);
+    assert.equal(payload.termination_kind, "observed_child_exit");
+    assert.equal(
+      await waitUntil(() => {
+        try {
+          process.kill(supervisor.pid, 0);
+          return false;
+        } catch {
+          return true;
+        }
+      }),
+      true
+    );
+  } finally {
+    if (workerPid) {
+      try { process.kill(workerPid); } catch {}
+    }
+    if (supervisor?.pid) {
+      try { process.kill(supervisor.pid); } catch {}
+    }
+    removeTempDirBestEffort(tempDir);
+  }
+}
+
+async function testWindowsSupervisorPersistsWrapperFailure() {
+  if (process.platform !== "win32") return;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-windows-supervisor-wrapper-test-"));
+  const missingNodePath = path.join(tempDir, "missing-node.exe");
+  const workerScriptPath = path.join(tempDir, "unused-worker.mjs");
+  const stdoutPath = path.join(tempDir, "worker.stdout.log");
+  const stderrPath = path.join(tempDir, "worker.stderr.log");
+  const exitStatusPath = path.join(tempDir, "worker.exit.json");
+  fs.writeFileSync(workerScriptPath, "process.exit(0);\n", "utf8");
+  let supervisor = null;
+  try {
+    supervisor = launchDetachedWorker({
+      nodePath: missingNodePath,
+      workerScriptPath,
+      domain: "recommend",
+      runId: "mcp_recommend_wrapper_failure_test",
+      stdoutPath,
+      stderrPath,
+      exitStatusPath
+    });
+    assert.equal(await waitUntil(() => fs.existsSync(exitStatusPath)), true);
+    const payload = JSON.parse(fs.readFileSync(exitStatusPath, "utf8"));
+    assert.equal(payload.domain, "recommend");
+    assert.equal(payload.run_id, "mcp_recommend_wrapper_failure_test");
+    assert.equal(payload.launch_id, "mcp_recommend_wrapper_failure_test");
+    assert.equal(payload.wrapper_pid, supervisor.pid);
+    assert.equal(payload.worker_pid, null);
+    assert.equal(payload.exit_code, 1);
+    assert.equal(payload.nonzero, true);
+    assert.equal(payload.termination_kind, "wrapper_error");
+    assert.equal(typeof payload.wrapper_error, "string");
+    assert.equal(payload.wrapper_error.length > 0, true);
+  } finally {
+    if (supervisor?.pid) {
+      try { process.kill(supervisor.pid); } catch {}
+    }
+    removeTempDirBestEffort(tempDir);
+  }
 }
 
 function testPosixLaunchRetainsExistingSpawnContract() {
@@ -149,6 +336,8 @@ function testPosixLaunchRetainsExistingSpawnContract() {
       "--domain",
       "chat",
       "--run-id",
+      "mcp_chat_safe",
+      "--launch-id",
       "mcp_chat_safe"
     ]);
     assert.equal(observed.options.detached, true);
@@ -167,4 +356,7 @@ testWindowsArgumentQuoting();
 testWindowsCimLaunchUsesOnlyControlledArguments();
 testWindowsCimFailuresAreExplicit();
 testPosixLaunchRetainsExistingSpawnContract();
+await testWindowsSupervisorPersistsObservedExitSidecar();
+await testWindowsSupervisorPersistsForcedWorkerTermination();
+await testWindowsSupervisorPersistsWrapperFailure();
 console.log("detached launcher tests passed");

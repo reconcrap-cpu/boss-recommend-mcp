@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -91,6 +90,7 @@ import {
   updateRunState,
   writeRunState
 } from "./run-state.js";
+import { launchDetachedWorker } from "./core/run/detached-launcher.js";
 
 const require = createRequire(import.meta.url);
 const { version: SERVER_VERSION } = require("../package.json");
@@ -173,6 +173,7 @@ const FRAMING_LINE = "line";
 const DETACHED_WORKER_FLAG = "--detached-worker";
 const DETACHED_WORKER_RUN_ID_FLAG = "--run-id";
 const DETACHED_WORKER_RESUME_FLAG = "--resume";
+const DETACHED_WORKER_SCRIPT = fileURLToPath(new URL("./detached-worker.js", import.meta.url));
 const AGENT_RUNTIME_HINT_KEYS = [
   "CODEX_CI",
   "CODEX_THREAD_ID",
@@ -190,7 +191,7 @@ const recommendTargetUrl = "https://www.zhipin.com/web/chat/recommend";
 
 let runPipelineImpl = null;
 let runSelfHealImpl = null;
-let spawnProcessImpl = spawn;
+let recommendDetachedWorkerLauncherImpl = launchDetachedWorker;
 let forceChatInProcForTests = false;
 let forceRecruitInProcForTests = false;
 const TERMINAL_RUN_STATES = new Set([RUN_STATE_COMPLETED, RUN_STATE_FAILED, RUN_STATE_CANCELED]);
@@ -411,7 +412,8 @@ function getRunArtifacts(runId) {
     run_state_path: path.join(getRunsDir(), `${normalizedRunId}.json`),
     checkpoint_path: path.join(getRunsDir(), `${normalizedRunId}.checkpoint.json`),
     worker_stdout_path: path.join(getRunsDir(), `${normalizedRunId}.worker.stdout.log`),
-    worker_stderr_path: path.join(getRunsDir(), `${normalizedRunId}.worker.stderr.log`)
+    worker_stderr_path: path.join(getRunsDir(), `${normalizedRunId}.worker.stderr.log`),
+    worker_exit_status_path: path.join(getRunsDir(), `${normalizedRunId}.worker.exit.json`)
   };
 }
 
@@ -507,6 +509,9 @@ function compactProgressForList(progress = {}) {
     "card_count",
     "detail_opened",
     "greet_count",
+    "greet_confirmed_count",
+    "greet_assumed_sent_count",
+    "greet_protected_no_replay_count",
     "post_action_clicked"
   ]) {
     if (Number.isFinite(progress?.[key])) {
@@ -590,7 +595,12 @@ function handleListRunsTool(args = {}) {
   const entries = fs.readdirSync(runsDir, { withFileTypes: true });
   const runs = [];
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".json") || entry.name.endsWith(".checkpoint.json")) continue;
+    if (
+      !entry.isFile()
+      || !entry.name.endsWith(".json")
+      || entry.name.endsWith(".checkpoint.json")
+      || entry.name.endsWith(".worker.exit.json")
+    ) continue;
     const filePath = path.join(runsDir, entry.name);
     const runId = entry.name.replace(/\.json$/, "");
     const raw = readRawRunState(runId);
@@ -2291,31 +2301,67 @@ function isMainModulePath(argvPath = "", modulePath = "") {
   return canonicalExecutablePath(argvPath) === canonicalExecutablePath(modulePath);
 }
 
-function launchDetachedRunWorker({ runId, resumeRun = false }) {
-  const childArgs = [thisFilePath, DETACHED_WORKER_FLAG, DETACHED_WORKER_RUN_ID_FLAG, String(runId)];
-  if (resumeRun) {
-    childArgs.push(DETACHED_WORKER_RESUME_FLAG);
-  }
+function launchDetachedRunWorker({
+  runId,
+  workspaceRoot = "",
+  launchId = createRunId(),
+  launchedAt = new Date().toISOString()
+}) {
   const artifacts = getRunArtifacts(runId);
   fs.mkdirSync(path.dirname(artifacts.worker_stdout_path), { recursive: true });
-  const stdoutFd = fs.openSync(artifacts.worker_stdout_path, "a");
-  const stderrFd = fs.openSync(artifacts.worker_stderr_path, "a");
-  let child;
-  try {
-    child = spawnProcessImpl(process.execPath, childArgs, {
-      detached: true,
-      stdio: ["ignore", stdoutFd, stderrFd],
-      windowsHide: true,
-      env: process.env
-    });
-  } finally {
-    fs.closeSync(stdoutFd);
-    fs.closeSync(stderrFd);
-  }
+  fs.closeSync(fs.openSync(artifacts.worker_stdout_path, "a"));
+  fs.closeSync(fs.openSync(artifacts.worker_stderr_path, "a"));
+  fs.rmSync(artifacts.worker_exit_status_path, { force: true });
+  const configResolution = resolveBossScreeningConfig(workspaceRoot || process.cwd());
+  const screenConfigPath = normalizeText(configResolution?.config_path || "");
+  const child = recommendDetachedWorkerLauncherImpl({
+    nodePath: process.execPath,
+    workerScriptPath: DETACHED_WORKER_SCRIPT,
+    domain: "recommend",
+    runId: String(runId),
+    launchId,
+    stdoutPath: artifacts.worker_stdout_path,
+    stderrPath: artifacts.worker_stderr_path,
+    exitStatusPath: artifacts.worker_exit_status_path,
+    recommendRuntimeHomePath: path.dirname(getRunsDir()),
+    screenConfigPath,
+    environment: process.env
+  });
   child.workerLogPaths = {
     stdoutPath: artifacts.worker_stdout_path,
-    stderrPath: artifacts.worker_stderr_path
+    stderrPath: artifacts.worker_stderr_path,
+    exitStatusPath: artifacts.worker_exit_status_path
   };
+  child.workerLauncher = {
+    mechanism: process.platform === "win32" ? "windows_cim_supervisor" : "posix_detached_spawn",
+    supervisorPid: process.platform === "win32" && Number.isInteger(child?.pid) ? child.pid : null,
+    workerPid: process.platform === "win32" ? null : (Number.isInteger(child?.pid) ? child.pid : null),
+    launchId,
+    launchedAt
+  };
+  if (typeof child?.once === "function") {
+    child.once("error", (error) => {
+      markDetachedWorkerFailed(runId, error, {
+        code: "RUN_WORKER_PROCESS_ERROR",
+        message: "Recommend detached worker process emitted an asynchronous error.",
+        workerLaunchId: launchId
+      });
+    });
+    child.once("exit", (exitCode, signal) => {
+      const normalizedSignal = normalizeText(signal);
+      const exitLabel = Number.isInteger(exitCode) ? `code=${exitCode}` : "code=unknown";
+      const signalLabel = normalizedSignal ? `, signal=${normalizedSignal}` : "";
+      const error = new Error(`Recommend detached worker exited before writing a terminal state (${exitLabel}${signalLabel}).`);
+      markDetachedWorkerFailed(runId, error, {
+        code: "RUN_WORKER_EXITED_EARLY",
+        workerExitCode: Number.isInteger(exitCode) ? exitCode : null,
+        workerSignal: normalizedSignal || null,
+        workerPid: Number.isInteger(child?.pid) ? child.pid : null,
+        workerLaunchId: launchId,
+        diagnosticSource: "posix_child_exit_event"
+      });
+    });
+  }
   if (typeof child?.unref === "function") {
     child.unref();
   }
@@ -2344,6 +2390,30 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
   const existing = readRawRunState(normalizedRunId) || {};
   const existingState = normalizeText(existing.state || existing.status);
   if (TERMINAL_RUN_STATES.has(existingState)) return existing;
+  const expectedLaunchId = normalizeText(existing.resume?.worker_launch_id || "");
+  const observedLaunchId = normalizeText(options.workerLaunchId || "");
+  const expectedSupervisorPid = Number(existing.resume?.worker_supervisor_pid);
+  const observedSupervisorPid = Number(options.supervisorPid);
+  const supervisorDiagnostic = normalizeText(options.diagnosticSource || "") === "windows_cim_supervisor";
+  if (
+    (expectedLaunchId && observedLaunchId && expectedLaunchId !== observedLaunchId)
+    || (expectedLaunchId && supervisorDiagnostic && observedLaunchId !== expectedLaunchId)
+    || (
+      Number.isInteger(expectedSupervisorPid)
+      && expectedSupervisorPid > 0
+      && (
+        supervisorDiagnostic
+          ? !Number.isInteger(observedSupervisorPid)
+            || observedSupervisorPid <= 0
+            || observedSupervisorPid !== expectedSupervisorPid
+          : Number.isInteger(observedSupervisorPid)
+            && observedSupervisorPid > 0
+            && observedSupervisorPid !== expectedSupervisorPid
+      )
+    )
+  ) {
+    return null;
+  }
 
   const now = new Date().toISOString();
   const artifacts = getRunArtifacts(normalizedRunId);
@@ -2351,6 +2421,28 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
     ...errorToDetachedWorkerPayload(error, options.message),
     ...(options.code ? { code: options.code } : {})
   };
+  const workerErrorCode = normalizeText(error?.code || "");
+  if (workerErrorCode && workerErrorCode !== errorPayload.code) {
+    errorPayload.worker_error_code = workerErrorCode;
+  }
+  if (Number.isInteger(options.workerExitCode)) {
+    errorPayload.worker_exit_code = options.workerExitCode;
+  }
+  if (normalizeText(options.workerSignal || "")) {
+    errorPayload.worker_signal = normalizeText(options.workerSignal);
+  }
+  if (Number.isInteger(options.workerPid) && options.workerPid > 0) {
+    errorPayload.worker_pid = options.workerPid;
+  }
+  if (Number.isInteger(options.supervisorPid) && options.supervisorPid > 0) {
+    errorPayload.supervisor_pid = options.supervisorPid;
+  }
+  if (normalizeText(options.diagnosticSource || "")) {
+    errorPayload.diagnostic_source = normalizeText(options.diagnosticSource);
+  }
+  if (observedLaunchId) {
+    errorPayload.worker_launch_id = observedLaunchId;
+  }
   if (existing.control?.cancel_requested === true && isShutdownLikeError(errorPayload)) {
     return finalizeRawRunStateAsCanceled(normalizedRunId, existing, {
       errorPayload,
@@ -2376,7 +2468,7 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
     stage: existing.stage || RUN_STAGE_PREFLIGHT,
     started_at: existing.started_at || now,
     updated_at: now,
-    heartbeat_at: now,
+    heartbeat_at: existing.heartbeat_at || now,
     completed_at: now,
     pid: Number.isInteger(existing.pid) && existing.pid > 0 ? existing.pid : process.pid,
     progress: existing.progress || {},
@@ -2393,12 +2485,33 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
       checkpoint_path: existing.resume?.checkpoint_path || artifacts.checkpoint_path,
       pause_control_path: existing.resume?.pause_control_path || artifacts.run_state_path,
       worker_stdout_path: artifacts.worker_stdout_path,
-      worker_stderr_path: artifacts.worker_stderr_path
+      worker_stderr_path: artifacts.worker_stderr_path,
+      worker_exit_status_path: artifacts.worker_exit_status_path
     },
     artifacts: {
       ...(existing.artifacts && typeof existing.artifacts === "object" ? existing.artifacts : {}),
       worker_stdout_path: artifacts.worker_stdout_path,
-      worker_stderr_path: artifacts.worker_stderr_path
+      worker_stderr_path: artifacts.worker_stderr_path,
+      worker_exit_status_path: artifacts.worker_exit_status_path
+    },
+    recovery: {
+      ...(existing.recovery && typeof existing.recovery === "object" ? existing.recovery : {}),
+      policy_version: 1,
+      classification: "worker_process_exited",
+      safe_for_outer_ai_agent: false,
+      recommended_action: "audit_durable_action_journals_then_start_one_reduced_target_replacement_only",
+      retryable: true,
+      worker_last_heartbeat_at: existing.recovery?.worker_last_heartbeat_at || existing.heartbeat_at || null,
+      reconciled_at: now,
+      reconciliation_reason: errorPayload.code,
+      automatic_restart_allowed: false,
+      requires_durable_action_journal_audit: true,
+      resume_failed_run_in_place_allowed: false,
+      constraints: [
+        "Never replay greeting_send_in_flight, outcome_unknown, pending, or incompletely bound post-action candidates.",
+        "Count exact unique durable greeting_confirmed and greeting_assumed_sent journals before computing a reduced replacement target; both are protected from replay.",
+        "Do not resume this terminal failed run in place; start at most one replacement after the audit."
+      ]
     },
     error: errorPayload,
     result
@@ -2786,15 +2899,46 @@ function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = proce
   return writeRunState(snapshot);
 }
 
-async function runDetachedWorker({ runId, resumeRun = false, workerPid = process.pid }) {
+async function waitForDetachedWorkerLaunchCommit(runId, launchId, timeoutMs = 15_000) {
+  const normalizedLaunchId = normalizeText(launchId);
+  const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 15_000);
+  while (Date.now() <= deadline) {
+    const snapshot = readRunState(runId);
+    if (!snapshot) {
+      return { ok: false, error: `run_id=${runId} not found` };
+    }
+    const state = normalizeText(snapshot.state || snapshot.status);
+    if (TERMINAL_RUN_STATES.has(state)) {
+      return { ok: false, error: `run_id=${runId} is already terminal (${state})` };
+    }
+    const expectedLaunchId = normalizeText(snapshot.resume?.worker_launch_id || "");
+    if (
+      (expectedLaunchId || normalizedLaunchId)
+      && expectedLaunchId !== normalizedLaunchId
+    ) {
+      return { ok: false, error: `run_id=${runId} detached worker launch identity does not match` };
+    }
+    if (!normalizedLaunchId || snapshot.resume?.worker_launch_committed === true) {
+      return { ok: true, snapshot };
+    }
+    await sleepMs(50);
+  }
+  return { ok: false, error: `run_id=${runId} detached worker launch was not committed` };
+}
+
+async function runDetachedWorker({
+  runId,
+  resumeRun = false,
+  workerPid = process.pid,
+  launchId = ""
+}) {
   const normalizedRunId = normalizeText(runId);
   if (!normalizedRunId) {
     return { ok: false, error: "run_id is required" };
   }
-  const snapshot = readRunState(normalizedRunId);
-  if (!snapshot) {
-    return { ok: false, error: `run_id=${normalizedRunId} not found` };
-  }
+  const launchCommit = await waitForDetachedWorkerLaunchCommit(normalizedRunId, launchId);
+  if (!launchCommit.ok) return launchCommit;
+  const snapshot = launchCommit.snapshot;
 
   const executionContext = resolveRunContext(snapshot);
   if (!executionContext) {
@@ -2816,14 +2960,39 @@ async function runDetachedWorker({ runId, resumeRun = false, workerPid = process
     return { ok: false, error: failedPayload.message };
   }
 
-  safeUpdateRunState(normalizedRunId, {
-    pid: Number.isInteger(workerPid) && workerPid > 0 ? workerPid : process.pid,
-    mode: RUN_MODE_ASYNC,
-    state: "queued",
-    last_message: resumeRun
-      ? "detached worker 已启动，准备恢复执行。"
-      : "detached worker 已启动，准备执行。"
+  const claimed = safeUpdateRunState(normalizedRunId, (current) => {
+    const currentState = normalizeText(current.state || current.status);
+    const expectedLaunchId = normalizeText(current.resume?.worker_launch_id || "");
+    if (
+      TERMINAL_RUN_STATES.has(currentState)
+      || ((expectedLaunchId || launchId) && expectedLaunchId !== normalizeText(launchId))
+      || (normalizeText(launchId) && current.resume?.worker_launch_committed !== true)
+    ) {
+      return {};
+    }
+    return {
+      pid: Number.isInteger(workerPid) && workerPid > 0 ? workerPid : process.pid,
+      mode: RUN_MODE_ASYNC,
+      state: "queued",
+      resume: {
+        worker_launch_id: expectedLaunchId || normalizeText(launchId) || null,
+        worker_node_pid: Number.isInteger(workerPid) && workerPid > 0 ? workerPid : process.pid,
+        worker_started_at: new Date().toISOString()
+      },
+      last_message: resumeRun
+        ? "detached worker 已启动，准备恢复执行。"
+        : "detached worker 已启动，准备执行。"
+    };
   });
+  if (
+    !claimed
+    || TERMINAL_RUN_STATES.has(normalizeText(claimed.state || claimed.status))
+    || (normalizeText(launchId) && claimed.resume?.worker_launch_committed !== true)
+    || ((normalizeText(claimed.resume?.worker_launch_id || "") || normalizeText(launchId))
+      && normalizeText(claimed.resume?.worker_launch_id || "") !== normalizeText(launchId))
+  ) {
+    return { ok: false, error: `run_id=${normalizedRunId} detached worker could not claim the authorized launch` };
+  }
 
   const started = await startRecommendPipelineRunTool({
     workspaceRoot: executionContext.workspaceRoot,
@@ -2876,6 +3045,8 @@ async function handleStartRunTool({ workspaceRoot, args }) {
 
   cleanupExpiredRuns();
   const runId = createDetachedRecommendRunId();
+  const workerLaunchId = createRunId();
+  const workerLaunchedAt = new Date().toISOString();
   try {
     initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
   } catch (error) {
@@ -2889,17 +3060,77 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     };
   }
 
+  const initialWorkerArtifacts = getRunArtifacts(runId);
+  const launchPreparedState = safeUpdateRunState(runId, {
+    resume: {
+      worker_stdout_path: initialWorkerArtifacts.worker_stdout_path,
+      worker_stderr_path: initialWorkerArtifacts.worker_stderr_path,
+      worker_exit_status_path: initialWorkerArtifacts.worker_exit_status_path,
+      worker_launcher: process.platform === "win32" ? "windows_cim_supervisor" : "posix_detached_spawn",
+      worker_launch_id: workerLaunchId,
+      worker_launched_at: workerLaunchedAt,
+      worker_launch_committed: false
+    }
+  });
+  if (normalizeText(launchPreparedState?.resume?.worker_launch_id || "") !== workerLaunchId) {
+    const failed = buildWorkerLaunchFailedPayload("无法持久化 detached worker launch identity，任务未启动。");
+    safeUpdateRunState(runId, {
+      state: RUN_STATE_FAILED,
+      stage: RUN_STAGE_PREFLIGHT,
+      last_message: failed.error.message,
+      error: failed.error,
+      result: failed
+    });
+    return failed;
+  }
+
   let worker;
   try {
-    worker = launchDetachedRunWorker({ runId });
-    const workerLogPaths = worker.workerLogPaths || {};
-    safeUpdateRunState(runId, {
-      pid: worker.pid || process.pid,
-      resume: {
-        worker_stdout_path: workerLogPaths.stdoutPath || getRunArtifacts(runId).worker_stdout_path,
-        worker_stderr_path: workerLogPaths.stderrPath || getRunArtifacts(runId).worker_stderr_path
-      }
+    worker = launchDetachedRunWorker({
+      runId,
+      workspaceRoot,
+      launchId: workerLaunchId,
+      launchedAt: workerLaunchedAt
     });
+    const workerLogPaths = worker.workerLogPaths || {};
+    const workerLauncher = worker.workerLauncher || {};
+    const launchCommittedState = safeUpdateRunState(runId, (current) => {
+      const currentState = normalizeText(current.state || current.status);
+      if (
+        TERMINAL_RUN_STATES.has(currentState)
+        || normalizeText(current.resume?.worker_launch_id || "") !== workerLaunchId
+      ) {
+        return {};
+      }
+      return {
+        pid: worker.pid || process.pid,
+        resume: {
+          worker_stdout_path: workerLogPaths.stdoutPath || getRunArtifacts(runId).worker_stdout_path,
+          worker_stderr_path: workerLogPaths.stderrPath || getRunArtifacts(runId).worker_stderr_path,
+          worker_exit_status_path: workerLogPaths.exitStatusPath || getRunArtifacts(runId).worker_exit_status_path,
+          worker_launcher: workerLauncher.mechanism || null,
+          worker_launch_id: workerLauncher.launchId || workerLaunchId,
+          worker_supervisor_pid: workerLauncher.supervisorPid || null,
+          worker_node_pid: workerLauncher.workerPid || null,
+          worker_launched_at: workerLauncher.launchedAt || workerLaunchedAt,
+          worker_launch_committed: true
+        }
+      };
+    });
+    if (
+      normalizeText(launchCommittedState?.resume?.worker_launch_id || "") !== workerLaunchId
+      || launchCommittedState?.resume?.worker_launch_committed !== true
+    ) {
+      const failed = buildWorkerLaunchFailedPayload("detached worker 已创建，但 launch commit 未能持久化；已禁止 worker 继续执行。");
+      safeUpdateRunState(runId, {
+        state: RUN_STATE_FAILED,
+        stage: RUN_STAGE_PREFLIGHT,
+        last_message: failed.error.message,
+        error: failed.error,
+        result: failed
+      });
+      return failed;
+    }
   } catch (error) {
     const failed = buildWorkerLaunchFailedPayload(error?.message || "无法启动 detached recommend worker。");
     safeUpdateRunState(runId, {
@@ -3483,6 +3714,14 @@ export function startServer() {
   });
 }
 
+export function runDetachedRecommendWorker(options = {}) {
+  return runDetachedWorker(options);
+}
+
+export function markDetachedRecommendWorkerFailed(runId, error, options = {}) {
+  return markDetachedWorkerFailed(runId, error, options);
+}
+
 export const __testables = {
   createToolsSchema,
   getConfiguredMcpToolset,
@@ -3493,7 +3732,29 @@ export const __testables = {
     return runDetachedWorker(options);
   },
   setSpawnProcessImplForTests(nextImpl) {
-    spawnProcessImpl = typeof nextImpl === "function" ? nextImpl : spawn;
+    recommendDetachedWorkerLauncherImpl = typeof nextImpl === "function"
+      ? (options) => nextImpl(
+          options.nodePath,
+          [
+            options.workerScriptPath,
+            "--domain",
+            options.domain,
+            "--run-id",
+            options.runId,
+            "--launch-id",
+            options.launchId
+          ],
+          {
+            detached: true,
+            stdio: ["ignore", options.stdoutPath, options.stderrPath],
+            windowsHide: true,
+            env: options.environment
+          }
+        )
+      : launchDetachedWorker;
+  },
+  setRecommendDetachedWorkerLauncherForTests(nextImpl) {
+    recommendDetachedWorkerLauncherImpl = typeof nextImpl === "function" ? nextImpl : launchDetachedWorker;
   },
   setRunPipelineImplForTests(nextImpl) {
     runPipelineImpl = typeof nextImpl === "function" ? nextImpl : null;

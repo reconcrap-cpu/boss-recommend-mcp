@@ -26,6 +26,9 @@ import { getRecommendRoots } from "./roots.js";
 
 const POST_ACTIONS = new Set(["none", "greet"]);
 const GREET_EXACT_LABEL_PATTERN = /^(?:打招呼|聊一聊|立即沟通(?:[\(（]\d+\s*[/／]\s*\d+[\)）])?|沟通)$/i;
+const RECOMMEND_NON_REPLAYABLE_INPUT_TIMEOUT_MS = 15_000;
+const RECOMMEND_INPUT_CLOSE_TIMEOUT_MS = 4_000;
+const RECOMMEND_INPUT_SETTLEMENT_TIMEOUT_MS = 2_000;
 export const RECOMMEND_DETAIL_ACTION_TEXT_SELECTORS = Object.freeze([
   "button",
   ".btn",
@@ -53,6 +56,127 @@ function uniqueByNode(candidates = []) {
 
 function lowerText(...parts) {
   return normalizeText(parts.filter(Boolean).join(" ")).toLowerCase();
+}
+
+function settleWithin(promise, timeoutMs) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(promise).then(
+      (value) => ({ settled: true, fulfilled: true, value }),
+      (error) => ({ settled: true, fulfilled: false, error })
+    ),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ settled: false }), timeoutMs);
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+export async function runRecommendNonReplayableInputWithDeadline(client, action, {
+  timeoutMs = RECOMMEND_NON_REPLAYABLE_INPUT_TIMEOUT_MS,
+  closeTimeoutMs = RECOMMEND_INPUT_CLOSE_TIMEOUT_MS,
+  settlementTimeoutMs = RECOMMEND_INPUT_SETTLEMENT_TIMEOUT_MS
+} = {}) {
+  if (typeof action !== "function") {
+    const error = new Error("Recommend non-replayable input action must be a function");
+    error.code = "RECOMMEND_ACTION_INPUT_INVALID";
+    throw error;
+  }
+  const normalizedTimeoutMs = Math.max(1, Number(timeoutMs) || RECOMMEND_NON_REPLAYABLE_INPUT_TIMEOUT_MS);
+  const startedAt = Date.now();
+  let timer = null;
+  let actionSettled = false;
+  const actionPromise = Promise.resolve()
+    .then(action)
+    .then(
+      (value) => {
+        actionSettled = true;
+        return value;
+      },
+      (error) => {
+        actionSettled = true;
+        throw error;
+      }
+    );
+  const first = await Promise.race([
+    actionPromise.then(
+      (value) => ({ type: "fulfilled", value }),
+      (error) => ({ type: "rejected", error })
+    ),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ type: "timeout" }), normalizedTimeoutMs);
+    })
+  ]);
+  if (timer) clearTimeout(timer);
+  if (first.type === "fulfilled") return first.value;
+  if (first.type === "rejected") throw first.error;
+
+  // The Input outcome is now unknown. Never replay it. Close the exact old
+  // transport, wait for the pending call to settle, and only then allow a new
+  // session. If containment cannot be proven, the caller must stop the run so
+  // a late release cannot land on a different candidate.
+  let closeResult = null;
+  let closeError = null;
+  if (typeof client?.close === "function") {
+    const close = await settleWithin(
+      Promise.resolve().then(() => client.close()),
+      Math.max(1, Number(closeTimeoutMs) || RECOMMEND_INPUT_CLOSE_TIMEOUT_MS)
+    );
+    if (close.settled && close.fulfilled && close.value !== false) {
+      closeResult = close.value ?? true;
+    } else {
+      closeError = close.settled
+        ? close.error || new Error("CDP close did not confirm containment")
+        : new Error("CDP close did not settle before the containment deadline");
+    }
+  } else {
+    closeError = new Error("CDP client does not expose a bounded close operation");
+  }
+
+  const settlement = actionSettled
+    ? { settled: true }
+    : await settleWithin(
+        actionPromise,
+        Math.max(1, Number(settlementTimeoutMs) || RECOMMEND_INPUT_SETTLEMENT_TIMEOUT_MS)
+      );
+  const transportContained = closeError == null && settlement.settled === true;
+  let reconnectResult = null;
+  let reconnectError = null;
+  if (transportContained && typeof client?.__abandonAndReconnect === "function") {
+    try {
+      reconnectResult = await client.__abandonAndReconnect({
+        reason: "recommend_non_replayable_input_timeout"
+      });
+    } catch (error) {
+      reconnectError = error;
+    }
+  }
+
+  const timeoutError = new Error(
+    `Recommend non-replayable Input did not settle within ${normalizedTimeoutMs}ms`
+  );
+  timeoutError.code = "RECOMMEND_ACTION_INPUT_TIMEOUT";
+  timeoutError.phase = "recommend:post-action-input";
+  timeoutError.cdp_method = "Input.dispatchMouseEvent";
+  timeoutError.cdp_timeout = true;
+  timeoutError.cdp_timeout_ms = normalizedTimeoutMs;
+  timeoutError.cdp_outcome_unknown = true;
+  timeoutError.cdp_replay_suppressed = true;
+  timeoutError.cdp_reconnect_required = reconnectResult == null;
+  timeoutError.recommend_input_dispatched = true;
+  timeoutError.recommend_input_transport_contained = transportContained;
+  timeoutError.recommend_input_transport_abandon_failed = !transportContained;
+  timeoutError.input_timeout_diagnostic = {
+    elapsed_ms: Date.now() - startedAt,
+    transport_close_confirmed: closeError == null,
+    pending_input_settled_after_close: settlement.settled === true,
+    reconnect_succeeded: reconnectResult?.reconnected === true,
+    reconnect_error: reconnectError?.message || null,
+    close_error: closeError?.message || null,
+    replay_suppressed: true
+  };
+  throw timeoutError;
 }
 
 function hasActiveClass(text) {
@@ -962,7 +1086,8 @@ export async function clickRecommendActionControl(client, control, {
   beforeFinalRefresh = null,
   beforeClick = null,
   beforeInput = null,
-  immediatelyBeforeInput = null
+  immediatelyBeforeInput = null,
+  inputTimeoutMs = RECOMMEND_NON_REPLAYABLE_INPUT_TIMEOUT_MS
 } = {}) {
   const greetQuota = control?.kind === "greet"
     ? assertGreetQuotaAvailable(control.greet_quota || control.label || "")
@@ -1197,10 +1322,21 @@ export async function clickRecommendActionControl(client, control, {
     failure.phase = failure.phase || "recommend:post-action-pre-input";
     throw failure;
   }
-  await clickPoint(client, clickCenter.x, clickCenter.y, {
-    humanRestEnabled: false,
-    moveBeforePress: false
-  });
+  try {
+    await runRecommendNonReplayableInputWithDeadline(
+      client,
+      () => clickPoint(client, clickCenter.x, clickCenter.y, {
+        humanRestEnabled: false,
+        moveBeforePress: false
+      }),
+      { timeoutMs: inputTimeoutMs }
+    );
+  } catch (error) {
+    if (error?.code === "RECOMMEND_ACTION_INPUT_TIMEOUT") {
+      error.recommend_action_control_hit_test = clickTargetProof;
+    }
+    throw error;
+  }
   return {
     clicked: true,
     kind: activeControl.kind,

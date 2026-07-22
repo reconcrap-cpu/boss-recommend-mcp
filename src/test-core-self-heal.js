@@ -547,7 +547,7 @@ async function testViewportGuardRejectsUnstableWindowResizeWithoutRatchetingBase
   assert.equal(guard.getStats().rebaselines, 0);
 }
 
-async function testViewportGuardTreatsUnreadableRootAsUnsafe() {
+async function testViewportGuardRecoversSingleUnreadableMeasurement() {
   const client = makeViewportFakeClient({
     widthSequence: [1280],
     heightSequence: [720],
@@ -556,21 +556,50 @@ async function testViewportGuardTreatsUnreadableRootAsUnsafe() {
   const guard = createViewportRunGuard({
     client,
     domain: "recommend",
-    repair: false
+    repair: false,
+    failureConfirmationDelayMs: 0
+  });
+  const rootState = { frame: 10 };
+
+  await guard.ensure(rootState, { phase: "baseline" });
+  const recovered = await guard.ensure(rootState, { phase: "unreadable_root" });
+
+  assert.equal(recovered.health.ok, true);
+  assert.equal(recovered.health.failureConfirmation.attempted, true);
+  assert.equal(recovered.health.failureConfirmation.attempts, 2);
+  assert.equal(recovered.health.failureConfirmation.transient_failure_recovered, true);
+  assert.equal(guard.getStats().failures, 0);
+  assert.equal(guard.getStats().unreadable_measurements, 1);
+}
+
+async function testViewportGuardRejectsPersistentUnreadableRoot() {
+  const client = makeViewportFakeClient({
+    widthSequence: [1280],
+    heightSequence: [720],
+    unreadableAt: [2, 3]
+  });
+  const guard = createViewportRunGuard({
+    client,
+    domain: "recommend",
+    repair: false,
+    failureConfirmationDelayMs: 0
   });
   const rootState = { frame: 10 };
 
   await guard.ensure(rootState, { phase: "baseline" });
   await assert.rejects(
-    () => guard.ensure(rootState, { phase: "unreadable_root" }),
+    () => guard.ensure(rootState, { phase: "persistently_unreadable_root" }),
     (error) => {
       assert.equal(error.code, "LIST_VIEWPORT_COLLAPSED");
       assert.equal(error.viewport_health.state.ok, false);
       assert.equal(error.viewport_health.state.measurementEvidence.contentRectReadable, false);
+      assert.equal(error.viewport_health.failureConfirmation.attempts, 2);
+      assert.equal(error.viewport_health.failureConfirmation.transient_failure_recovered, false);
       assert.match(error.viewport_health.error, /geometry is unreadable/i);
       return true;
     }
   );
+  assert.equal(guard.getStats().failures, 1);
   assert.equal(guard.getStats().unreadable_measurements, 1);
 }
 
@@ -922,7 +951,8 @@ await testViewportGuardDetectsCumulativeWidthLoss();
 await testViewportGuardDetectsCumulativeHeightLoss();
 await testViewportGuardRebaselinesOnlyForVerifiedWindowResize();
 await testViewportGuardRejectsUnstableWindowResizeWithoutRatchetingBaseline();
-await testViewportGuardTreatsUnreadableRootAsUnsafe();
+await testViewportGuardRecoversSingleUnreadableMeasurement();
+await testViewportGuardRejectsPersistentUnreadableRoot();
 await testViewportGuardReacquiresUnreadableRootsBeforeFailing();
 await testViewportGuardAcceptsFreshRootWithoutFalseRecovery();
 await testViewportGuardRepairsRealCollapseAfterUnreadableRoot();

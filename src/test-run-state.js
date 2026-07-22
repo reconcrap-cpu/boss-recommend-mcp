@@ -131,15 +131,42 @@ function testRunStateLifecycle() {
 
 function testRunStateCleanup() {
   withTempHome(() => {
-    const runId = createRunId();
-    writeRunState(createRunStateSnapshot({ runId, mode: RUN_MODE_ASYNC }));
-    const runFile = path.join(getRunsDir(), `${runId}.json`);
+    const terminalRunId = createRunId();
+    writeRunState(createRunStateSnapshot({
+      runId: terminalRunId,
+      mode: RUN_MODE_ASYNC,
+      state: RUN_STATE_COMPLETED
+    }));
+    const terminalRunFile = path.join(getRunsDir(), `${terminalRunId}.json`);
+    const activeStates = [RUN_STATE_QUEUED, RUN_STATE_RUNNING, RUN_STATE_PAUSED, "canceling"];
+    const activeFiles = [];
+    for (const state of activeStates) {
+      const runId = createRunId();
+      const runFile = path.join(getRunsDir(), `${runId}.json`);
+      if (state === "canceling") {
+        fs.writeFileSync(runFile, `${JSON.stringify({ run_id: runId, state, status: state })}\n`, "utf8");
+      } else {
+        writeRunState(createRunStateSnapshot({ runId, mode: RUN_MODE_ASYNC, state }));
+      }
+      const checkpointFile = path.join(getRunsDir(), `${runId}.checkpoint.json`);
+      const exitStatusFile = path.join(getRunsDir(), `${runId}.worker.exit.json`);
+      fs.writeFileSync(checkpointFile, `${JSON.stringify({ run_id: runId, cursor: 3 })}\n`, "utf8");
+      fs.writeFileSync(exitStatusFile, `${JSON.stringify({ run_id: runId, exit_code: null })}\n`, "utf8");
+      activeFiles.push(runFile, checkpointFile, exitStatusFile);
+    }
     const oldSeconds = Math.floor((Date.now() - 3 * 24 * 60 * 60 * 1000) / 1000);
-    fs.utimesSync(runFile, oldSeconds, oldSeconds);
+    for (const filePath of [terminalRunFile, ...activeFiles]) {
+      fs.utimesSync(filePath, oldSeconds, oldSeconds);
+    }
 
     const cleaned = cleanupExpiredRuns(1000);
-    assert.equal(cleaned.removed.some((item) => item.endsWith(`${runId}.json`)), true);
-    assert.equal(fs.existsSync(runFile), false);
+    assert.equal(cleaned.removed.includes(terminalRunFile), true);
+    assert.equal(fs.existsSync(terminalRunFile), false);
+    assert.equal(cleaned.preserved_active.length, activeFiles.length);
+    for (const filePath of activeFiles) {
+      assert.equal(fs.existsSync(filePath), true, `${filePath} should be preserved for an active run`);
+      assert.equal(cleaned.preserved_active.includes(filePath), true);
+    }
   });
 }
 

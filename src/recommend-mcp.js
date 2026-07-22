@@ -10,6 +10,7 @@ import {
   detectBossLoginState,
   enableDomains,
   FORBIDDEN_CDP_METHODS,
+  getCdpMethodLogStats,
   getMainFrameUrl,
   inspectChromeDebugCommandLine,
   isBossLoginUrl,
@@ -48,6 +49,10 @@ import {
   parseRecommendInstruction
 } from "./parser.js";
 import { getRunsDir } from "./run-state.js";
+import {
+  getCandidateResultJournalPath,
+  readCandidateResultJournal
+} from "./core/run/candidate-result-journal.js";
 import {
   resolveBossConfiguredOutputDir,
   resolveHumanBehaviorForRun,
@@ -618,17 +623,20 @@ function methodEvidenceFlags(methodSummaryValue = {}) {
 
 function buildPersistedCdpEvidence({ meta = {}, persisted = {} } = {}) {
   const hasLiveMethodLog = Array.isArray(meta.methodLog);
+  const liveMethodLogStats = hasLiveMethodLog
+    ? getCdpMethodLogStats(meta.methodLog)
+    : null;
   const persistedMethodLog = compactMethodLogForStatus(persisted.method_log);
   const methodLog = hasLiveMethodLog
     ? compactMethodLogForStatus(meta.methodLog)
     : persistedMethodLog;
   const persistedSummary = compactMethodSummaryForStatus(persisted.method_summary);
   const summary = hasLiveMethodLog
-    ? methodSummary(meta.methodLog)
+    ? compactMethodSummaryForStatus(liveMethodLogStats?.method_summary)
     : Object.keys(persistedSummary).length
       ? persistedSummary
       : methodSummary(methodLog);
-  const liveTotal = hasLiveMethodLog ? meta.methodLog.length : null;
+  const liveTotal = hasLiveMethodLog ? liveMethodLogStats?.total_count : null;
   const persistedTotal = Number(persisted.method_log_total);
   const methodLogTotal = Number.isInteger(liveTotal)
     ? liveTotal
@@ -675,6 +683,11 @@ function getRecommendRunArtifacts(runId) {
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
     worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
     worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
+    worker_exit_status_path: path.join(runsDir, `${normalized}.worker.exit.json`),
+    candidate_result_journal_path: getCandidateResultJournalPath({
+      runDir: runsDir,
+      runId: normalized
+    }),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
   };
@@ -835,6 +848,9 @@ function normalizeLegacyProgress(progress = {}, summary = null) {
     passed,
     skipped: Number.isInteger(progress.skipped) ? progress.skipped : Math.max(processed - passed, 0),
     greet_count: Number.isInteger(progress.greet_count) ? progress.greet_count : 0,
+    greet_confirmed_count: Number.isInteger(progress.greet_confirmed_count) ? progress.greet_confirmed_count : 0,
+    greet_assumed_sent_count: Number.isInteger(progress.greet_assumed_sent_count) ? progress.greet_assumed_sent_count : 0,
+    greet_protected_no_replay_count: Number.isInteger(progress.greet_protected_no_replay_count) ? progress.greet_protected_no_replay_count : 0,
     post_action_clicked: Number.isInteger(progress.post_action_clicked) ? progress.post_action_clicked : 0
   };
   if (Object.prototype.hasOwnProperty.call(normalized, "last_list_read_stale_diagnostic")) {
@@ -860,6 +876,75 @@ function normalizeLegacyProgress(progress = {}, summary = null) {
   return normalized;
 }
 
+function readRecommendWorkerExitStatus(artifacts, persisted = {}) {
+  const payload = artifacts?.worker_exit_status_path
+    ? readJsonFile(artifacts.worker_exit_status_path)
+    : null;
+  if (!payload || typeof payload !== "object") return null;
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  if (
+    payload.schema_version !== 1
+    || normalizeText(payload.domain).toLowerCase() !== "recommend"
+    || normalizeRunId(payload.run_id) !== runId
+  ) {
+    return null;
+  }
+  const wrapperPid = Number(payload.wrapper_pid);
+  const workerPid = payload.worker_pid === null ? null : Number(payload.worker_pid);
+  const launchId = normalizeText(payload.launch_id);
+  const expectedLaunchId = normalizeText(persisted.resume?.worker_launch_id);
+  const expectedWrapperPid = Number(persisted.resume?.worker_supervisor_pid);
+  const persistedPid = Number(persisted.pid);
+  if (!Number.isInteger(wrapperPid) || wrapperPid <= 0) return null;
+  if (workerPid !== null && (!Number.isInteger(workerPid) || workerPid <= 0)) return null;
+  if (expectedLaunchId && launchId !== expectedLaunchId) return null;
+  if (
+    Number.isInteger(expectedWrapperPid)
+    && expectedWrapperPid > 0
+    && wrapperPid !== expectedWrapperPid
+  ) {
+    return null;
+  }
+  if (
+    !expectedLaunchId
+    && (!Number.isInteger(expectedWrapperPid) || expectedWrapperPid <= 0)
+    && Number.isInteger(persistedPid)
+    && persistedPid > 0
+    && persistedPid !== wrapperPid
+    && persistedPid !== workerPid
+  ) {
+    return null;
+  }
+  const exitCode = Number(payload.exit_code);
+  const startedAt = normalizeText(payload.started_at);
+  const exitedAt = normalizeText(payload.exited_at);
+  const terminationKind = normalizeText(payload.termination_kind);
+  const startedAtMs = Date.parse(startedAt);
+  const exitedAtMs = Date.parse(exitedAt);
+  if (
+    !Number.isInteger(exitCode)
+    || !Number.isFinite(startedAtMs)
+    || !Number.isFinite(exitedAtMs)
+    || exitedAtMs < startedAtMs
+  ) return null;
+  if (!new Set(["observed_child_exit", "wrapper_error"]).has(terminationKind)) return null;
+  return {
+    schema_version: 1,
+    domain: "recommend",
+    run_id: runId,
+    launch_id: launchId || null,
+    wrapper_pid: wrapperPid,
+    worker_pid: workerPid,
+    started_at: startedAt,
+    exited_at: exitedAt,
+    exit_code: exitCode,
+    nonzero: payload.nonzero === true || exitCode !== 0,
+    termination_kind: terminationKind,
+    wrapper_error: normalizeText(payload.wrapper_error) || null,
+    diagnostic_source: "windows_cim_exit_sidecar"
+  };
+}
+
 const STATUS_COUNT_KEYS = [
   "processed",
   "screened",
@@ -868,6 +953,9 @@ const STATUS_COUNT_KEYS = [
   "skipped",
   "llm_screened",
   "greet_count",
+  "greet_confirmed_count",
+  "greet_assumed_sent_count",
+  "greet_protected_no_replay_count",
   "post_action_clicked",
   "image_capture_failed",
   "detail_open_failed",
@@ -1127,10 +1215,48 @@ function compactRecommendSummaryForStatus(summary) {
   }
   if (summary.target_url) compact.target_url = normalizeText(summary.target_url);
   if (summary.list_end_reason) compact.list_end_reason = normalizeText(summary.list_end_reason);
-  if (Array.isArray(summary.results)) {
-    compact.results_count = summary.results.length;
-  } else if (Number.isInteger(summary.results_count)) {
+  if (Number.isInteger(summary.results_count)) {
     compact.results_count = summary.results_count;
+  } else if (Array.isArray(summary.results)) {
+    compact.results_count = summary.results.length;
+  }
+  for (const key of [
+    "target_count",
+    "refresh_rounds",
+    "refresh_attempt_count",
+    "consecutive_refresh_attempts_without_progress",
+    "results_tail_limit"
+  ]) {
+    if (Number.isInteger(summary[key]) && summary[key] >= 0) compact[key] = summary[key];
+  }
+  if (summary.completion_reason) {
+    compact.completion_reason = normalizeText(summary.completion_reason);
+  }
+  for (const key of [
+    "target_reached",
+    "source_exhausted",
+    "source_exhaustion_verified",
+    "source_unverified_underfill",
+    "post_action_stopped",
+    "clean_completion",
+    "results_truncated",
+    "refresh_attempts_truncated"
+  ]) {
+    if (typeof summary[key] === "boolean") compact[key] = summary[key];
+  }
+  if (summary.candidate_result_journal && typeof summary.candidate_result_journal === "object") {
+    const journal = summary.candidate_result_journal;
+    compact.candidate_result_journal = {
+      journal_file: normalizeText(journal.journal_file),
+      raw_record_count: Number.isInteger(journal.raw_record_count) ? journal.raw_record_count : 0,
+      committed_count: Number.isInteger(journal.committed_count) ? journal.committed_count : 0,
+      superseded_record_count: Number.isInteger(journal.superseded_record_count)
+        ? journal.superseded_record_count
+        : Number.isInteger(journal.duplicate_count)
+          ? journal.duplicate_count
+          : 0,
+      tail_truncated: journal.tail_truncated === true
+    };
   }
   if (Array.isArray(summary.refresh_attempts)) {
     compact.refresh_attempt_count = summary.refresh_attempts.length;
@@ -1201,10 +1327,10 @@ function compactRecommendCheckpointForStatus(checkpoint) {
   if (checkpoint.updatedAt || checkpoint.updated_at) {
     compact.updatedAt = normalizeText(checkpoint.updatedAt || checkpoint.updated_at);
   }
-  if (Array.isArray(checkpoint.results)) {
-    compact.results_count = checkpoint.results.length;
-  } else if (Number.isInteger(checkpoint.results_count)) {
+  if (Number.isInteger(checkpoint.results_count)) {
     compact.results_count = checkpoint.results_count;
+  } else if (Array.isArray(checkpoint.results)) {
+    compact.results_count = checkpoint.results.length;
   }
   for (const key of STATUS_COUNT_KEYS) {
     if (Number.isInteger(checkpoint[key])) compact[key] = checkpoint[key];
@@ -1219,6 +1345,18 @@ function compactRecommendCheckpointForStatus(checkpoint) {
     const event = compactListReadStaleCheckpointEvent(checkpoint[key]);
     if (event) compact[key] = event;
   }
+  if (checkpoint.candidate_result_journal && typeof checkpoint.candidate_result_journal === "object") {
+    const journal = checkpoint.candidate_result_journal;
+    compact.candidate_result_journal = {
+      journal_file: normalizeText(journal.journal_file),
+      raw_record_count: Number.isInteger(journal.raw_record_count) ? journal.raw_record_count : 0,
+      committed_count: Number.isInteger(journal.committed_count) ? journal.committed_count : 0,
+      superseded_record_count: Number.isInteger(journal.superseded_record_count)
+        ? journal.superseded_record_count
+        : 0,
+      tail_truncated: journal.tail_truncated === true
+    };
+  }
   const domStaleForensic = compactDomStaleForensicForStatus(checkpoint.dom_stale_forensic);
   if (domStaleForensic) compact.dom_stale_forensic = domStaleForensic;
   const domStaleForensics = compactDomStaleForensicsForStatus(checkpoint.dom_stale_forensics);
@@ -1231,12 +1369,14 @@ function compactRecommendResultForStatus(result) {
   const compact = {
     ...result
   };
-  if (Array.isArray(result.results)) {
+  if (Number.isInteger(result.results_count)) {
+    compact.results_count = result.results_count;
+    compact.results_available = result.results_available === true
+      || result.results_count > 0
+      || (Array.isArray(result.results) && result.results.length > 0);
+  } else if (Array.isArray(result.results)) {
     compact.results_count = result.results.length;
     compact.results_available = result.results.length > 0;
-  } else if (Number.isInteger(result.results_count)) {
-    compact.results_count = result.results_count;
-    compact.results_available = result.results_available === true || result.results_count > 0;
   }
   delete compact.results;
   return compact;
@@ -1278,6 +1418,9 @@ function classifyRecommendRecovery(error = {}) {
   if (/IMAGE_CAPTURE_TIMEOUT|IMAGE_CAPTURE_TOTAL_TIMEOUT|Image fallback capture timed out/i.test(text)) {
     return "transient_image_capture";
   }
+  if (/RUN_PROCESS_EXITED|RUN_WORKER|DETACHED_WORKER|RECOMMEND_WORKER_EXITED/i.test(text)) {
+    return "worker_process_exited";
+  }
   if (/(?:aborted|abort|timeout|timed out|fetch failed|socket|network|ECONNRESET|ETIMEDOUT|EAI_AGAIN)/i.test(text)) {
     return "transient_network_or_llm";
   }
@@ -1293,17 +1436,23 @@ function buildConstrainedAgentRecovery(snapshot = {}, meta = {}, artifacts = nul
   const error = snapshot?.error || snapshot?.result?.error || null;
   const classification = classifyRecommendRecovery(error);
   if (!classification) return null;
-  const canRestartSameRequest = classification !== "login_required";
+  const workerProcessExited = classification === "worker_process_exited";
+  const canRestartSameRequest = classification !== "login_required" && !workerProcessExited;
   return {
     policy_version: 1,
     classification,
-    safe_for_outer_ai_agent: true,
-    recommended_action: canRestartSameRequest
-      ? "restart_same_recommend_request_only"
-      : "ask_user_to_login_then_retry_same_recommend_request",
+    safe_for_outer_ai_agent: !workerProcessExited,
+    recommended_action: workerProcessExited
+      ? "audit_durable_action_journals_then_start_one_reduced_target_replacement_only"
+      : canRestartSameRequest
+        ? "restart_same_recommend_request_only"
+        : "ask_user_to_login_then_retry_same_recommend_request",
     package_requirement: "@reconcrap/boss-recommend-mcp@>=2.0.30",
     run_id: snapshot?.runId || snapshot?.run_id || null,
     retryable: true,
+    automatic_restart_allowed: !workerProcessExited && canRestartSameRequest,
+    requires_durable_action_journal_audit: workerProcessExited,
+    resume_failed_run_in_place_allowed: false,
     same_request_sources: {
       instruction: "run.context.instruction",
       confirmation: "run.context.confirmation",
@@ -1311,11 +1460,21 @@ function buildConstrainedAgentRecovery(snapshot = {}, meta = {}, artifacts = nul
       follow_up: "run.context.follow_up"
     },
     constraints: [
-      "Do not change instruction, criteria, filters, job, page_scope, target_count, post_action, or max_greet_count.",
+      ...(workerProcessExited
+        ? [
+            "Preserve instruction, criteria, filters, job, page_scope, and post_action exactly; change only target_count and max_greet_count to the audited remaining deficit.",
+            "Set replacement target_count=max(0,cumulative_goal-exact_unique_durable_greeting_confirmed_or_assumed_sent); cap max_greet_count to that same remaining value."
+          ]
+        : ["Do not change instruction, criteria, filters, job, page_scope, target_count, post_action, or max_greet_count."]),
       "Do not switch to search/recruit/chat and do not add follow_up.chat.",
       "Do not summarize, translate, or rewrite criteria.",
       "Do not ask the user to reconfirm business choices unless Boss login is required or the stored context is missing.",
-      "Use the same Chrome debug port and recommend page route."
+      "Use the same Chrome debug port and recommend page route.",
+      ...(workerProcessExited ? [
+        "Never replay greeting_send_in_flight, outcome_unknown, pending, or incompletely bound post-action candidates.",
+        "Count exact unique durable greeting_confirmed and greeting_assumed_sent journals before computing a reduced replacement target; both are protected from replay.",
+        "Do not resume this terminal failed run in place; start at most one replacement after the audit."
+      ] : [])
     ],
     artifacts: artifacts ? {
       run_state_path: artifacts.run_state_path || null,
@@ -1326,28 +1485,91 @@ function buildConstrainedAgentRecovery(snapshot = {}, meta = {}, artifacts = nul
   };
 }
 
-function ensureRecommendRunArtifacts(snapshot) {
-  const artifacts = getRecommendRunArtifacts(snapshot?.runId || snapshot?.run_id);
-  if (!artifacts) return null;
+function recommendArtifactWriteWarning(kind, filePath, error) {
+  return {
+    code: "RECOMMEND_OPTIONAL_ARTIFACT_WRITE_FAILED",
+    artifact: kind,
+    path: filePath || null,
+    message: normalizeText(error?.message || error || "optional artifact write failed")
+      || "optional artifact write failed",
+    retryable: true,
+    occurred_at: new Date().toISOString()
+  };
+}
 
+function readRecommendCandidateResultJournalForArtifacts(runId) {
+  try {
+    return {
+      snapshot: readCandidateResultJournal({
+        runDir: getRunsDir(),
+        runId
+      }),
+      error: null
+    };
+  } catch (error) {
+    return { snapshot: null, error };
+  }
+}
+
+function writeOptionalRecommendRunArtifacts(snapshot) {
+  const artifacts = getRecommendRunArtifacts(snapshot?.runId || snapshot?.run_id);
+  if (!artifacts) return [];
+
+  const warnings = [];
+  const runId = snapshot?.runId || snapshot?.run_id;
   const meta = getRecommendRunMeta(snapshot?.runId || snapshot?.run_id);
   const checkpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
     ? snapshot.checkpoint
     : {};
-  writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
-  if (meta) meta.checkpointPath = artifacts.checkpoint_path;
-
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
-  const artifactSummary = summary || (checkpointResults.length ? {
+  let checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  if (!summary && checkpointResults.length === 0 && checkpoint.candidate_result_journal) {
+    const journal = readRecommendCandidateResultJournalForArtifacts(runId);
+    if (journal.error) {
+      warnings.push(recommendArtifactWriteWarning(
+        "candidate_result_journal_read",
+        artifacts.candidate_result_journal_path,
+        journal.error
+      ));
+    } else {
+      checkpointResults = journal.snapshot?.results || [];
+    }
+  }
+  let artifactSummary = summary || (checkpointResults.length ? {
     domain: "recommend",
     partial: true,
     partial_reason: snapshot?.status || snapshot?.state || "non_terminal",
     results: checkpointResults
   } : null);
-  if (artifactSummary) {
-    const rows = Array.isArray(artifactSummary.results) ? artifactSummary.results : [];
+  if (summary?.candidate_result_journal) {
+    const journal = readRecommendCandidateResultJournalForArtifacts(runId);
+    if (journal.error) {
+      warnings.push(recommendArtifactWriteWarning(
+        "candidate_result_journal_read",
+        artifacts.candidate_result_journal_path,
+        journal.error
+      ));
+    } else {
+      const journalResults = journal.snapshot?.results || [];
+      artifactSummary = {
+        ...summary,
+        runtime_results_truncated: summary.results_truncated === true,
+        results_count: journal.snapshot?.committed_count ?? journalResults.length,
+        results_truncated: false,
+        results: journalResults
+      };
+    }
+  }
+  if (!artifactSummary) return warnings;
+
+  const rows = Array.isArray(artifactSummary.results) ? artifactSummary.results : [];
+  try {
     writeRecommendLegacyCsvAtomic(artifacts.output_csv, rows, snapshot, meta);
+    if (meta) meta.outputCsvPath = artifacts.output_csv;
+  } catch (error) {
+    warnings.push(recommendArtifactWriteWarning("results_csv", artifacts.output_csv, error));
+  }
+  try {
     writeJsonAtomic(artifacts.report_json, {
       run_id: snapshot.runId || snapshot.run_id,
       status: snapshot.status || snapshot.state,
@@ -1361,13 +1583,11 @@ function ensureRecommendRunArtifacts(snapshot) {
       summary: artifactSummary,
       generated_at: new Date().toISOString()
     });
-    if (meta) {
-      meta.outputCsvPath = artifacts.output_csv;
-      meta.reportJsonPath = artifacts.report_json;
-    }
+    if (meta) meta.reportJsonPath = artifacts.report_json;
+  } catch (error) {
+    warnings.push(recommendArtifactWriteWarning("report_json", artifacts.report_json, error));
   }
-
-  return artifacts;
+  return warnings;
 }
 
 function persistRecommendCheckpointSnapshot(normalized) {
@@ -1383,15 +1603,18 @@ function persistRecommendCheckpointSnapshot(normalized) {
 
 function buildLegacyRecommendResult(snapshot) {
   if (!snapshot) return null;
-  const artifacts = ensureRecommendRunArtifacts(snapshot);
+  const artifacts = getRecommendRunArtifacts(snapshot.runId || snapshot.run_id);
   const meta = getRecommendRunMeta(snapshot.runId);
   const summary = snapshot.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
   const checkpoint = snapshot.checkpoint && typeof snapshot.checkpoint === "object" ? snapshot.checkpoint : {};
-  const resultRows = Array.isArray(summary?.results)
+  let resultRows = Array.isArray(summary?.results)
     ? summary.results
     : Array.isArray(checkpoint.results)
       ? checkpoint.results
       : [];
+  if (resultRows.length === 0 && checkpoint.candidate_result_journal) {
+    resultRows = readRecommendCandidateResultJournalForArtifacts(snapshot.runId).snapshot?.results || [];
+  }
   const progress = normalizeLegacyProgress(snapshot.progress, summary);
   const targetCount = Number.isInteger(progress.target_count)
     ? progress.target_count
@@ -1409,7 +1632,14 @@ function buildLegacyRecommendResult(snapshot) {
             ? "FAILED"
             : snapshot.status,
     run_id: snapshot.runId,
-    completion_reason: completionReason(snapshot.status),
+    completion_reason: normalizeText(summary?.completion_reason || "") || completionReason(snapshot.status),
+    lifecycle_completion_reason: completionReason(snapshot.status),
+    target_reached: summary?.target_reached === true,
+    source_exhausted: summary?.source_exhausted === true,
+    source_exhaustion_verified: summary?.source_exhaustion_verified === true,
+    source_unverified_underfill: summary?.source_unverified_underfill === true,
+    post_action_stopped: summary?.post_action_stopped === true,
+    clean_completion: summary?.clean_completion === true,
     requested_count: targetCount,
     processed_count: progress.processed,
     inspected_count: progress.processed,
@@ -1418,6 +1648,9 @@ function buildLegacyRecommendResult(snapshot) {
     skipped_count: progress.skipped,
     detail_opened: progress.detail_opened || summary?.detail_opened || 0,
     greet_count: progress.greet_count || 0,
+    greet_confirmed_count: progress.greet_confirmed_count || summary?.greet_confirmed_count || 0,
+    greet_assumed_sent_count: progress.greet_assumed_sent_count || summary?.greet_assumed_sent_count || 0,
+    greet_protected_no_replay_count: progress.greet_protected_no_replay_count || summary?.greet_protected_no_replay_count || 0,
     post_action_clicked: progress.post_action_clicked || summary?.post_action_clicked || 0,
     output_csv: artifacts?.output_csv || meta.outputCsvPath || null,
     report_json: artifacts?.report_json || meta.reportJsonPath || null,
@@ -1437,7 +1670,9 @@ function buildLegacyRecommendResult(snapshot) {
     target_count_semantics: TARGET_COUNT_SEMANTICS,
     error: snapshot.error || null,
     recovery: buildConstrainedAgentRecovery(snapshot, meta, artifacts),
-    results_count: resultRows.length,
+    results_count: Number.isInteger(summary?.results_count)
+      ? summary.results_count
+      : resultRows.length,
     results_available: resultRows.length > 0
   };
 }
@@ -1452,7 +1687,10 @@ function normalizeRunSnapshot(snapshot) {
     TERMINAL_STATUSES.has(snapshot.status)
     || snapshot.status === RUN_STATUS_PAUSED
   ) ? buildLegacyRecommendResult({ ...snapshot, progress }) : null;
-  const recovery = buildConstrainedAgentRecovery(snapshot, meta, artifacts);
+  const recovery = nonEmptyRecord({
+    ...plainRecord(snapshot.recovery),
+    ...plainRecord(buildConstrainedAgentRecovery(snapshot, meta, artifacts))
+  });
   const snapshotContext = plainRecord(snapshot.context);
   const metaArgs = plainRecord(meta.args);
   const oldContext = {
@@ -1475,7 +1713,7 @@ function normalizeRunSnapshot(snapshot) {
     started_at: snapshot.startedAt,
     updated_at: snapshot.updatedAt,
     completed_at: toIsoOrNull(snapshot.completedAt),
-    heartbeat_at: snapshot.updatedAt,
+    heartbeat_at: toIsoOrNull(snapshot.heartbeatAt || snapshot.heartbeat_at || snapshot.updatedAt),
     pid: Number.isInteger(snapshot.pid) && snapshot.pid > 0 ? snapshot.pid : process.pid || null,
     last_message: snapshot.error?.message || snapshot.phase || null,
     context: {
@@ -1490,11 +1728,13 @@ function normalizeRunSnapshot(snapshot) {
       cancel_requested: snapshot.status === RUN_STATUS_CANCELING
     },
     resume: {
+      ...plainRecord(snapshot.resume),
       checkpoint_path: legacyResult?.checkpoint_path || meta.checkpointPath || artifacts?.checkpoint_path || null,
       pause_control_path: artifacts?.run_state_path || null,
       output_csv: legacyResult?.output_csv || null,
       worker_stdout_path: artifacts?.worker_stdout_path || null,
       worker_stderr_path: artifacts?.worker_stderr_path || null,
+      worker_exit_status_path: artifacts?.worker_exit_status_path || null,
       resume_count: meta.resumeCount || 0,
       last_resumed_at: meta.lastResumedAt || null,
       last_paused_at: snapshot.status === RUN_STATUS_PAUSED ? snapshot.updatedAt : null
@@ -1622,40 +1862,84 @@ function persistRecommendRunSnapshot(snapshot, {
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
   const existing = readJsonFile(artifacts.run_state_path);
+  normalized.resume = {
+    ...plainRecord(existing?.resume),
+    ...plainRecord(normalized.resume)
+  };
   normalized.control = mergePersistedControlRequest(normalized, existing);
   normalized = coerceCanceledTerminalSnapshot(normalized, existing);
-  if (persistActiveCheckpoint) {
+  const shouldPersistCheckpoint = persistActiveCheckpoint
+    || TERMINAL_STATUSES.has(normalized.state)
+    || normalized.state === RUN_STATUS_PAUSED;
+  if (shouldPersistCheckpoint) {
     persistRecommendCheckpointSnapshot(snapshot);
   }
   const cdpEvidence = buildPersistedCdpEvidence({
     meta: getRecommendRunMeta(normalized.run_id),
     persisted: existing || {}
   });
-  const payload = {
-    run_id: normalized.run_id,
-    mode: normalized.mode,
-    state: normalized.state,
-    status: normalized.status,
-    stage: normalized.stage,
-    started_at: normalized.started_at,
-    updated_at: normalized.updated_at,
-    heartbeat_at: normalized.heartbeat_at,
-    completed_at: normalized.completed_at,
-    pid: normalized.pid,
-    progress: normalized.progress,
-    last_message: normalized.last_message,
-    context: normalized.context,
-    control: normalized.control,
-    resume: normalized.resume,
-    error: normalized.error,
-    recovery: normalized.recovery,
-    result: normalized.result,
-    summary: normalized.summary,
-    checkpoint: normalized.checkpoint,
-    artifacts: normalized.artifacts,
+  const existingArtifactWarnings = Array.isArray(existing?.artifact_warnings)
+    ? existing.artifact_warnings
+    : [];
+  const withArtifactWarnings = (value, warnings) => ({
+    ...value,
+    artifact_warnings: warnings,
+    artifacts: {
+      ...plainRecord(value.artifacts),
+      warnings
+    }
+  });
+  const buildPayload = (value) => ({
+    run_id: value.run_id,
+    mode: value.mode,
+    state: value.state,
+    status: value.status,
+    stage: value.stage,
+    started_at: value.started_at,
+    updated_at: value.updated_at,
+    heartbeat_at: value.heartbeat_at,
+    completed_at: value.completed_at,
+    pid: value.pid,
+    progress: value.progress,
+    last_message: value.last_message,
+    context: value.context,
+    control: value.control,
+    resume: value.resume,
+    error: value.error,
+    recovery: value.recovery,
+    result: value.result,
+    summary: value.summary,
+    checkpoint: value.checkpoint,
+    artifact_warnings: value.artifact_warnings,
+    artifacts: value.artifacts,
     ...cdpEvidence
-  };
-  writeJsonAtomic(artifacts.run_state_path, payload);
+  });
+  normalized = withArtifactWarnings(normalized, existingArtifactWarnings);
+  writeJsonAtomic(artifacts.run_state_path, buildPayload(normalized));
+
+  if (TERMINAL_STATUSES.has(normalized.state) || normalized.state === RUN_STATUS_PAUSED) {
+    let artifactWarnings;
+    try {
+      artifactWarnings = writeOptionalRecommendRunArtifacts(snapshot);
+    } catch (error) {
+      artifactWarnings = [recommendArtifactWriteWarning(
+        "artifact_generation",
+        null,
+        error
+      )];
+    }
+    normalized = withArtifactWarnings(normalized, artifactWarnings);
+    if (JSON.stringify(artifactWarnings) !== JSON.stringify(existingArtifactWarnings)) {
+      try {
+        writeJsonAtomic(artifacts.run_state_path, buildPayload(normalized));
+      } catch (error) {
+        normalized = withArtifactWarnings(normalized, [
+          ...artifactWarnings,
+          recommendArtifactWriteWarning("artifact_warning_state", artifacts.run_state_path, error)
+        ]);
+      }
+    }
+  }
   return normalized;
 }
 
@@ -1686,24 +1970,48 @@ function reconcilePersistedRecommendRunIfNeeded(persisted) {
   if (!persisted || typeof persisted !== "object") return persisted;
   const persistedState = normalizeText(persisted.state || persisted.status);
   if (TERMINAL_STATUSES.has(persistedState)) return persisted;
-  if (isProcessAlive(persisted.pid)) return persisted;
 
   const runId = normalizeRunId(persisted.run_id || persisted.runId);
   const artifacts = getRecommendRunArtifacts(runId);
+  const exitStatus = readRecommendWorkerExitStatus(artifacts, persisted);
+  if (!exitStatus && isProcessAlive(persisted.pid)) return persisted;
   const checkpoint = artifacts?.checkpoint_path ? readJsonFile(artifacts.checkpoint_path) : null;
   const now = new Date().toISOString();
   const cancelRequested = persisted.control?.cancel_requested === true;
-  const processExitedError = {
-    code: "RUN_PROCESS_EXITED",
-    message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}）。`,
-    retryable: true
-  };
+  const processExitedError = exitStatus
+    ? {
+        code: exitStatus.nonzero ? "RECOMMEND_WORKER_EXITED_NONZERO" : "RECOMMEND_WORKER_EXITED_EARLY",
+        message: exitStatus.wrapper_error
+          ? `Recommend worker supervisor failed: ${exitStatus.wrapper_error}`
+          : `Recommend worker exited before writing a terminal state (exit_code=${exitStatus.exit_code}).`,
+        retryable: true,
+        worker_exit_code: exitStatus.exit_code,
+        worker_launch_id: exitStatus.launch_id,
+        worker_pid: exitStatus.worker_pid,
+        supervisor_pid: exitStatus.wrapper_pid,
+        worker_exited_at: exitStatus.exited_at,
+        termination_kind: exitStatus.termination_kind,
+        diagnostic_source: exitStatus.diagnostic_source
+      }
+    : {
+        code: "RUN_PROCESS_EXITED",
+        message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}）。`,
+        retryable: true,
+        diagnostic_source: "pid_reconciliation"
+      };
   const error = cancelRequested
     ? cancelErrorFromShutdown(processExitedError)
     : {
         ...processExitedError,
-        message: `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}），已自动标记为失败。`
+        message: exitStatus
+          ? `${processExitedError.message} 已自动标记为失败。`
+          : `检测到推荐任务进程已退出（pid=${persisted.pid || "unknown"}），已自动标记为失败。`
       };
+  const workerLastHeartbeatAt = normalizeText(
+    persisted.recovery?.worker_last_heartbeat_at
+    || persisted.heartbeat_at
+    || ""
+  ) || null;
   return persistRecommendRunSnapshot({
     runId,
     name: persisted.name || runId,
@@ -1714,9 +2022,19 @@ function reconcilePersistedRecommendRunIfNeeded(persisted) {
     checkpoint: checkpoint || persisted.checkpoint || {},
     startedAt: persisted.started_at || persisted.startedAt || now,
     updatedAt: now,
+    heartbeatAt: workerLastHeartbeatAt || now,
     completedAt: now,
     pid: Number.isInteger(persisted.pid) && persisted.pid > 0 ? persisted.pid : null,
+    resume: persisted.resume || {},
     error,
+    recovery: {
+      ...plainRecord(persisted.recovery),
+      worker_last_heartbeat_at: workerLastHeartbeatAt,
+      reconciled_at: now,
+      reconciliation_reason: error.code,
+      automatic_restart_allowed: false,
+      requires_durable_action_journal_audit: !cancelRequested
+    },
     summary: persisted.summary || null
   });
 }
@@ -2600,7 +2918,7 @@ function getRunOptions(
     listSettleMs: parsePositiveInteger(args.list_settle_ms, slowLive ? 1800 : 1200),
     listFallbackPoint: null,
     refreshOnEnd: args.refresh_on_end !== false,
-    maxRefreshRounds: parseNonNegativeInteger(args.max_refresh_rounds, 2),
+    maxRefreshRounds: Math.min(2, parseNonNegativeInteger(args.max_refresh_rounds, 2)),
     refreshButtonSettleMs: parsePositiveInteger(args.refresh_button_settle_ms, slowLive ? 10000 : 8000),
     refreshReloadSettleMs: parsePositiveInteger(args.refresh_reload_settle_ms, slowLive ? 12000 : 8000),
     postAction: normalized.postAction,
@@ -2839,7 +3157,8 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
         actionJournalScope
       ),
       runId: fixedRunId || undefined,
-      pid: process.pid
+      pid: process.pid,
+      candidateResultJournalDir: getRunsDir()
     });
   } catch (error) {
     await session.close?.();

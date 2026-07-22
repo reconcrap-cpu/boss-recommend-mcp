@@ -2925,7 +2925,26 @@ export function matchesRecommendDetailNetwork(url) {
 
 export function createRecommendDetailNetworkRecorder(client) {
   const events = [];
-  client.Network.responseReceived((event) => {
+  const warnings = [];
+  const subscribe = (method, handler, required = false) => {
+    if (typeof client?.Network?.[method] !== "function") {
+      warnings.push({ method: `Network.${method}`, reason: "subscription_unavailable", required });
+      return false;
+    }
+    try {
+      client.Network[method](handler);
+      return true;
+    } catch (error) {
+      warnings.push({
+        method: `Network.${method}`,
+        reason: "subscription_failed",
+        required,
+        error: error?.message || String(error)
+      });
+      return false;
+    }
+  };
+  const available = subscribe("responseReceived", (event) => {
     const url = event?.response?.url || "";
     if (!matchesRecommendDetailNetwork(url)) return;
     events.push({
@@ -2935,25 +2954,23 @@ export function createRecommendDetailNetworkRecorder(client) {
       mimeType: event.response?.mimeType,
       type: event.type
     });
-  });
-  if (typeof client.Network.loadingFinished === "function") {
-    client.Network.loadingFinished((event) => {
+  }, true);
+  subscribe("loadingFinished", (event) => {
       const found = events.find((item) => item.requestId === event.requestId);
       if (!found) return;
       found.loading_finished = true;
       found.encodedDataLength = event.encodedDataLength;
-    });
-  }
-  if (typeof client.Network.loadingFailed === "function") {
-    client.Network.loadingFailed((event) => {
+  });
+  subscribe("loadingFailed", (event) => {
       const found = events.find((item) => item.requestId === event.requestId);
       if (!found) return;
       found.loading_failed = true;
       found.loading_error = event.errorText || event.blockedReason || "Network loading failed";
-    });
-  }
+  });
   return {
     events,
+    available,
+    warnings,
     clear() {
       events.length = 0;
     }
@@ -2987,6 +3004,17 @@ export async function waitForRecommendDetailNetworkEvents(recorder, {
   intervalMs = 100
 } = {}) {
   const started = Date.now();
+  if (!Array.isArray(recorder) && recorder?.available === false) {
+    return {
+      ok: false,
+      unavailable: true,
+      elapsed_ms: 0,
+      count: 0,
+      events: [],
+      total_event_count: 0,
+      warnings: recorder?.warnings || []
+    };
+  }
   const events = Array.isArray(recorder) ? recorder : recorder?.events || [];
   let matching = [];
   while (Date.now() - started <= timeoutMs) {
