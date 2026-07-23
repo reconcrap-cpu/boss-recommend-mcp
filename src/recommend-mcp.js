@@ -59,6 +59,11 @@ import {
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
 
 const DEFAULT_RECOMMEND_HOST = "127.0.0.1";
 const DEFAULT_RECOMMEND_PORT = 9222;
@@ -1855,13 +1860,24 @@ function coerceCanceledTerminalSnapshot(normalized, existing) {
 }
 
 function persistRecommendRunSnapshot(snapshot, {
-  persistActiveCheckpoint = false
+  persistActiveCheckpoint = false,
+  monitorEvent = {}
 } = {}) {
   let normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
   const existing = readJsonFile(artifacts.run_state_path);
+  const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
+  const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
+  const monitorMarker = existingMonitorMarker.contract_version === "1.0"
+    ? existingMonitorMarker
+    : normalizedMonitorMarker.contract_version === "1.0"
+      ? normalizedMonitorMarker
+      : monitorEvent?.v1_created === true
+        ? createBossMonitorSourceMarker(normalized.started_at || normalized.updated_at)
+        : null;
+  if (monitorMarker) normalized.monitoring_v1 = monitorMarker;
   normalized.resume = {
     ...plainRecord(existing?.resume),
     ...plainRecord(normalized.resume)
@@ -1910,6 +1926,7 @@ function persistRecommendRunSnapshot(snapshot, {
     result: value.result,
     summary: value.summary,
     checkpoint: value.checkpoint,
+    monitoring_v1: value.monitoring_v1,
     artifact_warnings: value.artifact_warnings,
     artifacts: value.artifacts,
     ...cdpEvidence
@@ -1940,6 +1957,7 @@ function persistRecommendRunSnapshot(snapshot, {
       }
     }
   }
+  writeBossMonitorProjectionNonfatal("recommend", normalized, monitorEvent);
   return normalized;
 }
 
@@ -2041,7 +2059,8 @@ function reconcilePersistedRecommendRunIfNeeded(persisted) {
 
 function persistRecommendLifecycleSnapshot(snapshot, event = {}) {
   return persistRecommendRunSnapshot(snapshot, {
-    persistActiveCheckpoint: event?.type === "checkpoint"
+    persistActiveCheckpoint: event?.type === "checkpoint",
+    monitorEvent: { ...event, producer: true }
   });
 }
 
@@ -3190,7 +3209,9 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
     health: session.health || null
   });
   trackRecommendRun(started.runId);
-  const persistedStarted = persistRecommendRunSnapshot(started);
+  const persistedStarted = persistRecommendRunSnapshot(started, {
+    monitorEvent: { type: "created", producer: true, v1_created: true }
+  });
 
   return {
     status: "ACCEPTED",
@@ -3286,7 +3307,10 @@ export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} 
 export async function startRecommendPipelineRunTool({ workspaceRoot = "", args = {}, runId = "" } = {}) {
   const started = await startRecommendPipelineRunInternal(args, { workspaceRoot, runId });
   if (started.status !== "ACCEPTED") return started;
-  return attachMethodEvidence(started, started.run_id);
+  return {
+    ...attachMethodEvidence(started, started.run_id),
+    monitoring: createBossMonitoringBlock("recommend", started.run_id)
+  };
 }
 
 export function getRecommendPipelineRunTool({ args = {} } = {}) {
@@ -3306,16 +3330,27 @@ export function getRecommendPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecommendRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: compactRecommendRunForStatus(normalizedRun)
+      run: compactRecommendRunForStatus(normalizedRun),
+      monitoring: createBossMonitoringBlock("recommend", runId)
     }, runId);
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
       const reconciled = compactRecommendRunForStatus(reconcilePersistedRecommendRunIfNeeded(persisted));
       const persistedEvidence = readRecommendRunState(runId) || persisted;
+      const artifacts = getRecommendRunArtifacts(runId);
+      const checkpoint = readJsonFile(artifacts?.checkpoint_path) || persistedEvidence.checkpoint || {};
+      const journalResults = checkpoint?.candidate_result_journal
+        ? readRecommendCandidateResultJournalForArtifacts(runId).snapshot?.results || []
+        : [];
+      writeBossMonitorProjectionNonfatal("recommend", {
+        ...persistedEvidence,
+        checkpoint: journalResults.length ? { ...checkpoint, results: journalResults } : checkpoint
+      }, { type: "backfill" });
       return attachPersistedCdpEvidence({
         status: "RUN_STATUS",
         run: reconciled,
+        monitoring: createBossMonitoringBlock("recommend", runId),
         persistence: {
           source: "disk",
           active_control_available: false,
@@ -3370,6 +3405,34 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
         message: "目标任务已结束，无需暂停。"
       }, persisted);
     }
+    if (persisted) {
+      const reconciled = reconcilePersistedRecommendRunIfNeeded(persisted);
+      const reconciledState = normalizeText(reconciled?.state || reconciled?.status);
+      if (TERMINAL_STATUSES.has(reconciledState)) {
+        return getRecommendPipelineRunTool({ args });
+      }
+      const pauseMessage = "暂停请求已写入 detached recommend run 控制文件。";
+      const patched = patchPersistedRecommendRunControl(runId, {
+        pause_requested: true,
+        pause_requested_at: new Date().toISOString(),
+        pause_requested_by: "pause_recommend_pipeline_run",
+        cancel_requested: false
+      }, {
+        message: pauseMessage
+      });
+      if (patched) {
+        return attachPersistedCdpEvidence({
+          status: "PAUSE_REQUESTED",
+          run: compactRecommendRunForStatus(patched),
+          message: pauseMessage,
+          persistence: {
+            source: "disk",
+            active_control_available: false,
+            detached_control_requested: true
+          }
+        }, patched);
+      }
+    }
     return getRecommendPipelineRunTool({ args });
   }
 }
@@ -3418,21 +3481,47 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedRecommendRunIfNeeded(persisted);
+      const reconciledState = normalizeText(reconciled?.state || reconciled?.status);
+      if (!TERMINAL_STATUSES.has(reconciledState)) {
+        const resumeMessage = "恢复请求已写入 detached recommend run 控制文件。";
+        const patched = patchPersistedRecommendRunControl(runId, {
+          pause_requested: false,
+          pause_requested_at: null,
+          pause_requested_by: null,
+          cancel_requested: false
+        }, {
+          message: resumeMessage
+        });
+        if (patched) {
+          return attachPersistedCdpEvidence({
+            status: "RESUME_REQUESTED",
+            run: compactRecommendRunForStatus(patched),
+            poll_after_sec: DEFAULT_RECOMMEND_POLL_AFTER_SEC,
+            message: resumeMessage,
+            persistence: {
+              source: "disk",
+              active_control_available: false,
+              detached_control_requested: true
+            }
+          }, patched);
+        }
+      }
       return attachPersistedCdpEvidence({
         status: "FAILED",
         error: {
-          code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
-          message: TERMINAL_STATUSES.has(persisted.state)
+          code: TERMINAL_STATUSES.has(reconciledState) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
+          message: TERMINAL_STATUSES.has(reconciledState)
             ? "目标任务已结束，无法继续。"
             : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
-          retryable: !TERMINAL_STATUSES.has(persisted.state)
+          retryable: !TERMINAL_STATUSES.has(reconciledState)
         },
-        run: compactRecommendRunForStatus(persisted),
+        run: compactRecommendRunForStatus(reconciled),
         persistence: {
           source: "disk",
           active_control_available: false
         }
-      }, persisted);
+      }, reconciled);
     }
     return getRecommendPipelineRunTool({ args });
   }

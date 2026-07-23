@@ -58,6 +58,17 @@ import {
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 import { launchDetachedWorker } from "./core/run/detached-launcher.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
+import {
+  boundedWorkflowCheckpoint,
+  compactWorkflowResultForState,
+  getWorkflowCandidateJournalPath,
+  reconstructWorkflowCandidateResults
+} from "./core/run/workflow-candidate-journal.js";
 
 const DEFAULT_CHAT_HOST = "127.0.0.1";
 const DEFAULT_CHAT_PORT = 9222;
@@ -186,6 +197,10 @@ function getChatRunArtifacts(runId) {
     worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
     worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    candidate_result_journal_path: getWorkflowCandidateJournalPath({
+      runDir: runsDir,
+      runId: normalized
+    }),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
   };
@@ -345,7 +360,23 @@ function readHydratedChatCheckpoint(persisted = {}) {
   ].map((value) => normalizeText(value)).filter(Boolean);
   for (const checkpointPath of new Set(checkpointPaths)) {
     const checkpoint = readJsonFile(checkpointPath);
-    if (checkpoint) return checkpoint;
+    if (checkpoint) {
+      const journalResults = artifacts
+        ? reconstructWorkflowCandidateResults({
+            runDir: artifacts.runs_dir,
+            runId
+          })
+        : [];
+      const {
+        candidate_result_journal: _candidateResultJournal,
+        results_count: _resultsCount,
+        results_truncated: _resultsTruncated,
+        ...legacyCheckpoint
+      } = checkpoint;
+      return journalResults.length
+        ? { ...legacyCheckpoint, results: journalResults }
+        : legacyCheckpoint;
+    }
   }
   return persisted.checkpoint && typeof persisted.checkpoint === "object"
     ? persisted.checkpoint
@@ -355,7 +386,11 @@ function readHydratedChatCheckpoint(persisted = {}) {
 function writeChatRunState(runId, payload) {
   const artifacts = getChatRunArtifacts(runId);
   if (!artifacts) return null;
-  writeJsonAtomic(artifacts.run_state_path, payload);
+  writeJsonAtomic(artifacts.run_state_path, {
+    ...payload,
+    result: compactWorkflowResultForState(payload?.result),
+    summary: compactWorkflowResultForState(payload?.summary)
+  });
   return payload;
 }
 
@@ -623,16 +658,31 @@ function ensureChatRunArtifacts(snapshot) {
     ? snapshot.checkpoint
     : {};
   const existingCheckpoint = readJsonFile(artifacts.checkpoint_path);
-  const checkpoint = hasChatCheckpointPayload(snapshotCheckpoint)
+  const fullCheckpoint = hasChatCheckpointPayload(snapshotCheckpoint)
     ? snapshotCheckpoint
     : existingCheckpoint || snapshotCheckpoint;
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id,
+    checkpoint: fullCheckpoint
+  });
   if (hasChatCheckpointPayload(snapshotCheckpoint) || !existingCheckpoint) {
     writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   }
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const journalResults = reconstructWorkflowCandidateResults({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id
+  });
+  const checkpointResults = journalResults.length
+    ? journalResults
+    : Array.isArray(fullCheckpoint.results)
+      ? fullCheckpoint.results
+      : Array.isArray(checkpoint.results)
+        ? checkpoint.results
+        : [];
   const artifactSummary = summary || (checkpointResults.length ? {
     domain: "chat",
     partial: true,
@@ -671,14 +721,19 @@ function persistChatCheckpointSnapshot(normalized) {
   const artifacts = getChatRunArtifacts(normalized?.run_id || normalized?.runId);
   if (!artifacts) return;
   const meta = getChatRunMeta(normalized?.run_id || normalized?.runId);
-  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+  const sourceCheckpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
     ? normalized.checkpoint
     : {};
   const existingCheckpoint = readJsonFile(artifacts.checkpoint_path);
-  if (!hasChatCheckpointPayload(checkpoint) && existingCheckpoint) {
+  if (!hasChatCheckpointPayload(sourceCheckpoint) && existingCheckpoint) {
     if (meta) meta.checkpointPath = artifacts.checkpoint_path;
     return;
   }
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: normalized?.run_id || normalized?.runId,
+    checkpoint: sourceCheckpoint
+  });
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 }
@@ -1012,13 +1067,24 @@ function mergePersistedChatControlRequest(normalized, existing) {
 }
 
 function persistChatRunSnapshot(snapshot, {
-  persistActiveCheckpoint = false
+  persistActiveCheckpoint = false,
+  monitorEvent = {}
 } = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getChatRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
   const existing = readJsonFile(artifacts.run_state_path);
+  const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
+  const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
+  const monitorMarker = existingMonitorMarker.contract_version === "1.0"
+    ? existingMonitorMarker
+    : normalizedMonitorMarker.contract_version === "1.0"
+      ? normalizedMonitorMarker
+      : monitorEvent?.v1_created === true
+        ? createBossMonitorSourceMarker(normalized.started_at || normalized.updated_at)
+        : null;
+  if (monitorMarker) normalized.monitoring_v1 = monitorMarker;
   normalized.control = mergePersistedChatControlRequest(normalized, existing);
   if (persistActiveCheckpoint) {
     persistChatCheckpointSnapshot(normalized);
@@ -1040,17 +1106,20 @@ function persistChatRunSnapshot(snapshot, {
     control: normalized.control,
     resume: normalized.resume,
     error: normalized.error,
-    result: normalized.result,
-    summary: normalized.summary,
+    result: compactWorkflowResultForState(normalized.result),
+    summary: compactWorkflowResultForState(normalized.summary),
+    monitoring_v1: normalized.monitoring_v1,
     artifacts: normalized.artifacts
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
+  writeBossMonitorProjectionNonfatal("chat", normalized, monitorEvent);
   return normalized;
 }
 
 function persistChatLifecycleSnapshot(snapshot, event = {}) {
   return persistChatRunSnapshot(snapshot, {
-    persistActiveCheckpoint: event?.type === "checkpoint"
+    persistActiveCheckpoint: event?.type === "checkpoint",
+    monitorEvent: { ...event, producer: true }
   });
 }
 
@@ -1654,7 +1723,9 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "", runId =
     health: session.health || null
   });
   trackChatRun(started.runId);
-  const persistedStarted = persistChatRunSnapshot(started);
+  const persistedStarted = persistChatRunSnapshot(started, {
+    monitorEvent: { type: "created", producer: true, v1_created: true }
+  });
 
   return {
     status: "ACCEPTED",
@@ -1904,7 +1975,10 @@ export async function bossChatHealthCheckTool({ workspaceRoot = "", args = {} } 
 export async function startBossChatRunTool({ workspaceRoot = "", args = {} } = {}) {
   const started = await startBossChatRunInternal(args, { workspaceRoot });
   if (started.status !== "ACCEPTED") return started;
-  return attachMethodEvidence(started, started.run_id);
+  return {
+    ...attachMethodEvidence(started, started.run_id),
+    monitoring: createBossMonitoringBlock("chat", started.run_id)
+  };
 }
 
 export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = {} } = {}) {
@@ -1994,14 +2068,21 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
         chrome: null
       };
     }
+    const queuedMonitorMarker = latest.monitoring_v1
+      || createBossMonitorSourceMarker(latest.started_at || now);
     const queued = {
       ...latest,
+      ...(queuedMonitorMarker ? { monitoring_v1: queuedMonitorMarker } : {}),
       pid: child.pid || process.pid,
       updated_at: now,
       heartbeat_at: now,
       last_message: "Boss chat detached worker launched."
     };
     writeChatRunState(runId, queued);
+    writeBossMonitorProjectionNonfatal("chat", queued, {
+      type: "created",
+      v1_created: true
+    });
     return {
       status: "ACCEPTED",
       run_id: runId,
@@ -2014,7 +2095,8 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
       runtime_evaluate_used: false,
       method_summary: {},
       method_log: [],
-      chrome: null
+      chrome: null,
+      monitoring: createBossMonitoringBlock("chat", runId)
     };
   } catch (error) {
     const failed = markBossChatDetachedWorkerFailed(runId, error, {
@@ -2098,15 +2180,23 @@ export function getBossChatRunTool({ args = {} } = {}) {
     const normalizedRun = persistChatRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: normalizedRun
+      run: normalizedRun,
+      monitoring: createBossMonitoringBlock("chat", runId)
     }, runId);
   } catch {
     const persisted = readChatRunState(runId);
     if (persisted) {
       const reconciled = reconcilePersistedChatRun(persisted);
+      const hydrated = snapshotFromPersistedChatRun(reconciled.run);
+      writeBossMonitorProjectionNonfatal(
+        "chat",
+        { ...reconciled.run, checkpoint: hydrated.checkpoint },
+        { type: "backfill" }
+      );
       return {
         status: "RUN_STATUS",
         run: reconciled.run,
+        monitoring: createBossMonitoringBlock("chat", runId),
         persistence: {
           source: "disk",
           active_control_available: false,

@@ -9,6 +9,7 @@ export const RUN_MODE_ASYNC = "async";
 export const RUN_STATE_QUEUED = "queued";
 export const RUN_STATE_RUNNING = "running";
 export const RUN_STATE_PAUSED = "paused";
+export const RUN_STATE_CANCELING = "canceling";
 export const RUN_STATE_COMPLETED = "completed";
 export const RUN_STATE_FAILED = "failed";
 export const RUN_STATE_CANCELED = "canceled";
@@ -35,6 +36,7 @@ const VALID_RUN_STATES = new Set([
   RUN_STATE_QUEUED,
   RUN_STATE_RUNNING,
   RUN_STATE_PAUSED,
+  RUN_STATE_CANCELING,
   RUN_STATE_COMPLETED,
   RUN_STATE_FAILED,
   RUN_STATE_CANCELED

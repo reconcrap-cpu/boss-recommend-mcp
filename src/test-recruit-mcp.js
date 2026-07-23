@@ -532,6 +532,117 @@ async function testRecruitAsyncPauseResume() {
   assert.equal(terminalResume.error.code, "RUN_ALREADY_TERMINATED");
 }
 
+async function testStaleDiskReconciliationPreservesCheckpoint() {
+  resetRecruitMcpStateForTests();
+  const runId = "mcp_recruit_stale_checkpoint_regression";
+  const runsDir = path.join(process.env.BOSS_RECRUIT_HOME, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const checkpointPath = path.join(runsDir, `${runId}.checkpoint.json`);
+  const checkpoint = {
+    updatedAt: "2026-01-01T00:00:02.000Z",
+    results: [
+      {
+        index: 0,
+        candidate_key: "search:test:one",
+        candidate: { identity: { name: "checkpoint-preserved" } },
+        screening: {
+          status: "pass",
+          passed: true,
+          score: 90,
+          reasons: ["checkpoint overwrite regression"]
+        }
+      }
+    ]
+  };
+  fs.writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
+  fs.writeFileSync(path.join(runsDir, `${runId}.json`), JSON.stringify({
+    run_id: runId,
+    mode: "async",
+    state: "running",
+    status: "running",
+    stage: "recruit:screening",
+    started_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:02.000Z",
+    heartbeat_at: "2026-01-01T00:00:02.000Z",
+    completed_at: null,
+    pid: 2147483647,
+    progress: {
+      target_count: 2,
+      processed: 1,
+      screened: 1,
+      passed: 1,
+      skipped: 0
+    },
+    context: {},
+    control: { cancel_requested: false },
+    resume: { checkpoint_path: checkpointPath },
+    error: null,
+    result: null,
+    summary: null
+  }, null, 2));
+
+  const payload = await callTool(TOOL_GET, { run_id: runId }, 41);
+  assert.equal(payload.status, "RUN_STATUS");
+  assert.equal(payload.persistence.stale_finalized, true);
+  assert.equal(payload.run.result.processed_count, 1);
+  assert.equal(payload.run.result.passed_count, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(checkpointPath, "utf8")), checkpoint);
+}
+
+async function testRecruitMonitorStorageFailureDoesNotFailLegacyRun() {
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitorRuntimeHome = process.env.RECRUITING_MONITOR_HOME;
+  const invalidMonitorHome = path.join(process.env.BOSS_RECRUIT_HOME, "monitor-home-is-a-file");
+  fs.writeFileSync(invalidMonitorHome, "not a directory", "utf8");
+  process.env.BOSS_MONITOR_HOME = invalidMonitorHome;
+  process.env.RECRUITING_MONITOR_HOME = path.join(
+    process.env.BOSS_RECRUIT_HOME,
+    "monitor-runtime-unavailable"
+  );
+  installFakeConnector();
+  setRecruitMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recruit:monitor-storage-unavailable");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+  try {
+    const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 42);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.monitoring.availability, "monitor_unavailable");
+    assert.equal(started.run.monitoring_v1, undefined);
+    const completed = await waitForRecruitRun(
+      started.run_id,
+      (run) => run?.status === "completed"
+    );
+    assert.equal(completed.status, "completed");
+    const persisted = JSON.parse(fs.readFileSync(completed.artifacts.run_state_path, "utf8"));
+    assert.equal(persisted.state, "completed");
+    assert.equal(persisted.monitoring_v1, undefined);
+  } finally {
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitorRuntimeHome === undefined) {
+      delete process.env.RECRUITING_MONITOR_HOME;
+    } else {
+      process.env.RECRUITING_MONITOR_HOME = previousMonitorRuntimeHome;
+    }
+  }
+}
+
 async function main() {
   const previousHome = process.env.BOSS_RECRUIT_HOME;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
@@ -589,6 +700,10 @@ async function main() {
     await testRecruitSyncRun();
     resetRecruitMcpStateForTests();
     await testRecruitAsyncPauseResume();
+    resetRecruitMcpStateForTests();
+    await testStaleDiskReconciliationPreservesCheckpoint();
+    resetRecruitMcpStateForTests();
+    await testRecruitMonitorStorageFailureDoesNotFailLegacyRun();
     console.log("recruit MCP tests passed");
   } finally {
     resetRecruitMcpStateForTests();

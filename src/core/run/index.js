@@ -164,6 +164,8 @@ export function createRunLifecycleManager({
       setPhase(phase) {
         entry.run.phase = phase;
         touch(entry);
+        emitSnapshot(entry, { type: "phase", phase });
+        return snapshotFromEntry(entry);
       },
       updateProgress(progressPatch = {}) {
         entry.run.progress = {

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   RUN_MODE_ASYNC,
+  RUN_STATE_CANCELING,
   RUN_STATE_PAUSED,
   RUN_STAGE_SCREEN,
   RUN_STATE_COMPLETED,
@@ -138,16 +139,13 @@ function testRunStateCleanup() {
       state: RUN_STATE_COMPLETED
     }));
     const terminalRunFile = path.join(getRunsDir(), `${terminalRunId}.json`);
-    const activeStates = [RUN_STATE_QUEUED, RUN_STATE_RUNNING, RUN_STATE_PAUSED, "canceling"];
+    const activeStates = [RUN_STATE_QUEUED, RUN_STATE_RUNNING, RUN_STATE_PAUSED, RUN_STATE_CANCELING];
     const activeFiles = [];
     for (const state of activeStates) {
       const runId = createRunId();
       const runFile = path.join(getRunsDir(), `${runId}.json`);
-      if (state === "canceling") {
-        fs.writeFileSync(runFile, `${JSON.stringify({ run_id: runId, state, status: state })}\n`, "utf8");
-      } else {
-        writeRunState(createRunStateSnapshot({ runId, mode: RUN_MODE_ASYNC, state }));
-      }
+      const snapshot = writeRunState(createRunStateSnapshot({ runId, mode: RUN_MODE_ASYNC, state }));
+      assert.equal(snapshot.state, state);
       const checkpointFile = path.join(getRunsDir(), `${runId}.checkpoint.json`);
       const exitStatusFile = path.join(getRunsDir(), `${runId}.worker.exit.json`);
       fs.writeFileSync(checkpointFile, `${JSON.stringify({ run_id: runId, cursor: 3 })}\n`, "utf8");

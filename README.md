@@ -543,6 +543,21 @@ Trae-CN / 长对话防循环建议：
 - 轮询期间不要重复 `start`，优先复用已有 `run_id`，避免重复筛选。
 - 处于 `chat_followup` 时，对父 run 的 `pause/resume/cancel` 会自动代理到内置 boss-chat 子 run。
 
+## 独立任务监控（V1）
+
+推荐、搜索、聊天 run 会向独立的 localhost monitor 写入标准化投影，并在成功的
+start/get 响应里追加 `monitoring.ref`、`availability` 和一次性
+`dashboard_url`。链接只返回给调用方，不会自动打开浏览器；原有 run 状态仍是
+权威数据，也没有向现有三套 MCP toolset 增加 dashboard 工具。
+
+监控默认写入 `BOSS_MONITOR_HOME`，可用
+`BOSS_MONITORING_ENABLED=false` 完全关闭。独立 monitor 通过无副作用导出
+`@reconcrap/boss-recommend-mcp/monitor-provider` 连接，不需要 AI harness
+轮询或 cron。
+
+完整的投影目录、环境变量、安全边界和本地验证方式见
+[`docs/recruiting-monitor-v1.md`](docs/recruiting-monitor-v1.md)。
+
 ## MCP Tool Input
 
 ```json

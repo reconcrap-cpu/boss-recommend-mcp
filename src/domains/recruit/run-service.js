@@ -45,6 +45,12 @@ import {
   resetInfiniteListForRefreshRound,
   resolveInfiniteListFallbackPoint
 } from "../../core/infinite-list/index.js";
+
+export function shouldContinueRecruitPassedTarget({ passedCount = 0, targetCount = 1 } = {}) {
+  const passed = Math.max(0, Number(passedCount) || 0);
+  const target = Math.max(1, Number(targetCount) || 1);
+  return passed < target;
+}
 import { createViewportRunGuard } from "../../core/self-heal/index.js";
 import {
   callScreeningLlm,
@@ -905,7 +911,8 @@ export async function runRecruitWorkflow({
     list_end_reason: null
   });
 
-  while (results.length < limit) {
+  let passedCount = results.filter((item) => item?.screening?.passed === true).length;
+  while (shouldContinueRecruitPassedTarget({ passedCount, targetCount: limit })) {
     const candidateStarted = Date.now();
     const timings = {};
     await runControl.waitIfPaused();
@@ -955,7 +962,7 @@ export async function runRecruitWorkflow({
       if (
         (nextCandidateResult.end_reached || isRefreshableListStall(nextCandidateResult.reason))
         && refreshOnEnd
-        && results.length < limit
+        && shouldContinueRecruitPassedTarget({ passedCount, targetCount: limit })
         && refreshRounds < Math.max(0, Number(maxRefreshRounds) || 0)
       ) {
         await runControl.waitIfPaused();
@@ -1542,6 +1549,7 @@ export async function runRecruitWorkflow({
       timings
     };
     results.push(compactResult);
+    if (screening.passed === true) passedCount += 1;
     markInfiniteListCandidateProcessed(listState, candidateKey, {
       metadata: {
         result_index: index,

@@ -108,7 +108,7 @@ function testRecommendRefreshBudgetsRemainExactlyTwo() {
   const source = fs.readFileSync(
     new URL("./domains/recommend/run-service.js", import.meta.url),
     "utf8"
-  );
+  ).replace(/\r\n/g, "\n");
   assert.equal(
     /const RECOMMEND_CONTEXT_RECOVERY_MAX_ATTEMPTS = 2;/.test(source),
     true,
@@ -414,7 +414,7 @@ function testPostActionBindingIsGatedByPassedScreening() {
   const source = fs.readFileSync(
     new URL("./domains/recommend/run-service.js", import.meta.url),
     "utf8"
-  );
+  ).replace(/\r\n/g, "\n");
   const postActionGuardStart = source.indexOf("if (\n      postActionEnabled");
   const postActionBinding = source.indexOf(
     'await requireCurrentDetailCandidateBinding("before_post_action_discovery")',

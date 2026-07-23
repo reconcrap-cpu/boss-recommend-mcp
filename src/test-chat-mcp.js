@@ -1044,6 +1044,47 @@ async function testChatDetachedChildExitDoesNotOverwriteTerminalState() {
   assert.equal(afterExit.error, null);
 }
 
+async function testChatDetachedMonitorStorageFailureDoesNotFailQueuedRun() {
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitorRuntimeHome = process.env.RECRUITING_MONITOR_HOME;
+  const invalidMonitorHome = path.join(process.env.BOSS_CHAT_HOME, "monitor-home-is-a-file");
+  fs.writeFileSync(invalidMonitorHome, "not a directory", "utf8");
+  process.env.BOSS_MONITOR_HOME = invalidMonitorHome;
+  process.env.RECRUITING_MONITOR_HOME = path.join(
+    process.env.BOSS_CHAT_HOME,
+    "monitor-runtime-unavailable"
+  );
+  const child = new EventEmitter();
+  child.pid = process.pid;
+  child.unref = () => {};
+  __setChatMcpSpawnForTests(() => child);
+  try {
+    const started = await startBossChatDetachedRunTool({
+      workspaceRoot: process.cwd(),
+      args: readyArgs({ delay_ms: 0 })
+    });
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.state, "queued");
+    assert.equal(started.monitoring.availability, "monitor_unavailable");
+    assert.equal(started.run.monitoring_v1, undefined);
+    const persisted = JSON.parse(fs.readFileSync(started.run.artifacts.run_state_path, "utf8"));
+    assert.equal(persisted.state, "queued");
+    assert.equal(persisted.monitoring_v1, undefined);
+  } finally {
+    __setChatMcpSpawnForTests(null);
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitorRuntimeHome === undefined) {
+      delete process.env.RECRUITING_MONITOR_HOME;
+    } else {
+      process.env.RECRUITING_MONITOR_HOME = previousMonitorRuntimeHome;
+    }
+  }
+}
+
 async function testChatDetachedWorkerSnapshotReplacesBootstrapPid() {
   installFakeConnector();
   setChatMcpWorkflowForTests(async (options, runControl) => {
@@ -1172,6 +1213,8 @@ async function main() {
     await testChatDetachedCollectCvBootstrapIncludesProcessingFloor();
     resetChatMcpStateForTests();
     await testChatDetachedChildExitDoesNotOverwriteTerminalState();
+    resetChatMcpStateForTests();
+    await testChatDetachedMonitorStorageFailureDoesNotFailQueuedRun();
     resetChatMcpStateForTests();
     await testChatDetachedWorkerSnapshotReplacesBootstrapPid();
     console.log("chat MCP tests passed");

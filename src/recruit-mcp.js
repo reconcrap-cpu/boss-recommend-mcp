@@ -41,6 +41,17 @@ import {
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
+import {
+  boundedWorkflowCheckpoint,
+  compactWorkflowResultForState,
+  getWorkflowCandidateJournalPath,
+  reconstructWorkflowCandidateResults
+} from "./core/run/workflow-candidate-journal.js";
 
 const RUN_MODE_ASYNC = "async";
 const RUN_MODE_SYNC = "sync";
@@ -127,6 +138,10 @@ function clonePlain(value, fallback = null) {
   }
 }
 
+function plainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 function normalizeRunId(runId) {
   const normalized = normalizeText(runId);
   if (!normalized || normalized.includes("/") || normalized.includes("\\")) return "";
@@ -155,6 +170,10 @@ function getRecruitRunArtifacts(runId) {
     worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
     worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    candidate_result_journal_path: getWorkflowCandidateJournalPath({
+      runDir: runsDir,
+      runId: normalized
+    }),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
   };
@@ -231,7 +250,11 @@ function readRecruitRunState(runId) {
 function writeRecruitRunState(runId, payload) {
   const artifacts = getRecruitRunArtifacts(runId);
   if (!artifacts) return null;
-  writeJsonAtomic(artifacts.run_state_path, payload);
+  writeJsonAtomic(artifacts.run_state_path, {
+    ...payload,
+    result: compactWorkflowResultForState(payload?.result),
+    summary: compactWorkflowResultForState(payload?.summary)
+  });
   return payload;
 }
 
@@ -389,14 +412,29 @@ function ensureRecruitRunArtifacts(snapshot) {
   if (!artifacts) return null;
 
   const meta = getRecruitRunMeta(snapshot?.runId || snapshot?.run_id);
-  const checkpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
+  const sourceCheckpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
     ? snapshot.checkpoint
     : {};
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id,
+    checkpoint: sourceCheckpoint
+  });
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const journalResults = reconstructWorkflowCandidateResults({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id
+  });
+  const checkpointResults = journalResults.length
+    ? journalResults
+    : Array.isArray(sourceCheckpoint.results)
+      ? sourceCheckpoint.results
+      : Array.isArray(checkpoint.results)
+        ? checkpoint.results
+        : [];
   const artifactSummary = summary || (checkpointResults.length ? {
     domain: "recruit",
     partial: true,
@@ -428,9 +466,14 @@ function ensureRecruitRunArtifacts(snapshot) {
 function persistRecruitCheckpointSnapshot(normalized) {
   const artifacts = getRecruitRunArtifacts(normalized?.run_id || normalized?.runId);
   if (!artifacts) return;
-  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+  const sourceCheckpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
     ? normalized.checkpoint
     : {};
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: normalized?.run_id || normalized?.runId,
+    checkpoint: sourceCheckpoint
+  });
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   const meta = getRecruitRunMeta(normalized?.run_id || normalized?.runId);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
@@ -477,6 +520,20 @@ function completionReason(status) {
 }
 
 function snapshotFromPersistedRecruitRun(persisted = {}) {
+  const artifacts = getRecruitRunArtifacts(persisted.run_id || persisted.runId);
+  const checkpoint = persisted.checkpoint || readJsonFile(artifacts?.checkpoint_path) || {};
+  const journalResults = artifacts
+    ? reconstructWorkflowCandidateResults({
+        runDir: artifacts.runs_dir,
+        runId: persisted.run_id || persisted.runId
+      })
+    : [];
+  const {
+    candidate_result_journal: _candidateResultJournal,
+    results_count: _resultsCount,
+    results_truncated: _resultsTruncated,
+    ...legacyCheckpoint
+  } = checkpoint;
   return {
     runId: persisted.run_id || persisted.runId,
     name: persisted.name || persisted.run_id || persisted.runId,
@@ -484,7 +541,9 @@ function snapshotFromPersistedRecruitRun(persisted = {}) {
     phase: persisted.stage || persisted.phase,
     progress: persisted.progress || {},
     context: persisted.context || {},
-    checkpoint: persisted.checkpoint || {},
+    checkpoint: journalResults.length
+      ? { ...legacyCheckpoint, results: journalResults }
+      : legacyCheckpoint,
     startedAt: persisted.started_at || persisted.startedAt,
     updatedAt: persisted.updated_at || persisted.updatedAt,
     completedAt: persisted.completed_at || persisted.completedAt || null,
@@ -1200,12 +1259,24 @@ function normalizeRunSnapshot(snapshot) {
 }
 
 function persistRecruitRunSnapshot(snapshot, {
-  persistActiveCheckpoint = false
+  persistActiveCheckpoint = false,
+  monitorEvent = {}
 } = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecruitRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const existing = readJsonFile(artifacts.run_state_path);
+  const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
+  const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
+  const monitorMarker = existingMonitorMarker.contract_version === "1.0"
+    ? existingMonitorMarker
+    : normalizedMonitorMarker.contract_version === "1.0"
+      ? normalizedMonitorMarker
+      : monitorEvent?.v1_created === true
+        ? createBossMonitorSourceMarker(normalized.started_at || normalized.updated_at)
+        : null;
+  if (monitorMarker) normalized.monitoring_v1 = monitorMarker;
   if (persistActiveCheckpoint) {
     persistRecruitCheckpointSnapshot(normalized);
   }
@@ -1226,17 +1297,20 @@ function persistRecruitRunSnapshot(snapshot, {
     control: normalized.control,
     resume: normalized.resume,
     error: normalized.error,
-    result: normalized.result,
-    summary: normalized.summary,
+    result: compactWorkflowResultForState(normalized.result),
+    summary: compactWorkflowResultForState(normalized.summary),
+    monitoring_v1: normalized.monitoring_v1,
     artifacts: normalized.artifacts
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
+  writeBossMonitorProjectionNonfatal("search", normalized, monitorEvent);
   return normalized;
 }
 
 function persistRecruitLifecycleSnapshot(snapshot, event = {}) {
   return persistRecruitRunSnapshot(snapshot, {
-    persistActiveCheckpoint: event?.type === "checkpoint"
+    persistActiveCheckpoint: event?.type === "checkpoint",
+    monitorEvent: { ...event, producer: true }
   });
 }
 
@@ -1597,7 +1671,9 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "", 
     parsed
   });
   trackRecruitRun(started.runId);
-  const persistedStarted = persistRecruitRunSnapshot(started);
+  const persistedStarted = persistRecruitRunSnapshot(started, {
+    monitorEvent: { type: "created", producer: true, v1_created: true }
+  });
 
   return {
     status: "ACCEPTED",
@@ -1664,7 +1740,10 @@ export async function startRecruitPipelineRunTool({ workspaceRoot = "", args = {
     execution_mode: RUN_MODE_ASYNC
   }, { workspaceRoot });
   if (started.status !== "ACCEPTED") return started;
-  return attachMethodEvidence(started, started.run_id);
+  return {
+    ...attachMethodEvidence(started, started.run_id),
+    monitoring: createBossMonitoringBlock("search", started.run_id)
+  };
 }
 
 export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", args = {} } = {}) {
@@ -1749,14 +1828,21 @@ export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", 
         chrome: null
       };
     }
+    const queuedMonitorMarker = latest.monitoring_v1
+      || createBossMonitorSourceMarker(latest.started_at || now);
     const queued = {
       ...latest,
+      ...(queuedMonitorMarker ? { monitoring_v1: queuedMonitorMarker } : {}),
       pid: child.pid || globalThis.process?.pid || null,
       updated_at: now,
       heartbeat_at: now,
       last_message: "Boss search detached worker launched."
     };
     writeRecruitRunState(runId, queued);
+    writeBossMonitorProjectionNonfatal("search", queued, {
+      type: "created",
+      v1_created: true
+    });
     return {
       status: "ACCEPTED",
       run_id: runId,
@@ -1770,7 +1856,8 @@ export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", 
       runtime_evaluate_used: false,
       method_summary: {},
       method_log: [],
-      chrome: null
+      chrome: null,
+      monitoring: createBossMonitoringBlock("search", runId)
     };
   } catch (error) {
     const failed = markBossRecruitDetachedWorkerFailed(runId, error, {
@@ -1857,15 +1944,23 @@ export function getRecruitPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecruitRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: normalizedRun
+      run: normalizedRun,
+      monitoring: createBossMonitoringBlock("search", runId)
     }, runId);
   } catch {
     const persisted = readRecruitRunState(runId);
     if (persisted) {
       const reconciled = reconcilePersistedRecruitRun(persisted);
+      const hydrated = snapshotFromPersistedRecruitRun(reconciled.run);
+      writeBossMonitorProjectionNonfatal(
+        "search",
+        { ...reconciled.run, checkpoint: hydrated.checkpoint },
+        { type: "backfill" }
+      );
       return {
         status: "RUN_STATUS",
         run: reconciled.run,
+        monitoring: createBossMonitoringBlock("search", runId),
         persistence: {
           source: "disk",
           active_control_available: false,

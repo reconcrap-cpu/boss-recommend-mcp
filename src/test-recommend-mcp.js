@@ -12,7 +12,9 @@ import {
   compactRecommendRunForStatus,
   getRecommendEmptyBootstrapPreflightAction,
   isRecommendConnectorHealthAccepted,
+  pauseRecommendPipelineRunTool,
   resolveRecommendActionJournalScope,
+  resumeRecommendPipelineRunTool,
   shouldPreserveRecommendDetailOnTerminal
 } from "./recommend-mcp.js";
 
@@ -1260,6 +1262,60 @@ async function testRecommendFinalConfirmedPayloadStartsAccepted() {
   assert.equal(observedOptions.humanBehavior.restLevel, "high");
 }
 
+async function testRecommendMonitorStorageFailureDoesNotFailLegacyRun() {
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitorRuntimeHome = process.env.RECRUITING_MONITOR_HOME;
+  const invalidMonitorHome = path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-home-is-a-file");
+  fs.writeFileSync(invalidMonitorHome, "not a directory", "utf8");
+  process.env.BOSS_MONITOR_HOME = invalidMonitorHome;
+  process.env.RECRUITING_MONITOR_HOME = path.join(
+    process.env.BOSS_RECOMMEND_HOME,
+    "monitor-runtime-unavailable"
+  );
+  installFakeConnector();
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:monitor-storage-unavailable");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+  try {
+    const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 152_1);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.monitoring.availability, "monitor_unavailable");
+    assert.equal(started.run.monitoring_v1, undefined);
+    const completed = await waitForRecommendRun(
+      started.run_id,
+      (run) => run?.status === "completed"
+    );
+    assert.equal(completed.status, "completed");
+    const persisted = JSON.parse(fs.readFileSync(completed.artifacts.run_state_path, "utf8"));
+    assert.equal(persisted.state, "completed");
+    assert.equal(persisted.monitoring_v1, undefined);
+  } finally {
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitorRuntimeHome === undefined) {
+      delete process.env.RECRUITING_MONITOR_HOME;
+    } else {
+      process.env.RECRUITING_MONITOR_HOME = previousMonitorRuntimeHome;
+    }
+  }
+}
+
 async function testRunRecommendAliasStartsAccepted() {
   installFakeConnector();
   let observedOptions = null;
@@ -1821,6 +1877,73 @@ async function testRecommendAsyncPauseResumeCancel() {
   assert.equal(diskPayload.persistence.source, "disk");
   assert.equal(diskPayload.persistence.active_control_available, false);
   assert.equal(connector.closeCount >= 1, true);
+}
+
+function testRecommendDirectDetachedPauseResumePersistsControl() {
+  resetRecommendMcpStateForTests();
+  const runId = "mcp_recommend_direct_detached_control_test";
+  const runsDir = path.join(process.env.BOSS_RECOMMEND_HOME, "runs");
+  const statePath = path.join(runsDir, `${runId}.json`);
+  const startedAt = new Date(Date.now() - 5_000).toISOString();
+  fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    run_id: runId,
+    state: "running",
+    status: "running",
+    stage: "recommend:detail",
+    started_at: startedAt,
+    updated_at: startedAt,
+    heartbeat_at: startedAt,
+    pid: process.pid,
+    progress: {
+      target_count: 3,
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      skipped: 1,
+      greet_count: 0
+    },
+    control: {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    }
+  }, null, 2)}\n`, "utf8");
+
+  const paused = pauseRecommendPipelineRunTool({ args: { run_id: runId } });
+  assert.equal(paused.status, "PAUSE_REQUESTED");
+  assert.equal(paused.persistence.source, "disk");
+  assert.equal(paused.persistence.active_control_available, false);
+  assert.equal(paused.persistence.detached_control_requested, true);
+  assert.equal(paused.run.control.pause_requested, true);
+  assert.equal(paused.run.control.pause_requested_by, "pause_recommend_pipeline_run");
+  assert.equal(paused.run.control.cancel_requested, false);
+  const pausePersisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(pausePersisted.control.pause_requested, true);
+  assert.equal(pausePersisted.control.pause_requested_by, "pause_recommend_pipeline_run");
+
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    ...pausePersisted,
+    state: "paused",
+    status: "paused",
+    updated_at: new Date().toISOString()
+  }, null, 2)}\n`, "utf8");
+  const resumed = resumeRecommendPipelineRunTool({ args: { run_id: runId } });
+  assert.equal(resumed.status, "RESUME_REQUESTED");
+  assert.equal(resumed.persistence.source, "disk");
+  assert.equal(resumed.persistence.active_control_available, false);
+  assert.equal(resumed.persistence.detached_control_requested, true);
+  assert.equal(resumed.run.control.pause_requested, false);
+  assert.equal(resumed.run.control.pause_requested_at, null);
+  assert.equal(resumed.run.control.pause_requested_by, null);
+  assert.equal(resumed.run.control.cancel_requested, false);
+  const resumePersisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(resumePersisted.control.pause_requested, false);
+  assert.equal(resumePersisted.control.pause_requested_at, null);
+  assert.equal(resumePersisted.control.pause_requested_by, null);
+  assert.equal(resumePersisted.control.cancel_requested, false);
+  fs.rmSync(statePath, { force: true });
 }
 
 async function testRecommendActiveRunPersistsProgressToDisk() {
@@ -3491,6 +3614,8 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendFinalConfirmedPayloadStartsAccepted();
     resetRecommendMcpStateForTests();
+    await testRecommendMonitorStorageFailureDoesNotFailLegacyRun();
+    resetRecommendMcpStateForTests();
     await testRunRecommendAliasStartsAccepted();
     resetRecommendMcpStateForTests();
     await testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler();
@@ -3520,6 +3645,8 @@ async function main() {
     await testRecommendHumanBehaviorArgsOverrideConfig();
     resetRecommendMcpStateForTests();
     await testRecommendAsyncPauseResumeCancel();
+    resetRecommendMcpStateForTests();
+    testRecommendDirectDetachedPauseResumePersistsControl();
     resetRecommendMcpStateForTests();
     await testRecommendActiveRunPersistsProgressToDisk();
     resetRecommendMcpStateForTests();
