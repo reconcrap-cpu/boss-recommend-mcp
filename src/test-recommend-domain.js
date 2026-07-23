@@ -976,7 +976,7 @@ async function testRecommendCurrentCityOnlyRejectsTransientControlDisappearanceW
   assert.equal(state.transientControlMissingReads, 0);
 }
 
-async function testColleagueContactInspectorFailsClosedWhenPanelMissing() {
+async function testColleagueContactInspectorContinuesWhenPanelMissing() {
   const result = await inspectRecentColleagueContact({
     DOM: {
       async querySelectorAll() {
@@ -997,12 +997,13 @@ async function testColleagueContactInspectorFailsClosedWhenPanelMissing() {
     sectionWaitMs: 0,
     sectionPollMs: 0
   });
-  assert.equal(result.checked, false);
+  assert.equal(result.checked, true);
   assert.equal(result.panel_found, false);
-  assert.equal(result.recent, null);
-  assert.equal(result.indeterminate, true);
+  assert.equal(result.recent, false);
+  assert.equal(result.indeterminate, false);
   assert.equal(result.reason, "panel_missing");
   assert.equal(isVerifiedColleagueContactInspection(result), false);
+  assert.equal(getColleagueContactSkipReason(result), "");
 }
 
 async function testColleagueContactInspectorAcceptsStablePanelAbsence() {
@@ -1295,6 +1296,20 @@ function testVerifiedColleagueContactInspectionRequiresExactPositiveEvidence() {
     recent: false,
     reason: "panel_missing"
   }), false);
+  assert.equal(getColleagueContactSkipReason({
+    checked: false,
+    panel_found: false,
+    recent: null,
+    indeterminate: true,
+    reason: "panel_missing"
+  }), "");
+  assert.equal(getColleagueContactSkipReason({
+    checked: false,
+    panel_found: true,
+    recent: null,
+    indeterminate: true,
+    reason: "panel_missing"
+  }), "colleague_contact_unverified");
   assert.equal(isVerifiedColleagueContactInspection({
     ...bound,
     recent: false,
@@ -5629,7 +5644,7 @@ await testColleagueContactNoRecentRequiresCompleteScrollCoverage();
 await testColleagueContactScrollDispatchFailureFailsClosed();
 await testColleagueContactInspectorSelectsColleagueTab();
 await testColleagueContactInspectorWaitsForLatePanel();
-await testColleagueContactInspectorFailsClosedWhenPanelMissing();
+await testColleagueContactInspectorContinuesWhenPanelMissing();
 await testColleagueContactInspectorAcceptsStablePanelAbsence();
 await testColleagueContactInspectorFailsClosedWhenQueryErrors();
 await testColleagueContactInspectorFailsClosedWhenTabUnavailable();

@@ -2832,6 +2832,14 @@ export function isVerifiedColleagueContactInspection(colleagueContact) {
 }
 
 export function getColleagueContactSkipReason(colleagueContact) {
+  // Boss omits the collaboration panel when there is no colleague-contact history.
+  // Panel absence is therefore a clear-to-screen state, not an unverified skip.
+  if (
+    colleagueContact?.reason === "panel_missing"
+    && colleagueContact?.panel_found === false
+  ) {
+    return "";
+  }
   if (!isVerifiedColleagueContactInspection(colleagueContact)) {
     return "colleague_contact_unverified";
   }

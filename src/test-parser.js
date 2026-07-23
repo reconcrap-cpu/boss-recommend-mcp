@@ -839,6 +839,51 @@ function testExplicitCriteriaBlockShouldKeepAllCoreRulesAndExcludeMetaFields() {
   assert.equal(criteria.includes("岗位"), false);
 }
 
+function testOpenClawInstructionShouldPreferLlmCriteriaOverPageFilters() {
+  const instruction = `启动Boss推荐页筛选任务。
+
+页面筛选条件：
+- 学历：博士
+- 学校标签：985 / 211 / 双一流院校 / 国内外名校
+- 性别：不限
+- 近14天已看过的人选：不限
+
+LLM筛选条件，必须同时满足全部条件：
+
+1）学历/科研门槛必须满足：至少一段学历为985、QS前300海外院校、中科院，或211/双一流院校相关专业。
+2）履历中必须能看到多模态大模型、视频生成、世界模型或3D重建方向的研究经历。
+
+目标人数：200
+通过动作：打招呼
+岗位：科研算法实习生（3D重建与生成）-可转正 _ 杭州`;
+  const result = parseRecommendInstruction({
+    instruction,
+    confirmation: { final_confirmed: true },
+    overrides: null
+  });
+  const criteria = result.screenParams.criteria || "";
+
+  assert.notEqual(criteria, "-");
+  assert.equal(criteria.includes("1）学历/科研门槛必须满足"), true);
+  assert.equal(criteria.includes("2）履历中必须能看到多模态大模型"), true);
+  assert.equal(criteria.includes("页面筛选条件"), false);
+  assert.equal(criteria.includes("学历：博士"), false);
+  assert.equal(result.criteria_normalized.includes("QS前300"), true);
+}
+
+function testCriteriaPlaceholderShouldRemainMissing() {
+  for (const criteria of ["-", "—", "暂无", "none"]) {
+    const result = parseRecommendInstruction({
+      instruction: `启动Boss推荐任务\n筛选标准：${criteria}`,
+      confirmation: { final_confirmed: true },
+      overrides: { criteria }
+    });
+
+    assert.equal(result.screenParams.criteria, null, criteria);
+    assert.equal(result.missing_fields.includes("criteria"), true, criteria);
+  }
+}
+
 function testFallbackCriteriaShouldStillWorkWithoutExplicitMarker() {
   const result = parseRecommendInstruction({
     instruction: "页面选择：推荐；学校标签：985/211；岗位：算法工程师；候选人需满足至少两段 AI 项目经验；最大招呼数：20；",
@@ -933,6 +978,8 @@ function main() {
   testConfirmedPageScopeShouldBeResolved();
   testPageScopeOverrideShouldNotBypassConfirmation();
   testExplicitCriteriaBlockShouldKeepAllCoreRulesAndExcludeMetaFields();
+  testOpenClawInstructionShouldPreferLlmCriteriaOverPageFilters();
+  testCriteriaPlaceholderShouldRemainMissing();
   testFallbackCriteriaShouldStillWorkWithoutExplicitMarker();
   testOverrideCriteriaShouldHaveHighestPriorityOverExplicitCriteriaBlock();
   testFallbackCriteriaShouldNotDropReal985211QsRules();

@@ -142,8 +142,9 @@ const MAX_GREET_COUNT_PATTERNS = [
   /(?:打招呼|沟通|联系)(?:上限|最多|不超过|至多)(?:为|是|:|：)?\s*(\d+)/i
 ];
 const RUN_META_FIELD_LABEL_PATTERN = "(?:页面选择|学校标签|院校标签|学历|学位|性别|是否过滤近14天看过|当前城市筛选|仅推荐本城市|仅推荐期望城市为本城市(?:的牛人)?|current[_\\s-]?city[_\\s-]?only|活跃度|活动度|activity[_\\s-]?level|筛选条件|目标筛选数|目标通过人数|通过筛选后动作|最大招呼数|最大打招呼数|岗位)";
-const CRITERIA_EXPLICIT_MARKER_PATTERN = /筛选条件\s*[：:]/i;
+const CRITERIA_EXPLICIT_MARKER_PATTERN = /(?:(?:LLM|大模型)\s*)?(?<!页面)(?:筛选条件|筛选标准)(?:\s*[，,][^：:\r\n]*)?\s*[：:]/i;
 const CRITERIA_EXPLICIT_STOP_PATTERN = new RegExp(`(?:^|[\\s；;])\\s*${RUN_META_FIELD_LABEL_PATTERN}\\s*[：:]`, "i");
+const CRITERIA_PLACEHOLDER_PATTERN = /^(?:[-—–_*/\\|]+|无|暂无|无要求|不限|null|none|n\/a)$/i;
 const CRITERIA_META_FIELD_PREFIX_PATTERNS = [
   new RegExp(`^${RUN_META_FIELD_LABEL_PATTERN}\\s*(?:[:：]|$)`, "i"),
   /^(?:近?14天(?:内)?(?:没有|没看过|未查看)|(?:不过滤|保留|过滤|排除)[^。；;\n]{0,12}14天)\s*(?:[:：]|$)?/i,
@@ -768,6 +769,10 @@ function sanitizeClause(clause) {
   return current;
 }
 
+function isCriteriaPlaceholder(value) {
+  return CRITERIA_PLACEHOLDER_PATTERN.test(normalizeText(value));
+}
+
 function isMetaClause(clause) {
   const normalized = sanitizeClause(clause);
   if (!normalized) return true;
@@ -820,6 +825,7 @@ function normalizeRawCriteriaClauses(clauses = []) {
   const filtered = clauses
     .map((item) => String(item || "").replace(/^[；;，,。]+/, "").replace(/[；;，,。]+$/, "").trim())
     .filter(Boolean)
+    .filter((item) => !isCriteriaPlaceholder(item))
     .filter((item) => !isMetaClause(item));
   const unique = uniqueList(filtered);
   if (!unique.length) return null;
@@ -837,6 +843,7 @@ function normalizeCriteriaClauses(clauses = []) {
     .map((item) => sanitizeClause(item))
     .map((item) => item.replace(/^[；;，,。]+/, "").replace(/[；;，,。]+$/, "").trim())
     .filter(Boolean)
+    .filter((item) => !isCriteriaPlaceholder(item))
     .filter((item) => !isMetaClause(item));
   const unique = uniqueList(filtered.map((item) => normalizeText(item)));
   if (!unique.length) return null;
@@ -853,6 +860,7 @@ function extractExplicitCriteriaBlock(text) {
   const normalizedText = String(text || "").replace(/\r\n/g, "\n");
   const markerMatch = normalizedText.match(CRITERIA_EXPLICIT_MARKER_PATTERN);
   if (!markerMatch) return {
+    found: false,
     raw: null,
     normalized: null
   };
@@ -864,6 +872,7 @@ function extractExplicitCriteriaBlock(text) {
   }
   const rawClauses = splitRawCriteriaClauses(block);
   return {
+    found: true,
     raw: normalizeRawCriteriaClauses(rawClauses),
     normalized: normalizeCriteriaClauses(rawClauses)
   };
@@ -883,7 +892,7 @@ function buildFallbackCriteria(text) {
 function buildCriteria({ instruction, rawInstruction, overrideCriteria }) {
   const rawOverride = String(overrideCriteria || "").trim();
   const normalizedOverride = normalizeText(rawOverride);
-  if (normalizedOverride) {
+  if (normalizedOverride && !isCriteriaPlaceholder(normalizedOverride)) {
     return {
       raw: rawOverride || normalizedOverride,
       normalized: normalizedOverride,
@@ -892,10 +901,10 @@ function buildCriteria({ instruction, rawInstruction, overrideCriteria }) {
   }
 
   const explicitCriteria = extractExplicitCriteriaBlock(rawInstruction || instruction);
-  if (explicitCriteria.raw) {
+  if (explicitCriteria.found) {
     return {
       ...explicitCriteria,
-      source: "explicit"
+      source: explicitCriteria.raw ? "explicit" : null
     };
   }
 

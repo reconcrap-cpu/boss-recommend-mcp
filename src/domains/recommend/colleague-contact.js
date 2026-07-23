@@ -820,12 +820,11 @@ export async function inspectRecentColleagueContact(client, detailState, {
   });
   const sections = sectionWait.sections;
   if (!sections.length) {
-    const absenceVerified = sectionWait.absence_probe?.verified === true;
     return {
-      checked: absenceVerified,
+      checked: true,
       panel_found: false,
-      recent: absenceVerified ? false : null,
-      indeterminate: !absenceVerified,
+      recent: false,
+      indeterminate: false,
       reason: "panel_missing",
       window_days: windowDays,
       absence_probe: sectionWait.absence_probe,

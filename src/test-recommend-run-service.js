@@ -2269,6 +2269,43 @@ async function testVerifiedPanelAbsenceContinuesAfterFreshCandidateBinding() {
   assert.equal(result.skip_reason, "");
 }
 
+async function testUnverifiedPanelAbsenceProbeStillContinuesAfterFreshCandidateBinding() {
+  let verificationCalls = 0;
+  const result = await bindRecommendColleagueContactInspectionResult({
+    checked: true,
+    panel_found: false,
+    recent: false,
+    indeterminate: false,
+    reason: "panel_missing",
+    rows: [],
+    absence_probe: {
+      verified: false,
+      selector: ".colleague-collaboration",
+      scope_count: 1,
+      stable_scope_count: 1,
+      poll_count: 1,
+      elapsed_ms: 0,
+      timeout_ms: 1000,
+      full_window_elapsed: false,
+      query_error_count: 0,
+      scope_binding_lost: false,
+      scope_backend_node_ids: [1005]
+    }
+  }, {
+    async reverifyCandidateBinding(stage) {
+      verificationCalls += 1;
+      assert.equal(stage, "after_colleague_contact_before_result");
+      return {
+        verified: true,
+        candidate_id: "candidate-panel-absent-unverified"
+      };
+    }
+  });
+  assert.equal(verificationCalls, 1);
+  assert.equal(result.candidate_binding.verified, true);
+  assert.equal(result.skip_reason, "");
+}
+
 async function testRecommendGreetingJournalProtectsUnknownClickAndReconcilesExactControl() {
   const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "recommend-greet-journal-"));
   try {
@@ -3869,6 +3906,7 @@ testPreClickStaleNoActionDispositionRequiresExactRetryExhaustion();
 testCandidateLocalCriticalCheckpointIncludesProcessedListState();
 await testColleagueResultBindingDriftPreventsDerivedSkip();
 await testVerifiedPanelAbsenceContinuesAfterFreshCandidateBinding();
+await testUnverifiedPanelAbsenceProbeStillContinuesAfterFreshCandidateBinding();
 await testRecommendGreetingJournalProtectsUnknownClickAndReconcilesExactControl();
 await testRecommendPostClickBackendScopedFrontendAliasConfirmsGreeting();
 await testRecommendCandidateBindingMismatchCannotEnterPostActionClick();
