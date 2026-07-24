@@ -53,6 +53,7 @@ import {
   getCandidateResultJournalPath,
   readCandidateResultJournal
 } from "./core/run/candidate-result-journal.js";
+import { withRunStateFileLockSync } from "./core/run/state-file-lock.js";
 import {
   resolveBossConfiguredOutputDir,
   resolveHumanBehaviorForRun,
@@ -73,6 +74,9 @@ const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screenin
 const RUN_MODE_ASYNC = "async";
 const REST_LEVEL_OPTIONS = ["low", "medium", "high"];
 const REST_LEVEL_SET = new Set(REST_LEVEL_OPTIONS);
+const RECOMMEND_ATOMIC_RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RECOMMEND_ATOMIC_RENAME_RETRY_DELAYS_MS = Object.freeze([25, 50, 100, 200, 400, 500]);
+const RECOMMEND_ATOMIC_RENAME_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 
 const TERMINAL_STATUSES = new Set([
   RUN_STATUS_COMPLETED,
@@ -704,9 +708,42 @@ function ensureDirectory(dirPath) {
 
 function writeJsonAtomic(filePath, payload) {
   ensureDirectory(path.dirname(filePath));
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tempPath, filePath);
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let renameAttempt = 0;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    while (true) {
+      try {
+        fs.renameSync(tempPath, filePath);
+        return;
+      } catch (error) {
+        const retryDelayMs = RECOMMEND_ATOMIC_RENAME_RETRY_DELAYS_MS[renameAttempt];
+        renameAttempt += 1;
+        if (
+          !RECOMMEND_ATOMIC_RENAME_RETRY_CODES.has(error?.code)
+          || retryDelayMs === undefined
+        ) {
+          throw error;
+        }
+        Atomics.wait(
+          RECOMMEND_ATOMIC_RENAME_SLEEP_CELL,
+          0,
+          0,
+          retryDelayMs
+        );
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
 }
 
 function readJsonFile(filePath) {
@@ -1867,6 +1904,7 @@ function persistRecommendRunSnapshot(snapshot, {
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const persisted = withRunStateFileLockSync(artifacts.run_state_path, () => {
   const existing = readJsonFile(artifacts.run_state_path);
   const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
   const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
@@ -1957,8 +1995,10 @@ function persistRecommendRunSnapshot(snapshot, {
       }
     }
   }
-  writeBossMonitorProjectionNonfatal("recommend", normalized, monitorEvent);
-  return normalized;
+    return normalized;
+  });
+  writeBossMonitorProjectionNonfatal("recommend", persisted, monitorEvent);
+  return persisted;
 }
 
 function patchPersistedRecommendRunControl(runId, controlPatch = {}, {
@@ -1966,22 +2006,24 @@ function patchPersistedRecommendRunControl(runId, controlPatch = {}, {
 } = {}) {
   const artifacts = getRecommendRunArtifacts(runId);
   if (!artifacts) return null;
-  const current = readJsonFile(artifacts.run_state_path);
-  const state = normalizeText(current?.state || current?.status || "");
-  if (!current || TERMINAL_STATUSES.has(state)) return null;
-  const now = new Date().toISOString();
-  const patched = {
-    ...current,
-    updated_at: now,
-    heartbeat_at: current.heartbeat_at || now,
-    last_message: message || current.last_message || "",
-    control: {
-      ...(current.control || {}),
-      ...controlPatch
-    }
-  };
-  writeJsonAtomic(artifacts.run_state_path, patched);
-  return patched;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readJsonFile(artifacts.run_state_path);
+    const state = normalizeText(current?.state || current?.status || "");
+    if (!current || TERMINAL_STATUSES.has(state)) return null;
+    const now = new Date().toISOString();
+    const patched = {
+      ...current,
+      updated_at: now,
+      heartbeat_at: current.heartbeat_at || now,
+      last_message: message || current.last_message || "",
+      control: {
+        ...(current.control || {}),
+        ...controlPatch
+      }
+    };
+    writeJsonAtomic(artifacts.run_state_path, patched);
+    return patched;
+  });
 }
 
 function reconcilePersistedRecommendRunIfNeeded(persisted) {

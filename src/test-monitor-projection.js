@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -42,6 +43,41 @@ function writeJson(filePath, payload) {
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function waitForPath(filePath, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (fs.existsSync(filePath)) {
+        resolve();
+        return;
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error(`Timed out waiting for ${filePath}`));
+        return;
+      }
+      setTimeout(poll, 10);
+    };
+    poll();
+  });
+}
+
+function waitForChild(child) {
+  return new Promise((resolve, reject) => {
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`child exited code=${code} signal=${signal || ""}: ${stderr}`));
+    });
+  });
 }
 
 function healthyDaemonFixture(overrides = {}) {
@@ -141,7 +177,10 @@ try {
   );
   const checkpointPath = path.join(recommendHome, "runs", "monitor-recommend.checkpoint.json");
   const recommendSource = runningSource("recommend", "monitor-recommend", checkpointPath, screenshotPath);
+  const recommendStatePath = path.join(recommendHome, "runs", "monitor-recommend.json");
+  recommendSource.resume.pause_control_path = recommendStatePath;
   writeJson(checkpointPath, recommendSource.checkpoint);
+  writeJson(recommendStatePath, recommendSource);
 
   const first = writeBossMonitorProjection("recommend", recommendSource, {
     type: "checkpoint",
@@ -203,11 +242,41 @@ try {
   assert.equal(events.events.length, 4);
   assert.equal(events.last_seq, snapshot.last_event_seq);
   fs.appendFileSync(path.join(runDir, "events.ndjson"), "{\"partial\":", "utf8");
+  const pauseRequestedAt = new Date().toISOString();
+  const commandSource = {
+    ...recommendSource,
+    updated_at: pauseRequestedAt,
+    heartbeat_at: pauseRequestedAt,
+    control: {
+      pause_requested: true,
+      pause_requested_at: pauseRequestedAt,
+      pause_requested_by: "monitor-test",
+      cancel_requested: false
+    }
+  };
+  writeJson(recommendStatePath, commandSource);
+  writeBossMonitorProjection("recommend", commandSource, {
+    type: "command",
+    command: "pause",
+    status: "accepted",
+    idempotency_key: "monitor-test-pause"
+  });
   await new Promise((resolve) => setTimeout(resolve, 5_200));
   const heartbeatSnapshot = await provider.getSnapshot(ref);
   assert.ok(heartbeatSnapshot.revision > snapshot.revision);
+  assert.equal(
+    heartbeatSnapshot.controls.pending.some((entry) => entry.command === "pause"),
+    true,
+    "producer heartbeat must refresh the authoritative disk control request"
+  );
   const heartbeatEvents = await provider.getEvents(ref, snapshot.last_event_seq, 20);
   assert.ok(heartbeatEvents.events.some((event) => event.type === "run.progress"));
+  assert.equal(
+    (await provider.getEvents(ref, 0, 100)).events
+      .filter((event) => event.type === "run.command" && event.payload.command === "pause").length,
+    1,
+    "heartbeats must not erase or duplicate the accepted command event"
+  );
   assert.equal(
     (await provider.getEvents(ref, 0, 100)).events
       .filter((event) => event.type === "artifact.available").length,
@@ -217,6 +286,90 @@ try {
   for (const line of fs.readFileSync(path.join(runDir, "events.ndjson"), "utf8").trim().split(/\r?\n/)) {
     assert.doesNotThrow(() => JSON.parse(line));
   }
+
+  const heartbeatRaceRunId = "heartbeat-control-lock-race";
+  const heartbeatRaceStatePath = path.join(
+    recommendHome,
+    "runs",
+    `${heartbeatRaceRunId}.json`
+  );
+  const heartbeatRaceCheckpointPath = path.join(
+    recommendHome,
+    "runs",
+    `${heartbeatRaceRunId}.checkpoint.json`
+  );
+  const heartbeatRaceSource = runningSource(
+    "recommend",
+    heartbeatRaceRunId,
+    heartbeatRaceCheckpointPath,
+    screenshotPath
+  );
+  heartbeatRaceSource.resume.pause_control_path = heartbeatRaceStatePath;
+  writeJson(heartbeatRaceCheckpointPath, heartbeatRaceSource.checkpoint);
+  writeJson(heartbeatRaceStatePath, heartbeatRaceSource);
+  writeBossMonitorProjection("recommend", heartbeatRaceSource, {
+    type: "created",
+    v1_created: true
+  });
+  const heartbeatRaceRunDir = getBossMonitorRunDir("recommend", heartbeatRaceRunId);
+  const heartbeatRaceWriterLock = path.join(heartbeatRaceRunDir, ".writer.lock");
+  writeJson(heartbeatRaceWriterLock, {
+    pid: process.pid,
+    worker_instance_id: "forced-heartbeat-race-owner",
+    nonce: "forced-heartbeat-race",
+    acquired_at: new Date().toISOString()
+  });
+  const heartbeatRaceSourcePath = path.join(testRoot, "heartbeat-race-source.json");
+  const heartbeatRaceReadyPath = path.join(testRoot, "heartbeat-race-ready");
+  writeJson(heartbeatRaceSourcePath, heartbeatRaceSource);
+  const heartbeatChildCode = `
+    import fs from "node:fs";
+    const projection = await import(process.argv[1]);
+    const source = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+    fs.writeFileSync(process.argv[3], "ready");
+    projection.writeBossMonitorProjection("recommend", source, {
+      type: "heartbeat",
+      producer: true
+    });
+  `;
+  const heartbeatChild = spawn(process.execPath, [
+    "--input-type=module",
+    "-e",
+    heartbeatChildCode,
+    new URL("./monitor/projection.js", import.meta.url).href,
+    heartbeatRaceSourcePath,
+    heartbeatRaceReadyPath
+  ], {
+    env: { ...process.env },
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  const heartbeatChildDone = waitForChild(heartbeatChild);
+  await waitForPath(heartbeatRaceReadyPath);
+  const heartbeatRaceRequestedAt = new Date().toISOString();
+  writeJson(heartbeatRaceStatePath, {
+    ...heartbeatRaceSource,
+    updated_at: heartbeatRaceRequestedAt,
+    heartbeat_at: heartbeatRaceRequestedAt,
+    control: {
+      pause_requested: true,
+      pause_requested_at: heartbeatRaceRequestedAt,
+      pause_requested_by: "forced-interleaving-test",
+      cancel_requested: false
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  fs.unlinkSync(heartbeatRaceWriterLock);
+  await heartbeatChildDone;
+  const heartbeatRaceSnapshot = await provider.getSnapshot({
+    provider: "boss",
+    kind: "recommend",
+    run_id: heartbeatRaceRunId
+  });
+  assert.equal(
+    heartbeatRaceSnapshot.controls.pending.some((entry) => entry.command === "pause"),
+    true,
+    "heartbeat must read authoritative controls only after acquiring the projection writer lock"
+  );
 
   const screenshotEvidence = candidateEvent.payload.candidate.evidence.find(
     (entry) => entry.type === "resume_screenshot"
@@ -474,7 +627,7 @@ try {
     type: "progress",
     v1_created: true
   });
-  assert.equal((await provider.listRuns({ kind: "recommend" })).runs.length, 3);
+  assert.equal((await provider.listRuns({ kind: "recommend" })).runs.length, 4);
   assert.equal((await provider.listRuns({ kind: "search" })).runs.length, 1);
   assert.equal((await provider.listRuns({ kind: "chat" })).runs.length, 0);
   const searchRef = { provider: "boss", kind: "search", run_id: "monitor-search" };
@@ -565,20 +718,31 @@ try {
   const recoveredLockRunDir = getBossMonitorRunDir("chat", recoveredLockRunId);
   fs.mkdirSync(recoveredLockRunDir, { recursive: true });
   const staleWriterLock = path.join(recoveredLockRunDir, ".writer.lock");
+  const staleWriterRecoveryLock = path.join(
+    recoveredLockRunDir,
+    ".writer.recovery.lock"
+  );
   writeJson(staleWriterLock, {
-    pid: 2147483647,
-    worker_instance_id: "dead-owner",
-    nonce: "dead-owner-nonce",
+    pid: process.pid,
+    worker_instance_id: "previous-process-that-reused-this-pid",
+    nonce: "expired-live-pid-owner",
+    acquired_at: "2025-01-01T00:00:00.000Z"
+  });
+  writeJson(staleWriterRecoveryLock, {
+    pid: process.pid,
+    nonce: "expired-live-pid-recovery-owner",
     acquired_at: "2025-01-01T00:00:00.000Z"
   });
   const oldLockTime = new Date(Date.now() - 30_000);
   fs.utimesSync(staleWriterLock, oldLockTime, oldLockTime);
+  fs.utimesSync(staleWriterRecoveryLock, oldLockTime, oldLockTime);
   const recoveredLockSnapshot = writeBossMonitorProjection("chat", {
     ...runningSource("chat", recoveredLockRunId, checkpointPath, screenshotPath),
     monitoring_v1: { contract_version: "1.0", created_at: new Date().toISOString() }
   }, { type: "created", v1_created: true });
   assert.equal(recoveredLockSnapshot.state, "running");
   assert.equal(fs.existsSync(staleWriterLock), false);
+  assert.equal(fs.existsSync(staleWriterRecoveryLock), false);
 
   writeJson(path.join(recommendHome, "runs", "monitor-recommend.json"), terminalSource);
   const commandRevision = (await provider.getSnapshot(ref)).revision;

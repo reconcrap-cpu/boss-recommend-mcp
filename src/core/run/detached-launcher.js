@@ -118,6 +118,7 @@ export function buildWindowsDetachedWorkerCommand({
   stderrPath,
   exitStatusPath,
   recommendRuntimeHomePath = "",
+  recruitRuntimeHomePath = "",
   chatRuntimeHomePath = "",
   screenConfigPath = "",
   bossMonitorHomePath = "",
@@ -153,6 +154,9 @@ export function buildWindowsDetachedWorkerCommand({
   ];
   if (recommendRuntimeHomePath) {
     args.push("-RecommendRuntimeHomePath", recommendRuntimeHomePath);
+  }
+  if (recruitRuntimeHomePath) {
+    args.push("-RecruitRuntimeHomePath", recruitRuntimeHomePath);
   }
   if (chatRuntimeHomePath) {
     args.push("-ChatRuntimeHomePath", chatRuntimeHomePath);
@@ -206,6 +210,7 @@ function launchWindowsDetachedWorker(options) {
     stderrPath,
     exitStatusPath,
     recommendRuntimeHomePath,
+    recruitRuntimeHomePath,
     chatRuntimeHomePath,
     screenConfigPath,
     bossMonitorHomePath,
@@ -227,6 +232,7 @@ function launchWindowsDetachedWorker(options) {
     stderrPath,
     exitStatusPath,
     recommendRuntimeHomePath,
+    recruitRuntimeHomePath,
     chatRuntimeHomePath,
     screenConfigPath,
     bossMonitorHomePath,
@@ -281,6 +287,45 @@ function launchWindowsDetachedWorker(options) {
   };
 }
 
+function buildPosixDetachedWorkerEnvironment({
+  environment,
+  recommendRuntimeHomePath,
+  recruitRuntimeHomePath,
+  chatRuntimeHomePath,
+  screenConfigPath,
+  bossMonitorHomePath,
+  recruitingMonitorHomePath,
+  bossMonitoringEnabled
+}) {
+  const childEnvironment = { ...environment };
+
+  // Monitoring paths come only from the validated/resolved launcher values.
+  // This removes invalid raw values while retaining unrelated inherited env.
+  delete childEnvironment.BOSS_MONITOR_HOME;
+  delete childEnvironment.RECRUITING_MONITOR_HOME;
+  if (bossMonitorHomePath) {
+    childEnvironment.BOSS_MONITOR_HOME = bossMonitorHomePath;
+  }
+  if (recruitingMonitorHomePath) {
+    childEnvironment.RECRUITING_MONITOR_HOME = recruitingMonitorHomePath;
+  }
+  childEnvironment.BOSS_MONITORING_ENABLED = bossMonitoringEnabled;
+
+  if (recommendRuntimeHomePath) {
+    childEnvironment.BOSS_RECOMMEND_HOME = recommendRuntimeHomePath;
+  }
+  if (recruitRuntimeHomePath) {
+    childEnvironment.BOSS_RECRUIT_HOME = recruitRuntimeHomePath;
+  }
+  if (chatRuntimeHomePath) {
+    childEnvironment.BOSS_CHAT_HOME = chatRuntimeHomePath;
+  }
+  if (screenConfigPath) {
+    childEnvironment.BOSS_RECOMMEND_SCREEN_CONFIG = screenConfigPath;
+  }
+  return childEnvironment;
+}
+
 function launchPosixDetachedWorker({
   nodePath,
   workerScriptPath,
@@ -289,6 +334,13 @@ function launchPosixDetachedWorker({
   launchId,
   stdoutPath,
   stderrPath,
+  recommendRuntimeHomePath,
+  recruitRuntimeHomePath,
+  chatRuntimeHomePath,
+  screenConfigPath,
+  bossMonitorHomePath,
+  recruitingMonitorHomePath,
+  bossMonitoringEnabled,
   spawnImpl = spawn,
   environment = process.env
 }) {
@@ -307,7 +359,16 @@ function launchPosixDetachedWorker({
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
       windowsHide: true,
-      env: environment
+      env: buildPosixDetachedWorkerEnvironment({
+        environment,
+        recommendRuntimeHomePath,
+        recruitRuntimeHomePath,
+        chatRuntimeHomePath,
+        screenConfigPath,
+        bossMonitorHomePath,
+        recruitingMonitorHomePath,
+        bossMonitoringEnabled
+      })
     });
   } finally {
     fs.closeSync(stdoutFd);
@@ -343,6 +404,9 @@ export function launchDetachedWorker(options = {}) {
     : "";
   const recommendRuntimeHomePath = options.recommendRuntimeHomePath
     ? assertControlledPath(options.recommendRuntimeHomePath, "recommendRuntimeHomePath", platform)
+    : "";
+  const recruitRuntimeHomePath = options.recruitRuntimeHomePath
+    ? assertControlledPath(options.recruitRuntimeHomePath, "recruitRuntimeHomePath", platform)
     : "";
   const screenConfigPath = options.screenConfigPath
     ? assertControlledPath(options.screenConfigPath, "screenConfigPath", platform)
@@ -387,6 +451,7 @@ export function launchDetachedWorker(options = {}) {
     stderrPath,
     exitStatusPath,
     recommendRuntimeHomePath,
+    recruitRuntimeHomePath,
     domain,
     runId,
     launchId,

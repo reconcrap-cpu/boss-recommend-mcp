@@ -3,6 +3,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { assertRunCommandResultV1 } from "@reconcrap/recruiting-run-monitor-contract";
 
 const testBase = path.resolve(
@@ -30,7 +32,8 @@ const {
   writeBossMonitorProjection
 } = await import("./monitor/projection.js");
 const {
-  createBossRecruitingRunProvider
+  createBossRecruitingRunProvider,
+  __test: monitorProviderTest
 } = await import("./monitor-provider.js");
 const {
   createCandidateResultJournal
@@ -38,6 +41,45 @@ const {
 
 const sources = new Map();
 const calls = [];
+const lockContenderScript = fileURLToPath(
+  new URL("./test-monitor-provider-lock-child.js", import.meta.url)
+);
+
+async function waitForPaths(filePaths, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (filePaths.every((filePath) => fs.existsSync(filePath))) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for files: ${filePaths.join(", ")}`);
+}
+
+function spawnLockContender(config) {
+  const encoded = Buffer.from(JSON.stringify(config), "utf8").toString("base64url");
+  const child = spawn(process.execPath, [lockContenderScript, encoded], {
+    cwd: path.dirname(lockContenderScript),
+    env: { ...process.env },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const completed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+  return { child, completed };
+}
 
 function sourceKey(kind, runId) {
   return `${kind}:${runId}`;
@@ -225,6 +267,203 @@ function projectSource(ref, patch = {}) {
   return writeBossMonitorProjection(ref.kind, next, {
     type: "fixture"
   });
+}
+
+function writeLockFixture(lockPath, owner, modifiedAt = new Date()) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  fs.writeFileSync(lockPath, `${JSON.stringify(owner)}\n`, {
+    encoding: "utf8",
+    mode: 0o600
+  });
+  fs.utimesSync(lockPath, modifiedAt, modifiedAt);
+}
+
+async function testReplacementOwnerSurvivesRecoveryRevalidation() {
+  const commandDir = path.join(testRoot, "command-lock-revalidation");
+  const lockPath = path.join(commandDir, ".run.lock");
+  const recoveryPath = path.join(commandDir, ".run.recovery.lock");
+  const staleAt = new Date(Date.now() - 60_000);
+  writeLockFixture(lockPath, {
+    schema_version: 2,
+    nonce: "stale-owner-before-replacement",
+    pid: 2_147_483_647,
+    process_instance_id: "stale-process-instance",
+    acquired_at: staleAt.toISOString(),
+    lease_expires_at: new Date(staleAt.getTime() + 5_000).toISOString()
+  }, staleAt);
+
+  const replacementOwner = {
+    schema_version: 2,
+    nonce: "fresh-replacement-owner",
+    pid: process.pid,
+    process_instance_id: "fresh-replacement-process-instance",
+    acquired_at: new Date().toISOString(),
+    lease_expires_at: new Date(Date.now() + 60_000).toISOString()
+  };
+  const stopAfterRevalidation = new Error("STOP_AFTER_RECOVERY_REVALIDATION");
+  stopAfterRevalidation.code = "STOP_AFTER_RECOVERY_REVALIDATION";
+  await assert.rejects(
+    () => monitorProviderTest.acquireCommandRunLock(commandDir, {
+      async afterRecoveryGuardAcquired({ lockPath: guardedLockPath }) {
+        fs.unlinkSync(guardedLockPath);
+        writeLockFixture(guardedLockPath, replacementOwner);
+      },
+      async afterRecoveryRevalidation({ removed }) {
+        assert.equal(removed, false);
+        assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).nonce, replacementOwner.nonce);
+        throw stopAfterRevalidation;
+      }
+    }),
+    (error) => error?.code === "STOP_AFTER_RECOVERY_REVALIDATION"
+  );
+  assert.equal(JSON.parse(fs.readFileSync(lockPath, "utf8")).nonce, replacementOwner.nonce);
+  assert.equal(fs.existsSync(recoveryPath), false);
+  fs.unlinkSync(lockPath);
+}
+
+async function testStaleRecoveryGuardIsReclaimed() {
+  const commandDir = path.join(testRoot, "command-lock-stale-recovery-guard");
+  const lockPath = path.join(commandDir, ".run.lock");
+  const recoveryPath = path.join(commandDir, ".run.recovery.lock");
+  const staleAt = new Date(Date.now() - 60_000);
+  writeLockFixture(recoveryPath, {
+    schema_version: 2,
+    nonce: "abandoned-recovery-owner",
+    pid: 2_147_483_647,
+    process_instance_id: "abandoned-recovery-instance",
+    acquired_at: staleAt.toISOString(),
+    lease_expires_at: new Date(staleAt.getTime() + 5_000).toISOString()
+  }, staleAt);
+  const release = await monitorProviderTest.acquireCommandRunLock(commandDir);
+  assert.equal(fs.existsSync(lockPath), true);
+  assert.equal(fs.existsSync(recoveryPath), false);
+  release();
+  assert.equal(fs.existsSync(lockPath), false);
+  assert.equal(fs.existsSync(recoveryPath), false);
+}
+
+async function testTransientCommandLockReleaseFailureIsRetried() {
+  const commandDir = path.join(testRoot, "command-lock-release-retry");
+  const lockPath = path.join(commandDir, ".run.lock");
+  let unlinkAttempts = 0;
+  const observedDelays = [];
+  const release = await monitorProviderTest.acquireCommandRunLock(commandDir, {
+    releaseUnlinkSyncImpl(filePath) {
+      unlinkAttempts += 1;
+      if (unlinkAttempts <= 2) {
+        const error = new Error("injected transient Windows command-lock unlink failure");
+        error.code = unlinkAttempts === 1 ? "EACCES" : "EBUSY";
+        throw error;
+      }
+      fs.unlinkSync(filePath);
+    },
+    releaseSleepSyncImpl(milliseconds) {
+      observedDelays.push(milliseconds);
+    }
+  });
+  assert.equal(fs.existsSync(lockPath), true);
+  release();
+  assert.equal(unlinkAttempts, 3);
+  assert.deepEqual(observedDelays, [10, 25]);
+  assert.equal(fs.existsSync(lockPath), false);
+}
+
+async function testMultiProcessStaleLockRecoveryIsSerializedAndExactlyOnce() {
+  const ref = createSource("recommend", "multiprocess-stale-lock-recommend");
+  const revision = (await provider.getSnapshot(ref)).revision;
+  const runDir = getBossMonitorRunDir(ref.kind, ref.run_id);
+  const commandDir = path.join(runDir, ".commands");
+  const lockPath = path.join(commandDir, ".run.lock");
+  const recoveryPath = path.join(commandDir, ".run.recovery.lock");
+  const fixtureDir = path.join(testRoot, "multiprocess-command-lock");
+  const goPath = path.join(fixtureDir, "go");
+  const tracePath = path.join(fixtureDir, "effects.ndjson");
+  const effectDir = path.join(fixtureDir, "effects");
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  fs.writeFileSync(tracePath, "", "utf8");
+
+  // The stale lock deliberately carries this still-live parent PID. Its
+  // absolute lease is expired, simulating a PID that was reused by a newer
+  // process while the old owner record remained on disk.
+  const staleAcquiredAt = new Date(Date.now() - 10 * 60_000);
+  writeLockFixture(lockPath, {
+    schema_version: 2,
+    nonce: "expired-live-pid-owner",
+    pid: process.pid,
+    process_instance_id: "previous-process-that-used-this-pid",
+    acquired_at: staleAcquiredAt.toISOString(),
+    lease_expires_at: new Date(staleAcquiredAt.getTime() + 5 * 60_000).toISOString()
+  });
+
+  const contenders = [0, 1].map((index) => {
+    const config = {
+      environment: {
+        BOSS_RECOMMEND_HOME: recommendHome,
+        BOSS_RECRUIT_HOME: recruitHome,
+        BOSS_MONITOR_HOME: monitorHome,
+        RECRUITING_MONITOR_HOME: process.env.RECRUITING_MONITOR_HOME,
+        BOSS_MONITORING_ENABLED: "true"
+      },
+      ref,
+      command: {
+        command: "pause",
+        idempotency_key: "multiprocess-exactly-once",
+        expected_revision: revision
+      },
+      ready_path: path.join(fixtureDir, `ready-${index}.json`),
+      go_path: goPath,
+      result_path: path.join(fixtureDir, `result-${index}.json`),
+      effect_dir: effectDir,
+      trace_path: tracePath
+    };
+    return {
+      config,
+      ...spawnLockContender(config)
+    };
+  });
+
+  try {
+    await waitForPaths(contenders.map(({ config }) => config.ready_path));
+    fs.writeFileSync(goPath, "go\n", "utf8");
+    const exits = await Promise.all(contenders.map(({ completed }) => completed));
+    for (const exit of exits) {
+      assert.equal(
+        exit.code,
+        0,
+        `lock contender failed (signal=${exit.signal}): ${exit.stderr || exit.stdout}`
+      );
+    }
+
+    const outputs = contenders.map(({ config }) => (
+      JSON.parse(fs.readFileSync(config.result_path, "utf8"))
+    ));
+    assert.equal(outputs.every((output) => output.ok === true), true);
+    assert.deepEqual(outputs[0].result, outputs[1].result);
+    assert.equal(outputs[0].result.status, "accepted");
+
+    const effects = fs.readdirSync(effectDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"));
+    assert.equal(effects.length, 1, "the legacy control effect must execute exactly once");
+    const trace = fs.readFileSync(tracePath, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.deepEqual(trace.map((entry) => entry.type), ["enter", "exit"]);
+    assert.equal(trace[0].pid, trace[1].pid);
+    assert.ok(trace[1].at >= trace[0].at);
+
+    assert.equal(fs.existsSync(lockPath), false);
+    assert.equal(fs.existsSync(recoveryPath), false);
+    assert.deepEqual(
+      fs.readdirSync(commandDir).filter((name) => name.endsWith(".lock")),
+      []
+    );
+  } finally {
+    for (const { child } of contenders) {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  }
 }
 
 try {
@@ -549,6 +788,11 @@ try {
   assertRunCommandResultV1(staleLockResult);
   assert.equal(staleLockResult.status, "accepted");
   assert.equal(fs.existsSync(staleLockPath), false);
+
+  await testReplacementOwnerSurvivesRecoveryRevalidation();
+  await testStaleRecoveryGuardIsReclaimed();
+  await testTransientCommandLockReleaseFailureIsRetried();
+  await testMultiProcessStaleLockRecoveryIsSerializedAndExactlyOnce();
 
   const evidenceRef = createSource("recommend", "evidence-validation");
   const invalidEvidenceIds = [

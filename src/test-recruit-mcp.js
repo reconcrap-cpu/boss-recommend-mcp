@@ -1,10 +1,20 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import {
+  __getRecruitMcpDetachedWorkerLauncherForTests,
+  __persistRecruitRunSnapshotForTests,
+  __setRecruitMcpDetachedWorkerLauncherForTests,
+  __writeRecruitJsonAtomicForTests,
+  runBossRecruitDetachedWorker,
+  startRecruitPipelineDetachedRunTool
+} from "./recruit-mcp.js";
+import { recordDetachedWorkerExit } from "./detached-worker.js";
 
 const {
   handleRequest,
@@ -49,6 +59,16 @@ async function waitForRecruitRun(runId, predicate, timeoutMs = 5000) {
     await sleep(50);
   }
   throw new Error(`Timed out waiting for recruit run ${runId}`);
+}
+
+async function waitForCondition(predicate, timeoutMs = 5000, message = "condition") {
+  const started = Date.now();
+  while (Date.now() - started <= timeoutMs) {
+    const value = await predicate();
+    if (value) return value;
+    await sleep(25);
+  }
+  throw new Error(`Timed out waiting for ${message}`);
 }
 
 function readyArgs(extra = {}) {
@@ -484,6 +504,90 @@ async function testRecruitSyncRun() {
   assert.equal(connector.closeCount >= 1, true);
 }
 
+async function testRecruitAsyncStartReturnsReadyMonitoringBlock() {
+  const environmentKeys = [
+    "BOSS_MONITOR_HOME",
+    "BOSS_MONITORING_ENABLED",
+    "RECRUITING_MONITOR_HOME",
+    "RECRUITING_MONITOR_LINK_SECRET",
+    "RECRUITING_MONITOR_URL"
+  ];
+  const previousEnvironment = Object.fromEntries(
+    environmentKeys.map((key) => [key, process.env[key]])
+  );
+  const monitorProjectionHome = path.join(
+    process.env.BOSS_RECRUIT_HOME,
+    "ready-monitor-projection"
+  );
+  const monitorRuntimeHome = path.join(
+    process.env.BOSS_RECRUIT_HOME,
+    "ready-monitor-runtime"
+  );
+  const monitorBaseUrl = "http://127.0.0.1:47831";
+  const monitorLinkSecret = "recruit-async-ready-monitor-secret-32-bytes";
+  const linkSecretHash = crypto.createHash("sha256")
+    .update(monitorLinkSecret, "utf8")
+    .digest("hex");
+  process.env.BOSS_MONITOR_HOME = monitorProjectionHome;
+  process.env.BOSS_MONITORING_ENABLED = "true";
+  process.env.RECRUITING_MONITOR_HOME = monitorRuntimeHome;
+  process.env.RECRUITING_MONITOR_LINK_SECRET = monitorLinkSecret;
+  process.env.RECRUITING_MONITOR_URL = monitorBaseUrl;
+  fs.mkdirSync(monitorRuntimeHome, { recursive: true });
+  fs.writeFileSync(path.join(monitorRuntimeHome, "daemon.json"), `${JSON.stringify({
+    pid: process.pid,
+    instance_id: "recruit-monitor-test-instance-1234",
+    started_at: new Date().toISOString(),
+    heartbeat_at: new Date().toISOString(),
+    base_url: monitorBaseUrl,
+    providers: ["boss"],
+    link_secret_sha256: linkSecretHash
+  }, null, 2)}\n`, "utf8");
+
+  installFakeConnector();
+  setRecruitMcpWorkflowForTests(async (_options, runControl) => {
+    runControl.setPhase("recruit:test");
+    runControl.updateProgress({ processed: 1, screened: 1, passed: 1 });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 1,
+      results: []
+    };
+  });
+
+  try {
+    const started = await callTool(TOOL_START, readyArgs(), 32);
+    assert.equal(started.status, "ACCEPTED");
+    assert.deepEqual(started.monitoring.ref, {
+      provider: "boss",
+      kind: "search",
+      run_id: started.run_id
+    });
+    assert.equal(started.monitoring.contract_version, "1.0");
+    assert.equal(started.monitoring.availability, "ready");
+    assert.match(
+      started.monitoring.dashboard_url,
+      /^http:\/\/127\.0\.0\.1:47831\/access\/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/
+    );
+    const token = started.monitoring.dashboard_url.split("/access/")[1];
+    const [ticketBody] = token.split(".");
+    const ticket = JSON.parse(Buffer.from(ticketBody, "base64url").toString("utf8"));
+    assert.deepEqual(ticket.ref, started.monitoring.ref);
+    await waitForRecruitRun(started.run_id, (run) => run?.status === "completed");
+  } finally {
+    for (const key of environmentKeys) {
+      if (previousEnvironment[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = previousEnvironment[key];
+      }
+    }
+  }
+}
+
 async function testRecruitAsyncPauseResume() {
   installFakeConnector();
   setRecruitMcpWorkflowForTests(async (_options, runControl) => {
@@ -647,14 +751,377 @@ async function testRecruitMonitorStorageFailureDoesNotFailLegacyRun() {
   }
 }
 
+function testRecruitAtomicWritesUseUniqueTempPaths() {
+  const atomicDir = path.join(process.env.BOSS_RECRUIT_HOME, "atomic-write-regression");
+  const targetPath = path.join(atomicDir, "state.json");
+  const renameSources = [];
+  const renameSyncImpl = (sourcePath, destinationPath) => {
+    renameSources.push(sourcePath);
+    fs.renameSync(sourcePath, destinationPath);
+  };
+  __writeRecruitJsonAtomicForTests(targetPath, { revision: 1 }, {
+    renameSyncImpl,
+    randomUUIDImpl: () => "first-unique-write"
+  });
+  __writeRecruitJsonAtomicForTests(targetPath, { revision: 2 }, {
+    renameSyncImpl,
+    randomUUIDImpl: () => "second-unique-write"
+  });
+  assert.equal(renameSources.length, 2);
+  assert.notEqual(renameSources[0], renameSources[1]);
+  assert.equal(
+    renameSources[0],
+    `${targetPath}.${process.pid}.first-unique-write.tmp`
+  );
+  assert.equal(
+    renameSources[1],
+    `${targetPath}.${process.pid}.second-unique-write.tmp`
+  );
+  assert.notEqual(renameSources[0], `${targetPath}.tmp`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(targetPath, "utf8")), { revision: 2 });
+  assert.deepEqual(
+    fs.readdirSync(atomicDir).filter((name) => name.endsWith(".tmp")),
+    []
+  );
+}
+
+function testRecruitResetRestoresSharedDetachedLauncher() {
+  const sharedLauncher = __getRecruitMcpDetachedWorkerLauncherForTests();
+  const sentinelLauncher = () => ({ pid: 1, unref() {} });
+  __setRecruitMcpDetachedWorkerLauncherForTests(sentinelLauncher);
+  assert.equal(
+    __getRecruitMcpDetachedWorkerLauncherForTests(),
+    sentinelLauncher
+  );
+  resetRecruitMcpStateForTests();
+  assert.equal(
+    __getRecruitMcpDetachedWorkerLauncherForTests(),
+    sharedLauncher
+  );
+}
+
+function recruitServiceSnapshot(runId, status = "running") {
+  const now = new Date().toISOString();
+  return {
+    runId,
+    name: runId,
+    status,
+    phase: "recruit:test-control-merge",
+    progress: {
+      target_count: 1,
+      processed: 0,
+      screened: 0,
+      detail_opened: 0,
+      llm_screened: 0,
+      passed: 0,
+      skipped: 0,
+      greet_count: 0
+    },
+    context: {},
+    checkpoint: {},
+    startedAt: now,
+    updatedAt: now,
+    completedAt: null,
+    error: null,
+    summary: null
+  };
+}
+
+function testRecruitWorkerSnapshotsPreserveDiskControlsAndLaunchMetadata() {
+  const runId = "mcp_recruit_control_merge_regression";
+  const runsDir = path.join(process.env.BOSS_RECRUIT_HOME, "runs");
+  const runStatePath = path.join(runsDir, `${runId}.json`);
+  fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(runStatePath, `${JSON.stringify({
+    run_id: runId,
+    mode: "async",
+    state: "queued",
+    status: "queued",
+    stage: "queued",
+    started_at: "2026-01-01T00:00:00.000Z",
+    updated_at: "2026-01-01T00:00:01.000Z",
+    heartbeat_at: "2026-01-01T00:00:01.000Z",
+    completed_at: null,
+    pid: process.pid,
+    progress: {},
+    context: {},
+    control: {
+      pause_requested: true,
+      pause_requested_at: "2026-01-01T00:00:01.000Z",
+      pause_requested_by: "cancel_recruit_pipeline_run",
+      cancel_requested: true
+    },
+    resume: {
+      worker_launch_id: "recruit-control-launch",
+      worker_launch_committed: true,
+      worker_supervisor_pid: 24680,
+      worker_exit_status_path: path.join(runsDir, `${runId}.worker.exit.json`)
+    },
+    error: null,
+    result: null,
+    summary: null
+  }, null, 2)}\n`, "utf8");
+
+  __persistRecruitRunSnapshotForTests(recruitServiceSnapshot(runId));
+  const persisted = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  assert.equal(persisted.control.pause_requested, true);
+  assert.equal(persisted.control.cancel_requested, true);
+  assert.equal(persisted.control.pause_requested_by, "cancel_recruit_pipeline_run");
+  assert.equal(persisted.resume.worker_launch_id, "recruit-control-launch");
+  assert.equal(persisted.resume.worker_launch_committed, true);
+  assert.equal(persisted.resume.worker_supervisor_pid, 24680);
+  assert.match(persisted.resume.worker_exit_status_path, /\.worker\.exit\.json$/);
+}
+
+async function testRecruitDetachedBarrierAndProducerProjection() {
+  let releaseConnector;
+  let connectorReached;
+  let resolveConnectorReached;
+  const connectorGate = new Promise((resolve) => {
+    releaseConnector = resolve;
+  });
+  const connectorReachedPromise = new Promise((resolve) => {
+    resolveConnectorReached = resolve;
+  });
+  let workerPromise = null;
+  let launcherOptions = null;
+
+  setRecruitMcpConnectorForTests(async () => {
+    resolveConnectorReached();
+    await connectorGate;
+    return {
+      client: { guarded: true },
+      target: {
+        id: "fake-recruit-detached-target",
+        url: "https://www.zhipin.com/web/chat/search",
+        type: "page"
+      },
+      methodLog: [],
+      async close() {}
+    };
+  });
+  setRecruitMcpWorkflowForTests(async (_options, runControl) => {
+    runControl.setPhase("recruit:detached-test");
+    runControl.updateProgress({
+      target_count: 1,
+      processed: 1,
+      screened: 1,
+      passed: 1
+    });
+    return {
+      domain: "recruit",
+      processed: 1,
+      screened: 1,
+      detail_opened: 0,
+      passed: 1,
+      results: []
+    };
+  });
+  __setRecruitMcpDetachedWorkerLauncherForTests((options) => {
+    launcherOptions = options;
+    workerPromise = runBossRecruitDetachedWorker({
+      runId: options.runId,
+      launchId: options.launchId
+    });
+    return {
+      pid: 42420,
+      unref() {}
+    };
+  });
+
+  const started = await startRecruitPipelineDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({ overrides: { ...readyArgs().overrides, target_count: 1 } })
+  });
+  assert.equal(started.status, "ACCEPTED");
+  assert.equal(started.run.resume.worker_launch_committed, true);
+  assert.equal(started.run.resume.worker_launch_id, launcherOptions.launchId);
+  assert.equal(launcherOptions.domain, "recruit");
+  assert.equal(launcherOptions.runId, started.run_id);
+  assert.equal(launcherOptions.recruitRuntimeHomePath, path.resolve(process.env.BOSS_RECRUIT_HOME));
+  assert.equal(
+    launcherOptions.exitStatusPath,
+    path.join(
+      process.env.BOSS_RECRUIT_HOME,
+      "runs",
+      `${started.run_id}.worker.exit.json`
+    )
+  );
+  assert.equal(started.run.resume.worker_exit_status_path, launcherOptions.exitStatusPath);
+
+  connectorReached = await Promise.race([
+    connectorReachedPromise.then(() => true),
+    sleep(3000).then(() => false)
+  ]);
+  assert.equal(connectorReached, true);
+  const projectionPath = path.join(
+    process.env.BOSS_MONITOR_HOME,
+    "v1",
+    "runs",
+    "search",
+    started.run_id,
+    "snapshot.json"
+  );
+  const producerProjection = await waitForCondition(() => {
+    if (!fs.existsSync(projectionPath)) return null;
+    const snapshot = JSON.parse(fs.readFileSync(projectionPath, "utf8"));
+    return snapshot.revision >= 2 ? snapshot : null;
+  }, 3000, "detached search producer projection before connector release");
+  assert.equal(producerProjection.state, "queued");
+  assert.equal(producerProjection.liveness.status, "alive");
+
+  releaseConnector();
+  const workerResult = await Promise.race([
+    workerPromise,
+    sleep(5000).then(() => ({ ok: false, error: "worker timeout" }))
+  ]);
+  assert.deepEqual(workerResult, { ok: true });
+
+  const runStatePath = path.join(
+    process.env.BOSS_RECRUIT_HOME,
+    "runs",
+    `${started.run_id}.json`
+  );
+  const finalState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  assert.equal(finalState.state, "completed");
+  assert.equal(finalState.resume.worker_launch_id, launcherOptions.launchId);
+  assert.equal(finalState.resume.worker_launch_committed, true);
+  assert.equal(finalState.resume.worker_node_pid, process.pid);
+
+  const eventsPath = path.join(path.dirname(projectionPath), "events.ndjson");
+  const events = fs.readFileSync(eventsPath, "utf8")
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const created = events.find((event) => event.type === "run.created");
+  assert.equal(created?.payload?.state, "queued");
+  assert.equal(
+    events.some((event) => (
+      event.type === "run.state_changed"
+      && event.payload?.from === "running"
+      && event.payload?.to === "queued"
+    )),
+    false
+  );
+}
+
+async function testRecruitDetachedRejectsStaleWorkerAndRecorder() {
+  let launcherOptions = null;
+  __setRecruitMcpDetachedWorkerLauncherForTests((options) => {
+    launcherOptions = options;
+    return {
+      pid: 51510,
+      unref() {}
+    };
+  });
+  const started = await startRecruitPipelineDetachedRunTool({
+    workspaceRoot: process.cwd(),
+    args: readyArgs({ overrides: { ...readyArgs().overrides, target_count: 1 } })
+  });
+  assert.equal(started.status, "ACCEPTED");
+
+  const staleWorker = await runBossRecruitDetachedWorker({
+    runId: started.run_id,
+    launchId: `${launcherOptions.launchId}-stale`
+  });
+  assert.equal(staleWorker.ok, false);
+  assert.match(staleWorker.error, /launch identity does not match/);
+
+  const staleLaunchRecorder = await recordDetachedWorkerExit({
+    domain: "recruit",
+    runId: started.run_id,
+    launchId: `${launcherOptions.launchId}-stale`,
+    workerExitCode: 1,
+    workerPid: 51511,
+    supervisorPid: started.run.resume.worker_supervisor_pid || 51510
+  });
+  assert.deepEqual(staleLaunchRecorder, { ok: true, persisted: false });
+
+  if (Number.isInteger(started.run.resume.worker_supervisor_pid)) {
+    const staleSupervisorRecorder = await recordDetachedWorkerExit({
+      domain: "recruit",
+      runId: started.run_id,
+      launchId: launcherOptions.launchId,
+      workerExitCode: 1,
+      workerPid: 51512,
+      supervisorPid: started.run.resume.worker_supervisor_pid + 1
+    });
+    assert.deepEqual(staleSupervisorRecorder, { ok: true, persisted: false });
+  }
+
+  const persistedBeforeAuthorizedFailure = JSON.parse(fs.readFileSync(
+    path.join(process.env.BOSS_RECRUIT_HOME, "runs", `${started.run_id}.json`),
+    "utf8"
+  ));
+  assert.equal(persistedBeforeAuthorizedFailure.state, "queued");
+
+  const authorizedRecord = await recordDetachedWorkerExit({
+    domain: "recruit",
+    runId: started.run_id,
+    launchId: launcherOptions.launchId,
+    workerExitCode: 1,
+    workerPid: 51513,
+    supervisorPid: started.run.resume.worker_supervisor_pid || undefined
+  });
+  assert.deepEqual(authorizedRecord, { ok: true, persisted: true });
+
+  const authorizedFailure = JSON.parse(fs.readFileSync(
+    path.join(process.env.BOSS_RECRUIT_HOME, "runs", `${started.run_id}.json`),
+    "utf8"
+  ));
+  assert.equal(authorizedFailure.state, "failed");
+  assert.equal(authorizedFailure.error.code, "DETACHED_WORKER_EXITED_EARLY");
+  assert.equal(authorizedFailure.error.worker_launch_id, launcherOptions.launchId);
+  assert.equal(authorizedFailure.error.worker_exit_code, 1);
+  assert.equal(authorizedFailure.error.worker_pid, 51513);
+
+  const monitorRunDir = path.join(
+    process.env.BOSS_MONITOR_HOME,
+    "v1",
+    "runs",
+    "search",
+    started.run_id
+  );
+  const publicSnapshot = JSON.parse(
+    fs.readFileSync(path.join(monitorRunDir, "snapshot.json"), "utf8")
+  );
+  assert.equal(publicSnapshot.state, "failed");
+  assert.equal(publicSnapshot.errors[0].code, "DETACHED_WORKER_EXITED_EARLY");
+  const publicExitSidecar = JSON.parse(
+    fs.readFileSync(path.join(monitorRunDir, "worker-exit.json"), "utf8")
+  );
+  assert.equal(publicExitSidecar.state, "failed");
+  assert.equal(
+    publicExitSidecar.worker_instance_id,
+    publicSnapshot.liveness.worker_instance_id
+  );
+  assert.equal(publicExitSidecar.pid, publicSnapshot.liveness.pid);
+  const publicEvents = fs.readFileSync(
+    path.join(monitorRunDir, "events.ndjson"),
+    "utf8"
+  ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(
+    publicEvents.some((event) => (
+      event.type === "run.error"
+      && event.payload?.error?.code === "DETACHED_WORKER_EXITED_EARLY"
+    )),
+    true
+  );
+}
+
 async function main() {
   const previousHome = process.env.BOSS_RECRUIT_HOME;
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitoringEnabled = process.env.BOSS_MONITORING_ENABLED;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
   const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-recruit-mcp-test-"));
   const outputDir = path.join(tempHome, "configured-output");
   const configPath = path.join(tempHome, "screening-config.json");
   process.env.BOSS_RECRUIT_HOME = tempHome;
+  process.env.BOSS_MONITOR_HOME = path.join(tempHome, "monitor-projection");
+  process.env.BOSS_MONITORING_ENABLED = "true";
   process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
   fs.writeFileSync(configPath, JSON.stringify({
     baseUrl: "https://api.example.com/v1",
@@ -703,9 +1170,21 @@ async function main() {
     resetRecruitMcpStateForTests();
     await testRecruitSyncRun();
     resetRecruitMcpStateForTests();
+    await testRecruitAsyncStartReturnsReadyMonitoringBlock();
+    resetRecruitMcpStateForTests();
     await testRecruitAsyncPauseResume();
     resetRecruitMcpStateForTests();
     await testStaleDiskReconciliationPreservesCheckpoint();
+    resetRecruitMcpStateForTests();
+    testRecruitAtomicWritesUseUniqueTempPaths();
+    resetRecruitMcpStateForTests();
+    testRecruitResetRestoresSharedDetachedLauncher();
+    resetRecruitMcpStateForTests();
+    testRecruitWorkerSnapshotsPreserveDiskControlsAndLaunchMetadata();
+    resetRecruitMcpStateForTests();
+    await testRecruitDetachedBarrierAndProducerProjection();
+    resetRecruitMcpStateForTests();
+    await testRecruitDetachedRejectsStaleWorkerAndRecorder();
     resetRecruitMcpStateForTests();
     await testRecruitMonitorStorageFailureDoesNotFailLegacyRun();
     console.log("recruit MCP tests passed");
@@ -715,6 +1194,16 @@ async function main() {
       delete process.env.BOSS_RECRUIT_HOME;
     } else {
       process.env.BOSS_RECRUIT_HOME = previousHome;
+    }
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitoringEnabled === undefined) {
+      delete process.env.BOSS_MONITORING_ENABLED;
+    } else {
+      process.env.BOSS_MONITORING_ENABLED = previousMonitoringEnabled;
     }
     if (previousScreenConfig === undefined) {
       delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;

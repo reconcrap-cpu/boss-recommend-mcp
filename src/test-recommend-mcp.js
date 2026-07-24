@@ -2666,11 +2666,15 @@ async function testRecommendOptionalArtifactFailuresDoNotBlockTerminalState() {
   fs.mkdirSync(outputDir, { recursive: true });
   const csvPath = path.join(outputDir, `${started.run_id}.results.csv`);
   const reportPath = path.join(outputDir, `${started.run_id}.report.json`);
-  const blockers = [`${csvPath}.tmp`, `${reportPath}.tmp`];
+  const blockers = [`${csvPath}.tmp`, reportPath];
   for (const blocker of blockers) fs.mkdirSync(blocker, { recursive: true });
   try {
     releaseWorkflow();
-    const completed = await waitForRecommendRun(started.run_id, (run) => run?.state === "completed");
+    const completed = await waitForRecommendRun(
+      started.run_id,
+      (run) => run?.state === "completed" && run?.artifact_warnings?.length === 2
+    );
+    for (const blocker of blockers) fs.rmSync(blocker, { recursive: true, force: true });
     assert.equal(completed.state, "completed");
     assert.deepEqual(
       completed.artifact_warnings.map((warning) => warning.artifact).sort(),
@@ -2839,6 +2843,46 @@ async function testRecommendSupervisorExitRecorderMarksFailureImmediately() {
     assert.equal(payload.run.recovery.classification, "worker_process_exited");
     assert.equal(payload.run.recovery.automatic_restart_allowed, false);
     assert.equal(payload.run.recovery.requires_durable_action_journal_audit, true);
+    const monitorRunDir = path.join(
+      process.env.BOSS_MONITOR_HOME
+        || path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-projection"),
+      "v1",
+      "runs",
+      "recommend",
+      started.run_id
+    );
+    const publicSnapshot = JSON.parse(
+      fs.readFileSync(path.join(monitorRunDir, "snapshot.json"), "utf8")
+    );
+    assert.equal(publicSnapshot.state, "failed");
+    assert.equal(publicSnapshot.errors[0].code, "DETACHED_WORKER_EXITED_EARLY");
+    const publicExit = JSON.parse(
+      fs.readFileSync(path.join(monitorRunDir, "worker-exit.json"), "utf8")
+    );
+    assert.equal(publicExit.state, "failed");
+    assert.equal(
+      publicExit.worker_instance_id,
+      publicSnapshot.liveness.worker_instance_id
+    );
+    assert.equal(publicExit.pid, publicSnapshot.liveness.pid);
+    const publicEvents = fs.readFileSync(
+      path.join(monitorRunDir, "events.ndjson"),
+      "utf8"
+    ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(
+      publicEvents.some((event) => (
+        event.type === "run.state_changed"
+        && event.payload?.to === "failed"
+      )),
+      true
+    );
+    assert.equal(
+      publicEvents.some((event) => (
+        event.type === "run.error"
+        && event.payload?.error?.code === "DETACHED_WORKER_EXITED_EARLY"
+      )),
+      true
+    );
     const lateWorker = await runDetachedWorkerForTests({
       runId: started.run_id,
       workerPid: 476546,
@@ -2876,11 +2920,17 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
   );
   process.env.BOSS_MONITORING_ENABLED = "true";
   let launcherOptions = null;
+  let concurrentWorkerPromise = null;
   let unrefCalled = false;
   let connectOptions = null;
   let workflowOptions = null;
   setRecommendDetachedWorkerLauncherForTests((options) => {
     launcherOptions = options;
+    concurrentWorkerPromise = runDetachedWorkerForTests({
+      runId: options.runId,
+      workerPid: 456789,
+      launchId: options.launchId
+    });
     return {
       pid: 456789,
       unref() {
@@ -2970,11 +3020,8 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     );
     assert.equal(started.run.context.args.overrides.job, startArgs.overrides.job);
 
-    const workerResult = await runDetachedWorkerForTests({
-      runId: started.run_id,
-      workerPid: 456789,
-      launchId: started.run.resume.worker_launch_id
-    });
+    assert.ok(concurrentWorkerPromise);
+    const workerResult = await concurrentWorkerPromise;
     assert.equal(workerResult.ok, true);
     assert.equal(connectOptions.port, 9777);
     assert.equal(connectOptions.slowLive, true);
@@ -2986,6 +3033,21 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(completed.run.state, "completed");
     assert.equal(completed.run.pid, process.pid);
     assert.equal(completed.run.progress.processed, 1);
+    const projectionEvents = fs.readFileSync(
+      path.join(path.dirname(queuedProjectionPath), "events.ndjson"),
+      "utf8"
+    ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(projectionEvents[0]?.type, "run.created");
+    assert.equal(projectionEvents[0]?.payload?.state, "queued");
+    assert.equal(
+      projectionEvents.some((event) => (
+        event.type === "run.state_changed"
+        && event.payload?.from === "running"
+        && event.payload?.to === "queued"
+      )),
+      false,
+      "a fast detached worker must never be overwritten by a stale queued projection"
+    );
   } finally {
     setRecommendDetachedWorkerLauncherForTests(null);
     if (previousDetached === undefined) {
@@ -3052,6 +3114,31 @@ async function testRecommendAmbiguousLauncherFailureCannotReviveRun() {
     assert.equal(workflowCalls, 0);
     const persisted = await callTool(TOOL_GET, { run_id: capturedRunId }, 333_2);
     assert.equal(persisted.run.state, "failed");
+    const monitorHome = process.env.BOSS_MONITOR_HOME
+      || path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-projection");
+    const projection = JSON.parse(fs.readFileSync(path.join(
+      monitorHome,
+      "v1",
+      "runs",
+      "recommend",
+      capturedRunId,
+      "snapshot.json"
+    ), "utf8"));
+    assert.equal(projection.state, "failed");
+    assert.equal(projection.errors[0].code, "RUN_WORKER_LAUNCH_FAILED");
+    const projectionExit = JSON.parse(fs.readFileSync(path.join(
+      monitorHome,
+      "v1",
+      "runs",
+      "recommend",
+      capturedRunId,
+      "worker-exit.json"
+    ), "utf8"));
+    assert.equal(projectionExit.state, "failed");
+    assert.equal(
+      projectionExit.worker_instance_id,
+      projection.liveness.worker_instance_id
+    );
   } finally {
     setRecommendDetachedWorkerLauncherForTests(null);
     if (previousDetached === undefined) {

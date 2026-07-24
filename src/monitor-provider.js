@@ -35,6 +35,15 @@ const COMMAND_LOCK_RETRY_MS = 20;
 const COMMAND_LOCK_TIMEOUT_MS = 15_000;
 const COMMAND_LOCK_STALE_MS = 30_000;
 const COMMAND_LOCK_INVALID_GRACE_MS = 2_000;
+const COMMAND_LOCK_MAX_LEASE_MS = 5 * 60_000;
+const COMMAND_RECOVERY_LOCK_STALE_MS = 5_000;
+const COMMAND_RECOVERY_LOCK_MAX_LEASE_MS = 5_000;
+const COMMAND_RELEASE_RETRY_DELAYS_MS = Object.freeze([10, 25, 50, 100]);
+const COMMAND_TRANSIENT_LOCK_CODES = new Set(["EACCES", "EPERM", "EBUSY"]);
+const commandLockSleepCell = new Int32Array(new SharedArrayBuffer(4));
+const COMMAND_LOCK_PROCESS_INSTANCE_ID = typeof crypto.randomUUID === "function"
+  ? crypto.randomUUID()
+  : crypto.randomBytes(16).toString("hex");
 
 function normalizeText(value, maxLength = 4_000) {
   const normalized = String(value ?? "").trim();
@@ -176,96 +185,326 @@ function delay(milliseconds) {
   });
 }
 
-function lockOwnerMatches(lockPath, nonce) {
-  const owner = readJson(lockPath);
-  return Boolean(owner?.nonce && owner.nonce === nonce);
+function waitSync(milliseconds) {
+  const delayMs = Math.max(0, Math.floor(Number(milliseconds) || 0));
+  if (delayMs > 0) Atomics.wait(commandLockSleepCell, 0, 0, delayMs);
 }
 
-async function acquireCommandRunLock(commandDir) {
+function lockOwnerIdentity(owner) {
+  const acquiredAt = Date.parse(owner?.acquired_at || "");
+  const pid = Number(owner?.pid);
+  const nonce = normalizeText(owner?.nonce, 200);
+  if (
+    !nonce
+    || !Number.isInteger(pid)
+    || pid <= 0
+    || !Number.isFinite(acquiredAt)
+  ) {
+    return null;
+  }
+  return {
+    nonce,
+    pid,
+    process_instance_id: normalizeText(owner?.process_instance_id, 200),
+    acquired_at: new Date(acquiredAt).toISOString()
+  };
+}
+
+function observeLock(lockPath) {
+  try {
+    const stat = fs.statSync(lockPath);
+    return {
+      owner: readJson(lockPath),
+      stat: {
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        birthtimeMs: stat.birthtimeMs,
+        mtimeMs: stat.mtimeMs
+      }
+    };
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function sameLockObservation(left, right) {
+  if (!left || !right) return false;
+  const leftOwner = lockOwnerIdentity(left.owner);
+  const rightOwner = lockOwnerIdentity(right.owner);
+  if (leftOwner && rightOwner) {
+    return leftOwner.nonce === rightOwner.nonce
+      && leftOwner.pid === rightOwner.pid
+      && leftOwner.process_instance_id === rightOwner.process_instance_id
+      && leftOwner.acquired_at === rightOwner.acquired_at;
+  }
+  return left.stat.dev === right.stat.dev
+    && left.stat.ino === right.stat.ino
+    && left.stat.size === right.stat.size
+    && left.stat.birthtimeMs === right.stat.birthtimeMs
+    && left.stat.mtimeMs === right.stat.mtimeMs;
+}
+
+function lockOwnerMatches(lockPath, expectedOwner) {
+  const observed = lockOwnerIdentity(readJson(lockPath));
+  const expected = lockOwnerIdentity(expectedOwner);
+  return Boolean(
+    observed
+    && expected
+    && observed.nonce === expected.nonce
+    && observed.pid === expected.pid
+    && observed.process_instance_id === expected.process_instance_id
+    && observed.acquired_at === expected.acquired_at
+  );
+}
+
+function lockLeaseDeadline(owner, maxLeaseMs) {
+  const acquiredAt = Date.parse(owner?.acquired_at || "");
+  if (!Number.isFinite(acquiredAt)) return null;
+  const boundedDeadline = acquiredAt + Math.max(1_000, Number(maxLeaseMs) || 1_000);
+  const declaredDeadline = Date.parse(owner?.lease_expires_at || "");
+  return Number.isFinite(declaredDeadline)
+    ? Math.min(boundedDeadline, declaredDeadline)
+    : boundedDeadline;
+}
+
+function lockObservationIsAbandoned(observation, {
+  maxLeaseMs,
+  invalidStaleMs
+}) {
+  if (!observation) return false;
+  const now = Date.now();
+  const ageMs = Math.max(0, now - observation.stat.mtimeMs);
+  const owner = lockOwnerIdentity(observation.owner);
+  if (!owner) return ageMs > invalidStaleMs;
+  const leaseDeadline = lockLeaseDeadline(observation.owner, maxLeaseMs);
+  if (Number.isFinite(leaseDeadline) && now >= leaseDeadline) return true;
+  return !isPidAlive(owner.pid) && ageMs > COMMAND_LOCK_INVALID_GRACE_MS;
+}
+
+function removeObservedLock(lockPath, observation) {
+  try {
+    const latest = observeLock(lockPath);
+    if (!sameLockObservation(observation, latest)) return false;
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+function createLockOwner(maxLeaseMs) {
+  const acquiredAt = Date.now();
+  return {
+    schema_version: 2,
+    nonce: crypto.randomBytes(18).toString("base64url"),
+    pid: process.pid,
+    process_instance_id: COMMAND_LOCK_PROCESS_INSTANCE_ID,
+    acquired_at: new Date(acquiredAt).toISOString(),
+    lease_expires_at: new Date(acquiredAt + maxLeaseMs).toISOString()
+  };
+}
+
+function tryCreateLock(lockPath, maxLeaseMs) {
+  const owner = createLockOwner(maxLeaseMs);
+  let fd = null;
+  let fdStat = null;
+  try {
+    fd = fs.openSync(lockPath, "wx", 0o600);
+    fdStat = fs.fstatSync(fd);
+    fs.writeFileSync(fd, `${JSON.stringify(owner)}\n`, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    return owner;
+  } catch (error) {
+    if (fd !== null) {
+      try {
+        if (!fdStat) fdStat = fs.fstatSync(fd);
+      } catch {
+        // The descriptor may already be unusable after a failed write.
+      }
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Preserve the original lock acquisition error.
+      }
+      try {
+        const observed = observeLock(lockPath);
+        const sameFile = observed
+          && fdStat
+          && observed.stat.dev === fdStat.dev
+          && observed.stat.ino === fdStat.ino;
+        if (lockOwnerMatches(lockPath, owner) || sameFile) {
+          fs.unlinkSync(lockPath);
+        }
+      } catch {
+        // The partially written lock may already have been removed.
+      }
+    }
+    if (
+      error?.code === "EEXIST"
+      || COMMAND_TRANSIENT_LOCK_CODES.has(error?.code)
+    ) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function releaseOwnedLock(lockPath, owner, {
+  unlinkSyncImpl = fs.unlinkSync,
+  sleepSyncImpl = waitSync,
+  retryDelaysMs = COMMAND_RELEASE_RETRY_DELAYS_MS
+} = {}) {
+  const expected = lockOwnerIdentity(owner);
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    try {
+      const current = lockOwnerIdentity(readJson(lockPath));
+      if (!current) {
+        if (!fs.existsSync(lockPath)) return true;
+        const retryDelayMs = retryDelaysMs[attempt];
+        if (retryDelayMs === undefined) return false;
+        sleepSyncImpl(retryDelayMs);
+        continue;
+      }
+      if (
+        !expected
+        || current.nonce !== expected.nonce
+        || current.pid !== expected.pid
+        || current.process_instance_id !== expected.process_instance_id
+        || current.acquired_at !== expected.acquired_at
+      ) {
+        return false;
+      }
+      unlinkSyncImpl(lockPath);
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") return true;
+      const retryDelayMs = retryDelaysMs[attempt];
+      if (
+        !COMMAND_TRANSIENT_LOCK_CODES.has(error?.code)
+        || retryDelayMs === undefined
+      ) {
+        return false;
+      }
+      sleepSyncImpl(retryDelayMs);
+    }
+  }
+  return false;
+}
+
+function recoverAbandonedRecoveryGuard(recoveryPath) {
+  const observed = observeLock(recoveryPath);
+  if (!observed) return false;
+  if (!lockObservationIsAbandoned(observed, {
+    maxLeaseMs: COMMAND_RECOVERY_LOCK_MAX_LEASE_MS,
+    invalidStaleMs: COMMAND_RECOVERY_LOCK_STALE_MS
+  })) {
+    return false;
+  }
+  return removeObservedLock(recoveryPath, observed);
+}
+
+async function acquireCommandRunLock(commandDir, testHooks = null) {
   fs.mkdirSync(commandDir, { recursive: true });
   const lockPath = path.join(commandDir, ".run.lock");
-  const nonce = crypto.randomBytes(18).toString("base64url");
+  const recoveryPath = path.join(commandDir, ".run.recovery.lock");
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < COMMAND_LOCK_TIMEOUT_MS) {
-    let fd = null;
-    try {
-      fd = fs.openSync(lockPath, "wx", 0o600);
-      const owner = {
-        schema_version: 1,
-        nonce,
-        pid: process.pid,
-        acquired_at: new Date().toISOString()
-      };
-      fs.writeFileSync(fd, `${JSON.stringify(owner)}\n`, "utf8");
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
-      fd = null;
+    const recoveryObservation = observeLock(recoveryPath);
+    if (recoveryObservation) {
+      recoverAbandonedRecoveryGuard(recoveryPath);
+      await delay(COMMAND_LOCK_RETRY_MS);
+      continue;
+    }
 
+    const owner = tryCreateLock(lockPath, COMMAND_LOCK_MAX_LEASE_MS);
+    if (owner) {
+      // A recovery contender may have observed the previous lock immediately
+      // before this owner acquired it. Never enter the command critical
+      // section while that recovery guard is active.
+      if (observeLock(recoveryPath)) {
+        releaseOwnedLock(lockPath, owner);
+        await delay(COMMAND_LOCK_RETRY_MS);
+        continue;
+      }
+
+      const leaseDeadline = lockLeaseDeadline(owner, COMMAND_LOCK_MAX_LEASE_MS);
       const lease = setInterval(() => {
         try {
-          if (!lockOwnerMatches(lockPath, nonce)) return;
+          if (Date.now() >= leaseDeadline || !lockOwnerMatches(lockPath, owner)) {
+            clearInterval(lease);
+            return;
+          }
           const now = new Date();
           fs.utimesSync(lockPath, now, now);
         } catch {
-          // Losing the lease will be detected by the nonce check on release.
+          clearInterval(lease);
         }
       }, Math.max(1_000, Math.floor(COMMAND_LOCK_STALE_MS / 3)));
       lease.unref?.();
 
       return () => {
         clearInterval(lease);
-        try {
-          if (lockOwnerMatches(lockPath, nonce)) fs.unlinkSync(lockPath);
-        } catch {
-          // A stale-lock recovery or process cleanup may already have removed it.
-        }
+        releaseOwnedLock(lockPath, owner, {
+          unlinkSyncImpl: testHooks?.releaseUnlinkSyncImpl || fs.unlinkSync,
+          sleepSyncImpl: testHooks?.releaseSleepSyncImpl || waitSync,
+          retryDelaysMs: testHooks?.releaseRetryDelaysMs
+            || COMMAND_RELEASE_RETRY_DELAYS_MS
+        });
       };
-    } catch (error) {
-      if (fd !== null) {
-        let fdStat = null;
-        try {
-          fdStat = fs.fstatSync(fd);
-        } catch {
-          // The descriptor may already be unusable after a failed write.
-        }
-        try {
-          fs.closeSync(fd);
-        } catch {
-          // Ignore cleanup errors while preserving the original failure.
-        }
-        try {
-          const pathStat = fs.statSync(lockPath);
-          const sameFile = fdStat
-            && fdStat.dev === pathStat.dev
-            && fdStat.ino === pathStat.ino;
-          if (lockOwnerMatches(lockPath, nonce) || sameFile) fs.unlinkSync(lockPath);
-        } catch {
-          // The lock may not have reached a readable owner record.
-        }
-      }
-      if (error?.code !== "EEXIST") throw error;
     }
 
-    try {
-      const stat = fs.statSync(lockPath);
-      const ageMs = Math.max(0, Date.now() - stat.mtimeMs);
-      const owner = readJson(lockPath);
-      const validOwner = Boolean(
-        owner
-        && typeof owner.nonce === "string"
-        && owner.nonce
-        && Number.isInteger(Number(owner.pid))
+    const observed = observeLock(lockPath);
+    if (
+      observed
+      && lockObservationIsAbandoned(observed, {
+        maxLeaseMs: COMMAND_LOCK_MAX_LEASE_MS,
+        invalidStaleMs: COMMAND_LOCK_STALE_MS
+      })
+    ) {
+      const recoveryOwner = tryCreateLock(
+        recoveryPath,
+        COMMAND_RECOVERY_LOCK_MAX_LEASE_MS
       );
-      const abandonedOwner = validOwner
-        ? !isPidAlive(owner.pid) && ageMs > COMMAND_LOCK_INVALID_GRACE_MS
-        : ageMs > COMMAND_LOCK_STALE_MS;
-      if (abandonedOwner) {
-        fs.unlinkSync(lockPath);
+      if (recoveryOwner) {
+        try {
+          if (typeof testHooks?.afterRecoveryGuardAcquired === "function") {
+            await testHooks.afterRecoveryGuardAcquired({
+              lockPath,
+              recoveryPath,
+              observed
+            });
+          }
+          const latest = observeLock(lockPath);
+          let removed = false;
+          if (
+            sameLockObservation(observed, latest)
+            && lockObservationIsAbandoned(latest, {
+              maxLeaseMs: COMMAND_LOCK_MAX_LEASE_MS,
+              invalidStaleMs: COMMAND_LOCK_STALE_MS
+            })
+          ) {
+            removed = removeObservedLock(lockPath, latest);
+          }
+          if (typeof testHooks?.afterRecoveryRevalidation === "function") {
+            await testHooks.afterRecoveryRevalidation({
+              lockPath,
+              recoveryPath,
+              observed,
+              latest,
+              removed
+            });
+          }
+        } finally {
+          releaseOwnedLock(recoveryPath, recoveryOwner);
+        }
         continue;
       }
-    } catch (error) {
-      if (error?.code === "ENOENT") continue;
     }
     await delay(COMMAND_LOCK_RETRY_MS);
   }
@@ -1382,6 +1621,7 @@ export const bossMonitorProviderDescriptor = Object.freeze({
 assertProviderDescriptorV1(bossMonitorProviderDescriptor);
 
 export const __test = {
+  acquireCommandRunLock,
   assertRef,
   configuredArtifactRoots,
   detectImageType,

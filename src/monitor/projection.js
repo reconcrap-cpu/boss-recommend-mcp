@@ -8,6 +8,7 @@ import {
   assertRunSnapshotV1
 } from "@reconcrap/recruiting-run-monitor-contract";
 import { readCandidateResultJournal } from "../core/run/candidate-result-journal.js";
+import { acquireFileLockSync } from "../core/run/state-file-lock.js";
 
 export const BOSS_MONITOR_CONTRACT_VERSION = "1.0";
 export const BOSS_MONITOR_SCHEMA_VERSION = 1;
@@ -23,6 +24,8 @@ const WRITER_LOCK_WAIT_MS = 5_000;
 const WRITER_LOCK_RETRY_MS = 10;
 const WRITER_LOCK_DEAD_OWNER_GRACE_MS = 2_000;
 const WRITER_LOCK_UNREADABLE_GRACE_MS = 10_000;
+const WRITER_LOCK_MAX_LEASE_MS = 120_000;
+const WRITER_RECOVERY_LOCK_MAX_LEASE_MS = 10_000;
 const CANDIDATE_JOURNAL_READ_MAX_BYTES = 128 * 1024 * 1024;
 const PROCESS_INSTANCE_ID = typeof crypto.randomUUID === "function"
   ? crypto.randomUUID()
@@ -141,6 +144,54 @@ function readJson(filePath) {
   }
 }
 
+function refreshActiveSourceFromRunState(entry) {
+  const source = clone(entry?.source, {});
+  const runId = normalizeRunId(entry?.runId);
+  const controlPath = normalizeText(source?.resume?.pause_control_path || "", 8_000);
+  if (
+    !runId
+    || !controlPath
+    || !path.isAbsolute(controlPath)
+    || path.basename(controlPath) !== `${runId}.json`
+  ) {
+    return source;
+  }
+  const persisted = readJson(controlPath);
+  if (!persisted) return source;
+  const persistedRunId = normalizeRunId(persisted.run_id || persisted.runId);
+  if (persistedRunId !== runId) return source;
+
+  const producerLaunchId = normalizeText(source?.resume?.worker_launch_id || "", 240);
+  const persistedLaunchId = normalizeText(persisted?.resume?.worker_launch_id || "", 240);
+  if (producerLaunchId && persistedLaunchId && producerLaunchId !== persistedLaunchId) {
+    // A superseded worker must never heartbeat over the replacement launch.
+    return null;
+  }
+  return {
+    ...source,
+    ...persisted,
+    progress: {
+      ...plainRecord(source.progress),
+      ...plainRecord(persisted.progress)
+    },
+    context: {
+      ...plainRecord(source.context),
+      ...plainRecord(persisted.context)
+    },
+    control: {
+      ...plainRecord(source.control),
+      ...plainRecord(persisted.control)
+    },
+    resume: {
+      ...plainRecord(source.resume),
+      ...plainRecord(persisted.resume)
+    },
+    monitoring_v1: plainRecord(persisted.monitoring_v1).contract_version === "1.0"
+      ? persisted.monitoring_v1
+      : source.monitoring_v1
+  };
+}
+
 function serializedPayload(payload, maxBytes = SNAPSHOT_MAX_BYTES) {
   const serialized = `${JSON.stringify(payload, null, 2)}\n`;
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
@@ -186,114 +237,24 @@ function isPidAlive(pid) {
   }
 }
 
-function waitSync(milliseconds) {
-  const waitMs = Math.max(0, Number(milliseconds) || 0);
-  if (waitMs === 0) return;
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
-}
-
 function acquireRunWriterLock(runDir) {
   fs.mkdirSync(runDir, { recursive: true });
   const lockPath = path.join(runDir, ".writer.lock");
   const recoveryPath = path.join(runDir, ".writer.recovery.lock");
-  const nonce = crypto.randomBytes(18).toString("base64url");
-  const deadline = Date.now() + WRITER_LOCK_WAIT_MS;
-  while (Date.now() < deadline) {
-    if (fs.existsSync(recoveryPath)) {
-      waitSync(WRITER_LOCK_RETRY_MS);
-      continue;
+  return acquireFileLockSync(lockPath, {
+    timeoutMs: WRITER_LOCK_WAIT_MS,
+    retryMs: WRITER_LOCK_RETRY_MS,
+    deadOwnerGraceMs: WRITER_LOCK_DEAD_OWNER_GRACE_MS,
+    unreadableGraceMs: WRITER_LOCK_UNREADABLE_GRACE_MS,
+    maxLeaseMs: WRITER_LOCK_MAX_LEASE_MS,
+    recoveryMaxLeaseMs: WRITER_RECOVERY_LOCK_MAX_LEASE_MS,
+    recoveryPath,
+    timeoutCode: "MONITOR_WRITER_LOCK_TIMEOUT",
+    timeoutMessage: "Timed out acquiring Boss monitor projection writer lock",
+    ownerMetadata: {
+      worker_instance_id: PROCESS_INSTANCE_ID
     }
-    try {
-      const fd = fs.openSync(lockPath, "wx", 0o600);
-      try {
-        fs.writeFileSync(fd, JSON.stringify({
-          pid: process.pid,
-          worker_instance_id: PROCESS_INSTANCE_ID,
-          nonce,
-          acquired_at: isoNow()
-        }), "utf8");
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-      return () => {
-        try {
-          const current = readJson(lockPath);
-          if (
-            current?.pid === process.pid
-            && current?.worker_instance_id === PROCESS_INSTANCE_ID
-            && current?.nonce === nonce
-          ) {
-            fs.unlinkSync(lockPath);
-          }
-        } catch {
-          // A failed owner must never remove a replacement owner's lock.
-        }
-      };
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
-      let recoveryFd = null;
-      try {
-        const stat = fs.statSync(lockPath);
-        const owner = readJson(lockPath);
-        const ageMs = Date.now() - stat.mtimeMs;
-        const ownerIsReadable = Boolean(
-          owner
-          && Number.isInteger(Number(owner.pid))
-          && normalizeText(owner.nonce, 200)
-        );
-        const mayRecover = ownerIsReadable
-          ? !isPidAlive(owner.pid) && ageMs > WRITER_LOCK_DEAD_OWNER_GRACE_MS
-          : ageMs > WRITER_LOCK_UNREADABLE_GRACE_MS;
-        if (mayRecover) {
-          try {
-            recoveryFd = fs.openSync(recoveryPath, "wx", 0o600);
-            fs.writeFileSync(recoveryFd, JSON.stringify({
-              pid: process.pid,
-              nonce,
-              acquired_at: isoNow()
-            }), "utf8");
-            fs.fsyncSync(recoveryFd);
-          } catch (recoveryError) {
-            if (recoveryError?.code !== "EEXIST") throw recoveryError;
-          } finally {
-            if (recoveryFd !== null) fs.closeSync(recoveryFd);
-          }
-          if (recoveryFd !== null) {
-            try {
-              const latestStat = fs.statSync(lockPath);
-              const latestOwner = readJson(lockPath);
-              const unchanged = ownerIsReadable
-                ? latestOwner?.pid === owner.pid
-                  && latestOwner?.worker_instance_id === owner.worker_instance_id
-                  && latestOwner?.nonce === owner.nonce
-                : latestStat.mtimeMs === stat.mtimeMs && latestStat.size === stat.size;
-              const latestAgeMs = Date.now() - latestStat.mtimeMs;
-              const stillRecoverable = ownerIsReadable
-                ? unchanged
-                  && !isPidAlive(latestOwner?.pid)
-                  && latestAgeMs > WRITER_LOCK_DEAD_OWNER_GRACE_MS
-                : unchanged && latestAgeMs > WRITER_LOCK_UNREADABLE_GRACE_MS;
-              if (stillRecoverable) fs.unlinkSync(lockPath);
-            } finally {
-              try {
-                fs.unlinkSync(recoveryPath);
-              } catch {
-                // Recovery ownership is short-lived and scoped to this run.
-              }
-            }
-            continue;
-          }
-        }
-      } catch {
-        // The owner may have released the lock between stat and read.
-      }
-      waitSync(WRITER_LOCK_RETRY_MS);
-    }
-  }
-  const error = new Error("Timed out acquiring Boss monitor projection writer lock");
-  error.code = "MONITOR_WRITER_LOCK_TIMEOUT";
-  throw error;
+  });
 }
 
 export function createBossMonitorSourceMarker(createdAt = isoNow()) {
@@ -1047,8 +1008,13 @@ function writeExitSidecar(kind, runId, snapshot, reason) {
   writeJsonAtomic(path.join(runDir, "worker-exit.json"), {
     contract_version: BOSS_MONITOR_CONTRACT_VERSION,
     ref: { provider: BOSS_MONITOR_PROVIDER, kind, run_id: runId },
-    worker_instance_id: PROCESS_INSTANCE_ID,
-    pid: process.pid,
+    worker_instance_id: normalizeText(
+      snapshot?.liveness?.worker_instance_id || PROCESS_INSTANCE_ID,
+      160
+    ),
+    pid: Number.isInteger(snapshot?.liveness?.pid) && snapshot.liveness.pid > 0
+      ? snapshot.liveness.pid
+      : process.pid,
     state: snapshot?.state || "unknown",
     reason: normalizeText(reason || snapshot?.state || "process_exit", 160),
     exited_at: isoNow()
@@ -1103,7 +1069,7 @@ export function writeBossMonitorProjection(kind, sourceSnapshot, eventContext = 
   const evidenceDir = path.join(runDir, ".evidence");
   const isProducer = eventContext?.producer === true;
   const key = `${normalizedKind}:${runId}`;
-  const desiredState = normalizeState(sourceSnapshot);
+  let desiredState = normalizeState(sourceSnapshot);
   let hasV1Marker = isPostInstallationV1Marker(sourceSnapshot?.monitoring_v1);
   if (!hasV1Marker && eventContext?.v1_created === true) {
     hasV1Marker = isPostInstallationV1Marker(
@@ -1133,6 +1099,19 @@ export function writeBossMonitorProjection(kind, sourceSnapshot, eventContext = 
   const releaseWriterLock = acquireRunWriterLock(runDir);
   try {
     const existing = readJson(snapshotPath);
+    if (isProducer && eventContext?.type === "heartbeat") {
+      const refreshedSource = refreshActiveSourceFromRunState({
+        kind: normalizedKind,
+        runId,
+        source: sourceSnapshot
+      });
+      if (!refreshedSource) {
+        activeSources.delete(key);
+        return existing;
+      }
+      sourceSnapshot = refreshedSource;
+      desiredState = normalizeState(sourceSnapshot);
+    }
     if (!existing && !mayCreateV1Run) return null;
     if (
       existing
@@ -1304,7 +1283,12 @@ export function writeBossMonitorProjection(kind, sourceSnapshot, eventContext = 
 
     if (TERMINAL_STATES.has(snapshot.state)) {
       activeSources.delete(key);
-      if (isProducer) {
+      const exitSidecarPath = path.join(runDir, "worker-exit.json");
+      if (
+        isProducer
+        || !TERMINAL_STATES.has(existing?.state)
+        || !fs.existsSync(exitSidecarPath)
+      ) {
         try {
           writeExitSidecar(normalizedKind, runId, snapshot, snapshot.state);
         } catch {

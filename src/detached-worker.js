@@ -170,6 +170,33 @@ export async function runDetachedWorkerMain(argv = process.argv.slice(2), depend
   installFailureHandlers(options.domain, options.runId, options.launchId, dependencies);
   const result = await runDetachedWorkerDomain(options, dependencies);
   if (!result?.ok) {
+    const rawResultError = result?.error;
+    const resultError = rawResultError instanceof Error
+      ? rawResultError
+      : new Error(
+          normalizeText(rawResultError?.message || rawResultError || result?.message)
+          || `Detached ${options.domain} worker returned a non-ok result.`
+        );
+    const failureCode = normalizeText(result?.code || rawResultError?.code || resultError?.code)
+      || "DETACHED_WORKER_START_FAILED";
+    if (!normalizeText(resultError.code)) {
+      resultError.code = failureCode;
+    }
+    try {
+      await markDetachedWorkerDomainFailed(
+        options.domain,
+        options.runId,
+        resultError,
+        {
+          code: failureCode,
+          workerLaunchId: options.launchId || null,
+          diagnosticSource: "detached_worker_non_ok_result"
+        },
+        dependencies
+      );
+    } catch (markError) {
+      console.error("[boss-recommend-mcp] failed to persist detached worker non-ok result", markError);
+    }
     process.exitCode = 1;
   }
 }

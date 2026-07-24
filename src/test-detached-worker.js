@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import {
   markDetachedWorkerDomainFailed,
   recordDetachedWorkerExit,
-  runDetachedWorkerDomain
+  runDetachedWorkerDomain,
+  runDetachedWorkerMain
 } from "./detached-worker.js";
 
 const calls = [];
@@ -110,5 +111,54 @@ await assert.rejects(
   ),
   (error) => error?.code === "DETACHED_RECOMMEND_WORKER_EXPORT_UNAVAILABLE"
 );
+
+const mainCalls = [];
+const previousExitCode = process.exitCode;
+try {
+  process.exitCode = undefined;
+  await runDetachedWorkerMain([
+    "--domain",
+    "chat",
+    "--run-id",
+    "chat-uncommitted-run",
+    "--launch-id",
+    "chat-current-launch"
+  ], {
+    runBossChatDetachedWorker: async (options) => {
+      mainCalls.push(["run-chat-main", options]);
+      return {
+        ok: false,
+        error: "run_id=chat-uncommitted-run detached worker launch was not committed"
+      };
+    },
+    markBossChatDetachedWorkerFailed: async (runId, error, options) => {
+      mainCalls.push(["mark-chat-main", runId, error.message, error.code, options]);
+      // A domain marker may return an already-terminal state when the domain
+      // worker persisted its own failure first. The main worker must make only
+      // one idempotent reconciliation attempt and still exit nonzero.
+      return { run_id: runId, state: "failed" };
+    }
+  });
+  assert.equal(process.exitCode, 1);
+} finally {
+  process.exitCode = previousExitCode;
+}
+assert.deepEqual(mainCalls, [
+  ["run-chat-main", {
+    runId: "chat-uncommitted-run",
+    launchId: "chat-current-launch"
+  }],
+  [
+    "mark-chat-main",
+    "chat-uncommitted-run",
+    "run_id=chat-uncommitted-run detached worker launch was not committed",
+    "DETACHED_WORKER_START_FAILED",
+    {
+      code: "DETACHED_WORKER_START_FAILED",
+      workerLaunchId: "chat-current-launch",
+      diagnosticSource: "detached_worker_non_ok_result"
+    }
+  ]
+]);
 
 console.log("detached worker dispatch tests passed");
