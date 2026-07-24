@@ -39,6 +39,11 @@ function testWindowsCimLaunchUsesOnlyControlledArguments() {
     recommendRuntimeHomePath: "C:\\Users\\tester\\.boss-recommend-mcp",
     chatRuntimeHomePath: "C:\\Users\\tester\\.boss-recommend-mcp\\boss-chat",
     screenConfigPath: "C:\\Users\\tester\\.boss-recommend-mcp\\screening-config.json",
+    environment: {
+      BOSS_MONITOR_HOME: "C:\\Users\\tester\\boss-monitor-projection",
+      RECRUITING_MONITOR_HOME: "C:\\Users\\tester\\recruiting-monitor",
+      BOSS_MONITORING_ENABLED: "off"
+    },
     prepareLogFileImpl: (filePath) => preparedLogs.push(filePath),
     spawnSyncImpl(command, args, options) {
       observed.command = command;
@@ -78,6 +83,11 @@ function testWindowsCimLaunchUsesOnlyControlledArguments() {
   assert.match(script, /C:\\Users\\tester\\\.boss-recommend-mcp\\boss-chat/);
   assert.match(script, /-ScreenConfigPath/);
   assert.match(script, /C:\\Users\\tester\\\.boss-recommend-mcp\\screening-config\.json/);
+  assert.match(script, /-BossMonitorHomePath/);
+  assert.match(script, /C:\\Users\\tester\\boss-monitor-projection/);
+  assert.match(script, /-RecruitingMonitorHomePath/);
+  assert.match(script, /C:\\Users\\tester\\recruiting-monitor/);
+  assert.match(script, /-BossMonitoringEnabled false/);
   assert.doesNotMatch(script, /criteria|api[_-]?key|greeting/i);
 
   const wrapperSource = fs.readFileSync(
@@ -87,6 +97,9 @@ function testWindowsCimLaunchUsesOnlyControlledArguments() {
   assert.match(wrapperSource, /EnvironmentVariables\['BOSS_CHAT_HOME'\]/);
   assert.match(wrapperSource, /EnvironmentVariables\['BOSS_RECOMMEND_SCREEN_CONFIG'\]/);
   assert.match(wrapperSource, /EnvironmentVariables\['BOSS_RECOMMEND_HOME'\]/);
+  assert.match(wrapperSource, /EnvironmentVariables\['BOSS_MONITOR_HOME'\]/);
+  assert.match(wrapperSource, /EnvironmentVariables\['RECRUITING_MONITOR_HOME'\]/);
+  assert.match(wrapperSource, /EnvironmentVariables\['BOSS_MONITORING_ENABLED'\]/);
   assert.match(wrapperSource, /Write-WorkerExitStatus/);
   assert.match(wrapperSource, /--record-exit/);
 }
@@ -129,6 +142,53 @@ function testWindowsCimFailuresAreExplicit() {
     ...common,
     exitStatusPath: "relative-exit.json"
   }), (error) => error?.code === "DETACHED_WORKER_PATH_INVALID");
+  assert.throws(() => launchDetachedWorker({
+    ...common,
+    bossMonitorHomePath: "relative-monitor-home"
+  }), (error) => error?.code === "DETACHED_WORKER_PATH_INVALID");
+  let relativeEnvironmentScript = "";
+  assert.doesNotThrow(() => launchDetachedWorker({
+    ...common,
+    environment: {
+      BOSS_MONITOR_HOME: "relative-monitor-home",
+      RECRUITING_MONITOR_HOME: "relative-monitor-runtime",
+      BOSS_MONITORING_ENABLED: "false"
+    },
+    spawnSyncImpl: (_command, args) => {
+      relativeEnvironmentScript = Buffer.from(args[5], "base64").toString("utf16le");
+      return {
+        status: 0,
+        stdout: '{"return_value":0,"process_id":321}',
+        stderr: ""
+      };
+    }
+  }));
+  assert.equal(
+    relativeEnvironmentScript.includes(path.win32.resolve("relative-monitor-home")),
+    true
+  );
+  assert.equal(
+    relativeEnvironmentScript.includes(path.win32.resolve("relative-monitor-runtime")),
+    true
+  );
+  let invalidEnvironmentScript = "";
+  assert.doesNotThrow(() => launchDetachedWorker({
+    ...common,
+    environment: {
+      BOSS_MONITOR_HOME: "invalid\nmonitor-home",
+      BOSS_MONITORING_ENABLED: "true"
+    },
+    spawnSyncImpl: (_command, args) => {
+      invalidEnvironmentScript = Buffer.from(args[5], "base64").toString("utf16le");
+      return {
+        status: 0,
+        stdout: '{"return_value":0,"process_id":322}',
+        stderr: ""
+      };
+    }
+  }));
+  assert.doesNotMatch(invalidEnvironmentScript, /-BossMonitorHomePath/);
+  assert.match(invalidEnvironmentScript, /-BossMonitoringEnabled false/);
 }
 
 async function waitUntil(predicate, timeoutMs = 15000) {
@@ -192,6 +252,63 @@ async function testWindowsSupervisorPersistsObservedExitSidecar() {
       true
     );
     assert.equal(fs.readdirSync(tempDir).some((name) => name.includes(".tmp.")), false);
+  } finally {
+    removeTempDirBestEffort(tempDir);
+  }
+}
+
+async function testWindowsSupervisorPropagatesMonitorEnvironment() {
+  if (process.platform !== "win32") return;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "boss-windows-monitor-env-test-"));
+  const workerScriptPath = path.join(tempDir, "capture-monitor-env.mjs");
+  const workerEnvironmentPath = path.join(tempDir, "worker-monitor-env.json");
+  const recorderEnvironmentPath = path.join(tempDir, "recorder-monitor-env.json");
+  const stdoutPath = path.join(tempDir, "worker.stdout.log");
+  const stderrPath = path.join(tempDir, "worker.stderr.log");
+  const exitStatusPath = path.join(tempDir, "worker.exit.json");
+  const bossMonitorHome = path.join(tempDir, "boss-monitor-projection");
+  const recruitingMonitorHome = path.join(tempDir, "recruiting-monitor");
+  fs.writeFileSync(workerScriptPath, [
+    'import fs from "node:fs";',
+    `const outputPath = process.argv.includes("--record-exit")`
+      + ` ? ${JSON.stringify(recorderEnvironmentPath)} : ${JSON.stringify(workerEnvironmentPath)};`,
+    "fs.writeFileSync(outputPath, JSON.stringify({",
+    "  boss_monitor_home: process.env.BOSS_MONITOR_HOME || null,",
+    "  recruiting_monitor_home: process.env.RECRUITING_MONITOR_HOME || null,",
+    "  monitoring_enabled: process.env.BOSS_MONITORING_ENABLED || null",
+    '}), "utf8");'
+  ].join("\n"), "utf8");
+  try {
+    launchDetachedWorker({
+      nodePath: process.execPath,
+      workerScriptPath,
+      domain: "recommend",
+      runId: "mcp_recommend_monitor_env_test",
+      stdoutPath,
+      stderrPath,
+      exitStatusPath,
+      environment: {
+        ...process.env,
+        BOSS_MONITOR_HOME: bossMonitorHome,
+        RECRUITING_MONITOR_HOME: recruitingMonitorHome,
+        BOSS_MONITORING_ENABLED: "disabled"
+      }
+    });
+    assert.equal(
+      await waitUntil(() => (
+        fs.existsSync(exitStatusPath)
+        && fs.existsSync(workerEnvironmentPath)
+        && fs.existsSync(recorderEnvironmentPath)
+      )),
+      true
+    );
+    const expected = {
+      boss_monitor_home: bossMonitorHome,
+      recruiting_monitor_home: recruitingMonitorHome,
+      monitoring_enabled: "false"
+    };
+    assert.deepEqual(JSON.parse(fs.readFileSync(workerEnvironmentPath, "utf8")), expected);
+    assert.deepEqual(JSON.parse(fs.readFileSync(recorderEnvironmentPath, "utf8")), expected);
   } finally {
     removeTempDirBestEffort(tempDir);
   }
@@ -357,6 +474,7 @@ testWindowsCimLaunchUsesOnlyControlledArguments();
 testWindowsCimFailuresAreExplicit();
 testPosixLaunchRetainsExistingSpawnContract();
 await testWindowsSupervisorPersistsObservedExitSidecar();
+await testWindowsSupervisorPropagatesMonitorEnvironment();
 await testWindowsSupervisorPersistsForcedWorkerTermination();
 await testWindowsSupervisorPersistsWrapperFailure();
 console.log("detached launcher tests passed");

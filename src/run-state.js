@@ -207,7 +207,8 @@ export function createRunStateSnapshot({
   lastMessage = null,
   context = null,
   control = null,
-  resume = null
+  resume = null,
+  monitoringV1 = null
 } = {}) {
   const now = toIsoNow();
   return {
@@ -224,6 +225,7 @@ export function createRunStateSnapshot({
     context: defaultContext(context),
     control: defaultControl(control),
     resume: defaultResume(resume),
+    monitoring_v1: clonePlainObject(monitoringV1),
     error: null,
     result: null
   };
@@ -249,6 +251,7 @@ export function writeRunState(snapshot) {
     context: defaultContext(snapshot.context),
     control: defaultControl(snapshot.control),
     resume: defaultResume(snapshot.resume),
+    monitoring_v1: clonePlainObject(snapshot.monitoring_v1),
     error: snapshot.error || null,
     result: snapshot.result || null
   };
@@ -273,6 +276,7 @@ export function readRunState(runId) {
     context: defaultContext(payload.context),
     control: defaultControl(payload.control),
     resume: defaultResume(payload.resume),
+    monitoring_v1: clonePlainObject(payload.monitoring_v1),
     error: payload.error || null,
     result: payload.result || null
   };

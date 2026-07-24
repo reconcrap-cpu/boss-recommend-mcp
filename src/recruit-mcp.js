@@ -1700,7 +1700,12 @@ export async function runRecruitPipelineTool({ workspaceRoot = "", args = {} } =
     execution_mode: mode
   }, { workspaceRoot });
   if (started.status !== "ACCEPTED") return started;
-  if (mode !== RUN_MODE_SYNC) return attachMethodEvidence(started, started.run_id);
+  if (mode !== RUN_MODE_SYNC) {
+    return attachMethodEvidence({
+      ...started,
+      monitoring: createBossMonitoringBlock("search", started.run_id)
+    }, started.run_id);
+  }
 
   const final = await waitForRecruitRunTerminal(started.run_id);
   await closeRecruitRunSession(started.run_id);
@@ -1724,6 +1729,7 @@ export async function runRecruitPipelineTool({ workspaceRoot = "", args = {} } =
         }
       : undefined,
     summary: final?.summary || null,
+    monitoring: createBossMonitoringBlock("search", started.run_id),
     error: finalStatus === "CANCELED"
       ? {
           code: "PIPELINE_CANCELED",

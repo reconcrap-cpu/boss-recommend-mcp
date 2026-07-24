@@ -2866,8 +2866,15 @@ async function testRecommendSupervisorExitRecorderMarksFailureImmediately() {
 async function testRecommendDetachedStartUsesWorkerProcess() {
   const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
   const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitoringEnabled = process.env.BOSS_MONITORING_ENABLED;
   process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
   process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  process.env.BOSS_MONITOR_HOME = path.join(
+    process.env.BOSS_RECOMMEND_HOME,
+    "detached-start-monitor"
+  );
+  process.env.BOSS_MONITORING_ENABLED = "true";
   let launcherOptions = null;
   let unrefCalled = false;
   let connectOptions = null;
@@ -2941,6 +2948,26 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(launcherOptions.exitStatusPath, started.run.resume.worker_exit_status_path);
     assert.equal(path.isAbsolute(launcherOptions.recommendRuntimeHomePath), true);
     assert.equal(path.isAbsolute(launcherOptions.screenConfigPath), true);
+    assert.equal(started.monitoring.ref.provider, "boss");
+    assert.equal(started.monitoring.ref.kind, "recommend");
+    assert.equal(started.monitoring.ref.run_id, started.run_id);
+    assert.equal(started.monitoring.contract_version, "1.0");
+    assert.equal(started.run.monitoring_v1.contract_version, "1.0");
+    const monitorHome = process.env.BOSS_MONITOR_HOME
+      || path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-projection");
+    const queuedProjectionPath = path.join(
+      monitorHome,
+      "v1",
+      "runs",
+      "recommend",
+      started.run_id,
+      "snapshot.json"
+    );
+    assert.equal(fs.existsSync(queuedProjectionPath), true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(queuedProjectionPath, "utf8")).state,
+      "queued"
+    );
     assert.equal(started.run.context.args.overrides.job, startArgs.overrides.job);
 
     const workerResult = await runDetachedWorkerForTests({
@@ -2970,6 +2997,16 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
       delete process.env.BOSS_RECOMMEND_CDP_INPROC;
     } else {
       process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitoringEnabled === undefined) {
+      delete process.env.BOSS_MONITORING_ENABLED;
+    } else {
+      process.env.BOSS_MONITORING_ENABLED = previousMonitoringEnabled;
     }
   }
 }

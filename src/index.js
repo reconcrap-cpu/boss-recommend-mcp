@@ -91,6 +91,11 @@ import {
   writeRunState
 } from "./run-state.js";
 import { launchDetachedWorker } from "./core/run/detached-launcher.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
 
 const require = createRequire(import.meta.url);
 const { version: SERVER_VERSION } = require("../package.json");
@@ -2873,6 +2878,7 @@ async function executeTrackedPipeline({
 
 function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = process.pid) {
   const artifacts = getRunArtifacts(runId);
+  const createdAt = new Date().toISOString();
   const snapshot = createRunStateSnapshot({
     runId,
     mode,
@@ -2894,7 +2900,8 @@ function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = proce
       resume_count: 0,
       last_resumed_at: null,
       last_paused_at: null
-    }
+    },
+    monitoringV1: createBossMonitorSourceMarker(createdAt)
   });
   return writeRunState(snapshot);
 }
@@ -3048,7 +3055,13 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   const workerLaunchId = createRunId();
   const workerLaunchedAt = new Date().toISOString();
   try {
-    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
+    initializeRunStateOrThrow(
+      runId,
+      RUN_MODE_ASYNC,
+      workspaceRoot,
+      args,
+      process.pid
+    );
   } catch (error) {
     return {
       status: "FAILED",
@@ -3059,7 +3072,6 @@ async function handleStartRunTool({ workspaceRoot, args }) {
       }
     };
   }
-
   const initialWorkerArtifacts = getRunArtifacts(runId);
   const launchPreparedState = safeUpdateRunState(runId, {
     resume: {
@@ -3085,6 +3097,7 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   }
 
   let worker;
+  let launchCommittedState;
   try {
     worker = launchDetachedRunWorker({
       runId,
@@ -3094,7 +3107,7 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     });
     const workerLogPaths = worker.workerLogPaths || {};
     const workerLauncher = worker.workerLauncher || {};
-    const launchCommittedState = safeUpdateRunState(runId, (current) => {
+    launchCommittedState = safeUpdateRunState(runId, (current) => {
       const currentState = normalizeText(current.state || current.status);
       if (
         TERMINAL_RUN_STATES.has(currentState)
@@ -3143,6 +3156,10 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     return failed;
   }
 
+  writeBossMonitorProjectionNonfatal("recommend", launchCommittedState, {
+    type: "created",
+    v1_created: true
+  });
   const run = readRunState(runId);
   return {
     status: "ACCEPTED",
@@ -3153,7 +3170,8 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     message: getDefaultAcceptedMessage(args),
     post_action: prepared.post_action,
     target_count_semantics: prepared.target_count_semantics,
-    review: prepared.review
+    review: prepared.review,
+    monitoring: createBossMonitoringBlock("recommend", runId)
   };
 }
 

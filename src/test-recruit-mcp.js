@@ -451,6 +451,10 @@ async function testRecruitSyncRun() {
     execution_mode: "sync"
   }, 3);
   assert.equal(payload.status, "COMPLETED");
+  assert.equal(payload.monitoring.ref.provider, "boss");
+  assert.equal(payload.monitoring.ref.kind, "search");
+  assert.equal(payload.monitoring.ref.run_id, payload.run_id);
+  assert.equal(payload.monitoring.contract_version, "1.0");
   assert.equal(payload.summary.domain, "recruit");
   assert.equal(typeof payload.result.run_id, "string");
   assert.equal(payload.result.processed_count, 1);

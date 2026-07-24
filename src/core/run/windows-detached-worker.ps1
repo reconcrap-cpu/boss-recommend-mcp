@@ -33,7 +33,17 @@ param(
   [string]$ChatRuntimeHomePath = '',
 
   [Parameter(Mandatory = $false)]
-  [string]$ScreenConfigPath = ''
+  [string]$ScreenConfigPath = '',
+
+  [Parameter(Mandatory = $false)]
+  [string]$BossMonitorHomePath = '',
+
+  [Parameter(Mandatory = $false)]
+  [string]$RecruitingMonitorHomePath = '',
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet('true', 'false')]
+  [string]$BossMonitoringEnabled = 'true'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,6 +89,12 @@ try {
   if ($ScreenConfigPath) {
     Assert-ControlledPath $ScreenConfigPath 'ScreenConfigPath'
   }
+  if ($BossMonitorHomePath) {
+    Assert-ControlledPath $BossMonitorHomePath 'BossMonitorHomePath'
+  }
+  if ($RecruitingMonitorHomePath) {
+    Assert-ControlledPath $RecruitingMonitorHomePath 'RecruitingMonitorHomePath'
+  }
   if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
     throw 'NodePath does not exist.'
   }
@@ -107,6 +123,13 @@ try {
   if ($ScreenConfigPath) {
     $startInfo.EnvironmentVariables['BOSS_RECOMMEND_SCREEN_CONFIG'] = $ScreenConfigPath
   }
+  if ($BossMonitorHomePath) {
+    $startInfo.EnvironmentVariables['BOSS_MONITOR_HOME'] = $BossMonitorHomePath
+  }
+  if ($RecruitingMonitorHomePath) {
+    $startInfo.EnvironmentVariables['RECRUITING_MONITOR_HOME'] = $RecruitingMonitorHomePath
+  }
+  $startInfo.EnvironmentVariables['BOSS_MONITORING_ENABLED'] = $BossMonitoringEnabled
 
   $worker = New-Object System.Diagnostics.Process
   $worker.StartInfo = $startInfo
@@ -177,6 +200,13 @@ try {
     if ($ScreenConfigPath) {
       $recordInfo.EnvironmentVariables['BOSS_RECOMMEND_SCREEN_CONFIG'] = $ScreenConfigPath
     }
+    if ($BossMonitorHomePath) {
+      $recordInfo.EnvironmentVariables['BOSS_MONITOR_HOME'] = $BossMonitorHomePath
+    }
+    if ($RecruitingMonitorHomePath) {
+      $recordInfo.EnvironmentVariables['RECRUITING_MONITOR_HOME'] = $RecruitingMonitorHomePath
+    }
+    $recordInfo.EnvironmentVariables['BOSS_MONITORING_ENABLED'] = $BossMonitoringEnabled
     $recorder = New-Object System.Diagnostics.Process
     $recorder.StartInfo = $recordInfo
     if ($recorder.Start()) {
