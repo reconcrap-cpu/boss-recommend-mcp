@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
@@ -91,6 +92,12 @@ import {
   writeRunState
 } from "./run-state.js";
 import { launchDetachedWorker } from "./core/run/detached-launcher.js";
+import { withRunStateFileLockSync } from "./core/run/state-file-lock.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
 
 const require = createRequire(import.meta.url);
 const { version: SERVER_VERSION } = require("../package.json");
@@ -481,11 +488,42 @@ function finalizeRawRunStateAsCanceled(runId, existing = {}, {
 
 function writeRawRunState(runId, payload) {
   const artifacts = getRunArtifacts(runId);
-  fs.mkdirSync(path.dirname(artifacts.run_state_path), { recursive: true });
-  const tempPath = `${artifacts.run_state_path}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tempPath, artifacts.run_state_path);
-  return payload;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    fs.mkdirSync(path.dirname(artifacts.run_state_path), { recursive: true });
+    const tempPath = `${artifacts.run_state_path}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+        encoding: "utf8",
+        flag: "wx"
+      });
+      let lastError = null;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        try {
+          fs.renameSync(tempPath, artifacts.run_state_path);
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (
+            process.platform !== "win32"
+            || !["EACCES", "EPERM", "EBUSY"].includes(error?.code)
+            || attempt === 4
+          ) {
+            throw error;
+          }
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 * (attempt + 1));
+        }
+      }
+      if (lastError) throw lastError;
+      return payload;
+    } finally {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+  });
 }
 
 function readRawRunState(runId) {
@@ -629,26 +667,40 @@ function handleListRunsTool(args = {}) {
   };
 }
 
-function patchRawRunState(runId, patch) {
-  const current = readRawRunState(runId);
-  if (!current) return null;
-  const now = new Date().toISOString();
-  const next = {
-    ...current,
-    ...patch,
-    run_id: current.run_id || runId,
-    updated_at: now,
-    heartbeat_at: current.heartbeat_at || now,
-    control: {
-      ...(current.control || {}),
-      ...(patch.control || {})
-    },
-    resume: {
-      ...(current.resume || {}),
-      ...(patch.resume || {})
+function patchRawRunState(runId, patchOrUpdater) {
+  const artifacts = getRunArtifacts(runId);
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readRawRunState(runId);
+    if (!current) return null;
+    const patch = typeof patchOrUpdater === "function"
+      ? patchOrUpdater(current)
+      : patchOrUpdater;
+    if (
+      !patch
+      || typeof patch !== "object"
+      || Array.isArray(patch)
+      || Object.keys(patch).length === 0
+    ) {
+      return current;
     }
-  };
-  return writeRawRunState(runId, next);
+    const now = new Date().toISOString();
+    const next = {
+      ...current,
+      ...patch,
+      run_id: current.run_id || runId,
+      updated_at: now,
+      heartbeat_at: current.heartbeat_at || now,
+      control: {
+        ...(current.control || {}),
+        ...(patch.control || {})
+      },
+      resume: {
+        ...(current.resume || {}),
+        ...(patch.resume || {})
+      }
+    };
+    return writeRawRunState(runId, next);
+  });
 }
 
 function createDetachedRecommendRunId() {
@@ -2387,6 +2439,16 @@ function errorToDetachedWorkerPayload(error, fallbackMessage = "detached recomme
 function markDetachedWorkerFailed(runId, error, options = {}) {
   const normalizedRunId = normalizeText(runId);
   if (!normalizedRunId) return null;
+  const artifacts = getRunArtifacts(normalizedRunId);
+  return withRunStateFileLockSync(
+    artifacts.run_state_path,
+    () => markDetachedWorkerFailedUnderLock(normalizedRunId, error, options)
+  );
+}
+
+function markDetachedWorkerFailedUnderLock(runId, error, options = {}) {
+  const normalizedRunId = normalizeText(runId);
+  if (!normalizedRunId) return null;
   const existing = readRawRunState(normalizedRunId) || {};
   const existingState = normalizeText(existing.state || existing.status);
   if (TERMINAL_RUN_STATES.has(existingState)) return existing;
@@ -2444,10 +2506,14 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
     errorPayload.worker_launch_id = observedLaunchId;
   }
   if (existing.control?.cancel_requested === true && isShutdownLikeError(errorPayload)) {
-    return finalizeRawRunStateAsCanceled(normalizedRunId, existing, {
+    const canceledState = finalizeRawRunStateAsCanceled(normalizedRunId, existing, {
       errorPayload,
       message: "流水线已取消；detached worker 在取消收尾时关闭了浏览器连接。"
     });
+    if (canceledState) {
+      writeBossMonitorProjectionNonfatal("recommend", canceledState);
+    }
+    return canceledState;
   }
   const previousResult = existing.result && typeof existing.result === "object" ? existing.result : {};
   const result = {
@@ -2459,7 +2525,7 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
     worker_stderr_path: artifacts.worker_stderr_path
   };
 
-  return writeRawRunState(normalizedRunId, {
+  const failedState = writeRawRunState(normalizedRunId, {
     ...existing,
     run_id: normalizedRunId,
     mode: existing.mode || RUN_MODE_ASYNC,
@@ -2516,6 +2582,8 @@ function markDetachedWorkerFailed(runId, error, options = {}) {
     error: errorPayload,
     result
   });
+  writeBossMonitorProjectionNonfatal("recommend", failedState);
+  return failedState;
 }
 
 function installDetachedWorkerFailureHandlers(runId) {
@@ -2563,6 +2631,22 @@ function buildWorkerLaunchFailedPayload(message) {
       retryable: true
     }
   };
+}
+
+function persistDetachedRecommendLaunchFailure(runId, failed) {
+  const failedState = safeUpdateRunState(runId, {
+    state: RUN_STATE_FAILED,
+    stage: RUN_STAGE_PREFLIGHT,
+    last_message: failed.error.message,
+    error: failed.error,
+    result: failed
+  });
+  if (failedState) {
+    writeBossMonitorProjectionNonfatal("recommend", failedState, {
+      v1_created: true
+    });
+  }
+  return failedState;
 }
 
 function finalizeCanceledRun(runId, snapshot) {
@@ -2873,6 +2957,7 @@ async function executeTrackedPipeline({
 
 function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = process.pid) {
   const artifacts = getRunArtifacts(runId);
+  const createdAt = new Date().toISOString();
   const snapshot = createRunStateSnapshot({
     runId,
     mode,
@@ -2894,7 +2979,8 @@ function initializeRunStateOrThrow(runId, mode, workspaceRoot, args, pid = proce
       resume_count: 0,
       last_resumed_at: null,
       last_paused_at: null
-    }
+    },
+    monitoringV1: createBossMonitorSourceMarker(createdAt)
   });
   return writeRunState(snapshot);
 }
@@ -2993,6 +3079,9 @@ async function runDetachedWorker({
   ) {
     return { ok: false, error: `run_id=${normalizedRunId} detached worker could not claim the authorized launch` };
   }
+  writeBossMonitorProjectionNonfatal("recommend", claimed, {
+    producer: true
+  });
 
   const started = await startRecommendPipelineRunTool({
     workspaceRoot: executionContext.workspaceRoot,
@@ -3048,7 +3137,13 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   const workerLaunchId = createRunId();
   const workerLaunchedAt = new Date().toISOString();
   try {
-    initializeRunStateOrThrow(runId, RUN_MODE_ASYNC, workspaceRoot, args, process.pid);
+    initializeRunStateOrThrow(
+      runId,
+      RUN_MODE_ASYNC,
+      workspaceRoot,
+      args,
+      process.pid
+    );
   } catch (error) {
     return {
       status: "FAILED",
@@ -3059,7 +3154,6 @@ async function handleStartRunTool({ workspaceRoot, args }) {
       }
     };
   }
-
   const initialWorkerArtifacts = getRunArtifacts(runId);
   const launchPreparedState = safeUpdateRunState(runId, {
     resume: {
@@ -3074,17 +3168,13 @@ async function handleStartRunTool({ workspaceRoot, args }) {
   });
   if (normalizeText(launchPreparedState?.resume?.worker_launch_id || "") !== workerLaunchId) {
     const failed = buildWorkerLaunchFailedPayload("无法持久化 detached worker launch identity，任务未启动。");
-    safeUpdateRunState(runId, {
-      state: RUN_STATE_FAILED,
-      stage: RUN_STAGE_PREFLIGHT,
-      last_message: failed.error.message,
-      error: failed.error,
-      result: failed
-    });
+    persistDetachedRecommendLaunchFailure(runId, failed);
     return failed;
   }
 
   let worker;
+  let launchReadyState;
+  let launchCommittedState;
   try {
     worker = launchDetachedRunWorker({
       runId,
@@ -3094,7 +3184,7 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     });
     const workerLogPaths = worker.workerLogPaths || {};
     const workerLauncher = worker.workerLauncher || {};
-    const launchCommittedState = safeUpdateRunState(runId, (current) => {
+    launchReadyState = safeUpdateRunState(runId, (current) => {
       const currentState = normalizeText(current.state || current.status);
       if (
         TERMINAL_RUN_STATES.has(currentState)
@@ -3113,6 +3203,54 @@ async function handleStartRunTool({ workspaceRoot, args }) {
           worker_supervisor_pid: workerLauncher.supervisorPid || null,
           worker_node_pid: workerLauncher.workerPid || null,
           worker_launched_at: workerLauncher.launchedAt || workerLaunchedAt,
+          worker_launch_committed: false
+        }
+      };
+    });
+    const launchReadyStateName = normalizeText(
+      launchReadyState?.state || launchReadyState?.status
+    );
+    if (TERMINAL_RUN_STATES.has(launchReadyStateName)) {
+      writeBossMonitorProjectionNonfatal("recommend", launchReadyState, {
+        v1_created: true
+      });
+      return {
+        status: "FAILED",
+        error: launchReadyState.error || buildWorkerLaunchFailedPayload(
+          "detached worker 在 launch commit 前已终止。"
+        ).error,
+        run: launchReadyState
+      };
+    }
+    if (
+      normalizeText(launchReadyState?.resume?.worker_launch_id || "") !== workerLaunchId
+      || launchReadyState?.resume?.worker_launch_committed === true
+    ) {
+      const failed = buildWorkerLaunchFailedPayload(
+        "detached worker 已创建，但 launch metadata 未能持久化；已禁止 worker 继续执行。"
+      );
+      persistDetachedRecommendLaunchFailure(runId, failed);
+      return failed;
+    }
+
+    // The detached worker waits for worker_launch_committed=true. Publish the
+    // authoritative queued snapshot before releasing that barrier so a fast
+    // worker can never be overwritten by a stale parent-side projection.
+    writeBossMonitorProjectionNonfatal("recommend", launchReadyState, {
+      type: "created",
+      v1_created: true
+    });
+
+    launchCommittedState = safeUpdateRunState(runId, (current) => {
+      const currentState = normalizeText(current.state || current.status);
+      if (
+        TERMINAL_RUN_STATES.has(currentState)
+        || normalizeText(current.resume?.worker_launch_id || "") !== workerLaunchId
+      ) {
+        return {};
+      }
+      return {
+        resume: {
           worker_launch_committed: true
         }
       };
@@ -3120,26 +3258,31 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     if (
       normalizeText(launchCommittedState?.resume?.worker_launch_id || "") !== workerLaunchId
       || launchCommittedState?.resume?.worker_launch_committed !== true
+      || TERMINAL_RUN_STATES.has(
+        normalizeText(launchCommittedState?.state || launchCommittedState?.status)
+      )
     ) {
-      const failed = buildWorkerLaunchFailedPayload("detached worker 已创建，但 launch commit 未能持久化；已禁止 worker 继续执行。");
-      safeUpdateRunState(runId, {
-        state: RUN_STATE_FAILED,
-        stage: RUN_STAGE_PREFLIGHT,
-        last_message: failed.error.message,
-        error: failed.error,
-        result: failed
-      });
-      return failed;
+      const failed = buildWorkerLaunchFailedPayload(
+        "detached worker 已创建，但 launch commit 未能持久化；已禁止 worker 继续执行。"
+      );
+      const existingState = normalizeText(
+        launchCommittedState?.state || launchCommittedState?.status
+      );
+      if (TERMINAL_RUN_STATES.has(existingState)) {
+        writeBossMonitorProjectionNonfatal("recommend", launchCommittedState, {
+          v1_created: true
+        });
+      } else {
+        persistDetachedRecommendLaunchFailure(runId, failed);
+      }
+      return {
+        ...failed,
+        ...(launchCommittedState ? { run: launchCommittedState } : {})
+      };
     }
   } catch (error) {
     const failed = buildWorkerLaunchFailedPayload(error?.message || "无法启动 detached recommend worker。");
-    safeUpdateRunState(runId, {
-      state: RUN_STATE_FAILED,
-      stage: RUN_STAGE_PREFLIGHT,
-      last_message: failed.error.message,
-      error: failed.error,
-      result: failed
-    });
+    persistDetachedRecommendLaunchFailure(runId, failed);
     return failed;
   }
 
@@ -3153,7 +3296,8 @@ async function handleStartRunTool({ workspaceRoot, args }) {
     message: getDefaultAcceptedMessage(args),
     post_action: prepared.post_action,
     target_count_semantics: prepared.target_count_semantics,
-    review: prepared.review
+    review: prepared.review,
+    monitoring: createBossMonitoringBlock("recommend", runId)
   };
 }
 
@@ -3168,14 +3312,17 @@ function patchDetachedRecommendControl(args, controlPatch, {
 } = {}) {
   const runId = normalizeText(args?.run_id || args?.runId || "");
   if (!runId) return null;
-  const current = readRawRunState(runId);
-  const state = normalizeText(current?.state || current?.status || "");
-  if (!current || TERMINAL_RUN_STATES.has(state)) return null;
-  const patched = patchRawRunState(runId, {
-    last_message: lastMessage || message || current.last_message || "",
-    control: controlPatch
+  const patched = patchRawRunState(runId, (current) => {
+    const state = normalizeText(current?.state || current?.status || "");
+    if (TERMINAL_RUN_STATES.has(state)) return {};
+    return {
+      last_message: lastMessage || message || current.last_message || "",
+      control: controlPatch
+    };
   });
-  if (!patched) return null;
+  if (!patched || TERMINAL_RUN_STATES.has(normalizeText(patched.state || patched.status || ""))) {
+    return null;
+  }
   return {
     status,
     run: patched,

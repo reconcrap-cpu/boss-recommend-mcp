@@ -1,7 +1,8 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import process from "node:process";
 import { fileURLToPath } from "node:url";
 import {
   assertNoForbiddenCdpCalls,
@@ -41,6 +42,19 @@ import {
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import { launchDetachedWorker } from "./core/run/detached-launcher.js";
+import { withRunStateFileLockSync } from "./core/run/state-file-lock.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
+import {
+  boundedWorkflowCheckpoint,
+  compactWorkflowResultForState,
+  getWorkflowCandidateJournalPath,
+  reconstructWorkflowCandidateResults
+} from "./core/run/workflow-candidate-journal.js";
 
 const RUN_MODE_ASYNC = "async";
 const RUN_MODE_SYNC = "sync";
@@ -51,6 +65,10 @@ const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screenin
 const DEFAULT_RECRUIT_HOME_DIR = ".boss-recruit-mcp";
 const DETACHED_WORKER_SCRIPT = fileURLToPath(new URL("./detached-worker.js", import.meta.url));
 const DETACHED_WORKER_POLL_MS = 1000;
+const DETACHED_WORKER_LAUNCH_COMMIT_TIMEOUT_MS = 15_000;
+const RECRUIT_ATOMIC_RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RECRUIT_ATOMIC_RENAME_RETRY_DELAYS_MS = Object.freeze([25, 50, 100, 200, 400, 500]);
+const RECRUIT_ATOMIC_RENAME_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 
 const TERMINAL_STATUSES = new Set([
   RUN_STATUS_COMPLETED,
@@ -65,6 +83,7 @@ const STALE_PROCESS_STATUSES = new Set([
 
 let recruitWorkflowImpl = runRecruitWorkflow;
 let recruitConnectorImpl = connectRecruitChromeSession;
+let recruitDetachedWorkerLauncherImpl = launchDetachedWorker;
 let recruitRunService = createRecruitRunService({
   idPrefix: "mcp_recruit",
   workflow: (...args) => recruitWorkflowImpl(...args),
@@ -127,6 +146,10 @@ function clonePlain(value, fallback = null) {
   }
 }
 
+function plainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 function normalizeRunId(runId) {
   const normalized = normalizeText(runId);
   if (!normalized || normalized.includes("/") || normalized.includes("\\")) return "";
@@ -154,7 +177,12 @@ function getRecruitRunArtifacts(runId) {
     detached_args_path: path.join(runsDir, `${normalized}.detached-args.json`),
     worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
     worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
+    worker_exit_status_path: path.join(runsDir, `${normalized}.worker.exit.json`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    candidate_result_journal_path: getWorkflowCandidateJournalPath({
+      runDir: runsDir,
+      runId: normalized
+    }),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
   };
@@ -164,11 +192,59 @@ function ensureDirectory(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function writeJsonAtomic(filePath, payload) {
+function sleepSync(milliseconds) {
+  const delayMs = Math.max(0, Math.floor(Number(milliseconds) || 0));
+  if (delayMs <= 0) return;
+  Atomics.wait(RECRUIT_ATOMIC_RENAME_SLEEP_CELL, 0, 0, delayMs);
+}
+
+function writeJsonAtomic(filePath, payload, {
+  renameSyncImpl = fs.renameSync,
+  sleepSyncImpl = sleepSync,
+  randomUUIDImpl = randomUUID
+} = {}) {
   ensureDirectory(path.dirname(filePath));
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tempPath, filePath);
+  const tempPath = `${filePath}.${process.pid}.${randomUUIDImpl()}.tmp`;
+  let renameAttempts = 0;
+  const retryDelays = [];
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    while (true) {
+      renameAttempts += 1;
+      try {
+        renameSyncImpl(tempPath, filePath);
+        return;
+      } catch (error) {
+        const retryDelayMs = RECRUIT_ATOMIC_RENAME_RETRY_DELAYS_MS[renameAttempts - 1];
+        if (
+          !RECRUIT_ATOMIC_RENAME_RETRY_CODES.has(error?.code)
+          || retryDelayMs === undefined
+        ) {
+          try {
+            error.atomic_rename_attempts = renameAttempts;
+            error.atomic_rename_retry_delays_ms = [...retryDelays];
+            error.atomic_rename_source = tempPath;
+            error.atomic_rename_target = filePath;
+          } catch {
+            // Preserve the original filesystem error when it is not extensible.
+          }
+          throw error;
+        }
+        retryDelays.push(retryDelayMs);
+        sleepSyncImpl(retryDelayMs);
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup only; never hide the original persistence outcome.
+    }
+  }
 }
 
 function readJsonFile(filePath) {
@@ -231,8 +307,41 @@ function readRecruitRunState(runId) {
 function writeRecruitRunState(runId, payload) {
   const artifacts = getRecruitRunArtifacts(runId);
   if (!artifacts) return null;
-  writeJsonAtomic(artifacts.run_state_path, payload);
-  return payload;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    writeJsonAtomic(artifacts.run_state_path, {
+      ...payload,
+      result: compactWorkflowResultForState(payload?.result),
+      summary: compactWorkflowResultForState(payload?.summary)
+    });
+    return payload;
+  });
+}
+
+function updatePersistedRecruitRun(runId, patchOrUpdater) {
+  const artifacts = getRecruitRunArtifacts(runId);
+  if (!artifacts) return null;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readRecruitRunState(runId);
+    if (!current) return null;
+    const patch = typeof patchOrUpdater === "function"
+      ? patchOrUpdater(current)
+      : patchOrUpdater;
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) return current;
+    const next = {
+      ...current,
+      ...patch,
+      control: {
+        ...plainRecord(current.control),
+        ...plainRecord(patch.control)
+      },
+      resume: {
+        ...plainRecord(current.resume),
+        ...plainRecord(patch.resume)
+      }
+    };
+    writeRecruitRunState(runId, next);
+    return next;
+  });
 }
 
 function createDetachedRecruitRunId() {
@@ -255,10 +364,13 @@ function buildInitialRecruitDetachedState(runId, {
   workspaceRoot = "",
   args = {},
   parsed = {},
-  pid = globalThis.process?.pid
+  pid = globalThis.process?.pid,
+  workerLaunchId = "",
+  workerLaunchedAt = ""
 } = {}) {
   const artifacts = getRecruitRunArtifacts(runId);
   const now = new Date().toISOString();
+  const monitorMarker = createBossMonitorSourceMarker(now);
   const targetCount = parsePositiveInteger(args.max_candidates, parsed.screenParams?.target_count || 10);
   return {
     run_id: runId,
@@ -308,10 +420,19 @@ function buildInitialRecruitDetachedState(runId, {
       output_csv: null,
       worker_stdout_path: artifacts?.worker_stdout_path || null,
       worker_stderr_path: artifacts?.worker_stderr_path || null,
+      worker_exit_status_path: artifacts?.worker_exit_status_path || null,
+      worker_launcher: process.platform === "win32" ? "windows_cim_supervisor" : "posix_detached_spawn",
+      worker_launch_id: normalizeText(workerLaunchId) || null,
+      worker_supervisor_pid: null,
+      worker_node_pid: null,
+      worker_launched_at: normalizeText(workerLaunchedAt) || now,
+      worker_started_at: null,
+      worker_launch_committed: false,
       resume_count: 0,
       last_resumed_at: null,
       last_paused_at: null
     },
+    ...(monitorMarker ? { monitoring_v1: monitorMarker } : {}),
     error: null,
     result: null,
     summary: null,
@@ -324,61 +445,102 @@ function patchPersistedRecruitControl(runId, controlPatch = {}, {
   message = "",
   lastMessage = ""
 } = {}) {
-  const current = readRecruitRunState(runId);
-  if (!current) return null;
-  const state = normalizeText(current.state || current.status);
-  if (TERMINAL_STATUSES.has(state)) return null;
-  const now = new Date().toISOString();
-  const patched = {
-    ...current,
-    updated_at: now,
-    heartbeat_at: now,
-    last_message: lastMessage || message || current.last_message || "",
-    control: {
-      ...(current.control || {}),
-      ...controlPatch
-    }
-  };
-  writeRecruitRunState(runId, patched);
-  return {
-    status,
-    run: patched,
-    message,
-    persistence: {
-      source: "disk",
-      active_control_available: false,
-      detached_control_requested: true
-    },
-    runtime_evaluate_used: false,
-    method_summary: {},
-    method_log: [],
-    chrome: null
-  };
+  const artifacts = getRecruitRunArtifacts(runId);
+  if (!artifacts) return null;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readRecruitRunState(runId);
+    if (!current) return null;
+    const state = normalizeText(current.state || current.status);
+    if (TERMINAL_STATUSES.has(state)) return null;
+    const now = new Date().toISOString();
+    const patched = {
+      ...current,
+      updated_at: now,
+      heartbeat_at: now,
+      last_message: lastMessage || message || current.last_message || "",
+      control: {
+        ...(current.control || {}),
+        ...controlPatch
+      }
+    };
+    writeRecruitRunState(runId, patched);
+    return {
+      status,
+      run: patched,
+      message,
+      persistence: {
+        source: "disk",
+        active_control_available: false,
+        detached_control_requested: true
+      },
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      chrome: null
+    };
+  });
 }
 
-function launchDetachedRecruitWorker(runId) {
+function launchDetachedRecruitWorker(runId, {
+  launchId = "",
+  screenConfigPath = "",
+  launchedAt = new Date().toISOString()
+} = {}) {
   const artifacts = getRecruitRunArtifacts(runId);
   if (!artifacts) throw new Error("Invalid recruit run_id");
-  fs.mkdirSync(path.dirname(artifacts.worker_stdout_path), { recursive: true });
-  const stdoutFd = fs.openSync(artifacts.worker_stdout_path, "a");
-  const stderrFd = fs.openSync(artifacts.worker_stderr_path, "a");
-  let child;
-  try {
-    child = spawn(globalThis.process.execPath, [
-      DETACHED_WORKER_SCRIPT,
-      "--domain",
-      "recruit",
-      "--run-id",
-      runId
-    ], {
-      detached: true,
-      stdio: ["ignore", stdoutFd, stderrFd],
-      windowsHide: true,
-      env: globalThis.process.env
+  fs.rmSync(artifacts.worker_exit_status_path, { force: true });
+  const child = recruitDetachedWorkerLauncherImpl({
+    nodePath: process.execPath,
+    workerScriptPath: DETACHED_WORKER_SCRIPT,
+    domain: "recruit",
+    runId,
+    launchId,
+    stdoutPath: artifacts.worker_stdout_path,
+    stderrPath: artifacts.worker_stderr_path,
+    exitStatusPath: artifacts.worker_exit_status_path,
+    recruitRuntimeHomePath: getRecruitStateHome(),
+    screenConfigPath,
+    environment: process.env
+  });
+  child.workerLogPaths = {
+    stdoutPath: artifacts.worker_stdout_path,
+    stderrPath: artifacts.worker_stderr_path,
+    exitStatusPath: artifacts.worker_exit_status_path
+  };
+  child.workerLauncher = {
+    mechanism: process.platform === "win32" ? "windows_cim_supervisor" : "posix_detached_spawn",
+    supervisorPid: process.platform === "win32" && Number.isInteger(child?.pid) ? child.pid : null,
+    workerPid: process.platform === "win32" ? null : (Number.isInteger(child?.pid) ? child.pid : null),
+    launchId,
+    launchedAt
+  };
+  if (typeof child?.once === "function") {
+    child.once("error", (error) => {
+      markBossRecruitDetachedWorkerFailed(runId, error, {
+        code: "RECRUIT_WORKER_PROCESS_ERROR",
+        message: "Boss search detached worker process emitted an asynchronous error.",
+        workerLaunchId: launchId
+      });
     });
-  } finally {
-    fs.closeSync(stdoutFd);
-    fs.closeSync(stderrFd);
+    child.once("exit", (exitCode, signal) => {
+      const normalizedSignal = normalizeText(signal);
+      const exitLabel = Number.isInteger(exitCode) ? `code=${exitCode}` : "code=unknown";
+      const signalLabel = normalizedSignal ? `, signal=${normalizedSignal}` : "";
+      const error = new Error(`Boss search detached worker exited before writing a terminal state (${exitLabel}${signalLabel}).`);
+      markBossRecruitDetachedWorkerFailed(runId, error, {
+        code: "RECRUIT_WORKER_EXITED_EARLY",
+        workerExitCode: Number.isInteger(exitCode) ? exitCode : null,
+        workerSignal: normalizedSignal || null,
+        workerPid: Number.isInteger(child?.pid) ? child.pid : null,
+        supervisorPid: process.platform === "win32" && Number.isInteger(child?.pid)
+          ? child.pid
+          : null,
+        workerLaunchId: launchId,
+        diagnosticSource: process.platform === "win32"
+          ? "windows_cim_supervisor"
+          : "posix_child_exit_event"
+      });
+    });
   }
   if (typeof child?.unref === "function") child.unref();
   return child;
@@ -389,14 +551,29 @@ function ensureRecruitRunArtifacts(snapshot) {
   if (!artifacts) return null;
 
   const meta = getRecruitRunMeta(snapshot?.runId || snapshot?.run_id);
-  const checkpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
+  const sourceCheckpoint = snapshot?.checkpoint && typeof snapshot.checkpoint === "object"
     ? snapshot.checkpoint
     : {};
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id,
+    checkpoint: sourceCheckpoint
+  });
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const journalResults = reconstructWorkflowCandidateResults({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id
+  });
+  const checkpointResults = journalResults.length
+    ? journalResults
+    : Array.isArray(sourceCheckpoint.results)
+      ? sourceCheckpoint.results
+      : Array.isArray(checkpoint.results)
+        ? checkpoint.results
+        : [];
   const artifactSummary = summary || (checkpointResults.length ? {
     domain: "recruit",
     partial: true,
@@ -428,9 +605,14 @@ function ensureRecruitRunArtifacts(snapshot) {
 function persistRecruitCheckpointSnapshot(normalized) {
   const artifacts = getRecruitRunArtifacts(normalized?.run_id || normalized?.runId);
   if (!artifacts) return;
-  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+  const sourceCheckpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
     ? normalized.checkpoint
     : {};
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: normalized?.run_id || normalized?.runId,
+    checkpoint: sourceCheckpoint
+  });
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   const meta = getRecruitRunMeta(normalized?.run_id || normalized?.runId);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
@@ -477,6 +659,20 @@ function completionReason(status) {
 }
 
 function snapshotFromPersistedRecruitRun(persisted = {}) {
+  const artifacts = getRecruitRunArtifacts(persisted.run_id || persisted.runId);
+  const checkpoint = persisted.checkpoint || readJsonFile(artifacts?.checkpoint_path) || {};
+  const journalResults = artifacts
+    ? reconstructWorkflowCandidateResults({
+        runDir: artifacts.runs_dir,
+        runId: persisted.run_id || persisted.runId
+      })
+    : [];
+  const {
+    candidate_result_journal: _candidateResultJournal,
+    results_count: _resultsCount,
+    results_truncated: _resultsTruncated,
+    ...legacyCheckpoint
+  } = checkpoint;
   return {
     runId: persisted.run_id || persisted.runId,
     name: persisted.name || persisted.run_id || persisted.runId,
@@ -484,7 +680,9 @@ function snapshotFromPersistedRecruitRun(persisted = {}) {
     phase: persisted.stage || persisted.phase,
     progress: persisted.progress || {},
     context: persisted.context || {},
-    checkpoint: persisted.checkpoint || {},
+    checkpoint: journalResults.length
+      ? { ...legacyCheckpoint, results: journalResults }
+      : legacyCheckpoint,
     startedAt: persisted.started_at || persisted.startedAt,
     updatedAt: persisted.updated_at || persisted.updatedAt,
     completedAt: persisted.completed_at || persisted.completedAt || null,
@@ -529,6 +727,24 @@ function finalizePersistedRecruitRun(persisted = {}, {
         message: error?.message || message || "Boss search run process exited before it wrote a terminal state."
       }
     : null;
+  if (normalizedError) {
+    for (const field of [
+      "worker_error_code",
+      "worker_exit_code",
+      "worker_signal",
+      "worker_pid",
+      "supervisor_pid",
+      "diagnostic_source",
+      "worker_launch_id"
+    ]) {
+      if (error?.[field] !== undefined && error?.[field] !== null && error?.[field] !== "") {
+        normalizedError[field] = error[field];
+      }
+    }
+    if (normalizeText(error?.stack || "")) {
+      normalizedError.stack = String(error.stack).slice(0, 8000);
+    }
+  }
   const next = {
     ...persisted,
     run_id: runId,
@@ -550,6 +766,16 @@ function finalizePersistedRecruitRun(persisted = {}, {
 }
 
 function reconcilePersistedRecruitRun(persisted = {}, { cancelStale = false } = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  const artifacts = getRecruitRunArtifacts(runId);
+  if (!runId || !artifacts) return { run: persisted };
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const latest = readRecruitRunState(runId) || persisted;
+    return reconcilePersistedRecruitRunUnderLock(latest, { cancelStale });
+  });
+}
+
+function reconcilePersistedRecruitRunUnderLock(persisted = {}, { cancelStale = false } = {}) {
   const status = persisted.status || persisted.state;
   if (STALE_PROCESS_STATUSES.has(status) && !isPidAlive(persisted.pid)) {
     const shouldCancel = cancelStale || status === RUN_STATUS_CANCELING || persisted.control?.cancel_requested === true;
@@ -573,22 +799,84 @@ function reconcilePersistedRecruitRun(persisted = {}, { cancelStale = false } = 
 export function markBossRecruitDetachedWorkerFailed(runId, error, options = {}) {
   const normalizedRunId = normalizeRunId(runId);
   if (!normalizedRunId) return null;
-  const persisted = readRecruitRunState(normalizedRunId) || buildInitialRecruitDetachedState(normalizedRunId, {});
+  const artifacts = getRecruitRunArtifacts(normalizedRunId);
+  if (!artifacts) return null;
+  return withRunStateFileLockSync(
+    artifacts.run_state_path,
+    () => markBossRecruitDetachedWorkerFailedUnderLock(normalizedRunId, error, options)
+  );
+}
+
+function markBossRecruitDetachedWorkerFailedUnderLock(runId, error, options = {}) {
+  const normalizedRunId = normalizeRunId(runId);
+  if (!normalizedRunId) return null;
+  const persisted = readRecruitRunState(normalizedRunId);
+  if (!persisted) return null;
   const state = normalizeText(persisted.state || persisted.status);
   if (TERMINAL_STATUSES.has(state)) return persisted;
+  const expectedLaunchId = normalizeText(persisted.resume?.worker_launch_id || "");
+  const observedLaunchId = normalizeText(options.workerLaunchId || "");
+  const expectedSupervisorPid = Number(persisted.resume?.worker_supervisor_pid);
+  const observedSupervisorPid = Number(options.supervisorPid);
+  const supervisorDiagnostic = normalizeText(options.diagnosticSource || "") === "windows_cim_supervisor";
+  if (
+    (expectedLaunchId && observedLaunchId && expectedLaunchId !== observedLaunchId)
+    || (expectedLaunchId && supervisorDiagnostic && observedLaunchId !== expectedLaunchId)
+    || (
+      Number.isInteger(expectedSupervisorPid)
+      && expectedSupervisorPid > 0
+      && (
+        supervisorDiagnostic
+          ? !Number.isInteger(observedSupervisorPid)
+            || observedSupervisorPid <= 0
+            || observedSupervisorPid !== expectedSupervisorPid
+          : Number.isInteger(observedSupervisorPid)
+            && observedSupervisorPid > 0
+            && observedSupervisorPid !== expectedSupervisorPid
+      )
+    )
+  ) {
+    return null;
+  }
   const errorPayload = {
     name: error?.name || "Error",
     code: options.code || error?.code || "RECRUIT_WORKER_UNHANDLED_EXCEPTION",
     message: normalizeText(error?.message || error || options.message) || "Boss search detached worker exited unexpectedly."
   };
+  const workerErrorCode = normalizeText(error?.code || "");
+  if (workerErrorCode && workerErrorCode !== errorPayload.code) {
+    errorPayload.worker_error_code = workerErrorCode;
+  }
+  if (Number.isInteger(options.workerExitCode)) {
+    errorPayload.worker_exit_code = options.workerExitCode;
+  }
+  if (normalizeText(options.workerSignal || "")) {
+    errorPayload.worker_signal = normalizeText(options.workerSignal);
+  }
+  if (Number.isInteger(options.workerPid) && options.workerPid > 0) {
+    errorPayload.worker_pid = options.workerPid;
+  }
+  if (Number.isInteger(options.supervisorPid) && options.supervisorPid > 0) {
+    errorPayload.supervisor_pid = options.supervisorPid;
+  }
+  if (normalizeText(options.diagnosticSource || "")) {
+    errorPayload.diagnostic_source = normalizeText(options.diagnosticSource);
+  }
+  if (observedLaunchId) {
+    errorPayload.worker_launch_id = observedLaunchId;
+  }
   if (normalizeText(error?.stack || "")) {
     errorPayload.stack = String(error.stack).slice(0, 8000);
   }
-  return finalizePersistedRecruitRun(persisted, {
+  const failedState = finalizePersistedRecruitRun(persisted, {
     status: RUN_STATUS_FAILED,
     error: errorPayload,
     message: errorPayload.message
   });
+  writeBossMonitorProjectionNonfatal("search", failedState, {
+    producer: true
+  });
+  return failedState;
 }
 
 function buildLegacyRunResult(snapshot) {
@@ -1199,13 +1487,75 @@ function normalizeRunSnapshot(snapshot) {
   };
 }
 
+function mergePersistedRecruitControlRequest(normalized, existing) {
+  const control = {
+    ...plainRecord(normalized?.control)
+  };
+  if (!normalized) return control;
+  const existingControl = plainRecord(existing?.control);
+  if (TERMINAL_STATUSES.has(normalized.state)) return control;
+  if (existingControl.cancel_requested === true) {
+    return {
+      ...control,
+      pause_requested: true,
+      pause_requested_at: existingControl.pause_requested_at
+        || control.pause_requested_at
+        || new Date().toISOString(),
+      pause_requested_by: existingControl.pause_requested_by
+        || control.pause_requested_by
+        || "cancel_recruit_pipeline_run",
+      cancel_requested: true
+    };
+  }
+  if (existingControl.pause_requested === true && normalized.state !== RUN_STATUS_PAUSED) {
+    return {
+      ...control,
+      pause_requested: true,
+      pause_requested_at: existingControl.pause_requested_at
+        || control.pause_requested_at
+        || new Date().toISOString(),
+      pause_requested_by: existingControl.pause_requested_by
+        || control.pause_requested_by
+        || "pause_recruit_pipeline_run"
+    };
+  }
+  if (existingControl.pause_requested === false && normalized.state === RUN_STATUS_PAUSED) {
+    return {
+      ...control,
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    };
+  }
+  return control;
+}
+
 function persistRecruitRunSnapshot(snapshot, {
-  persistActiveCheckpoint = false
+  persistActiveCheckpoint = false,
+  monitorEvent = {}
 } = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecruitRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const persisted = withRunStateFileLockSync(artifacts.run_state_path, () => {
+  const existing = readJsonFile(artifacts.run_state_path);
+  const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
+  const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
+  const monitorMarker = existingMonitorMarker.contract_version === "1.0"
+    ? existingMonitorMarker
+    : normalizedMonitorMarker.contract_version === "1.0"
+      ? normalizedMonitorMarker
+      : monitorEvent?.v1_created === true
+        ? createBossMonitorSourceMarker(normalized.started_at || normalized.updated_at)
+        : null;
+  if (monitorMarker) normalized.monitoring_v1 = monitorMarker;
+  normalized.resume = {
+    ...plainRecord(existing?.resume),
+    ...plainRecord(normalized.resume)
+  };
+  normalized.control = mergePersistedRecruitControlRequest(normalized, existing);
   if (persistActiveCheckpoint) {
     persistRecruitCheckpointSnapshot(normalized);
   }
@@ -1226,17 +1576,22 @@ function persistRecruitRunSnapshot(snapshot, {
     control: normalized.control,
     resume: normalized.resume,
     error: normalized.error,
-    result: normalized.result,
-    summary: normalized.summary,
+    result: compactWorkflowResultForState(normalized.result),
+    summary: compactWorkflowResultForState(normalized.summary),
+    ...(normalized.monitoring_v1 ? { monitoring_v1: normalized.monitoring_v1 } : {}),
     artifacts: normalized.artifacts
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
-  return normalized;
+    return normalized;
+  });
+  writeBossMonitorProjectionNonfatal("search", persisted, monitorEvent);
+  return persisted;
 }
 
 function persistRecruitLifecycleSnapshot(snapshot, event = {}) {
   return persistRecruitRunSnapshot(snapshot, {
-    persistActiveCheckpoint: event?.type === "checkpoint"
+    persistActiveCheckpoint: event?.type === "checkpoint",
+    monitorEvent: { ...event, producer: true }
   });
 }
 
@@ -1597,7 +1952,9 @@ async function startRecruitPipelineRunInternal(args = {}, { workspaceRoot = "", 
     parsed
   });
   trackRecruitRun(started.runId);
-  const persistedStarted = persistRecruitRunSnapshot(started);
+  const persistedStarted = persistRecruitRunSnapshot(started, {
+    monitorEvent: { type: "created", producer: true, v1_created: true }
+  });
 
   return {
     status: "ACCEPTED",
@@ -1624,7 +1981,12 @@ export async function runRecruitPipelineTool({ workspaceRoot = "", args = {} } =
     execution_mode: mode
   }, { workspaceRoot });
   if (started.status !== "ACCEPTED") return started;
-  if (mode !== RUN_MODE_SYNC) return attachMethodEvidence(started, started.run_id);
+  if (mode !== RUN_MODE_SYNC) {
+    return attachMethodEvidence({
+      ...started,
+      monitoring: createBossMonitoringBlock("search", started.run_id)
+    }, started.run_id);
+  }
 
   const final = await waitForRecruitRunTerminal(started.run_id);
   await closeRecruitRunSession(started.run_id);
@@ -1648,6 +2010,7 @@ export async function runRecruitPipelineTool({ workspaceRoot = "", args = {} } =
         }
       : undefined,
     summary: final?.summary || null,
+    monitoring: createBossMonitoringBlock("search", started.run_id),
     error: finalStatus === "CANCELED"
       ? {
           code: "PIPELINE_CANCELED",
@@ -1664,7 +2027,10 @@ export async function startRecruitPipelineRunTool({ workspaceRoot = "", args = {
     execution_mode: RUN_MODE_ASYNC
   }, { workspaceRoot });
   if (started.status !== "ACCEPTED") return started;
-  return attachMethodEvidence(started, started.run_id);
+  return {
+    ...attachMethodEvidence(started, started.run_id),
+    monitoring: createBossMonitoringBlock("search", started.run_id)
+  };
 }
 
 export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", args = {} } = {}) {
@@ -1703,17 +2069,22 @@ export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", 
   }
 
   const runId = createDetachedRecruitRunId();
+  const workerLaunchId = randomUUID();
+  const workerLaunchedAt = new Date().toISOString();
   const artifacts = getRecruitRunArtifacts(runId);
   const initial = buildInitialRecruitDetachedState(runId, {
     workspaceRoot,
     args: normalizedArgs,
     parsed,
-    pid: globalThis.process?.pid
+    pid: globalThis.process?.pid,
+    workerLaunchId,
+    workerLaunchedAt
   });
   try {
     writeJsonAtomic(artifacts.detached_args_path, {
       domain: "recruit",
       run_id: runId,
+      worker_launch_id: workerLaunchId,
       workspace_root: normalizeText(workspaceRoot) || globalThis.process?.cwd?.() || "",
       args: clonePlain(normalizedArgs, {})
     });
@@ -1730,38 +2101,138 @@ export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", 
   }
 
   try {
-    const child = launchDetachedRecruitWorker(runId);
+    const child = launchDetachedRecruitWorker(runId, {
+      launchId: workerLaunchId,
+      screenConfigPath: configResolution?.config_path || "",
+      launchedAt: workerLaunchedAt
+    });
+    const workerLogPaths = child.workerLogPaths || {};
+    const workerLauncher = child.workerLauncher || {};
     const now = new Date().toISOString();
-    const latest = readRecruitRunState(runId) || initial;
-    const latestState = normalizeText(latest.state || latest.status);
-    if (TERMINAL_STATUSES.has(latestState)) {
+    const launchReadyState = updatePersistedRecruitRun(runId, (current) => {
+      const currentState = normalizeText(current.state || current.status);
+      if (
+        TERMINAL_STATUSES.has(currentState)
+        || normalizeText(current.resume?.worker_launch_id || "") !== workerLaunchId
+      ) {
+        return {};
+      }
+      return {
+        pid: child.pid || globalThis.process?.pid || null,
+        updated_at: now,
+        heartbeat_at: now,
+        last_message: "Boss search detached worker launched.",
+        resume: {
+          worker_stdout_path: workerLogPaths.stdoutPath || artifacts.worker_stdout_path,
+          worker_stderr_path: workerLogPaths.stderrPath || artifacts.worker_stderr_path,
+          worker_exit_status_path: workerLogPaths.exitStatusPath || artifacts.worker_exit_status_path,
+          worker_launcher: workerLauncher.mechanism || null,
+          worker_launch_id: workerLauncher.launchId || workerLaunchId,
+          worker_supervisor_pid: workerLauncher.supervisorPid || null,
+          worker_node_pid: workerLauncher.workerPid || null,
+          worker_launched_at: workerLauncher.launchedAt || workerLaunchedAt,
+          worker_launch_committed: false
+        }
+      };
+    });
+    const launchReadyStateName = normalizeText(
+      launchReadyState?.state || launchReadyState?.status
+    );
+    if (TERMINAL_STATUSES.has(launchReadyStateName)) {
       return {
         status: "FAILED",
-        error: latest.error || {
+        error: launchReadyState.error || {
           code: "RECRUIT_WORKER_LAUNCH_FAILED",
           message: "Boss search detached worker exited during launch.",
           retryable: true
         },
-        run: latest,
+        run: launchReadyState,
         runtime_evaluate_used: false,
         method_summary: {},
         method_log: [],
         chrome: null
       };
     }
-    const queued = {
-      ...latest,
-      pid: child.pid || globalThis.process?.pid || null,
-      updated_at: now,
-      heartbeat_at: now,
-      last_message: "Boss search detached worker launched."
-    };
-    writeRecruitRunState(runId, queued);
+    if (
+      normalizeText(launchReadyState?.resume?.worker_launch_id || "") !== workerLaunchId
+      || launchReadyState?.resume?.worker_launch_committed === true
+    ) {
+      const failedError = new Error(
+        "Boss search detached worker launch metadata could not be persisted; the worker was not authorized to continue."
+      );
+      const failed = markBossRecruitDetachedWorkerFailed(runId, failedError, {
+        code: "RECRUIT_WORKER_LAUNCH_NOT_PREPARED",
+        workerLaunchId
+      });
+      return {
+        status: "FAILED",
+        error: failed?.error || {
+          code: "RECRUIT_WORKER_LAUNCH_NOT_PREPARED",
+          message: failedError.message,
+          retryable: true
+        },
+        run: failed || launchReadyState,
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
+
+    // The detached worker waits for worker_launch_committed=true. Publish the
+    // authoritative queued snapshot first so a fast worker can never be
+    // overwritten by a stale parent-side queued projection.
+    writeBossMonitorProjectionNonfatal("search", launchReadyState, {
+      type: "created",
+      v1_created: true
+    });
+    const launchCommittedState = updatePersistedRecruitRun(runId, (current) => {
+      const currentState = normalizeText(current.state || current.status);
+      if (
+        TERMINAL_STATUSES.has(currentState)
+        || normalizeText(current.resume?.worker_launch_id || "") !== workerLaunchId
+      ) {
+        return {};
+      }
+      return {
+        resume: {
+          worker_launch_committed: true
+        }
+      };
+    });
+    if (
+      normalizeText(launchCommittedState?.resume?.worker_launch_id || "") !== workerLaunchId
+      || launchCommittedState?.resume?.worker_launch_committed !== true
+      || TERMINAL_STATUSES.has(
+        normalizeText(launchCommittedState?.state || launchCommittedState?.status)
+      )
+    ) {
+      const failedError = new Error(
+        "Boss search detached worker launch commit could not be persisted; the worker was not authorized to continue."
+      );
+      const failed = markBossRecruitDetachedWorkerFailed(runId, failedError, {
+        code: "RECRUIT_WORKER_LAUNCH_COMMIT_FAILED",
+        workerLaunchId
+      });
+      return {
+        status: "FAILED",
+        error: failed?.error || {
+          code: "RECRUIT_WORKER_LAUNCH_COMMIT_FAILED",
+          message: failedError.message,
+          retryable: true
+        },
+        run: failed || launchCommittedState || launchReadyState,
+        runtime_evaluate_used: false,
+        method_summary: {},
+        method_log: [],
+        chrome: null
+      };
+    }
     return {
       status: "ACCEPTED",
       run_id: runId,
       state: "queued",
-      run: queued,
+      run: launchCommittedState,
       poll_after_sec: DEFAULT_RECRUIT_POLL_AFTER_SEC,
       review: parsed.review,
       message: "Boss search run started in a detached worker. It can continue after the MCP host returns or is recycled.",
@@ -1770,12 +2241,14 @@ export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", 
       runtime_evaluate_used: false,
       method_summary: {},
       method_log: [],
-      chrome: null
+      chrome: null,
+      monitoring: createBossMonitoringBlock("search", runId)
     };
   } catch (error) {
     const failed = markBossRecruitDetachedWorkerFailed(runId, error, {
       code: "RECRUIT_WORKER_LAUNCH_FAILED",
-      message: "Unable to launch Boss search detached worker."
+      message: "Unable to launch Boss search detached worker.",
+      workerLaunchId
     });
     return {
       status: "FAILED",
@@ -1793,16 +2266,108 @@ export async function startRecruitPipelineDetachedRunTool({ workspaceRoot = "", 
   }
 }
 
-export async function runBossRecruitDetachedWorker({ runId } = {}) {
+async function waitForRecruitDetachedWorkerLaunchCommit(
+  runId,
+  launchId,
+  timeoutMs = DETACHED_WORKER_LAUNCH_COMMIT_TIMEOUT_MS
+) {
+  const normalizedLaunchId = normalizeText(launchId);
+  const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || DETACHED_WORKER_LAUNCH_COMMIT_TIMEOUT_MS);
+  while (Date.now() <= deadline) {
+    const persisted = readRecruitRunState(runId);
+    if (!persisted) {
+      return { ok: false, error: `run_id=${runId} not found` };
+    }
+    const state = normalizeText(persisted.state || persisted.status);
+    if (TERMINAL_STATUSES.has(state)) {
+      return { ok: false, error: `run_id=${runId} is already terminal (${state})` };
+    }
+    const expectedLaunchId = normalizeText(persisted.resume?.worker_launch_id || "");
+    if (
+      (expectedLaunchId || normalizedLaunchId)
+      && expectedLaunchId !== normalizedLaunchId
+    ) {
+      return {
+        ok: false,
+        error: `run_id=${runId} detached worker launch identity does not match`
+      };
+    }
+    if (!normalizedLaunchId || persisted.resume?.worker_launch_committed === true) {
+      return { ok: true, persisted };
+    }
+    await sleep(50);
+  }
+  return {
+    ok: false,
+    error: `run_id=${runId} detached worker launch was not committed`
+  };
+}
+
+export async function runBossRecruitDetachedWorker({ runId, launchId = "" } = {}) {
   const normalizedRunId = normalizeRunId(runId);
   if (!normalizedRunId) return { ok: false, error: "run_id is required" };
+  const launchCommit = await waitForRecruitDetachedWorkerLaunchCommit(
+    normalizedRunId,
+    launchId
+  );
+  if (!launchCommit.ok) return launchCommit;
   const artifacts = getRecruitRunArtifacts(normalizedRunId);
   const spec = readJsonFile(artifacts?.detached_args_path || "");
   if (!spec) {
     const error = new Error(`Boss search detached args were not found for run_id=${normalizedRunId}`);
-    markBossRecruitDetachedWorkerFailed(normalizedRunId, error, { code: "RECRUIT_WORKER_ARGS_MISSING" });
+    markBossRecruitDetachedWorkerFailed(normalizedRunId, error, {
+      code: "RECRUIT_WORKER_ARGS_MISSING",
+      workerLaunchId: launchId
+    });
     return { ok: false, error: error.message };
   }
+
+  const claimed = updatePersistedRecruitRun(normalizedRunId, (current) => {
+    const currentState = normalizeText(current.state || current.status);
+    const expectedLaunchId = normalizeText(current.resume?.worker_launch_id || "");
+    if (
+      TERMINAL_STATUSES.has(currentState)
+      || ((expectedLaunchId || launchId) && expectedLaunchId !== normalizeText(launchId))
+      || (normalizeText(launchId) && current.resume?.worker_launch_committed !== true)
+    ) {
+      return {};
+    }
+    const now = new Date().toISOString();
+    return {
+      pid: process.pid,
+      state: "queued",
+      status: "queued",
+      updated_at: now,
+      heartbeat_at: now,
+      last_message: "Boss search detached worker claimed the authorized launch.",
+      resume: {
+        worker_launch_id: expectedLaunchId || normalizeText(launchId) || null,
+        worker_node_pid: process.pid,
+        worker_started_at: now
+      }
+    };
+  });
+  if (
+    !claimed
+    || TERMINAL_STATUSES.has(normalizeText(claimed.state || claimed.status))
+    || (normalizeText(launchId) && claimed.resume?.worker_launch_committed !== true)
+    || (
+      (normalizeText(claimed.resume?.worker_launch_id || "") || normalizeText(launchId))
+      && normalizeText(claimed.resume?.worker_launch_id || "") !== normalizeText(launchId)
+    )
+  ) {
+    return {
+      ok: false,
+      error: `run_id=${normalizedRunId} detached worker could not claim the authorized launch`
+    };
+  }
+
+  // Register this process as the live producer before connector discovery can
+  // block. This starts monitor heartbeats while Chrome/service startup awaits.
+  writeBossMonitorProjectionNonfatal("search", claimed, {
+    producer: true,
+    v1_created: true
+  });
 
   const started = await startRecruitPipelineRunInternal({
     ...(spec.args || {}),
@@ -1818,7 +2383,8 @@ export async function runBossRecruitDetachedWorker({ runId } = {}) {
       retryable: true
     };
     markBossRecruitDetachedWorkerFailed(normalizedRunId, failedError, {
-      code: failedError.code || "RECRUIT_WORKER_START_FAILED"
+      code: failedError.code || "RECRUIT_WORKER_START_FAILED",
+      workerLaunchId: launchId
     });
     return { ok: false, error: failedError.message || "Boss search detached worker failed to start." };
   }
@@ -1857,15 +2423,23 @@ export function getRecruitPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecruitRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: normalizedRun
+      run: normalizedRun,
+      monitoring: createBossMonitoringBlock("search", runId)
     }, runId);
   } catch {
     const persisted = readRecruitRunState(runId);
     if (persisted) {
       const reconciled = reconcilePersistedRecruitRun(persisted);
+      const hydrated = snapshotFromPersistedRecruitRun(reconciled.run);
+      writeBossMonitorProjectionNonfatal(
+        "search",
+        { ...reconciled.run, checkpoint: hydrated.checkpoint },
+        { type: "backfill" }
+      );
       return {
         status: "RUN_STATUS",
         run: reconciled.run,
+        monitoring: createBossMonitoringBlock("search", runId),
         persistence: {
           source: "disk",
           active_control_available: false,
@@ -2098,6 +2672,24 @@ export function __setRecruitMcpConnectorForTests(nextConnector) {
   recruitConnectorImpl = typeof nextConnector === "function" ? nextConnector : connectRecruitChromeSession;
 }
 
+export function __setRecruitMcpDetachedWorkerLauncherForTests(nextLauncher) {
+  recruitDetachedWorkerLauncherImpl = typeof nextLauncher === "function"
+    ? nextLauncher
+    : launchDetachedWorker;
+}
+
+export function __getRecruitMcpDetachedWorkerLauncherForTests() {
+  return recruitDetachedWorkerLauncherImpl;
+}
+
+export function __writeRecruitJsonAtomicForTests(filePath, payload, options = {}) {
+  return writeJsonAtomic(filePath, payload, options);
+}
+
+export function __persistRecruitRunSnapshotForTests(snapshot, options = {}) {
+  return persistRecruitRunSnapshot(snapshot, options);
+}
+
 export function __setRecruitMcpWorkflowForTests(nextWorkflow) {
   recruitWorkflowImpl = typeof nextWorkflow === "function" ? nextWorkflow : runRecruitWorkflow;
   recruitRunService = createRecruitRunService({
@@ -2117,5 +2709,6 @@ export function __resetRecruitMcpStateForTests() {
   }
   recruitRunMeta.clear();
   __setRecruitMcpConnectorForTests(null);
+  __setRecruitMcpDetachedWorkerLauncherForTests(null);
   __setRecruitMcpWorkflowForTests(null);
 }

@@ -8,6 +8,7 @@ const WINDOWS_WRAPPER_PATH = fileURLToPath(new URL("./windows-detached-worker.ps
 const SAFE_DOMAIN_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const SAFE_RUN_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const SAFE_DOMAINS = new Set(["chat", "recommend", "recruit"]);
+const MONITORING_DISABLED_VALUES = new Set(["0", "false", "off", "disabled", "no"]);
 
 function createLauncherError(code, message, cause = null) {
   const error = new Error(message);
@@ -39,6 +40,31 @@ function assertControlledToken(value, label, pattern) {
     throw createLauncherError("DETACHED_WORKER_ARGUMENT_INVALID", `${label} contains unsupported characters`);
   }
   return normalized;
+}
+
+function optionalControlledEnvironmentPath(environment, key, platform) {
+  const value = String(environment?.[key] || "");
+  if (!value) return { invalid: false, value: "" };
+  const pathApi = platform === "win32" ? path.win32 : path;
+  try {
+    return {
+      invalid: false,
+      value: assertControlledPath(
+        pathApi.isAbsolute(value) ? value : pathApi.resolve(value),
+        key,
+        platform
+      )
+    };
+  } catch {
+    // Monitoring configuration must never make recruiting execution fail or
+    // silently redirect a detached worker to an unrelated fallback root.
+    return { invalid: true, value: "" };
+  }
+}
+
+function normalizeBossMonitoringEnabled(value) {
+  const normalized = String(value ?? "true").trim().toLowerCase();
+  return MONITORING_DISABLED_VALUES.has(normalized) ? "false" : "true";
 }
 
 export function quoteWindowsCommandLineArgument(value) {
@@ -92,8 +118,12 @@ export function buildWindowsDetachedWorkerCommand({
   stderrPath,
   exitStatusPath,
   recommendRuntimeHomePath = "",
+  recruitRuntimeHomePath = "",
   chatRuntimeHomePath = "",
-  screenConfigPath = ""
+  screenConfigPath = "",
+  bossMonitorHomePath = "",
+  recruitingMonitorHomePath = "",
+  bossMonitoringEnabled = "true"
 }) {
   const args = [
     powershellPath,
@@ -125,12 +155,22 @@ export function buildWindowsDetachedWorkerCommand({
   if (recommendRuntimeHomePath) {
     args.push("-RecommendRuntimeHomePath", recommendRuntimeHomePath);
   }
+  if (recruitRuntimeHomePath) {
+    args.push("-RecruitRuntimeHomePath", recruitRuntimeHomePath);
+  }
   if (chatRuntimeHomePath) {
     args.push("-ChatRuntimeHomePath", chatRuntimeHomePath);
   }
   if (screenConfigPath) {
     args.push("-ScreenConfigPath", screenConfigPath);
   }
+  if (bossMonitorHomePath) {
+    args.push("-BossMonitorHomePath", bossMonitorHomePath);
+  }
+  if (recruitingMonitorHomePath) {
+    args.push("-RecruitingMonitorHomePath", recruitingMonitorHomePath);
+  }
+  args.push("-BossMonitoringEnabled", bossMonitoringEnabled);
   return args.map(quoteWindowsCommandLineArgument).join(" ");
 }
 
@@ -170,8 +210,12 @@ function launchWindowsDetachedWorker(options) {
     stderrPath,
     exitStatusPath,
     recommendRuntimeHomePath,
+    recruitRuntimeHomePath,
     chatRuntimeHomePath,
     screenConfigPath,
+    bossMonitorHomePath,
+    recruitingMonitorHomePath,
+    bossMonitoringEnabled,
     wrapperScriptPath = WINDOWS_WRAPPER_PATH,
     powershellPath = windowsPowerShellPath(options.environment),
     spawnSyncImpl = spawnSync
@@ -188,8 +232,12 @@ function launchWindowsDetachedWorker(options) {
     stderrPath,
     exitStatusPath,
     recommendRuntimeHomePath,
+    recruitRuntimeHomePath,
     chatRuntimeHomePath,
-    screenConfigPath
+    screenConfigPath,
+    bossMonitorHomePath,
+    recruitingMonitorHomePath,
+    bossMonitoringEnabled
   });
   const encodedCommand = buildWindowsCimEncodedCommand(commandLine);
   const result = spawnSyncImpl(powershellPath, [
@@ -239,6 +287,45 @@ function launchWindowsDetachedWorker(options) {
   };
 }
 
+function buildPosixDetachedWorkerEnvironment({
+  environment,
+  recommendRuntimeHomePath,
+  recruitRuntimeHomePath,
+  chatRuntimeHomePath,
+  screenConfigPath,
+  bossMonitorHomePath,
+  recruitingMonitorHomePath,
+  bossMonitoringEnabled
+}) {
+  const childEnvironment = { ...environment };
+
+  // Monitoring paths come only from the validated/resolved launcher values.
+  // This removes invalid raw values while retaining unrelated inherited env.
+  delete childEnvironment.BOSS_MONITOR_HOME;
+  delete childEnvironment.RECRUITING_MONITOR_HOME;
+  if (bossMonitorHomePath) {
+    childEnvironment.BOSS_MONITOR_HOME = bossMonitorHomePath;
+  }
+  if (recruitingMonitorHomePath) {
+    childEnvironment.RECRUITING_MONITOR_HOME = recruitingMonitorHomePath;
+  }
+  childEnvironment.BOSS_MONITORING_ENABLED = bossMonitoringEnabled;
+
+  if (recommendRuntimeHomePath) {
+    childEnvironment.BOSS_RECOMMEND_HOME = recommendRuntimeHomePath;
+  }
+  if (recruitRuntimeHomePath) {
+    childEnvironment.BOSS_RECRUIT_HOME = recruitRuntimeHomePath;
+  }
+  if (chatRuntimeHomePath) {
+    childEnvironment.BOSS_CHAT_HOME = chatRuntimeHomePath;
+  }
+  if (screenConfigPath) {
+    childEnvironment.BOSS_RECOMMEND_SCREEN_CONFIG = screenConfigPath;
+  }
+  return childEnvironment;
+}
+
 function launchPosixDetachedWorker({
   nodePath,
   workerScriptPath,
@@ -247,6 +334,13 @@ function launchPosixDetachedWorker({
   launchId,
   stdoutPath,
   stderrPath,
+  recommendRuntimeHomePath,
+  recruitRuntimeHomePath,
+  chatRuntimeHomePath,
+  screenConfigPath,
+  bossMonitorHomePath,
+  recruitingMonitorHomePath,
+  bossMonitoringEnabled,
   spawnImpl = spawn,
   environment = process.env
 }) {
@@ -265,7 +359,16 @@ function launchPosixDetachedWorker({
       detached: true,
       stdio: ["ignore", stdoutFd, stderrFd],
       windowsHide: true,
-      env: environment
+      env: buildPosixDetachedWorkerEnvironment({
+        environment,
+        recommendRuntimeHomePath,
+        recruitRuntimeHomePath,
+        chatRuntimeHomePath,
+        screenConfigPath,
+        bossMonitorHomePath,
+        recruitingMonitorHomePath,
+        bossMonitoringEnabled
+      })
     });
   } finally {
     fs.closeSync(stdoutFd);
@@ -275,6 +378,9 @@ function launchPosixDetachedWorker({
 
 export function launchDetachedWorker(options = {}) {
   const platform = String(options.platform || process.platform);
+  const environment = options.environment && typeof options.environment === "object"
+    ? options.environment
+    : process.env;
   const nodePath = assertControlledPath(options.nodePath || process.execPath, "nodePath", platform);
   const workerScriptPath = assertControlledPath(options.workerScriptPath, "workerScriptPath", platform);
   const stdoutPath = assertControlledPath(options.stdoutPath, "stdoutPath", platform);
@@ -299,9 +405,37 @@ export function launchDetachedWorker(options = {}) {
   const recommendRuntimeHomePath = options.recommendRuntimeHomePath
     ? assertControlledPath(options.recommendRuntimeHomePath, "recommendRuntimeHomePath", platform)
     : "";
+  const recruitRuntimeHomePath = options.recruitRuntimeHomePath
+    ? assertControlledPath(options.recruitRuntimeHomePath, "recruitRuntimeHomePath", platform)
+    : "";
   const screenConfigPath = options.screenConfigPath
     ? assertControlledPath(options.screenConfigPath, "screenConfigPath", platform)
     : "";
+  const bossMonitorHomeFromEnvironment = optionalControlledEnvironmentPath(
+    environment,
+    "BOSS_MONITOR_HOME",
+    platform
+  );
+  const recruitingMonitorHomeFromEnvironment = optionalControlledEnvironmentPath(
+    environment,
+    "RECRUITING_MONITOR_HOME",
+    platform
+  );
+  const bossMonitorHomePath = options.bossMonitorHomePath
+    ? assertControlledPath(options.bossMonitorHomePath, "bossMonitorHomePath", platform)
+    : bossMonitorHomeFromEnvironment.value;
+  const recruitingMonitorHomePath = options.recruitingMonitorHomePath
+    ? assertControlledPath(options.recruitingMonitorHomePath, "recruitingMonitorHomePath", platform)
+    : recruitingMonitorHomeFromEnvironment.value;
+  let bossMonitoringEnabled = normalizeBossMonitoringEnabled(
+    options.bossMonitoringEnabled ?? environment.BOSS_MONITORING_ENABLED
+  );
+  if (
+    bossMonitorHomeFromEnvironment.invalid
+    || recruitingMonitorHomeFromEnvironment.invalid
+  ) {
+    bossMonitoringEnabled = "false";
+  }
   const prepareLogFile = typeof options.prepareLogFileImpl === "function"
     ? options.prepareLogFileImpl
     : ensureLogFile;
@@ -317,12 +451,17 @@ export function launchDetachedWorker(options = {}) {
     stderrPath,
     exitStatusPath,
     recommendRuntimeHomePath,
+    recruitRuntimeHomePath,
     domain,
     runId,
     launchId,
     wrapperScriptPath,
     chatRuntimeHomePath,
-    screenConfigPath
+    screenConfigPath,
+    bossMonitorHomePath,
+    recruitingMonitorHomePath,
+    bossMonitoringEnabled,
+    environment
   };
   return platform === "win32"
     ? launchWindowsDetachedWorker(normalized)

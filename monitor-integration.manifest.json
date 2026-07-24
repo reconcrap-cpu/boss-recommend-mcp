@@ -1,0 +1,21 @@
+{
+  "integration": "recruiting-run-monitor",
+  "contract_version": "1.0",
+  "provider": "boss",
+  "base": {
+    "remote": "origin",
+    "branch": "main",
+    "sha": "23292fa8e859edb8068d4b02fa941a7d82f987e0"
+  },
+  "development": {
+    "branch": "codex/monitor-contract-v1",
+    "isolation": "fresh-clone",
+    "live_worktree_modified": false
+  },
+  "runtime": {
+    "monitor_home_env": "BOSS_MONITOR_HOME",
+    "monitoring_toggle_env": "BOSS_MONITORING_ENABLED",
+    "contract_package": "@reconcrap/recruiting-run-monitor-contract",
+    "contract_version": "1.0.0"
+  }
+}

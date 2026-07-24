@@ -30,10 +30,23 @@ param(
   [string]$RecommendRuntimeHomePath = '',
 
   [Parameter(Mandatory = $false)]
+  [string]$RecruitRuntimeHomePath = '',
+
+  [Parameter(Mandatory = $false)]
   [string]$ChatRuntimeHomePath = '',
 
   [Parameter(Mandatory = $false)]
-  [string]$ScreenConfigPath = ''
+  [string]$ScreenConfigPath = '',
+
+  [Parameter(Mandatory = $false)]
+  [string]$BossMonitorHomePath = '',
+
+  [Parameter(Mandatory = $false)]
+  [string]$RecruitingMonitorHomePath = '',
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet('true', 'false')]
+  [string]$BossMonitoringEnabled = 'true'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +77,75 @@ function Write-WorkerExitStatus($Payload) {
   }
 }
 
+function Invoke-ExitRecorder([int]$ObservedExitCode, $ObservedWorkerPid) {
+  try {
+    if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf) -or -not (Test-Path -LiteralPath $WorkerScriptPath -PathType Leaf)) {
+      return
+    }
+
+    $workerPidArgument = ''
+    if ($null -ne $ObservedWorkerPid -and [int]$ObservedWorkerPid -gt 0) {
+      $workerPidArgument = ' --worker-pid {0}' -f [int]$ObservedWorkerPid
+    }
+    $recordInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $recordInfo.FileName = $NodePath
+    $recordInfo.Arguments = ('"{0}" --domain {1} --run-id {2} --launch-id {3} --record-exit --worker-exit-code {4}{5} --supervisor-pid {6}' -f $WorkerScriptPath, $Domain, $RunId, $LaunchId, $ObservedExitCode, $workerPidArgument, $PID)
+    $recordInfo.WorkingDirectory = [System.IO.Path]::GetDirectoryName($WorkerScriptPath)
+    $recordInfo.UseShellExecute = $false
+    $recordInfo.CreateNoWindow = $true
+    $recordInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $recordInfo.RedirectStandardOutput = $true
+    $recordInfo.RedirectStandardError = $true
+    if ($RecommendRuntimeHomePath) {
+      $recordInfo.EnvironmentVariables['BOSS_RECOMMEND_HOME'] = $RecommendRuntimeHomePath
+    }
+    if ($RecruitRuntimeHomePath) {
+      $recordInfo.EnvironmentVariables['BOSS_RECRUIT_HOME'] = $RecruitRuntimeHomePath
+    }
+    if ($ChatRuntimeHomePath) {
+      $recordInfo.EnvironmentVariables['BOSS_CHAT_HOME'] = $ChatRuntimeHomePath
+    }
+    if ($ScreenConfigPath) {
+      $recordInfo.EnvironmentVariables['BOSS_RECOMMEND_SCREEN_CONFIG'] = $ScreenConfigPath
+    }
+    if ($BossMonitorHomePath) {
+      $recordInfo.EnvironmentVariables['BOSS_MONITOR_HOME'] = $BossMonitorHomePath
+    }
+    if ($RecruitingMonitorHomePath) {
+      $recordInfo.EnvironmentVariables['RECRUITING_MONITOR_HOME'] = $RecruitingMonitorHomePath
+    }
+    $recordInfo.EnvironmentVariables['BOSS_MONITORING_ENABLED'] = $BossMonitoringEnabled
+
+    $recorder = New-Object System.Diagnostics.Process
+    $recorder.StartInfo = $recordInfo
+    if (-not $recorder.Start()) {
+      throw 'Node detached worker exit recorder did not start.'
+    }
+    $recordStdoutTask = $recorder.StandardOutput.ReadToEndAsync()
+    $recordStderrTask = $recorder.StandardError.ReadToEndAsync()
+    $recorder.WaitForExit()
+    $recordStdout = $recordStdoutTask.GetAwaiter().GetResult()
+    $recordStderr = $recordStderrTask.GetAwaiter().GetResult()
+    if ($recordStdout) {
+      [System.IO.File]::AppendAllText($StdoutPath, $recordStdout, $utf8)
+    }
+    if ($recordStderr) {
+      [System.IO.File]::AppendAllText($StderrPath, $recordStderr, $utf8)
+    }
+  } catch {
+    try {
+      [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($StderrPath)) | Out-Null
+      [System.IO.File]::AppendAllText(
+        $StderrPath,
+        "[windows-detached-worker] exit recorder failed: $($_.Exception.Message)$([Environment]::NewLine)",
+        $utf8
+      )
+    } catch {
+      # Recorder reconciliation is best-effort when the controlled log path is unavailable.
+    }
+  }
+}
+
 try {
   Assert-ControlledPath $NodePath 'NodePath'
   Assert-ControlledPath $WorkerScriptPath 'WorkerScriptPath'
@@ -73,11 +155,20 @@ try {
   if ($RecommendRuntimeHomePath) {
     Assert-ControlledPath $RecommendRuntimeHomePath 'RecommendRuntimeHomePath'
   }
+  if ($RecruitRuntimeHomePath) {
+    Assert-ControlledPath $RecruitRuntimeHomePath 'RecruitRuntimeHomePath'
+  }
   if ($ChatRuntimeHomePath) {
     Assert-ControlledPath $ChatRuntimeHomePath 'ChatRuntimeHomePath'
   }
   if ($ScreenConfigPath) {
     Assert-ControlledPath $ScreenConfigPath 'ScreenConfigPath'
+  }
+  if ($BossMonitorHomePath) {
+    Assert-ControlledPath $BossMonitorHomePath 'BossMonitorHomePath'
+  }
+  if ($RecruitingMonitorHomePath) {
+    Assert-ControlledPath $RecruitingMonitorHomePath 'RecruitingMonitorHomePath'
   }
   if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
     throw 'NodePath does not exist.'
@@ -101,12 +192,22 @@ try {
   if ($RecommendRuntimeHomePath) {
     $startInfo.EnvironmentVariables['BOSS_RECOMMEND_HOME'] = $RecommendRuntimeHomePath
   }
+  if ($RecruitRuntimeHomePath) {
+    $startInfo.EnvironmentVariables['BOSS_RECRUIT_HOME'] = $RecruitRuntimeHomePath
+  }
   if ($ChatRuntimeHomePath) {
     $startInfo.EnvironmentVariables['BOSS_CHAT_HOME'] = $ChatRuntimeHomePath
   }
   if ($ScreenConfigPath) {
     $startInfo.EnvironmentVariables['BOSS_RECOMMEND_SCREEN_CONFIG'] = $ScreenConfigPath
   }
+  if ($BossMonitorHomePath) {
+    $startInfo.EnvironmentVariables['BOSS_MONITOR_HOME'] = $BossMonitorHomePath
+  }
+  if ($RecruitingMonitorHomePath) {
+    $startInfo.EnvironmentVariables['RECRUITING_MONITOR_HOME'] = $RecruitingMonitorHomePath
+  }
+  $startInfo.EnvironmentVariables['BOSS_MONITORING_ENABLED'] = $BossMonitoringEnabled
 
   $worker = New-Object System.Diagnostics.Process
   $worker.StartInfo = $startInfo
@@ -158,47 +259,7 @@ try {
     wrapper_error = $null
   })
 
-  try {
-    $recordInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $recordInfo.FileName = $NodePath
-    $recordInfo.Arguments = ('"{0}" --domain {1} --run-id {2} --launch-id {3} --record-exit --worker-exit-code {4} --worker-pid {5} --supervisor-pid {6}' -f $WorkerScriptPath, $Domain, $RunId, $LaunchId, $workerExitCode, $workerPid, $PID)
-    $recordInfo.WorkingDirectory = [System.IO.Path]::GetDirectoryName($WorkerScriptPath)
-    $recordInfo.UseShellExecute = $false
-    $recordInfo.CreateNoWindow = $true
-    $recordInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-    $recordInfo.RedirectStandardOutput = $true
-    $recordInfo.RedirectStandardError = $true
-    if ($RecommendRuntimeHomePath) {
-      $recordInfo.EnvironmentVariables['BOSS_RECOMMEND_HOME'] = $RecommendRuntimeHomePath
-    }
-    if ($ChatRuntimeHomePath) {
-      $recordInfo.EnvironmentVariables['BOSS_CHAT_HOME'] = $ChatRuntimeHomePath
-    }
-    if ($ScreenConfigPath) {
-      $recordInfo.EnvironmentVariables['BOSS_RECOMMEND_SCREEN_CONFIG'] = $ScreenConfigPath
-    }
-    $recorder = New-Object System.Diagnostics.Process
-    $recorder.StartInfo = $recordInfo
-    if ($recorder.Start()) {
-      $recordStdoutTask = $recorder.StandardOutput.ReadToEndAsync()
-      $recordStderrTask = $recorder.StandardError.ReadToEndAsync()
-      $recorder.WaitForExit()
-      $recordStdout = $recordStdoutTask.GetAwaiter().GetResult()
-      $recordStderr = $recordStderrTask.GetAwaiter().GetResult()
-      if ($recordStdout) {
-        [System.IO.File]::AppendAllText($StdoutPath, $recordStdout, $utf8)
-      }
-      if ($recordStderr) {
-        [System.IO.File]::AppendAllText($StderrPath, $recordStderr, $utf8)
-      }
-    }
-  } catch {
-    [System.IO.File]::AppendAllText(
-      $StderrPath,
-      "[windows-detached-worker] exit recorder failed: $($_.Exception.Message)$([Environment]::NewLine)",
-      $utf8
-    )
-  }
+  Invoke-ExitRecorder -ObservedExitCode $workerExitCode -ObservedWorkerPid $workerPid
   exit $workerExitCode
 } catch {
   $wrapperError = $_.Exception.Message
@@ -230,6 +291,7 @@ try {
   } catch {
     # No additional recovery is available if even the controlled log path is unavailable.
   }
+  Invoke-ExitRecorder -ObservedExitCode 1 -ObservedWorkerPid $workerPid
   exit 1
 } finally {
   if ($stdoutStream) {

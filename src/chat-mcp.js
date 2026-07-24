@@ -58,6 +58,18 @@ import {
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
 import { launchDetachedWorker } from "./core/run/detached-launcher.js";
+import { withRunStateFileLockSync } from "./core/run/state-file-lock.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
+import {
+  boundedWorkflowCheckpoint,
+  compactWorkflowResultForState,
+  getWorkflowCandidateJournalPath,
+  reconstructWorkflowCandidateResults
+} from "./core/run/workflow-candidate-journal.js";
 
 const DEFAULT_CHAT_HOST = "127.0.0.1";
 const DEFAULT_CHAT_PORT = 9222;
@@ -185,7 +197,12 @@ function getChatRunArtifacts(runId) {
     detached_args_path: path.join(runsDir, `${normalized}.detached-args.json`),
     worker_stdout_path: path.join(runsDir, `${normalized}.worker.stdout.log`),
     worker_stderr_path: path.join(runsDir, `${normalized}.worker.stderr.log`),
+    worker_exit_status_path: path.join(runsDir, `${normalized}.worker.exit.json`),
     checkpoint_path: path.join(runsDir, `${normalized}.checkpoint.json`),
+    candidate_result_journal_path: getWorkflowCandidateJournalPath({
+      runDir: runsDir,
+      runId: normalized
+    }),
     output_csv: path.join(outputDir, `${normalized}.results.csv`),
     report_json: path.join(outputDir, `${normalized}.report.json`)
   };
@@ -345,7 +362,23 @@ function readHydratedChatCheckpoint(persisted = {}) {
   ].map((value) => normalizeText(value)).filter(Boolean);
   for (const checkpointPath of new Set(checkpointPaths)) {
     const checkpoint = readJsonFile(checkpointPath);
-    if (checkpoint) return checkpoint;
+    if (checkpoint) {
+      const journalResults = artifacts
+        ? reconstructWorkflowCandidateResults({
+            runDir: artifacts.runs_dir,
+            runId
+          })
+        : [];
+      const {
+        candidate_result_journal: _candidateResultJournal,
+        results_count: _resultsCount,
+        results_truncated: _resultsTruncated,
+        ...legacyCheckpoint
+      } = checkpoint;
+      return journalResults.length
+        ? { ...legacyCheckpoint, results: journalResults }
+        : legacyCheckpoint;
+    }
   }
   return persisted.checkpoint && typeof persisted.checkpoint === "object"
     ? persisted.checkpoint
@@ -355,8 +388,48 @@ function readHydratedChatCheckpoint(persisted = {}) {
 function writeChatRunState(runId, payload) {
   const artifacts = getChatRunArtifacts(runId);
   if (!artifacts) return null;
-  writeJsonAtomic(artifacts.run_state_path, payload);
-  return payload;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    writeJsonAtomic(artifacts.run_state_path, {
+      ...payload,
+      result: compactWorkflowResultForState(payload?.result),
+      summary: compactWorkflowResultForState(payload?.summary)
+    });
+    return payload;
+  });
+}
+
+function updatePersistedChatRun(runId, patchOrUpdater) {
+  const artifacts = getChatRunArtifacts(runId);
+  if (!artifacts) return null;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readChatRunState(runId);
+    if (!current) return null;
+    const patch = typeof patchOrUpdater === "function"
+      ? patchOrUpdater(current)
+      : patchOrUpdater;
+    if (
+      !patch
+      || typeof patch !== "object"
+      || Array.isArray(patch)
+      || Object.keys(patch).length === 0
+    ) {
+      return current;
+    }
+    const next = {
+      ...current,
+      ...patch,
+      control: {
+        ...plainRecord(current.control),
+        ...plainRecord(patch.control)
+      },
+      resume: {
+        ...plainRecord(current.resume),
+        ...plainRecord(patch.resume)
+      }
+    };
+    writeChatRunState(runId, next);
+    return next;
+  });
 }
 
 function createDetachedChatRunId() {
@@ -367,10 +440,13 @@ function buildInitialChatDetachedState(runId, {
   workspaceRoot = "",
   args = {},
   normalized = {},
-  pid = process.pid
+  pid = process.pid,
+  workerLaunchId = "",
+  workerLaunchedAt = ""
 } = {}) {
   const artifacts = getChatRunArtifacts(runId);
   const now = new Date().toISOString();
+  const monitorMarker = createBossMonitorSourceMarker(now);
   const isAllTarget = normalized.publicTargetCount === "all";
   const processedLimit = isAllTarget ? CHAT_ALL_MAX_CANDIDATES : Math.max(1, Number(normalized.targetCount) || 1);
   const criteria = normalizeText(normalized.criteria || args.criteria || "");
@@ -442,10 +518,19 @@ function buildInitialChatDetachedState(runId, {
       output_csv: null,
       worker_stdout_path: artifacts?.worker_stdout_path || null,
       worker_stderr_path: artifacts?.worker_stderr_path || null,
+      worker_exit_status_path: artifacts?.worker_exit_status_path || null,
+      worker_launcher: process.platform === "win32" ? "windows_cim_supervisor" : "posix_detached_spawn",
+      worker_launch_id: normalizeText(workerLaunchId) || null,
+      worker_supervisor_pid: null,
+      worker_node_pid: null,
+      worker_launched_at: normalizeText(workerLaunchedAt) || now,
+      worker_started_at: null,
+      worker_launch_committed: false,
       resume_count: 0,
       last_resumed_at: null,
       last_paused_at: null
     },
+    ...(monitorMarker ? { monitoring_v1: monitorMarker } : {}),
     error: null,
     result: null,
     summary: null,
@@ -458,39 +543,46 @@ function patchPersistedChatControl(runId, controlPatch = {}, {
   message = "",
   lastMessage = ""
 } = {}) {
-  const current = readChatRunState(runId);
-  if (!current) return null;
-  const state = normalizeText(current.state || current.status);
-  if (TERMINAL_STATUSES.has(state)) return null;
-  const now = new Date().toISOString();
-  const patched = {
-    ...current,
-    updated_at: now,
-    heartbeat_at: now,
-    last_message: lastMessage || message || current.last_message || "",
-    control: {
-      ...(current.control || {}),
-      ...controlPatch
-    }
-  };
-  writeChatRunState(runId, patched);
-  return {
-    status,
-    run: patched,
-    message,
-    persistence: {
-      source: "disk",
-      active_control_available: false,
-      detached_control_requested: true
-    },
-    runtime_evaluate_used: false,
-    method_summary: {},
-    method_log: [],
-    chrome: null
-  };
+  const artifacts = getChatRunArtifacts(runId);
+  if (!artifacts) return null;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readChatRunState(runId);
+    if (!current) return null;
+    const state = normalizeText(current.state || current.status);
+    if (TERMINAL_STATUSES.has(state)) return null;
+    const now = new Date().toISOString();
+    const patched = {
+      ...current,
+      updated_at: now,
+      heartbeat_at: now,
+      last_message: lastMessage || message || current.last_message || "",
+      control: {
+        ...(current.control || {}),
+        ...controlPatch
+      }
+    };
+    writeChatRunState(runId, patched);
+    return {
+      status,
+      run: patched,
+      message,
+      persistence: {
+        source: "disk",
+        active_control_available: false,
+        detached_control_requested: true
+      },
+      runtime_evaluate_used: false,
+      method_summary: {},
+      method_log: [],
+      chrome: null
+    };
+  });
 }
 
-function launchDetachedChatWorker(runId, { screenConfigPath = "" } = {}) {
+function launchDetachedChatWorker(runId, {
+  screenConfigPath = "",
+  launchId = ""
+} = {}) {
   const artifacts = getChatRunArtifacts(runId);
   if (!artifacts) throw new Error("Invalid chat run_id");
   const child = chatDetachedWorkerLauncherImpl({
@@ -498,8 +590,10 @@ function launchDetachedChatWorker(runId, { screenConfigPath = "" } = {}) {
     workerScriptPath: DETACHED_WORKER_SCRIPT,
     domain: "chat",
     runId,
+    launchId,
     stdoutPath: artifacts.worker_stdout_path,
     stderrPath: artifacts.worker_stderr_path,
+    exitStatusPath: artifacts.worker_exit_status_path,
     chatRuntimeHomePath: getBossChatDataDir(),
     screenConfigPath,
     environment: process.env
@@ -508,7 +602,8 @@ function launchDetachedChatWorker(runId, { screenConfigPath = "" } = {}) {
     child.once("error", (error) => {
       markBossChatDetachedWorkerFailed(runId, error, {
         code: "CHAT_WORKER_PROCESS_ERROR",
-        message: "Boss chat detached worker process emitted an asynchronous error."
+        message: "Boss chat detached worker process emitted an asynchronous error.",
+        workerLaunchId: launchId
       });
     });
     child.once("exit", (exitCode, signal) => {
@@ -519,7 +614,15 @@ function launchDetachedChatWorker(runId, { screenConfigPath = "" } = {}) {
       markBossChatDetachedWorkerFailed(runId, error, {
         code: "CHAT_WORKER_EXITED_EARLY",
         workerExitCode: Number.isInteger(exitCode) ? exitCode : null,
-        workerSignal: normalizedSignal || null
+        workerSignal: normalizedSignal || null,
+        workerPid: Number.isInteger(child?.pid) ? child.pid : null,
+        supervisorPid: process.platform === "win32" && Number.isInteger(child?.pid)
+          ? child.pid
+          : null,
+        workerLaunchId: launchId,
+        diagnosticSource: process.platform === "win32"
+          ? "windows_cim_supervisor"
+          : "posix_child_exit_event"
       });
     });
   }
@@ -623,16 +726,31 @@ function ensureChatRunArtifacts(snapshot) {
     ? snapshot.checkpoint
     : {};
   const existingCheckpoint = readJsonFile(artifacts.checkpoint_path);
-  const checkpoint = hasChatCheckpointPayload(snapshotCheckpoint)
+  const fullCheckpoint = hasChatCheckpointPayload(snapshotCheckpoint)
     ? snapshotCheckpoint
     : existingCheckpoint || snapshotCheckpoint;
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id,
+    checkpoint: fullCheckpoint
+  });
   if (hasChatCheckpointPayload(snapshotCheckpoint) || !existingCheckpoint) {
     writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   }
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 
   const summary = snapshot?.summary && typeof snapshot.summary === "object" ? snapshot.summary : null;
-  const checkpointResults = Array.isArray(checkpoint.results) ? checkpoint.results : [];
+  const journalResults = reconstructWorkflowCandidateResults({
+    runDir: artifacts.runs_dir,
+    runId: snapshot?.runId || snapshot?.run_id
+  });
+  const checkpointResults = journalResults.length
+    ? journalResults
+    : Array.isArray(fullCheckpoint.results)
+      ? fullCheckpoint.results
+      : Array.isArray(checkpoint.results)
+        ? checkpoint.results
+        : [];
   const artifactSummary = summary || (checkpointResults.length ? {
     domain: "chat",
     partial: true,
@@ -671,14 +789,19 @@ function persistChatCheckpointSnapshot(normalized) {
   const artifacts = getChatRunArtifacts(normalized?.run_id || normalized?.runId);
   if (!artifacts) return;
   const meta = getChatRunMeta(normalized?.run_id || normalized?.runId);
-  const checkpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
+  const sourceCheckpoint = normalized?.checkpoint && typeof normalized.checkpoint === "object"
     ? normalized.checkpoint
     : {};
   const existingCheckpoint = readJsonFile(artifacts.checkpoint_path);
-  if (!hasChatCheckpointPayload(checkpoint) && existingCheckpoint) {
+  if (!hasChatCheckpointPayload(sourceCheckpoint) && existingCheckpoint) {
     if (meta) meta.checkpointPath = artifacts.checkpoint_path;
     return;
   }
+  const checkpoint = boundedWorkflowCheckpoint({
+    runDir: artifacts.runs_dir,
+    runId: normalized?.run_id || normalized?.runId,
+    checkpoint: sourceCheckpoint
+  });
   writeJsonAtomic(artifacts.checkpoint_path, checkpoint);
   if (meta) meta.checkpointPath = artifacts.checkpoint_path;
 }
@@ -715,8 +838,10 @@ function snapshotFromPersistedChatRun(persisted = {}) {
 function persistDiskChatRun(runId, payload) {
   const artifacts = getChatRunArtifacts(runId);
   if (!artifacts) return payload;
-  writeJsonAtomic(artifacts.run_state_path, payload);
-  return payload;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    writeJsonAtomic(artifacts.run_state_path, payload);
+    return payload;
+  });
 }
 
 function attachLegacyArtifactsToPersistedChatRun(persisted = {}) {
@@ -797,9 +922,42 @@ function finalizePersistedChatRun(persisted = {}, {
 export function markBossChatDetachedWorkerFailed(runId, error, options = {}) {
   const normalizedRunId = normalizeRunId(runId);
   if (!normalizedRunId) return null;
-  const persisted = readChatRunState(normalizedRunId) || buildInitialChatDetachedState(normalizedRunId, {});
+  const artifacts = getChatRunArtifacts(normalizedRunId);
+  if (!artifacts) return null;
+  return withRunStateFileLockSync(
+    artifacts.run_state_path,
+    () => markBossChatDetachedWorkerFailedUnderLock(normalizedRunId, error, options)
+  );
+}
+
+function markBossChatDetachedWorkerFailedUnderLock(runId, error, options = {}) {
+  const normalizedRunId = normalizeRunId(runId);
+  if (!normalizedRunId) return null;
+  const persisted = readChatRunState(normalizedRunId);
+  if (!persisted) return null;
   const state = normalizeText(persisted.state || persisted.status);
   if (TERMINAL_STATUSES.has(state)) return persisted;
+  const expectedLaunchId = normalizeText(persisted.resume?.worker_launch_id || "");
+  const observedLaunchId = normalizeText(options.workerLaunchId || "");
+  const expectedSupervisorPid = Number(persisted.resume?.worker_supervisor_pid);
+  const observedSupervisorPid = Number(options.supervisorPid);
+  const supervisorDiagnostic = normalizeText(options.diagnosticSource || "") === "windows_cim_supervisor";
+  if (
+    (expectedLaunchId && observedLaunchId && expectedLaunchId !== observedLaunchId)
+    || (expectedLaunchId && supervisorDiagnostic && observedLaunchId !== expectedLaunchId)
+    || (
+      Number.isInteger(expectedSupervisorPid)
+      && expectedSupervisorPid > 0
+      && supervisorDiagnostic
+      && (
+        !Number.isInteger(observedSupervisorPid)
+        || observedSupervisorPid <= 0
+        || observedSupervisorPid !== expectedSupervisorPid
+      )
+    )
+  ) {
+    return null;
+  }
   const errorPayload = {
     name: error?.name || "Error",
     code: options.code || error?.code || "CHAT_WORKER_UNHANDLED_EXCEPTION",
@@ -815,14 +973,28 @@ export function markBossChatDetachedWorkerFailed(runId, error, options = {}) {
   if (normalizeText(options.workerSignal || "")) {
     errorPayload.worker_signal = normalizeText(options.workerSignal);
   }
+  if (Number.isInteger(options.workerPid) && options.workerPid > 0) {
+    errorPayload.worker_pid = options.workerPid;
+  }
+  if (Number.isInteger(options.supervisorPid) && options.supervisorPid > 0) {
+    errorPayload.supervisor_pid = options.supervisorPid;
+  }
+  if (normalizeText(options.diagnosticSource || "")) {
+    errorPayload.diagnostic_source = normalizeText(options.diagnosticSource);
+  }
+  if (observedLaunchId) {
+    errorPayload.worker_launch_id = observedLaunchId;
+  }
   if (normalizeText(error?.stack || "")) {
     errorPayload.stack = String(error.stack).slice(0, 8000);
   }
-  return finalizePersistedChatRun(persisted, {
+  const failedState = finalizePersistedChatRun(persisted, {
     status: RUN_STATUS_FAILED,
     error: errorPayload,
     message: errorPayload.message
   });
+  writeBossMonitorProjectionNonfatal("chat", failedState);
+  return failedState;
 }
 
 function persistedChatRunArtifactMissing(persisted = {}) {
@@ -844,6 +1016,16 @@ function persistedChatRunArtifactMissing(persisted = {}) {
 }
 
 function reconcilePersistedChatRun(persisted = {}, { cancelStale = false } = {}) {
+  const runId = normalizeRunId(persisted.run_id || persisted.runId);
+  const artifacts = getChatRunArtifacts(runId);
+  if (!runId || !artifacts) return { run: persisted };
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const latest = readChatRunState(runId) || persisted;
+    return reconcilePersistedChatRunUnderLock(latest, { cancelStale });
+  });
+}
+
+function reconcilePersistedChatRunUnderLock(persisted = {}, { cancelStale = false } = {}) {
   const status = persisted.status || persisted.state;
   if (STALE_PROCESS_STATUSES.has(status) && !isPidAlive(persisted.pid)) {
     const shouldCancel = cancelStale || status === RUN_STATUS_CANCELING || persisted.control?.cancel_requested === true;
@@ -1012,13 +1194,29 @@ function mergePersistedChatControlRequest(normalized, existing) {
 }
 
 function persistChatRunSnapshot(snapshot, {
-  persistActiveCheckpoint = false
+  persistActiveCheckpoint = false,
+  monitorEvent = {}
 } = {}) {
   const normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getChatRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const persisted = withRunStateFileLockSync(artifacts.run_state_path, () => {
   const existing = readJsonFile(artifacts.run_state_path);
+  const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
+  const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
+  const monitorMarker = existingMonitorMarker.contract_version === "1.0"
+    ? existingMonitorMarker
+    : normalizedMonitorMarker.contract_version === "1.0"
+      ? normalizedMonitorMarker
+      : monitorEvent?.v1_created === true
+        ? createBossMonitorSourceMarker(normalized.started_at || normalized.updated_at)
+        : null;
+  if (monitorMarker) normalized.monitoring_v1 = monitorMarker;
+  normalized.resume = {
+    ...plainRecord(existing?.resume),
+    ...plainRecord(normalized.resume)
+  };
   normalized.control = mergePersistedChatControlRequest(normalized, existing);
   if (persistActiveCheckpoint) {
     persistChatCheckpointSnapshot(normalized);
@@ -1040,17 +1238,22 @@ function persistChatRunSnapshot(snapshot, {
     control: normalized.control,
     resume: normalized.resume,
     error: normalized.error,
-    result: normalized.result,
-    summary: normalized.summary,
+    result: compactWorkflowResultForState(normalized.result),
+    summary: compactWorkflowResultForState(normalized.summary),
+    monitoring_v1: normalized.monitoring_v1,
     artifacts: normalized.artifacts
   };
   writeJsonAtomic(artifacts.run_state_path, payload);
-  return normalized;
+    return normalized;
+  });
+  writeBossMonitorProjectionNonfatal("chat", persisted, monitorEvent);
+  return persisted;
 }
 
 function persistChatLifecycleSnapshot(snapshot, event = {}) {
   return persistChatRunSnapshot(snapshot, {
-    persistActiveCheckpoint: event?.type === "checkpoint"
+    persistActiveCheckpoint: event?.type === "checkpoint",
+    monitorEvent: { ...event, producer: true }
   });
 }
 
@@ -1654,7 +1857,9 @@ async function startBossChatRunInternal(args = {}, { workspaceRoot = "", runId =
     health: session.health || null
   });
   trackChatRun(started.runId);
-  const persistedStarted = persistChatRunSnapshot(started);
+  const persistedStarted = persistChatRunSnapshot(started, {
+    monitorEvent: { type: "created", producer: true, v1_created: true }
+  });
 
   return {
     status: "ACCEPTED",
@@ -1904,7 +2109,10 @@ export async function bossChatHealthCheckTool({ workspaceRoot = "", args = {} } 
 export async function startBossChatRunTool({ workspaceRoot = "", args = {} } = {}) {
   const started = await startBossChatRunInternal(args, { workspaceRoot });
   if (started.status !== "ACCEPTED") return started;
-  return attachMethodEvidence(started, started.run_id);
+  return {
+    ...attachMethodEvidence(started, started.run_id),
+    monitoring: createBossMonitoringBlock("chat", started.run_id)
+  };
 }
 
 export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = {} } = {}) {
@@ -1945,12 +2153,16 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
   }
 
   const runId = createDetachedChatRunId();
+  const workerLaunchId = randomUUID();
+  const workerLaunchedAt = new Date().toISOString();
   const artifacts = getChatRunArtifacts(runId);
   const initial = buildInitialChatDetachedState(runId, {
     workspaceRoot,
     args,
     normalized,
-    pid: process.pid
+    pid: process.pid,
+    workerLaunchId,
+    workerLaunchedAt
   });
   try {
     writeJsonAtomic(artifacts.detached_args_path, {
@@ -1960,6 +2172,10 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
       args: clonePlain(args, {})
     });
     writeChatRunState(runId, initial);
+    writeBossMonitorProjectionNonfatal("chat", initial, {
+      type: "created",
+      v1_created: true
+    });
   } catch (error) {
     return {
       status: "FAILED",
@@ -1974,39 +2190,105 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
   let child;
   try {
     child = launchDetachedChatWorker(runId, {
-      screenConfigPath: defaultConfigResolution?.config_path || ""
+      screenConfigPath: defaultConfigResolution?.config_path || "",
+      launchId: workerLaunchId
     });
     const now = new Date().toISOString();
-    const latest = readChatRunState(runId) || initial;
-    const latestState = normalizeText(latest.state || latest.status);
-    if (TERMINAL_STATUSES.has(latestState)) {
+    const launchReady = updatePersistedChatRun(runId, (current) => {
+      const currentState = normalizeText(current.state || current.status);
+      if (
+        TERMINAL_STATUSES.has(currentState)
+        || normalizeText(current.resume?.worker_launch_id || "") !== workerLaunchId
+      ) {
+        return {};
+      }
+      return {
+        pid: child.pid || process.pid,
+        updated_at: now,
+        heartbeat_at: now,
+        last_message: "Boss chat detached worker launched.",
+        resume: {
+          worker_exit_status_path: artifacts.worker_exit_status_path,
+          worker_launch_id: workerLaunchId,
+          worker_supervisor_pid: process.platform === "win32"
+            ? (child.pid || null)
+            : null,
+          worker_node_pid: process.platform === "win32"
+            ? null
+            : (child.pid || null),
+          worker_launched_at: workerLaunchedAt,
+          worker_launch_committed: false
+        }
+      };
+    });
+    const launchReadyState = normalizeText(
+      launchReady?.state || launchReady?.status
+    );
+    if (TERMINAL_STATUSES.has(launchReadyState)) {
       return {
         status: "FAILED",
-        error: latest.error || {
+        error: launchReady.error || {
           code: "CHAT_WORKER_LAUNCH_FAILED",
           message: "Boss chat detached worker exited during launch.",
           retryable: true
         },
-        run: latest,
+        run: launchReady,
         runtime_evaluate_used: false,
         method_summary: {},
         method_log: [],
         chrome: null
       };
     }
-    const queued = {
-      ...latest,
-      pid: child.pid || process.pid,
-      updated_at: now,
-      heartbeat_at: now,
-      last_message: "Boss chat detached worker launched."
-    };
-    writeChatRunState(runId, queued);
+    if (
+      normalizeText(launchReady?.resume?.worker_launch_id || "") !== workerLaunchId
+      || launchReady?.resume?.worker_launch_committed === true
+    ) {
+      throw new Error("Boss chat detached worker launch identity was not persisted.");
+    }
+    writeBossMonitorProjectionNonfatal("chat", launchReady);
+    const committed = updatePersistedChatRun(runId, (current) => {
+      const currentState = normalizeText(current.state || current.status);
+      if (
+        TERMINAL_STATUSES.has(currentState)
+        || normalizeText(current.resume?.worker_launch_id || "") !== workerLaunchId
+      ) {
+        return {};
+      }
+      return {
+        updated_at: new Date().toISOString(),
+        resume: {
+          worker_launch_committed: true
+        }
+      };
+    });
+    if (
+      normalizeText(committed?.resume?.worker_launch_id || "") !== workerLaunchId
+      || committed?.resume?.worker_launch_committed !== true
+      || TERMINAL_STATUSES.has(normalizeText(committed?.state || committed?.status))
+    ) {
+      if (TERMINAL_STATUSES.has(normalizeText(committed?.state || committed?.status))) {
+        writeBossMonitorProjectionNonfatal("chat", committed);
+        return {
+          status: "FAILED",
+          error: committed.error || {
+            code: "CHAT_WORKER_LAUNCH_FAILED",
+            message: "Boss chat detached worker exited before launch commit.",
+            retryable: true
+          },
+          run: committed,
+          runtime_evaluate_used: false,
+          method_summary: {},
+          method_log: [],
+          chrome: null
+        };
+      }
+      throw new Error("Boss chat detached worker launch commit was not persisted.");
+    }
     return {
       status: "ACCEPTED",
       run_id: runId,
       state: "queued",
-      run: queued,
+      run: committed,
       poll_after_sec: DEFAULT_CHAT_POLL_AFTER_SEC,
       message: "Boss chat run started in a detached worker. It can continue after the MCP host returns or is recycled.",
       target_count_semantics: TARGET_COUNT_SEMANTICS,
@@ -2014,12 +2296,14 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
       runtime_evaluate_used: false,
       method_summary: {},
       method_log: [],
-      chrome: null
+      chrome: null,
+      monitoring: createBossMonitoringBlock("chat", runId)
     };
   } catch (error) {
     const failed = markBossChatDetachedWorkerFailed(runId, error, {
       code: "CHAT_WORKER_LAUNCH_FAILED",
-      message: "Unable to launch Boss chat detached worker."
+      message: "Unable to launch Boss chat detached worker.",
+      workerLaunchId
     });
     return {
       status: "FAILED",
@@ -2037,16 +2321,98 @@ export async function startBossChatDetachedRunTool({ workspaceRoot = "", args = 
   }
 }
 
-export async function runBossChatDetachedWorker({ runId } = {}) {
+async function waitForChatDetachedWorkerLaunchCommit(runId, launchId, timeoutMs = 15_000) {
+  const normalizedLaunchId = normalizeText(launchId);
+  const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 15_000);
+  while (Date.now() <= deadline) {
+    const persisted = readChatRunState(runId);
+    if (!persisted) {
+      return { ok: false, error: `run_id=${runId} not found` };
+    }
+    const state = normalizeText(persisted.state || persisted.status);
+    if (TERMINAL_STATUSES.has(state)) {
+      return { ok: false, error: `run_id=${runId} is already terminal (${state})` };
+    }
+    const expectedLaunchId = normalizeText(persisted.resume?.worker_launch_id || "");
+    if (
+      normalizedLaunchId
+      && expectedLaunchId
+      && expectedLaunchId !== normalizedLaunchId
+    ) {
+      return { ok: false, error: `run_id=${runId} detached worker launch identity does not match` };
+    }
+    if (persisted.resume?.worker_launch_committed === true) {
+      return { ok: true, persisted, launchId: expectedLaunchId || normalizedLaunchId };
+    }
+    await sleep(50);
+  }
+  return { ok: false, error: `run_id=${runId} detached worker launch was not committed` };
+}
+
+export async function runBossChatDetachedWorker({ runId, launchId = "" } = {}) {
   const normalizedRunId = normalizeRunId(runId);
   if (!normalizedRunId) return { ok: false, error: "run_id is required" };
+  const launchCommit = await waitForChatDetachedWorkerLaunchCommit(
+    normalizedRunId,
+    launchId
+  );
+  if (!launchCommit.ok) return launchCommit;
+  const effectiveLaunchId = launchCommit.launchId;
   const artifacts = getChatRunArtifacts(normalizedRunId);
   const spec = readJsonFile(artifacts?.detached_args_path || "");
   if (!spec) {
     const error = new Error(`Boss chat detached args were not found for run_id=${normalizedRunId}`);
-    markBossChatDetachedWorkerFailed(normalizedRunId, error, { code: "CHAT_WORKER_ARGS_MISSING" });
+    markBossChatDetachedWorkerFailed(normalizedRunId, error, {
+      code: "CHAT_WORKER_ARGS_MISSING",
+      workerLaunchId: effectiveLaunchId
+    });
     return { ok: false, error: error.message };
   }
+
+  const claimed = updatePersistedChatRun(normalizedRunId, (latest) => {
+    const latestState = normalizeText(latest.state || latest.status);
+    if (
+      TERMINAL_STATUSES.has(latestState)
+      || (
+        effectiveLaunchId
+        && normalizeText(latest.resume?.worker_launch_id || "") !== effectiveLaunchId
+      )
+      || latest.resume?.worker_launch_committed !== true
+    ) {
+      return {};
+    }
+    const now = new Date().toISOString();
+    return {
+      pid: process.pid,
+      updated_at: now,
+      heartbeat_at: now,
+      last_message: "Boss chat detached worker claimed the authorized launch.",
+      resume: {
+        worker_node_pid: process.pid,
+        worker_started_at: now,
+        worker_launch_id: effectiveLaunchId || null,
+        worker_launch_committed: true
+      }
+    };
+  });
+  if (
+    !claimed
+    || TERMINAL_STATUSES.has(normalizeText(claimed.state || claimed.status))
+    || (
+      effectiveLaunchId
+      && normalizeText(claimed.resume?.worker_launch_id || "") !== effectiveLaunchId
+    )
+    || claimed.resume?.worker_launch_committed !== true
+    || Number(claimed.resume?.worker_node_pid) !== process.pid
+  ) {
+    return {
+      ok: false,
+      error: `run_id=${normalizedRunId} detached worker could not claim the authorized launch`
+    };
+  }
+  writeBossMonitorProjectionNonfatal("chat", claimed, {
+    producer: true
+  });
 
   const started = await startBossChatRunInternal(spec.args || {}, {
     workspaceRoot: spec.workspace_root || "",
@@ -2059,7 +2425,8 @@ export async function runBossChatDetachedWorker({ runId } = {}) {
       retryable: true
     };
     markBossChatDetachedWorkerFailed(normalizedRunId, failedError, {
-      code: failedError.code || "CHAT_WORKER_START_FAILED"
+      code: failedError.code || "CHAT_WORKER_START_FAILED",
+      workerLaunchId: effectiveLaunchId
     });
     return { ok: false, error: failedError.message || "Boss chat detached worker failed to start." };
   }
@@ -2098,15 +2465,23 @@ export function getBossChatRunTool({ args = {} } = {}) {
     const normalizedRun = persistChatRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: normalizedRun
+      run: normalizedRun,
+      monitoring: createBossMonitoringBlock("chat", runId)
     }, runId);
   } catch {
     const persisted = readChatRunState(runId);
     if (persisted) {
       const reconciled = reconcilePersistedChatRun(persisted);
+      const hydrated = snapshotFromPersistedChatRun(reconciled.run);
+      writeBossMonitorProjectionNonfatal(
+        "chat",
+        { ...reconciled.run, checkpoint: hydrated.checkpoint },
+        { type: "backfill" }
+      );
       return {
         status: "RUN_STATUS",
         run: reconciled.run,
+        monitoring: createBossMonitoringBlock("chat", runId),
         persistence: {
           source: "disk",
           active_control_available: false,

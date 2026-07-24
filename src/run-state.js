@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { withRunStateFileLockSync } from "./core/run/state-file-lock.js";
 
 export const RUN_MODE_SYNC = "sync";
 export const RUN_MODE_ASYNC = "async";
@@ -9,6 +10,7 @@ export const RUN_MODE_ASYNC = "async";
 export const RUN_STATE_QUEUED = "queued";
 export const RUN_STATE_RUNNING = "running";
 export const RUN_STATE_PAUSED = "paused";
+export const RUN_STATE_CANCELING = "canceling";
 export const RUN_STATE_COMPLETED = "completed";
 export const RUN_STATE_FAILED = "failed";
 export const RUN_STATE_CANCELED = "canceled";
@@ -35,6 +37,7 @@ const VALID_RUN_STATES = new Set([
   RUN_STATE_QUEUED,
   RUN_STATE_RUNNING,
   RUN_STATE_PAUSED,
+  RUN_STATE_CANCELING,
   RUN_STATE_COMPLETED,
   RUN_STATE_FAILED,
   RUN_STATE_CANCELED
@@ -105,9 +108,21 @@ function safeReadJson(filePath) {
 
 function safeWriteJson(filePath, payload) {
   ensureRunsDir();
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tempPath, filePath);
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    fs.renameSync(tempPath, filePath);
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
 }
 
 function defaultProgress(progress = {}) {
@@ -205,9 +220,11 @@ export function createRunStateSnapshot({
   lastMessage = null,
   context = null,
   control = null,
-  resume = null
+  resume = null,
+  monitoringV1 = null
 } = {}) {
   const now = toIsoNow();
+  const normalizedMonitoringV1 = clonePlainObject(monitoringV1);
   return {
     run_id: normalizeRunId(runId) || createRunId(),
     mode: normalizeRunMode(mode),
@@ -222,17 +239,19 @@ export function createRunStateSnapshot({
     context: defaultContext(context),
     control: defaultControl(control),
     resume: defaultResume(resume),
+    ...(normalizedMonitoringV1 ? { monitoring_v1: normalizedMonitoringV1 } : {}),
     error: null,
     result: null
   };
 }
 
-export function writeRunState(snapshot) {
+function writeRunStateUnlocked(snapshot) {
   const runId = normalizeRunId(snapshot?.run_id);
   if (!runId) {
     throw new Error("run_id is required");
   }
   const now = toIsoNow();
+  const normalizedMonitoringV1 = clonePlainObject(snapshot.monitoring_v1);
   const payload = {
     run_id: runId,
     mode: normalizeRunMode(snapshot.mode),
@@ -247,6 +266,7 @@ export function writeRunState(snapshot) {
     context: defaultContext(snapshot.context),
     control: defaultControl(snapshot.control),
     resume: defaultResume(snapshot.resume),
+    ...(normalizedMonitoringV1 ? { monitoring_v1: normalizedMonitoringV1 } : {}),
     error: snapshot.error || null,
     result: snapshot.result || null
   };
@@ -254,9 +274,22 @@ export function writeRunState(snapshot) {
   return payload;
 }
 
+export function writeRunState(snapshot) {
+  const runId = normalizeRunId(snapshot?.run_id);
+  if (!runId) {
+    throw new Error("run_id is required");
+  }
+  const statePath = getRunStatePath(runId);
+  return withRunStateFileLockSync(
+    statePath,
+    () => writeRunStateUnlocked(snapshot)
+  );
+}
+
 export function readRunState(runId) {
   const payload = safeReadJson(getRunStatePath(runId));
   if (!payload) return null;
+  const normalizedMonitoringV1 = clonePlainObject(payload.monitoring_v1);
   return {
     run_id: normalizeRunId(payload.run_id),
     mode: normalizeRunMode(payload.mode),
@@ -271,54 +304,58 @@ export function readRunState(runId) {
     context: defaultContext(payload.context),
     control: defaultControl(payload.control),
     resume: defaultResume(payload.resume),
+    ...(normalizedMonitoringV1 ? { monitoring_v1: normalizedMonitoringV1 } : {}),
     error: payload.error || null,
     result: payload.result || null
   };
 }
 
 export function updateRunState(runId, updater) {
-  const current = readRunState(runId);
-  if (!current) return null;
-  const patch = typeof updater === "function" ? updater({ ...current }) : updater;
-  if (!patch || typeof patch !== "object") {
-    return current;
-  }
-  const now = toIsoNow();
-  const next = {
-    ...current,
-    ...patch,
-    run_id: current.run_id,
-    mode: normalizeRunMode(patch.mode ?? current.mode),
-    state: normalizeRunState(patch.state ?? current.state),
-    stage: normalizeRunStage(patch.stage ?? current.stage),
-    progress: defaultProgress({
-      ...current.progress,
-      ...(patch.progress || {})
-    }),
-    context: Object.prototype.hasOwnProperty.call(patch, "context")
-      ? defaultContext(patch.context)
-      : current.context,
-    control: defaultControl({
-      ...current.control,
-      ...(patch.control || {})
-    }),
-    resume: defaultResume({
-      ...current.resume,
-      ...(patch.resume || {})
-    }),
-    last_message: normalizeMessage(
-      Object.prototype.hasOwnProperty.call(patch, "last_message")
-        ? patch.last_message
-        : current.last_message
-    ),
-    updated_at: now,
-    heartbeat_at: String(
-      Object.prototype.hasOwnProperty.call(patch, "heartbeat_at")
-        ? (patch.heartbeat_at || now)
-        : current.heartbeat_at
-    )
-  };
-  return writeRunState(next);
+  const statePath = getRunStatePath(runId);
+  return withRunStateFileLockSync(statePath, () => {
+    const current = readRunState(runId);
+    if (!current) return null;
+    const patch = typeof updater === "function" ? updater({ ...current }) : updater;
+    if (!patch || typeof patch !== "object") {
+      return current;
+    }
+    const now = toIsoNow();
+    const next = {
+      ...current,
+      ...patch,
+      run_id: current.run_id,
+      mode: normalizeRunMode(patch.mode ?? current.mode),
+      state: normalizeRunState(patch.state ?? current.state),
+      stage: normalizeRunStage(patch.stage ?? current.stage),
+      progress: defaultProgress({
+        ...current.progress,
+        ...(patch.progress || {})
+      }),
+      context: Object.prototype.hasOwnProperty.call(patch, "context")
+        ? defaultContext(patch.context)
+        : current.context,
+      control: defaultControl({
+        ...current.control,
+        ...(patch.control || {})
+      }),
+      resume: defaultResume({
+        ...current.resume,
+        ...(patch.resume || {})
+      }),
+      last_message: normalizeMessage(
+        Object.prototype.hasOwnProperty.call(patch, "last_message")
+          ? patch.last_message
+          : current.last_message
+      ),
+      updated_at: now,
+      heartbeat_at: String(
+        Object.prototype.hasOwnProperty.call(patch, "heartbeat_at")
+          ? (patch.heartbeat_at || now)
+          : current.heartbeat_at
+      )
+    };
+    return writeRunStateUnlocked(next);
+  });
 }
 
 export function touchRunHeartbeat(runId, message = null) {

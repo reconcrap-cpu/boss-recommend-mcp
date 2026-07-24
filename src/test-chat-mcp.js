@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { __testables } from "./index.js";
+import { recordDetachedWorkerExit } from "./detached-worker.js";
 import {
   __setChatMcpSpawnForTests,
   __writeChatJsonAtomicForTests,
@@ -967,6 +968,18 @@ async function testChatDetachedChildAsyncErrorAndEarlyExitPersist() {
   assert.equal(errorState.heartbeat_at, errorStarted.run.heartbeat_at);
   assert.equal(errorState.recovery.worker_last_heartbeat_at, errorStarted.run.heartbeat_at);
   assert.equal(typeof errorState.recovery.reconciled_at, "string");
+  const errorMonitorRunDir = path.join(
+    process.env.BOSS_MONITOR_HOME,
+    "v1",
+    "runs",
+    "chat",
+    errorStarted.run_id
+  );
+  const errorPublicSnapshot = JSON.parse(
+    fs.readFileSync(path.join(errorMonitorRunDir, "snapshot.json"), "utf8")
+  );
+  assert.equal(errorPublicSnapshot.state, "failed");
+  assert.equal(errorPublicSnapshot.errors[0].code, "CHAT_WORKER_PROCESS_ERROR");
 
   const exitChild = makeChild();
   __setChatMcpSpawnForTests(() => exitChild);
@@ -975,12 +988,61 @@ async function testChatDetachedChildAsyncErrorAndEarlyExitPersist() {
     args: readyArgs({ delay_ms: 0 })
   });
   assert.equal(exitStarted.status, "ACCEPTED");
-  exitChild.emit("exit", 7, null);
+  const staleRecord = await recordDetachedWorkerExit({
+    domain: "chat",
+    runId: exitStarted.run_id,
+    launchId: "stale-chat-launch",
+    workerExitCode: 7,
+    workerPid: 777001,
+    supervisorPid: exitStarted.run.resume.worker_supervisor_pid
+  });
+  assert.deepEqual(staleRecord, { ok: true, persisted: false });
+  const recorded = await recordDetachedWorkerExit({
+    domain: "chat",
+    runId: exitStarted.run_id,
+    launchId: exitStarted.run.resume.worker_launch_id,
+    workerExitCode: 7,
+    workerPid: 777002,
+    supervisorPid: exitStarted.run.resume.worker_supervisor_pid
+  });
+  assert.deepEqual(recorded, { ok: true, persisted: true });
   const exitState = JSON.parse(fs.readFileSync(exitStarted.run.artifacts.run_state_path, "utf8"));
   assert.equal(exitState.status, "failed");
-  assert.equal(exitState.error.code, "CHAT_WORKER_EXITED_EARLY");
+  assert.equal(exitState.error.code, "DETACHED_WORKER_EXITED_EARLY");
   assert.equal(exitState.error.worker_exit_code, 7);
   assert.match(exitState.error.message, /code=7/);
+  const exitMonitorRunDir = path.join(
+    process.env.BOSS_MONITOR_HOME,
+    "v1",
+    "runs",
+    "chat",
+    exitStarted.run_id
+  );
+  const exitPublicSnapshot = JSON.parse(
+    fs.readFileSync(path.join(exitMonitorRunDir, "snapshot.json"), "utf8")
+  );
+  assert.equal(exitPublicSnapshot.state, "failed");
+  assert.equal(exitPublicSnapshot.errors[0].code, "DETACHED_WORKER_EXITED_EARLY");
+  const exitPublicSidecar = JSON.parse(
+    fs.readFileSync(path.join(exitMonitorRunDir, "worker-exit.json"), "utf8")
+  );
+  assert.equal(exitPublicSidecar.state, "failed");
+  assert.equal(
+    exitPublicSidecar.worker_instance_id,
+    exitPublicSnapshot.liveness.worker_instance_id
+  );
+  assert.equal(exitPublicSidecar.pid, exitPublicSnapshot.liveness.pid);
+  const exitPublicEvents = fs.readFileSync(
+    path.join(exitMonitorRunDir, "events.ndjson"),
+    "utf8"
+  ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(
+    exitPublicEvents.some((event) => (
+      event.type === "run.error"
+      && event.payload?.error?.code === "DETACHED_WORKER_EXITED_EARLY"
+    )),
+    true
+  );
 }
 
 async function testChatDetachedCollectCvBootstrapIncludesProcessingFloor() {
@@ -1044,8 +1106,77 @@ async function testChatDetachedChildExitDoesNotOverwriteTerminalState() {
   assert.equal(afterExit.error, null);
 }
 
+async function testChatDetachedMonitorStorageFailureDoesNotFailQueuedRun() {
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitorRuntimeHome = process.env.RECRUITING_MONITOR_HOME;
+  const invalidMonitorHome = path.join(process.env.BOSS_CHAT_HOME, "monitor-home-is-a-file");
+  fs.writeFileSync(invalidMonitorHome, "not a directory", "utf8");
+  process.env.BOSS_MONITOR_HOME = invalidMonitorHome;
+  process.env.RECRUITING_MONITOR_HOME = path.join(
+    process.env.BOSS_CHAT_HOME,
+    "monitor-runtime-unavailable"
+  );
+  const child = new EventEmitter();
+  child.pid = process.pid;
+  child.unref = () => {};
+  __setChatMcpSpawnForTests(() => child);
+  try {
+    const started = await startBossChatDetachedRunTool({
+      workspaceRoot: process.cwd(),
+      args: readyArgs({ delay_ms: 0 })
+    });
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.state, "queued");
+    assert.equal(started.monitoring.availability, "monitor_unavailable");
+    assert.equal(started.run.monitoring_v1, undefined);
+    const persisted = JSON.parse(fs.readFileSync(started.run.artifacts.run_state_path, "utf8"));
+    assert.equal(persisted.state, "queued");
+    assert.equal(persisted.monitoring_v1, undefined);
+  } finally {
+    __setChatMcpSpawnForTests(null);
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitorRuntimeHome === undefined) {
+      delete process.env.RECRUITING_MONITOR_HOME;
+    } else {
+      process.env.RECRUITING_MONITOR_HOME = previousMonitorRuntimeHome;
+    }
+  }
+}
+
 async function testChatDetachedWorkerSnapshotReplacesBootstrapPid() {
-  installFakeConnector();
+  let releaseConnector;
+  let resolveConnectorReached;
+  const connectorGate = new Promise((resolve) => {
+    releaseConnector = resolve;
+  });
+  const connectorReached = new Promise((resolve) => {
+    resolveConnectorReached = resolve;
+  });
+  setChatMcpConnectorForTests(async () => {
+    resolveConnectorReached();
+    await connectorGate;
+    return {
+      client: { guarded: true },
+      target: {
+        id: "fake-chat-detached-target",
+        url: "https://www.zhipin.com/web/chat/index",
+        type: "page"
+      },
+      methodLog: [],
+      navigation: {
+        navigated: false,
+        url: "https://www.zhipin.com/web/chat/index"
+      },
+      health: {
+        status: "healthy"
+      },
+      async close() {}
+    };
+  });
   setChatMcpWorkflowForTests(async (options, runControl) => {
     assert.equal(options.targetPassCount, 1);
     runControl.setPhase("chat:test-worker-pid");
@@ -1078,7 +1209,13 @@ async function testChatDetachedWorkerSnapshotReplacesBootstrapPid() {
   const bootstrap = new EventEmitter();
   bootstrap.pid = bootstrapPid;
   bootstrap.unref = () => {};
-  __setChatMcpSpawnForTests(() => bootstrap);
+  let concurrentWorkerPromise = null;
+  __setChatMcpSpawnForTests((_command, workerArgs) => {
+    const runId = workerArgs[workerArgs.indexOf("--run-id") + 1];
+    const launchId = workerArgs[workerArgs.indexOf("--launch-id") + 1];
+    concurrentWorkerPromise = runBossChatDetachedWorker({ runId, launchId });
+    return bootstrap;
+  });
 
   const started = await startBossChatDetachedRunTool({
     workspaceRoot: process.cwd(),
@@ -1088,22 +1225,69 @@ async function testChatDetachedWorkerSnapshotReplacesBootstrapPid() {
   const statePath = started.run.artifacts.run_state_path;
   const bootstrapState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(bootstrapState.pid, bootstrapPid);
+  assert.equal(bootstrapState.state, "queued");
+  assert.equal(bootstrapState.resume.worker_launch_committed, true);
 
-  const workerResult = await runBossChatDetachedWorker({ runId: started.run_id });
+  assert.equal(await Promise.race([
+    connectorReached.then(() => true),
+    sleep(3000).then(() => false)
+  ]), true);
+  const preflightMonitorRunDir = path.join(
+    process.env.BOSS_MONITOR_HOME,
+    "v1",
+    "runs",
+    "chat",
+    started.run_id
+  );
+  const preflightProjection = JSON.parse(
+    fs.readFileSync(path.join(preflightMonitorRunDir, "snapshot.json"), "utf8")
+  );
+  assert.ok(preflightProjection.revision >= 2);
+  assert.equal(preflightProjection.state, "queued");
+  assert.equal(preflightProjection.liveness.status, "alive");
+
+  releaseConnector();
+  assert.ok(concurrentWorkerPromise);
+  const workerResult = await concurrentWorkerPromise;
   assert.equal(workerResult.ok, true);
   const workerState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(workerState.pid, process.pid);
   assert.notEqual(workerState.pid, bootstrapPid);
   assert.equal(workerState.status, "completed");
+  const monitorRunDir = path.join(
+    process.env.BOSS_MONITOR_HOME,
+    "v1",
+    "runs",
+    "chat",
+    started.run_id
+  );
+  const publicEvents = fs.readFileSync(
+    path.join(monitorRunDir, "events.ndjson"),
+    "utf8"
+  ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(publicEvents[0]?.type, "run.created");
+  assert.equal(publicEvents[0]?.payload?.state, "queued");
+  assert.equal(
+    publicEvents.some((event) => (
+      event.type === "run.state_changed"
+      && event.payload?.from === "running"
+      && event.payload?.to === "queued"
+    )),
+    false
+  );
 }
 
 async function main() {
   const previousHome = process.env.BOSS_CHAT_HOME;
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitoringEnabled = process.env.BOSS_MONITORING_ENABLED;
   const previousScreenConfig = process.env.BOSS_RECOMMEND_SCREEN_CONFIG;
   const previousOutputDir = process.env.TEST_BOSS_OUTPUT_DIR;
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "boss-chat-mcp-test-"));
   const outputDir = path.join(tempHome, "configured-output");
   process.env.BOSS_CHAT_HOME = tempHome;
+  process.env.BOSS_MONITOR_HOME = path.join(tempHome, "monitor-projection");
+  process.env.BOSS_MONITORING_ENABLED = "true";
   process.env.TEST_BOSS_OUTPUT_DIR = outputDir;
   const configPath = path.join(tempHome, "screening-config.json");
   fs.writeFileSync(configPath, JSON.stringify({
@@ -1173,6 +1357,8 @@ async function main() {
     resetChatMcpStateForTests();
     await testChatDetachedChildExitDoesNotOverwriteTerminalState();
     resetChatMcpStateForTests();
+    await testChatDetachedMonitorStorageFailureDoesNotFailQueuedRun();
+    resetChatMcpStateForTests();
     await testChatDetachedWorkerSnapshotReplacesBootstrapPid();
     console.log("chat MCP tests passed");
   } finally {
@@ -1181,6 +1367,16 @@ async function main() {
       delete process.env.BOSS_CHAT_HOME;
     } else {
       process.env.BOSS_CHAT_HOME = previousHome;
+    }
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitoringEnabled === undefined) {
+      delete process.env.BOSS_MONITORING_ENABLED;
+    } else {
+      process.env.BOSS_MONITORING_ENABLED = previousMonitoringEnabled;
     }
     if (previousScreenConfig === undefined) {
       delete process.env.BOSS_RECOMMEND_SCREEN_CONFIG;

@@ -12,7 +12,9 @@ import {
   compactRecommendRunForStatus,
   getRecommendEmptyBootstrapPreflightAction,
   isRecommendConnectorHealthAccepted,
+  pauseRecommendPipelineRunTool,
   resolveRecommendActionJournalScope,
+  resumeRecommendPipelineRunTool,
   shouldPreserveRecommendDetailOnTerminal
 } from "./recommend-mcp.js";
 
@@ -1260,6 +1262,60 @@ async function testRecommendFinalConfirmedPayloadStartsAccepted() {
   assert.equal(observedOptions.humanBehavior.restLevel, "high");
 }
 
+async function testRecommendMonitorStorageFailureDoesNotFailLegacyRun() {
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitorRuntimeHome = process.env.RECRUITING_MONITOR_HOME;
+  const invalidMonitorHome = path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-home-is-a-file");
+  fs.writeFileSync(invalidMonitorHome, "not a directory", "utf8");
+  process.env.BOSS_MONITOR_HOME = invalidMonitorHome;
+  process.env.RECRUITING_MONITOR_HOME = path.join(
+    process.env.BOSS_RECOMMEND_HOME,
+    "monitor-runtime-unavailable"
+  );
+  installFakeConnector();
+  setRecommendMcpWorkflowForTests(async (options, runControl) => {
+    runControl.setPhase("recommend:monitor-storage-unavailable");
+    runControl.updateProgress({
+      target_count: options.maxCandidates,
+      processed: 1,
+      screened: 1,
+      passed: 0
+    });
+    return {
+      domain: "recommend",
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      results: []
+    };
+  });
+  try {
+    const started = await callTool(TOOL_START, readyArgs({ delay_ms: 0 }), 152_1);
+    assert.equal(started.status, "ACCEPTED");
+    assert.equal(started.monitoring.availability, "monitor_unavailable");
+    assert.equal(started.run.monitoring_v1, undefined);
+    const completed = await waitForRecommendRun(
+      started.run_id,
+      (run) => run?.status === "completed"
+    );
+    assert.equal(completed.status, "completed");
+    const persisted = JSON.parse(fs.readFileSync(completed.artifacts.run_state_path, "utf8"));
+    assert.equal(persisted.state, "completed");
+    assert.equal(persisted.monitoring_v1, undefined);
+  } finally {
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitorRuntimeHome === undefined) {
+      delete process.env.RECRUITING_MONITOR_HOME;
+    } else {
+      process.env.RECRUITING_MONITOR_HOME = previousMonitorRuntimeHome;
+    }
+  }
+}
+
 async function testRunRecommendAliasStartsAccepted() {
   installFakeConnector();
   let observedOptions = null;
@@ -1821,6 +1877,73 @@ async function testRecommendAsyncPauseResumeCancel() {
   assert.equal(diskPayload.persistence.source, "disk");
   assert.equal(diskPayload.persistence.active_control_available, false);
   assert.equal(connector.closeCount >= 1, true);
+}
+
+function testRecommendDirectDetachedPauseResumePersistsControl() {
+  resetRecommendMcpStateForTests();
+  const runId = "mcp_recommend_direct_detached_control_test";
+  const runsDir = path.join(process.env.BOSS_RECOMMEND_HOME, "runs");
+  const statePath = path.join(runsDir, `${runId}.json`);
+  const startedAt = new Date(Date.now() - 5_000).toISOString();
+  fs.mkdirSync(runsDir, { recursive: true });
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    run_id: runId,
+    state: "running",
+    status: "running",
+    stage: "recommend:detail",
+    started_at: startedAt,
+    updated_at: startedAt,
+    heartbeat_at: startedAt,
+    pid: process.pid,
+    progress: {
+      target_count: 3,
+      processed: 1,
+      screened: 1,
+      passed: 0,
+      skipped: 1,
+      greet_count: 0
+    },
+    control: {
+      pause_requested: false,
+      pause_requested_at: null,
+      pause_requested_by: null,
+      cancel_requested: false
+    }
+  }, null, 2)}\n`, "utf8");
+
+  const paused = pauseRecommendPipelineRunTool({ args: { run_id: runId } });
+  assert.equal(paused.status, "PAUSE_REQUESTED");
+  assert.equal(paused.persistence.source, "disk");
+  assert.equal(paused.persistence.active_control_available, false);
+  assert.equal(paused.persistence.detached_control_requested, true);
+  assert.equal(paused.run.control.pause_requested, true);
+  assert.equal(paused.run.control.pause_requested_by, "pause_recommend_pipeline_run");
+  assert.equal(paused.run.control.cancel_requested, false);
+  const pausePersisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(pausePersisted.control.pause_requested, true);
+  assert.equal(pausePersisted.control.pause_requested_by, "pause_recommend_pipeline_run");
+
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    ...pausePersisted,
+    state: "paused",
+    status: "paused",
+    updated_at: new Date().toISOString()
+  }, null, 2)}\n`, "utf8");
+  const resumed = resumeRecommendPipelineRunTool({ args: { run_id: runId } });
+  assert.equal(resumed.status, "RESUME_REQUESTED");
+  assert.equal(resumed.persistence.source, "disk");
+  assert.equal(resumed.persistence.active_control_available, false);
+  assert.equal(resumed.persistence.detached_control_requested, true);
+  assert.equal(resumed.run.control.pause_requested, false);
+  assert.equal(resumed.run.control.pause_requested_at, null);
+  assert.equal(resumed.run.control.pause_requested_by, null);
+  assert.equal(resumed.run.control.cancel_requested, false);
+  const resumePersisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(resumePersisted.control.pause_requested, false);
+  assert.equal(resumePersisted.control.pause_requested_at, null);
+  assert.equal(resumePersisted.control.pause_requested_by, null);
+  assert.equal(resumePersisted.control.cancel_requested, false);
+  fs.rmSync(statePath, { force: true });
 }
 
 async function testRecommendActiveRunPersistsProgressToDisk() {
@@ -2543,11 +2666,15 @@ async function testRecommendOptionalArtifactFailuresDoNotBlockTerminalState() {
   fs.mkdirSync(outputDir, { recursive: true });
   const csvPath = path.join(outputDir, `${started.run_id}.results.csv`);
   const reportPath = path.join(outputDir, `${started.run_id}.report.json`);
-  const blockers = [`${csvPath}.tmp`, `${reportPath}.tmp`];
+  const blockers = [`${csvPath}.tmp`, reportPath];
   for (const blocker of blockers) fs.mkdirSync(blocker, { recursive: true });
   try {
     releaseWorkflow();
-    const completed = await waitForRecommendRun(started.run_id, (run) => run?.state === "completed");
+    const completed = await waitForRecommendRun(
+      started.run_id,
+      (run) => run?.state === "completed" && run?.artifact_warnings?.length === 2
+    );
+    for (const blocker of blockers) fs.rmSync(blocker, { recursive: true, force: true });
     assert.equal(completed.state, "completed");
     assert.deepEqual(
       completed.artifact_warnings.map((warning) => warning.artifact).sort(),
@@ -2716,6 +2843,46 @@ async function testRecommendSupervisorExitRecorderMarksFailureImmediately() {
     assert.equal(payload.run.recovery.classification, "worker_process_exited");
     assert.equal(payload.run.recovery.automatic_restart_allowed, false);
     assert.equal(payload.run.recovery.requires_durable_action_journal_audit, true);
+    const monitorRunDir = path.join(
+      process.env.BOSS_MONITOR_HOME
+        || path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-projection"),
+      "v1",
+      "runs",
+      "recommend",
+      started.run_id
+    );
+    const publicSnapshot = JSON.parse(
+      fs.readFileSync(path.join(monitorRunDir, "snapshot.json"), "utf8")
+    );
+    assert.equal(publicSnapshot.state, "failed");
+    assert.equal(publicSnapshot.errors[0].code, "DETACHED_WORKER_EXITED_EARLY");
+    const publicExit = JSON.parse(
+      fs.readFileSync(path.join(monitorRunDir, "worker-exit.json"), "utf8")
+    );
+    assert.equal(publicExit.state, "failed");
+    assert.equal(
+      publicExit.worker_instance_id,
+      publicSnapshot.liveness.worker_instance_id
+    );
+    assert.equal(publicExit.pid, publicSnapshot.liveness.pid);
+    const publicEvents = fs.readFileSync(
+      path.join(monitorRunDir, "events.ndjson"),
+      "utf8"
+    ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(
+      publicEvents.some((event) => (
+        event.type === "run.state_changed"
+        && event.payload?.to === "failed"
+      )),
+      true
+    );
+    assert.equal(
+      publicEvents.some((event) => (
+        event.type === "run.error"
+        && event.payload?.error?.code === "DETACHED_WORKER_EXITED_EARLY"
+      )),
+      true
+    );
     const lateWorker = await runDetachedWorkerForTests({
       runId: started.run_id,
       workerPid: 476546,
@@ -2743,14 +2910,27 @@ async function testRecommendSupervisorExitRecorderMarksFailureImmediately() {
 async function testRecommendDetachedStartUsesWorkerProcess() {
   const previousDetached = process.env.BOSS_RECOMMEND_CDP_DETACHED;
   const previousInproc = process.env.BOSS_RECOMMEND_CDP_INPROC;
+  const previousMonitorHome = process.env.BOSS_MONITOR_HOME;
+  const previousMonitoringEnabled = process.env.BOSS_MONITORING_ENABLED;
   process.env.BOSS_RECOMMEND_CDP_INPROC = "0";
   process.env.BOSS_RECOMMEND_CDP_DETACHED = "1";
+  process.env.BOSS_MONITOR_HOME = path.join(
+    process.env.BOSS_RECOMMEND_HOME,
+    "detached-start-monitor"
+  );
+  process.env.BOSS_MONITORING_ENABLED = "true";
   let launcherOptions = null;
+  let concurrentWorkerPromise = null;
   let unrefCalled = false;
   let connectOptions = null;
   let workflowOptions = null;
   setRecommendDetachedWorkerLauncherForTests((options) => {
     launcherOptions = options;
+    concurrentWorkerPromise = runDetachedWorkerForTests({
+      runId: options.runId,
+      workerPid: 456789,
+      launchId: options.launchId
+    });
     return {
       pid: 456789,
       unref() {
@@ -2818,13 +2998,30 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(launcherOptions.exitStatusPath, started.run.resume.worker_exit_status_path);
     assert.equal(path.isAbsolute(launcherOptions.recommendRuntimeHomePath), true);
     assert.equal(path.isAbsolute(launcherOptions.screenConfigPath), true);
+    assert.equal(started.monitoring.ref.provider, "boss");
+    assert.equal(started.monitoring.ref.kind, "recommend");
+    assert.equal(started.monitoring.ref.run_id, started.run_id);
+    assert.equal(started.monitoring.contract_version, "1.0");
+    assert.equal(started.run.monitoring_v1.contract_version, "1.0");
+    const monitorHome = process.env.BOSS_MONITOR_HOME
+      || path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-projection");
+    const queuedProjectionPath = path.join(
+      monitorHome,
+      "v1",
+      "runs",
+      "recommend",
+      started.run_id,
+      "snapshot.json"
+    );
+    assert.equal(fs.existsSync(queuedProjectionPath), true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(queuedProjectionPath, "utf8")).state,
+      "queued"
+    );
     assert.equal(started.run.context.args.overrides.job, startArgs.overrides.job);
 
-    const workerResult = await runDetachedWorkerForTests({
-      runId: started.run_id,
-      workerPid: 456789,
-      launchId: started.run.resume.worker_launch_id
-    });
+    assert.ok(concurrentWorkerPromise);
+    const workerResult = await concurrentWorkerPromise;
     assert.equal(workerResult.ok, true);
     assert.equal(connectOptions.port, 9777);
     assert.equal(connectOptions.slowLive, true);
@@ -2836,6 +3033,21 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
     assert.equal(completed.run.state, "completed");
     assert.equal(completed.run.pid, process.pid);
     assert.equal(completed.run.progress.processed, 1);
+    const projectionEvents = fs.readFileSync(
+      path.join(path.dirname(queuedProjectionPath), "events.ndjson"),
+      "utf8"
+    ).trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(projectionEvents[0]?.type, "run.created");
+    assert.equal(projectionEvents[0]?.payload?.state, "queued");
+    assert.equal(
+      projectionEvents.some((event) => (
+        event.type === "run.state_changed"
+        && event.payload?.from === "running"
+        && event.payload?.to === "queued"
+      )),
+      false,
+      "a fast detached worker must never be overwritten by a stale queued projection"
+    );
   } finally {
     setRecommendDetachedWorkerLauncherForTests(null);
     if (previousDetached === undefined) {
@@ -2847,6 +3059,16 @@ async function testRecommendDetachedStartUsesWorkerProcess() {
       delete process.env.BOSS_RECOMMEND_CDP_INPROC;
     } else {
       process.env.BOSS_RECOMMEND_CDP_INPROC = previousInproc;
+    }
+    if (previousMonitorHome === undefined) {
+      delete process.env.BOSS_MONITOR_HOME;
+    } else {
+      process.env.BOSS_MONITOR_HOME = previousMonitorHome;
+    }
+    if (previousMonitoringEnabled === undefined) {
+      delete process.env.BOSS_MONITORING_ENABLED;
+    } else {
+      process.env.BOSS_MONITORING_ENABLED = previousMonitoringEnabled;
     }
   }
 }
@@ -2892,6 +3114,31 @@ async function testRecommendAmbiguousLauncherFailureCannotReviveRun() {
     assert.equal(workflowCalls, 0);
     const persisted = await callTool(TOOL_GET, { run_id: capturedRunId }, 333_2);
     assert.equal(persisted.run.state, "failed");
+    const monitorHome = process.env.BOSS_MONITOR_HOME
+      || path.join(process.env.BOSS_RECOMMEND_HOME, "monitor-projection");
+    const projection = JSON.parse(fs.readFileSync(path.join(
+      monitorHome,
+      "v1",
+      "runs",
+      "recommend",
+      capturedRunId,
+      "snapshot.json"
+    ), "utf8"));
+    assert.equal(projection.state, "failed");
+    assert.equal(projection.errors[0].code, "RUN_WORKER_LAUNCH_FAILED");
+    const projectionExit = JSON.parse(fs.readFileSync(path.join(
+      monitorHome,
+      "v1",
+      "runs",
+      "recommend",
+      capturedRunId,
+      "worker-exit.json"
+    ), "utf8"));
+    assert.equal(projectionExit.state, "failed");
+    assert.equal(
+      projectionExit.worker_instance_id,
+      projection.liveness.worker_instance_id
+    );
   } finally {
     setRecommendDetachedWorkerLauncherForTests(null);
     if (previousDetached === undefined) {
@@ -3491,6 +3738,8 @@ async function main() {
     resetRecommendMcpStateForTests();
     await testRecommendFinalConfirmedPayloadStartsAccepted();
     resetRecommendMcpStateForTests();
+    await testRecommendMonitorStorageFailureDoesNotFailLegacyRun();
+    resetRecommendMcpStateForTests();
     await testRunRecommendAliasStartsAccepted();
     resetRecommendMcpStateForTests();
     await testRecommendScheduleFinalConfirmedPayloadUsesPackageScheduler();
@@ -3520,6 +3769,8 @@ async function main() {
     await testRecommendHumanBehaviorArgsOverrideConfig();
     resetRecommendMcpStateForTests();
     await testRecommendAsyncPauseResumeCancel();
+    resetRecommendMcpStateForTests();
+    testRecommendDirectDetachedPauseResumePersistsControl();
     resetRecommendMcpStateForTests();
     await testRecommendActiveRunPersistsProgressToDisk();
     resetRecommendMcpStateForTests();

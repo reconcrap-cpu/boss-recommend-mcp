@@ -25,6 +25,7 @@ async function testSnapshotHookPersistsProgressAndCheckpointEvents() {
       events.push({
         type: event.type,
         status: snapshot.status,
+        phase: snapshot.phase,
         progress: snapshot.progress,
         checkpoint: snapshot.checkpoint
       });
@@ -33,6 +34,7 @@ async function testSnapshotHookPersistsProgressAndCheckpointEvents() {
   const started = manager.startRun({
     name: "snapshot-hook",
     task: async (run) => {
+      run.setPhase("test:phase");
       run.updateProgress({ processed: 1 });
       run.checkpoint({ results: [{ index: 0 }] });
       return { processed: 1 };
@@ -41,6 +43,7 @@ async function testSnapshotHookPersistsProgressAndCheckpointEvents() {
   const final = await manager.waitForRun(started.runId);
   assert.equal(final.status, RUN_STATUS_COMPLETED);
   assert.equal(events.some((event) => event.type === "progress" && event.progress.processed === 1), true);
+  assert.equal(events.some((event) => event.type === "phase" && event.phase === "test:phase"), true);
   assert.equal(events.some((event) => event.type === "checkpoint" && event.checkpoint.results?.length === 1), true);
   assert.equal(events.some((event) => event.type === "status" && event.status === RUN_STATUS_COMPLETED), true);
 }

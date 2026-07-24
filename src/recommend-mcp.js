@@ -53,12 +53,18 @@ import {
   getCandidateResultJournalPath,
   readCandidateResultJournal
 } from "./core/run/candidate-result-journal.js";
+import { withRunStateFileLockSync } from "./core/run/state-file-lock.js";
 import {
   resolveBossConfiguredOutputDir,
   resolveHumanBehaviorForRun,
   resolveBossScreeningConfig
 } from "./chat-runtime-config.js";
 import { DEFAULT_MAX_IMAGE_PAGES } from "./core/cv-acquisition/index.js";
+import {
+  createBossMonitorSourceMarker,
+  createBossMonitoringBlock,
+  writeBossMonitorProjectionNonfatal
+} from "./monitor/projection.js";
 
 const DEFAULT_RECOMMEND_HOST = "127.0.0.1";
 const DEFAULT_RECOMMEND_PORT = 9222;
@@ -68,6 +74,9 @@ const TARGET_COUNT_SEMANTICS = "target_count means candidates that pass screenin
 const RUN_MODE_ASYNC = "async";
 const REST_LEVEL_OPTIONS = ["low", "medium", "high"];
 const REST_LEVEL_SET = new Set(REST_LEVEL_OPTIONS);
+const RECOMMEND_ATOMIC_RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RECOMMEND_ATOMIC_RENAME_RETRY_DELAYS_MS = Object.freeze([25, 50, 100, 200, 400, 500]);
+const RECOMMEND_ATOMIC_RENAME_SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
 
 const TERMINAL_STATUSES = new Set([
   RUN_STATUS_COMPLETED,
@@ -699,9 +708,42 @@ function ensureDirectory(dirPath) {
 
 function writeJsonAtomic(filePath, payload) {
   ensureDirectory(path.dirname(filePath));
-  const tempPath = `${filePath}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
-  fs.renameSync(tempPath, filePath);
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let renameAttempt = 0;
+  try {
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600
+    });
+    while (true) {
+      try {
+        fs.renameSync(tempPath, filePath);
+        return;
+      } catch (error) {
+        const retryDelayMs = RECOMMEND_ATOMIC_RENAME_RETRY_DELAYS_MS[renameAttempt];
+        renameAttempt += 1;
+        if (
+          !RECOMMEND_ATOMIC_RENAME_RETRY_CODES.has(error?.code)
+          || retryDelayMs === undefined
+        ) {
+          throw error;
+        }
+        Atomics.wait(
+          RECOMMEND_ATOMIC_RENAME_SLEEP_CELL,
+          0,
+          0,
+          retryDelayMs
+        );
+      }
+    }
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
 }
 
 function readJsonFile(filePath) {
@@ -1855,13 +1897,25 @@ function coerceCanceledTerminalSnapshot(normalized, existing) {
 }
 
 function persistRecommendRunSnapshot(snapshot, {
-  persistActiveCheckpoint = false
+  persistActiveCheckpoint = false,
+  monitorEvent = {}
 } = {}) {
   let normalized = normalizeRunSnapshot(snapshot);
   if (!normalized?.run_id) return normalized;
   const artifacts = getRecommendRunArtifacts(normalized.run_id);
   if (!artifacts) return normalized;
+  const persisted = withRunStateFileLockSync(artifacts.run_state_path, () => {
   const existing = readJsonFile(artifacts.run_state_path);
+  const existingMonitorMarker = plainRecord(existing?.monitoring_v1);
+  const normalizedMonitorMarker = plainRecord(normalized?.monitoring_v1);
+  const monitorMarker = existingMonitorMarker.contract_version === "1.0"
+    ? existingMonitorMarker
+    : normalizedMonitorMarker.contract_version === "1.0"
+      ? normalizedMonitorMarker
+      : monitorEvent?.v1_created === true
+        ? createBossMonitorSourceMarker(normalized.started_at || normalized.updated_at)
+        : null;
+  if (monitorMarker) normalized.monitoring_v1 = monitorMarker;
   normalized.resume = {
     ...plainRecord(existing?.resume),
     ...plainRecord(normalized.resume)
@@ -1910,6 +1964,7 @@ function persistRecommendRunSnapshot(snapshot, {
     result: value.result,
     summary: value.summary,
     checkpoint: value.checkpoint,
+    monitoring_v1: value.monitoring_v1,
     artifact_warnings: value.artifact_warnings,
     artifacts: value.artifacts,
     ...cdpEvidence
@@ -1940,7 +1995,10 @@ function persistRecommendRunSnapshot(snapshot, {
       }
     }
   }
-  return normalized;
+    return normalized;
+  });
+  writeBossMonitorProjectionNonfatal("recommend", persisted, monitorEvent);
+  return persisted;
 }
 
 function patchPersistedRecommendRunControl(runId, controlPatch = {}, {
@@ -1948,22 +2006,24 @@ function patchPersistedRecommendRunControl(runId, controlPatch = {}, {
 } = {}) {
   const artifacts = getRecommendRunArtifacts(runId);
   if (!artifacts) return null;
-  const current = readJsonFile(artifacts.run_state_path);
-  const state = normalizeText(current?.state || current?.status || "");
-  if (!current || TERMINAL_STATUSES.has(state)) return null;
-  const now = new Date().toISOString();
-  const patched = {
-    ...current,
-    updated_at: now,
-    heartbeat_at: current.heartbeat_at || now,
-    last_message: message || current.last_message || "",
-    control: {
-      ...(current.control || {}),
-      ...controlPatch
-    }
-  };
-  writeJsonAtomic(artifacts.run_state_path, patched);
-  return patched;
+  return withRunStateFileLockSync(artifacts.run_state_path, () => {
+    const current = readJsonFile(artifacts.run_state_path);
+    const state = normalizeText(current?.state || current?.status || "");
+    if (!current || TERMINAL_STATUSES.has(state)) return null;
+    const now = new Date().toISOString();
+    const patched = {
+      ...current,
+      updated_at: now,
+      heartbeat_at: current.heartbeat_at || now,
+      last_message: message || current.last_message || "",
+      control: {
+        ...(current.control || {}),
+        ...controlPatch
+      }
+    };
+    writeJsonAtomic(artifacts.run_state_path, patched);
+    return patched;
+  });
 }
 
 function reconcilePersistedRecommendRunIfNeeded(persisted) {
@@ -2041,7 +2101,8 @@ function reconcilePersistedRecommendRunIfNeeded(persisted) {
 
 function persistRecommendLifecycleSnapshot(snapshot, event = {}) {
   return persistRecommendRunSnapshot(snapshot, {
-    persistActiveCheckpoint: event?.type === "checkpoint"
+    persistActiveCheckpoint: event?.type === "checkpoint",
+    monitorEvent: { ...event, producer: true }
   });
 }
 
@@ -3190,7 +3251,9 @@ async function startRecommendPipelineRunInternal(args = {}, { workspaceRoot = ""
     health: session.health || null
   });
   trackRecommendRun(started.runId);
-  const persistedStarted = persistRecommendRunSnapshot(started);
+  const persistedStarted = persistRecommendRunSnapshot(started, {
+    monitorEvent: { type: "created", producer: true, v1_created: true }
+  });
 
   return {
     status: "ACCEPTED",
@@ -3286,7 +3349,10 @@ export function prepareRecommendPipelineRunTool({ workspaceRoot = "", args = {} 
 export async function startRecommendPipelineRunTool({ workspaceRoot = "", args = {}, runId = "" } = {}) {
   const started = await startRecommendPipelineRunInternal(args, { workspaceRoot, runId });
   if (started.status !== "ACCEPTED") return started;
-  return attachMethodEvidence(started, started.run_id);
+  return {
+    ...attachMethodEvidence(started, started.run_id),
+    monitoring: createBossMonitoringBlock("recommend", started.run_id)
+  };
 }
 
 export function getRecommendPipelineRunTool({ args = {} } = {}) {
@@ -3306,16 +3372,27 @@ export function getRecommendPipelineRunTool({ args = {} } = {}) {
     const normalizedRun = persistRecommendRunSnapshot(run);
     return attachMethodEvidence({
       status: "RUN_STATUS",
-      run: compactRecommendRunForStatus(normalizedRun)
+      run: compactRecommendRunForStatus(normalizedRun),
+      monitoring: createBossMonitoringBlock("recommend", runId)
     }, runId);
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
       const reconciled = compactRecommendRunForStatus(reconcilePersistedRecommendRunIfNeeded(persisted));
       const persistedEvidence = readRecommendRunState(runId) || persisted;
+      const artifacts = getRecommendRunArtifacts(runId);
+      const checkpoint = readJsonFile(artifacts?.checkpoint_path) || persistedEvidence.checkpoint || {};
+      const journalResults = checkpoint?.candidate_result_journal
+        ? readRecommendCandidateResultJournalForArtifacts(runId).snapshot?.results || []
+        : [];
+      writeBossMonitorProjectionNonfatal("recommend", {
+        ...persistedEvidence,
+        checkpoint: journalResults.length ? { ...checkpoint, results: journalResults } : checkpoint
+      }, { type: "backfill" });
       return attachPersistedCdpEvidence({
         status: "RUN_STATUS",
         run: reconciled,
+        monitoring: createBossMonitoringBlock("recommend", runId),
         persistence: {
           source: "disk",
           active_control_available: false,
@@ -3370,6 +3447,34 @@ export function pauseRecommendPipelineRunTool({ args = {} } = {}) {
         message: "目标任务已结束，无需暂停。"
       }, persisted);
     }
+    if (persisted) {
+      const reconciled = reconcilePersistedRecommendRunIfNeeded(persisted);
+      const reconciledState = normalizeText(reconciled?.state || reconciled?.status);
+      if (TERMINAL_STATUSES.has(reconciledState)) {
+        return getRecommendPipelineRunTool({ args });
+      }
+      const pauseMessage = "暂停请求已写入 detached recommend run 控制文件。";
+      const patched = patchPersistedRecommendRunControl(runId, {
+        pause_requested: true,
+        pause_requested_at: new Date().toISOString(),
+        pause_requested_by: "pause_recommend_pipeline_run",
+        cancel_requested: false
+      }, {
+        message: pauseMessage
+      });
+      if (patched) {
+        return attachPersistedCdpEvidence({
+          status: "PAUSE_REQUESTED",
+          run: compactRecommendRunForStatus(patched),
+          message: pauseMessage,
+          persistence: {
+            source: "disk",
+            active_control_available: false,
+            detached_control_requested: true
+          }
+        }, patched);
+      }
+    }
     return getRecommendPipelineRunTool({ args });
   }
 }
@@ -3418,21 +3523,47 @@ export function resumeRecommendPipelineRunTool({ args = {} } = {}) {
   } catch {
     const persisted = readRecommendRunState(runId);
     if (persisted) {
+      const reconciled = reconcilePersistedRecommendRunIfNeeded(persisted);
+      const reconciledState = normalizeText(reconciled?.state || reconciled?.status);
+      if (!TERMINAL_STATUSES.has(reconciledState)) {
+        const resumeMessage = "恢复请求已写入 detached recommend run 控制文件。";
+        const patched = patchPersistedRecommendRunControl(runId, {
+          pause_requested: false,
+          pause_requested_at: null,
+          pause_requested_by: null,
+          cancel_requested: false
+        }, {
+          message: resumeMessage
+        });
+        if (patched) {
+          return attachPersistedCdpEvidence({
+            status: "RESUME_REQUESTED",
+            run: compactRecommendRunForStatus(patched),
+            poll_after_sec: DEFAULT_RECOMMEND_POLL_AFTER_SEC,
+            message: resumeMessage,
+            persistence: {
+              source: "disk",
+              active_control_available: false,
+              detached_control_requested: true
+            }
+          }, patched);
+        }
+      }
       return attachPersistedCdpEvidence({
         status: "FAILED",
         error: {
-          code: TERMINAL_STATUSES.has(persisted.state) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
-          message: TERMINAL_STATUSES.has(persisted.state)
+          code: TERMINAL_STATUSES.has(reconciledState) ? "RUN_ALREADY_TERMINATED" : "RUN_NOT_ACTIVE",
+          message: TERMINAL_STATUSES.has(reconciledState)
             ? "目标任务已结束，无法继续。"
             : "该 run 只有磁盘快照，没有当前进程内的活动 CDP 会话，无法安全继续。",
-          retryable: !TERMINAL_STATUSES.has(persisted.state)
+          retryable: !TERMINAL_STATUSES.has(reconciledState)
         },
-        run: compactRecommendRunForStatus(persisted),
+        run: compactRecommendRunForStatus(reconciled),
         persistence: {
           source: "disk",
           active_control_available: false
         }
-      }, persisted);
+      }, reconciled);
     }
     return getRecommendPipelineRunTool({ args });
   }

@@ -1,6 +1,6 @@
 {
   "name": "@reconcrap/boss-recommend-mcp",
-  "version": "2.1.27",
+  "version": "2.2.0",
   "description": "Unified MCP pipeline for recommend-page filtering and screening on Boss Zhipin",
   "keywords": [
     "boss",
@@ -12,6 +12,11 @@
   ],
   "type": "module",
   "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./monitor-provider": "./src/monitor-provider.js",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "boss-recommend-mcp": "bin/boss-recommend-mcp.js"
   },
@@ -42,6 +47,7 @@
     "test:recommend-mcp": "node src/test-recommend-mcp.js",
     "test:live-recommend-mcp-smoke": "node src/test-live-recommend-mcp-smoke.js",
     "test:recruit-domain": "node src/test-recruit-domain.js",
+    "test:recruit-target-semantics": "node src/test-recruit-target-semantics.js",
     "test:recruit-mcp": "node src/test-recruit-mcp.js",
     "test:chat-action-journal": "node src/test-chat-action-journal.js",
     "test:chat-domain": "node src/test-chat-domain.js",
@@ -49,6 +55,7 @@
     "test:chat-mcp": "node src/test-chat-mcp.js",
     "test:async": "node src/test-index-async.js",
     "test:runtime-scan": "node src/test-runtime-scan.js",
+    "test:monitor": "node src/test-monitor-projection.js && node src/test-monitor-provider-security.js && node src/test-workflow-candidate-journal.js",
     "test:live-capture-acceptance": "node src/test-live-capture-acceptance.js",
     "scan:runtime": "node scripts/scan-forbidden-runtime.js",
     "scan:runtime:json": "node scripts/scan-forbidden-runtime.js --json",
@@ -100,14 +107,18 @@
     "src/cli.js",
     "src/detached-worker.js",
     "src/index.js",
+    "src/monitor",
+    "src/monitor-provider.js",
     "src/parser.js",
     "src/recommend-mcp.js",
     "src/recommend-scheduler.js",
     "src/recruit-mcp.js",
     "src/run-state.js",
+    "monitor-integration.manifest.json",
     "README.md"
   ],
   "dependencies": {
+    "@reconcrap/recruiting-run-monitor-contract": "1.0.0",
     "chrome-remote-interface": "^0.33.3",
     "sharp": "^0.34.4",
     "ws": "^8.19.0"
@@ -119,7 +130,6 @@
     "access": "public"
   },
   "license": "MIT",
-  "devDependencies": {},
   "repository": {
     "type": "git",
     "url": "git+https://github.com/reconcrap-cpu/boss-recommend-mcp.git"
